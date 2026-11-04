@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
   ApiError,
@@ -10,22 +10,18 @@ import {
   type PilotAttachmentRef,
   type PilotFacts,
   type PilotFollowup,
-  type PilotGameFactsItem,
   type PilotNavigateFacts,
   type PilotPhase,
   type PilotPriceFacts,
-  type PilotProvider,
   type PilotRegionsFacts,
   type PilotResumePayload,
   type PilotSessionListItem,
   type PilotSessionStats,
   type PilotStep,
 } from '@/api/client'
-import { formatCnyFen } from '@/api/regions'
-import { buildCtxSegments, shouldShowCacheHitRate } from '@/lib/ctxSegments'
-import { canRateTurn, fmtTokens, isEmptyLlmFailure, isErrorReason, isLongAnswerText, pilotCoverUrl, positivePct, ratingClass, sessionTime } from '@/lib/pilotView'
-import HlImg from '@/components/ui/HlImg.vue'
-import HlPilotCards from '@/components/business/HlPilotCards.vue'
+import { isEmptyLlmFailure, sessionTime } from '@/lib/pilotView'
+import HlPilotComposer from '@/components/business/HlPilotComposer.vue'
+import HlPilotTurnItem from '@/components/business/HlPilotTurnItem.vue'
 import HlPilotChain from '@/components/business/HlPilotChain.vue'
 import HlPilotMarkdown from '@/components/business/HlPilotMarkdown.vue'
 import HlPilotSidebar from '@/components/business/HlPilotSidebar.vue'
@@ -35,13 +31,8 @@ import HlPilotRuns from '@/components/business/HlPilotRuns.vue'
 import HlPilotStats from '@/components/business/HlPilotStats.vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n, type MessageKey } from '@/locales'
-import HlButton from '@/components/ui/HlButton.vue'
-import HlTextarea from '@/components/ui/HlTextarea.vue'
-import HlChip from '@/components/ui/HlChip.vue'
-import HlDropdown from '@/components/ui/HlDropdown.vue'
 import HlInput from '@/components/ui/HlInput.vue'
 import { message } from '@/components/ui'
-import { useElementPicker } from '@/composables/useElementPicker'
 
 /**
  * 领航台对话核心（抽屉与整页 /pilot 共用同一实现——一事实一实现）。
@@ -81,64 +72,8 @@ const viewContext = computed(() => {
 })
 
 /** 页面元素选择器：用户点击输入框中的按钮进入选择模式，点击页面元素采集引用 */
-const {
-  isPicking: elPicking,
-  picked: pickedElements,
-  startPicking: startElPicking,
-  cancelPicking: cancelElPicking,
-  removePicked: removePickedEl,
-  clearPicked: clearPickedEls,
-} = useElementPicker()
+/* 页面元素选择器与待发引用/附件清单归 HlPilotComposer；发送载荷经组件 expose 取用 */
 
-/** 已选元素引用 → 随提问发送的精简数据（只传 agent 需要的字段） */
-const elementRefs = computed(() =>
-  pickedElements.value.map((p) => ({
-    tag: p.tag,
-    label: p.label,
-    text: p.text,
-    selector: p.selector,
-    role: p.role,
-  })),
-)
-
-interface Turn {
-  q: string
-  tid?: string
-  feedback?: 'accepted' | 'rejected' | null
-  /** pending = 用户发言已上屏、回复未到的占位轮（回复完成后原位替换） */
-  kind: 'candidates' | 'action' | 'price' | 'games' | 'answer' | 'guide' | 'reason' | 'pending' | 'compact'
-    | 'proposal'
-  /** compact 分隔线的触发来源（auto / manual），仅 kind=compact 时有值 */
-  compactTrigger?: string
-  /** 本轮被用户停止生成（保留已流出内容） */
-  stopped?: boolean
-  /** 账本里的轮次序号（编辑重问的定位依据）；未落账的轮为 undefined */
-  turnIndex?: number
-  text?: string
-  reasonKey?: MessageKey
-  diagnostic?: { id: string; code: string; message: string; status_code?: number | null }
-  items?: PilotGameFactsItem[]
-  cards?: PilotFacts[]
-  cached?: boolean
-  steps: PilotStep[]
-  /** 按 agent 循环步分段的阶段记录（权威）；旧账本轮次无此项，过程链回落 think + steps */
-  phases?: PilotPhase[]
-  think?: string
-  /** 思考用时（秒，服务端工时接入后随 done 下发；缺省不显示时长） */
-  thinkSec?: number
-  /** 整轮工时（秒，服务端墙钟含工具执行；缺省不显示时长） */
-  elapsedSec?: number
-  /** 过程链记忆快照：本轮上下文占用 + 归档边界 + 缓存命中 */
-  mem?: { tokens: number | null; budget: number | null; archived: number | null; cached: boolean } | null
-  /** 本轮随问携带的长文本附件（用户气泡下的附件芯片；点击展开内容） */
-  attachments?: PilotAttachmentRef[]
-  /** 本轮随问携带的编号引用（编号 + 正文）；气泡内按编号把标号渲染成胶囊 */
-  quotes?: { n: number; text: string }[]
-  /** 长回答是否展开（最新对话结果默认展开，发新对话时自动收敛；随轮持有，可手动切换） */
-  expanded?: boolean
-  /** 后端下发的本轮追问（结构化 key + args）；缺失时追问走本地卡片推导 */
-  followups?: PilotFollowup[]
-}
 
 const question = ref('')
 const streaming = ref(false)
@@ -175,74 +110,8 @@ function clearQueuedHint() {
   queuedHint.value = null
 }
 
-/* ── 引用：带编号（引用1 / 引用2），编号在句子里标位置 ──
-   内容存在 pendingQuotes，用户在输入框用「引用N」指明这句里各引用对应哪一段；
-   发送时把编号与正文一并交给后端，agent 据编号理解引用在句中的位置。 */
-interface PendingQuote {
-  id: string
-  /** 稳定编号：取最小未占用正整数，删除后不回填重排（句中标号保持有效） */
-  n: number
-  text: string
-  /** 展示标题：过长截断，完整内容留给悬停面板 */
-  title: string
-}
-
-const pendingQuotes = ref<PendingQuote[]>([])
-
-/** 引用在提问正文里的标号：文案走词条（中英各自的形态用户都读得懂），编号用于回取正文 */
-function quoteMarker(n: number): string {
-  return `\u3010${t('pilot.quote.markerPrefix')}${n}\u3011`
-}
-
-/** 两种语言的标号都认：括号内非数字前缀 + 编号，中英界面切换后旧轮仍解析得出 */
-const QUOTE_MARKER_RE = /\u3010[^\u3011\d]*(\d+)\u3011/g
-
-/** 新引用的编号：最小未占用正整数（删掉引用1后新建仍可复用 1，旧标号不受影响） */
-function nextQuoteNo(): number {
-  const used = new Set(pendingQuotes.value.map((q) => q.n))
-  let n = 1
-  while (used.has(n)) n += 1
-  return n
-}
-
-/** 引用展示标题：压平空白后截断（完整正文在悬停面板里） */
-function quoteTitleOf(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length > 28 ? `${flat.slice(0, 28)}…` : flat
-}
-
-/** 提问正文按引用标号切片：文本段与引用段交替，渲染层据此把标号换成胶囊 */
-function quoteSegments(q: string): { kind: 'text' | 'quote'; value: string; n?: number }[] {
-  const out: { kind: 'text' | 'quote'; value: string; n?: number }[] = []
-  const text = q || ''
-  let last = 0
-  QUOTE_MARKER_RE.lastIndex = 0
-  for (const m of text.matchAll(QUOTE_MARKER_RE)) {
-    const at = m.index ?? 0
-    if (at > last) out.push({ kind: 'text', value: text.slice(last, at) })
-    out.push({ kind: 'quote', value: m[0], n: Number(m[1]) })
-    last = at + m[0].length
-  }
-  if (last < text.length) out.push({ kind: 'text', value: text.slice(last) })
-  return out
-}
-
-/** 提问正文段是否行内渲染：带编号引用的消息片段走行内契约（标号胶囊保持句内位置），
-    整条无标号消息走与回答相同的块级渲染；复制与编辑重问始终取原始文本 */
-function qInline(turn: { q: string }): boolean {
-  QUOTE_MARKER_RE.lastIndex = 0
-  return QUOTE_MARKER_RE.test(turn.q || '')
-}
-
-/** 某编号引用的正文（发给后端 / 气泡悬停面板按编号取） */
-function quoteTextOf(turn: { quotes?: { n: number; text: string }[] }, n: number): string {
-  return turn.quotes?.find((q) => q.n === n)?.text ?? ''
-}
 
 /** 本轮编号引用 → 随提问发送的结构（编号 + 正文） */
-function quotePayload(): { n: number; text: string }[] {
-  return pendingQuotes.value.map((q) => ({ n: q.n, text: q.text }))
-}
 /** 流式期步骤展平（过程链的旧口径 prop；阶段记录在场时以 phases 为准） */
 const liveStepsFlat = computed(() => livePhases.value.flatMap((p) => p.steps))
 /* 终答就位渲染：回答层只承接「尚未被工具定性的当前段」正文——tool_start
@@ -303,28 +172,13 @@ const turns = ref<Turn[]>([])
 // 追问与指代靠它串起；「新对话」重新生成。
 const sessionId = ref('')
 const scrollBox = ref<HTMLDivElement | null>(null)
-// 输入区状态栏：在用模型 + 最近一轮上下文占用（均来自后端账本/配置，前端不自测）
-const pilotModel = ref('')
-// 三态：null=尚未拿到配置（不渲染，避免误报「未配置」）/ true=可用 / false=确认未配
-const pilotReady = ref<boolean | null>(null)
-// 多供应商：菜单按厂商分组收敛/展开（活跃组默认展开）
-const pilotProviders = ref<PilotProvider[]>([])
-const pilotActiveId = ref('')
-const openGroups = ref<Set<string>>(new Set())
+// 输入区状态栏：最近一轮上下文占用（模型菜单与切换在 HlPilotComposer 内自持）
 const lastCtx = ref<{
   tokens: number
   budget: number
   breakdown?: { source: string; chars: number }[] | null
   hitRate?: number | null
 } | null>(null)
-const ctxOpen = ref(false)
-const ctxSegments = computed(() => buildCtxSegments(lastCtx.value?.breakdown))
-const ctxTitle = computed(() =>
-  lastCtx.value
-    ? t('pilot.composer.ctx', { n: `${fmtTokens(lastCtx.value.tokens)}/${fmtTokens(lastCtx.value.budget)}` })
-    : t('pilot.ctx.empty'),
-)
-const ctxCacheVisible = computed(() => shouldShowCacheHitRate(lastCtx.value?.hitRate, import.meta.env.DEV))
 // 会话统计投影（底栏 HlPilotStats 与 ctx 面板消耗段）：getSession 折叠为种子，
 // 每轮 done 原位累加——与后端 session_stats 同口径的增量折叠，不另算一遍
 const sessionStats = ref<PilotSessionStats | null>(null)
@@ -374,26 +228,7 @@ const statsTotal = computed(() => {
   if (!s) return 0
   return (s.cache_base_tokens ?? s.usage_in) + s.usage_out
 })
-const statsNumFmt = computed(() => new Intl.NumberFormat(useI18n().locale.value === 'zh-CN' ? 'zh-CN' : 'en'))
-function fmtInt(v: number): string {
-  return statsNumFmt.value.format(v)
-}
-/** 命中率百分比：部分命中永不进位到 100（99.9x 诚实显示） */
-function fmtHit(hit: number): string {
-  const p = hit * 100
-  if (p >= 100) return '100'
-  if (p > 99.9) return '99.9'
-  return String(Math.round(p * 10) / 10)
-}
-const pctFmt = new Intl.NumberFormat(useI18n().locale.value === 'zh-CN' ? 'zh-CN' : 'en', {
-  style: 'percent',
-  maximumFractionDigits: 1,
-})
-function fmtPct(v: number | null | undefined): string {
-  return typeof v === 'number' && Number.isFinite(v) ? pctFmt.format(v) : '—'
-}
 // 模型就地切换：chip 弹清单，选中即 PUT 配置（不关抽屉不跳页）
-const switchingModel = ref(false)
 // 会话管理：常驻标签栏 + 跨会话引用（清单是后端账本投影，轮后刷新；null = 投影未到，不猜）
 const sessions = ref<PilotSessionListItem[] | null>(null)
 // 历史清单读取失败标记：失败保留旧清单（可能陈旧但不静默清空），面板给显式提示
@@ -407,11 +242,6 @@ const historyOpen = ref(false)
 const historyRoot = ref<HTMLElement | null>(null)
 // 会话列检索词（输入与防抖在 HlPilotSidebar，账本重投影留此）
 const sessionQuery = ref('')
-
-const ctxPercent = computed(() => {
-  if (!lastCtx.value || lastCtx.value.budget <= 0) return 0
-  return Math.min(Math.round((lastCtx.value.tokens / lastCtx.value.budget) * 100), 100)
-})
 
 
 const REASON_KEYS: Record<string, MessageKey> = {
@@ -514,7 +344,6 @@ function openFromHistory(sid: string) {
 
 onMounted(() => {
   document.addEventListener('click', onDocClickCloseMenu)
-  void loadPilotStatus()
   void loadSessions()
   const saved = readSavedSessionId()
   if (saved) {
@@ -533,86 +362,14 @@ onMounted(() => {
 })
 
 /** 领航员在用模型与可用态（设置页保存后重开表面即刷新）。 */
-async function loadPilotStatus(retry = 0): Promise<void> {
-  try {
-    const cfg = await pilotApi.getConfig()
-    pilotModel.value = cfg.model || ''
-    pilotProviders.value = cfg.providers || []
-    pilotActiveId.value = cfg.active || ''
-    // 与后端 llm_ready 同口径：enabled + base_url + model；密钥可选，不参与判定
-    pilotReady.value = Boolean(cfg.enabled && cfg.base_url && cfg.model)
-  } catch {
-    // 冷启动窗口（后端装配/DB 写锁排队）内首次拉取会失败：按退避重拉，
-    // 不把一次失败当终态——否则整个会话都停在「未配置」，只有刷新页面才恢复
-    if (retry < 4) {
-      setTimeout(() => void loadPilotStatus(retry + 1), 800 * (retry + 1))
-      return
-    }
-    pilotReady.value = false
-  }
-}
-
-// 模型就地切换：ghost chip 弹向上清单，点击即切不关抽屉
-/** 分组清单：按供应商收敛，每组只出启用模型；当前模型不在启用清单也保底可见 */
-const menuGroups = computed(() =>
-  pilotProviders.value.map((p) => {
-    const disabled = new Set(p.models_disabled)
-    const models = p.models.filter((m) => !disabled.has(m))
-    if (p.id === pilotActiveId.value && pilotModel.value && !models.includes(pilotModel.value)) {
-      models.unshift(pilotModel.value)
-    }
-    return { id: p.id, name: p.name || t('pilot.title'), models, active: p.id === pilotActiveId.value }
-  }),
-)
-
-function toggleGroup(id: string) {
-  const next = new Set(openGroups.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  openGroups.value = next
-}
-
-const modelMenuOpen = ref(false)
-const modelPickRoot = ref<HTMLElement | null>(null)
-
-function openModelMenu() {
-  const next = new Set(openGroups.value)
-  if (pilotActiveId.value) next.add(pilotActiveId.value)
-  openGroups.value = next
-  modelMenuOpen.value = !modelMenuOpen.value
-}
-
 function onDocClickCloseMenu(e: MouseEvent) {
-  if (modelPickRoot.value && !modelPickRoot.value.contains(e.target as Node)) modelMenuOpen.value = false
   if (historyRoot.value && !historyRoot.value.contains(e.target as Node)) historyOpen.value = false
-}
-
-async function pickModel(providerId: string, m: string) {
-  const sameProvider = providerId === pilotActiveId.value
-  if (switchingModel.value || (sameProvider && m === pilotModel.value)) {
-    modelMenuOpen.value = false
-    return
-  }
-  switchingModel.value = true
-  try {
-    await pilotApi.updateConfig(sameProvider ? { model: m } : { active: providerId, model: m })
-    pilotActiveId.value = providerId
-    pilotModel.value = m
-    modelMenuOpen.value = false
-  } catch {
-    message.error(t('pilot.modelMenu.switchFailed'))
-  }
-  switchingModel.value = false
 }
 
 /* 等待话术：每轮轮换一句（有活力、说人话，不重复出现感） */
 const LOADING_KEYS = ['pilot.loading.scan', 'pilot.loading.compare', 'pilot.loading.brief', 'pilot.loading.low'] as const
 const loadingSeq = ref(0)
 const loadingText = computed(() => t(LOADING_KEYS[loadingSeq.value % LOADING_KEYS.length] as MessageKey))
-
-function goSettings() {
-  void router.push('/settings')
-}
 
 /** 重开表面 / 重启应用后续接上次对话（后端会话账本还原历史轮）。 */
 async function restoreSession(sid: string) {
@@ -622,8 +379,16 @@ async function restoreSession(sid: string) {
     sessionStats.value = data.stats ?? null
     forkedFrom.value = data.forked_from ?? null
     const inflightQ = String(data.inflight_q ?? '')
-    // 只有已落账本轮次、且没有在飞轮：确属空会话（无可渲染事实）
-    if (!data.turns.length && !inflightQ) return
+    // 空会话（编辑重问首条后常见）：清空旧渲染——服务端投影才是事实源，
+    // 早退不清会让已作废的轮残留界面
+    if (!data.turns.length && !inflightQ) {
+      turns.value = []
+      lastCtx.value = null
+      livePhases.value = []
+      liveCards.value = []
+      proposalStates.value = new Map()
+      return
+    }
     proposalStates.value = new Map(
       (data.proposals ?? []).map((p) => [p.pid, { ...p, failedCount: p.failedCount ?? 0 }]),
     )
@@ -683,7 +448,7 @@ function startNewChat() {
   sessionId.value = newSessionId()
   saveSessionId(sessionId.value)
   question.value = ''
-  pendingQuotes.value = []
+  composerRef.value?.clearQuotes()
   draftReady = true
   loadQueue()
   referenceSession.value = null
@@ -782,7 +547,7 @@ async function switchSession(sid: string) {
   referenceSession.value = null
   forkedFrom.value = null
   question.value = readDraft(sid)
-  pendingQuotes.value = []
+  composerRef.value?.clearQuotes()
   draftReady = true
   await restoreSession(sid)
 }
@@ -864,10 +629,6 @@ function onReferenceSelect(item: { value?: string }) {
   if (!item.value) return
   const it = (sessions.value ?? []).find((x) => x.sid === item.value)
   if (it) referenceSession.value = { sid: it.sid, title: it.title || t('pilot.session.untitled') }
-}
-
-function fen(v: number | null | undefined): string {
-  return typeof v === 'number' && v > 0 ? formatCnyFen(v) : '—'
 }
 
 /** 聚焦框：主内容区外圈亮环，2.2s 后淡出移除 */
@@ -1260,13 +1021,6 @@ async function rateTurn(turn: Turn, feedback: 'accepted' | 'rejected') {
 }
 
 /** 答复头的复制钮：取当面那一轮的可见正文（只有数据卡、没有正文的轮不挂钮） */
-function onCopyReply(e: MouseEvent) {
-  const body = (e.currentTarget as HTMLElement)
-    .closest('.pilot-reply')
-    ?.querySelector<HTMLElement>('.pilot-answer')
-  void onCopyText(body?.innerText ?? '')
-}
-
 /** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换、复制操作与代码块复制 */
 function onTurnsClick(e: MouseEvent) {
   const codeCopy = (e.target as HTMLElement).closest<HTMLElement>('.pilot-code-copy')
@@ -1358,59 +1112,22 @@ const selBarStyle = computed(() => {
   return { top: `${Math.max(s.top - 44, 8)}px`, left: `${Math.min(Math.max(s.left, half), limit)}px` }
 })
 
-const composer = ref<ComponentPublicInstance | null>(null)
+const composerRef = ref<InstanceType<typeof HlPilotComposer> | null>(null)
 
-/** 取回一颗待发引用：移除并回填到输入框 */
-function removePendingQuote(id: string) {
-  pendingQuotes.value = pendingQuotes.value.filter((q) => q.id !== id)
-}
-
-/** 引用回填：拖选正文收成一颗带编号的引用（「引用N」插到光标处，正文存起来） */
+/** 引用回填：消息面引用钮 / 拖选浮条 → 组件插入光标处；浮选与选区清理留在消息面 */
 function quoteToComposer(text: string) {
-  const body = text.trim()
-  if (!body) return
-  const n = nextQuoteNo()
-  pendingQuotes.value = [...pendingQuotes.value, { id: newSessionId(), n, text: body, title: quoteTitleOf(body) }]
-  // 光标处插入标号：引用在句中的位置由用户自己摆，「引用1 不如 引用2」这种对比才写得出
-  const el = composer.value?.$el as HTMLTextAreaElement | undefined
-  const cur = question.value
-  const at = el?.selectionStart ?? cur.length
-  const end = el?.selectionEnd ?? cur.length
-  const marker = quoteMarker(n)
-  question.value = `${cur.slice(0, at)}${marker}${cur.slice(end)}`
+  composerRef.value?.insertQuoteAtCursor(text)
   hideSelQuote()
   window.getSelection()?.removeAllRanges()
-  const caret = at + marker.length
-  void nextTick(() => {
-    el?.focus()
-    el?.setSelectionRange(caret, caret)
-  })
-}
-
-function onComposerKeydown(e: KeyboardEvent) {
-  // Enter 发送；输入法组词确认的 Enter（isComposing）不是发送意图，放行给编辑器
-  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return
-  if (e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return
-  e.preventDefault()
-  ask()
 }
 
 let abortCtrl: AbortController | null = null
 
-/* ── 长文本附件：粘贴超阈值即落盘，消息里只带引用（与后端 attachments 同源口径） ──
-   内联上限 15360 字符（对齐后端常量）：超过就不进提问字段，改存附件文件，
-   提问只带「名称 / 字符数 / 行数」；正文按需展开（区间读取，一次一块，可续读）。
-   这样输入长度不再有天花板，长文本也不会每轮重复挤占上下文。 */
-const ATTACH_INLINE_LIMIT = 15360
-/** 待发附件（发送后随本轮上屏并清空） */
-const pendingAttachments = ref<PilotAttachmentRef[]>([])
-const attachBusy = ref(false)
 /** 展开中的附件（同一时刻只展开一枚）；chunk 为空 = 正在取块 */
 const openAtt = ref<{ ref: PilotAttachmentRef; chunk: PilotAttachmentChunk | null; busy: boolean } | null>(null)
 
-function fmtChars(n: number): string {
-  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n)
-}
+/** 附件上传在途（Console 持有会话权威并驱动 API；清单展示在 HlPilotComposer） */
+const attachBusy = ref(false)
 
 async function attachText(text: string, name?: string) {
   if (!sessionId.value) {
@@ -1420,47 +1137,13 @@ async function attachText(text: string, name?: string) {
   attachBusy.value = true
   try {
     const ref_ = await pilotApi.createAttachment(sessionId.value, text, name)
-    pendingAttachments.value = [...pendingAttachments.value, ref_]
+    composerRef.value?.addAttachment(ref_)
     message.success(t('pilot.attach.added', { name: ref_.name, n: ref_.lines }))
   } catch {
     message.error(t('pilot.attach.failed'))
   } finally {
     attachBusy.value = false
   }
-}
-
-function removePendingAttachment(id: string) {
-  pendingAttachments.value = pendingAttachments.value.filter((a) => a.id !== id)
-}
-
-/** 同类引用收拢胶囊：悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清）；条目清空即收起 */
-const attGroupOpen = ref(false)
-const elGroupOpen = ref(false)
-watch(pendingAttachments, (v) => {
-  if (!v.length) attGroupOpen.value = false
-})
-watch(pickedElements, (v) => {
-  if (!v.length) elGroupOpen.value = false
-})
-const attachGroupLabel = computed(() => {
-  const atts = pendingAttachments.value
-  if (!atts.length) return t('pilot.attach.uploading')
-  if (atts.length === 1) return t('pilot.attach.chip', { name: atts[0].name, n: atts[0].lines })
-  return t('pilot.attach.group', { n: atts.length })
-})
-const elGroupLabel = computed(() => {
-  const els = pickedElements.value
-  if (els.length === 1) return t('pilot.elPicker.chip', { tag: els[0].tag, label: els[0].label || els[0].text })
-  return t('pilot.elPicker.group', { n: els.length })
-})
-
-/** 粘贴拦截：短文本照常进输入框；长文本落盘换引用（长度不再是输入的天花板） */
-function onComposerPaste(e: ClipboardEvent) {
-  const text = e.clipboardData?.getData('text/plain') ?? ''
-  if (!text || text.length <= ATTACH_INLINE_LIMIT) return
-  e.preventDefault()
-  const first = (text.split('\n')[0] ?? '').trim().slice(0, 24)
-  void attachText(text, first || t('pilot.attach.pastedName'))
 }
 
 /** 展开/收起附件内容：块按需取（truncated 时可按提示续读下一块） */
@@ -1622,66 +1305,25 @@ function nextTurnIndex(): number {
 }
 
 const editingIndex = ref<number | null>(null)
-const editingText = ref('')
 const editBusy = ref(false)
-
-function canEditTurn(turn: Turn): boolean {
-  if (streaming.value) return false
-  return typeof turn.turnIndex === 'number' || turn.kind === 'reason' || Boolean(turn.stopped)
-}
-
-/** 该轮可否分叉：只有已落账本（有轮号）且不在生成中的轮才有确定的分叉点 */
-function canForkTurn(turn: Turn): boolean {
-  return typeof turn.turnIndex === 'number' && !streaming.value && !flagBusy.value
-}
-
-/** 该轮之后还会被丢掉的轮数（编辑提示用） */
-const editDropCount = computed(() => {
-  const i = editingIndex.value
-  const turn = i === null ? undefined : turns.value[i]
-  if (!turn) return 0
-  if (typeof turn.turnIndex === 'number') {
-    return turns.value.filter((t) => typeof t.turnIndex === 'number' && t.turnIndex > turn.turnIndex!).length
-  }
-  return Math.max(0, turns.value.length - 1 - i)
-})
 
 function startEdit(index: number) {
   const turn = turns.value[index]
-  if (streaming.value || !turn || !canEditTurn(turn)) return
+  if (streaming.value || !turn || editingIndex.value !== null) return
+  if (!(typeof turn.turnIndex === 'number' || turn.kind === 'reason' || Boolean(turn.stopped))) return
   editingIndex.value = index
-  editingText.value = turn.q
-  void nextTick(() => editBoxes.value[0]?.focus())
 }
 
-/** 编辑态文本框（同一时刻最多一个，v-for 内字符串 ref 收到数组） */
-const editBoxes = ref<HTMLTextAreaElement[]>([])
-
-function cancelEdit() {
-  editingIndex.value = null
-  editingText.value = ''
-}
-
-function onEditKeydown(e: KeyboardEvent) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-    e.preventDefault()
-    void submitEdit()
-  } else if (e.key === 'Escape') {
-    cancelEdit()
-  }
-}
-
+/** 该轮可否分叉：只有已落账本（有轮号）且不在生成中的轮才有确定的分叉点 */
 const EDIT_FAIL_KEYS: Record<string, MessageKey> = {
   no_session: 'pilot.edit.fail.gone',
   busy: 'pilot.edit.fail.busy',
   write_failed: 'pilot.edit.fail.write',
 }
 
-async function submitEdit() {
-  const i = editingIndex.value
-  const turn = i === null ? undefined : turns.value[i]
-  const text = editingText.value.trim()
-  if (!turn || !canEditTurn(turn) || !text || editBusy.value) return
+async function submitEdit(i: number, text: string) {
+  const turn = turns.value[i]
+  if (!turn || !(typeof turn.turnIndex === 'number' || turn.kind === 'reason' || Boolean(turn.stopped)) || !text || editBusy.value) return
   editBusy.value = true
   try {
     if (typeof turn.turnIndex === 'number') {
@@ -1691,14 +1333,12 @@ async function submitEdit() {
         return
       }
       editingIndex.value = null
-      editingText.value = ''
       // 账本同源：截断后按后端投影重建对话流，再提交新提问
       if (sessionId.value) await restoreSession(sessionId.value)
       void ask(text)
     } else {
       // 未落账轮次（失败轮 / 中断轮）：无需服务端软截断，直接丢弃该轮及其后未入账轮次并重新提问
       editingIndex.value = null
-      editingText.value = ''
       turns.value.splice(i)
       void ask(text)
     }
@@ -1707,10 +1347,6 @@ async function submitEdit() {
   } finally {
     editBusy.value = false
   }
-}
-
-function canRetryTurn(turn: Turn): boolean {
-  return turn.kind === 'reason' && Boolean(turn.q)
 }
 
 async function retryTurn(index: number) {
@@ -1731,18 +1367,8 @@ async function retryTurn(index: number) {
     // 未落账失败轮：直接从对话记录中移除该轮，原位重发
     turns.value.splice(index)
   }
-  if (retryAtts.length) pendingAttachments.value = retryAtts
+  if (retryAtts.length) composerRef.value?.restoreAttachments(retryAtts)
   void ask(retryQ, undefined, retryQuotes.length ? retryQuotes : undefined)
-}
-
-/* ── 长回答折叠：最新对话结果默认展开，发新对话时收敛历史轮次（纯前端，不改账本） ── */
-
-function isLongAnswer(turn: Turn): boolean {
-  return isLongAnswerText(turn.text)
-}
-
-function toggleAnswer(turn: Turn) {
-  turn.expanded = !turn.expanded
 }
 
 /** 分叉溯源文案：源会话标题按账本投影解析（找不到回落「新对话」） */
@@ -1772,9 +1398,11 @@ function sessionLabel(item: { title?: string | null; forked_from?: string | null
 
 async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: number; text: string }[]) {
   const typedQ = (text ?? question.value).trim()
-  const sentAtts = pendingAttachments.value
-  // 编号引用：常规输入走待发区；重试/续跑由调用方把该轮的引用原样带回来
-  const sentQuotes = quotes ?? quotePayload()
+  // 待发载荷（引用/附件/元素引用）自组件取用；重试/续跑由调用方把该轮的引用原样带回来
+  const payload = composerRef.value?.getComposerPayload()
+    ?? { quotes: [] as { n: number; text: string }[], attachments: [], elements: [] }
+  const sentAtts = payload.attachments
+  const sentQuotes = quotes ?? payload.quotes
   // 允许「只挂附件、不写问题」的提交（附件本体已是内容）；提问留空时补一句，
   // 与后端回落用同一句，气泡与账本才不会一边空一边有字
   if (!typedQ && !sentAtts.length) return
@@ -1793,11 +1421,9 @@ async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: num
     question.value = ''
     dropDraft(sessionId.value)
   }
-  pendingAttachments.value = []
-  pendingQuotes.value = []
   // 元素引用随本轮发送后即清空（一次性，与附件同语义）
-  const sentElRefs = elementRefs.value.length ? [...elementRefs.value] : null
-  clearPickedEls()
+  const sentElRefs = payload.elements.length ? [...payload.elements] : null
+  composerRef.value?.clearPending()
   streaming.value = true
   abortCtrl = new AbortController()
   livePhases.value = []
@@ -1921,7 +1547,7 @@ async function ask(text?: string, resume?: PilotResumePayload, quotes?: { n: num
       failed = true
       failedMsg = String((err as Error)?.message ?? '')
       // 附件已落盘仍有效：放回待发区，用户可一键重试（不重传内容）
-      if (sentAtts.length) pendingAttachments.value = sentAtts
+      if (sentAtts.length) composerRef.value?.restoreAttachments(sentAtts)
     }
   }
   referenceSession.value = null
@@ -2340,386 +1966,30 @@ function triggerFollowUp(prompt: string) {
           </span>
           <span class="pilot-compact__line" aria-hidden="true"></span>
         </div>
-        <template v-else>
-        <div class="pilot-turn__row">
-          <!-- 编辑态：改完提交 → 作废该轮及其后各轮，用新提问重跑 -->
-          <div v-if="editingIndex === i" class="pilot-edit">
-            <textarea
-              ref="editBoxes"
-              v-model="editingText"
-              class="pilot-edit__box"
-              rows="2"
-              :placeholder="t('pilot.edit.placeholder')"
-              @keydown="onEditKeydown"
-            ></textarea>
-            <div class="pilot-edit__bar">
-              <span v-if="editDropCount" class="pilot-edit__warn">
-                {{ t('pilot.edit.dropWarn', { n: editDropCount }) }}
-              </span>
-              <button
-                type="button"
-                class="pilot-edit__btn"
-                :disabled="editBusy || !editingText.trim()"
-                @click="submitEdit"
-              >{{ t('pilot.edit.submit') }}</button>
-              <button type="button" class="pilot-edit__btn is-ghost" @click="cancelEdit">
-                {{ t('pilot.edit.cancel') }}
-              </button>
-            </div>
-          </div>
-          <!-- 提问气泡：文本段与助手回答同一 Markdown 契约（带标号时按行内渲染保胶囊句内位置，
-               无标号整条走块级渲染）；复制/编辑重问仍取原始文本 -->
-          <div v-else class="pilot-turn__q">
-            <template v-for="(seg, si) in quoteSegments(turn.q)" :key="si">
-              <span
-                v-if="seg.kind === 'quote'"
-                class="pilot-qchip"
-                :class="{ 'is-missing': !quoteTextOf(turn, seg.n!) }"
-                tabindex="0"
-              >
-                <span class="pilot-qchip__no">{{ seg.n }}</span>
-                <span class="pilot-qchip__title">{{ quoteTextOf(turn, seg.n!) ? quoteTitleOf(quoteTextOf(turn, seg.n!)) : t('pilot.quote.gone') }}</span>
-                <span v-if="quoteTextOf(turn, seg.n!)" class="pilot-qchip__full">{{ quoteTextOf(turn, seg.n!) }}</span>
-              </span>
-              <HlPilotMarkdown
-                v-else-if="seg.value"
-                :inline="qInline(turn)"
-                :source="seg.value"
-              />
-            </template>
-          </div>
-        </div>
-
-        <!-- 发言动作行：挂在气泡下方独立一行（右沿对齐），hover 才显形；
-             动作不再挤在气泡旁边，气泡宽度与位置恒定 -->
-        <div v-if="editingIndex !== i" class="pilot-acts pilot-acts--end">
-          <button
-            type="button"
-            class="pilot-act"
-            :title="t('pilot.copy')"
-            :aria-label="t('pilot.copy')"
-            @click="onCopyText(turn.q)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2" />
-              <path d="M15 5H6a2 2 0 0 0-2 2v9" />
-            </svg>
-          </button>
-          <!-- 改一句重问：已落账轮或失败/中断轮均可改（修改后重发） -->
-          <button
-            v-if="canEditTurn(turn)"
-            type="button"
-            class="pilot-act"
-            :title="t('pilot.edit.title')"
-            :aria-label="t('pilot.edit.title')"
-            @click="startEdit(i)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z" />
-              <path d="M14.5 6.5 17.5 9.5" />
-            </svg>
-          </button>
-        </div>
-
-        <!-- 本轮附件：长文本的引用（名称 / 字符数 / 行数），点开按需取块看内容。
-             与回复层同级挂纵向的 pilot-turn 下——气泡那一行是横向 flex，
-             留在行内会被当成行内第三项横排到气泡旁边。 -->
-        <div v-if="turn.attachments?.length" class="pilot-atts">
-          <button
-            v-for="a in turn.attachments"
-            :key="a.id"
-            type="button"
-            class="pilot-att"
-            :class="{ 'is-open': openAtt?.ref.id === a.id }"
-            :title="t('pilot.attach.toggle')"
-            @click="toggleAttachment(a)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M14 3v5h5" />
-              <path d="M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-4-5Z" />
-            </svg>
-            <span class="pilot-att__name">{{ a.name }}</span>
-            <span class="pilot-att__meta">{{ t('pilot.attach.meta', { chars: fmtChars(a.chars), lines: a.lines }) }}</span>
-          </button>
-        </div>
-        <div
-          v-if="openAtt && turn.attachments?.some((a) => a.id === openAtt?.ref.id)"
-          class="pilot-att-panel"
-        >
-          <pre class="pilot-att-panel__body">{{ openAtt.busy && !openAtt.chunk ? t('pilot.attach.loading') : openAtt.chunk?.content }}</pre>
-          <div class="pilot-att-panel__bar">
-            <span class="pilot-att-panel__note">{{ openAtt.chunk?.note }}</span>
-            <button
-              v-if="openAtt.chunk?.truncated"
-              type="button"
-              class="pilot-att-panel__more"
-              :disabled="openAtt.busy"
-              @click="loadAttachment(openAtt.ref, (openAtt.chunk?.end_line ?? 0) + 1, true)"
-            >{{ t('pilot.attach.more') }}</button>
-          </div>
-        </div>
-
-        <!-- agent 回复层：与用户气泡两种图层的统一左对齐面板；pending 轮只上屏发言，回复侧由下方 live 区承担 -->
-        <div v-if="turn.kind !== 'pending'" class="pilot-reply">
-          <div class="pilot-reply__header">
-            <span class="pilot-reply__avatar">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="12" cy="12" r="10" />
-                <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
-              </svg>
-            </span>
-            <span class="pilot-reply__role">Pilot</span>
-            <!-- 中断续跑：已完成的工具事实回灌，接着把这一轮做完 -->
-            <button
-              v-if="turn.stopped && !streaming"
-              type="button"
-              class="pilot-resume"
-              :title="t('pilot.continue.title')"
-              @click="continueStopped(i)"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M6 3.5 20 12 6 20.5v-17Z" />
-              </svg>
-              <span>{{ t('pilot.continue') }}</span>
-            </button>
-          </div>
-
-          <!-- agent 过程链：链头一行摘要（工时+步数），展开看思考/步骤/记忆；done.steps 全量回填 -->
-          <HlPilotChain
-            v-if="turn.phases?.length || turn.think || turn.steps.length"
-            hide-phase-text
-            :steps="turn.steps"
-            :phases="turn.phases ?? []"
-            :think="turn.think"
-            :think-sec="turn.thinkSec ?? null"
-            :elapsed-sec="turn.elapsedSec ?? null"
-            :memory="turn.mem ?? null"
-            :failed="turn.kind === 'reason'"
-            @quote="quoteToComposer"
-            @copy="onCopyText"
-          />
-
-          <!-- 结果异常/原因气泡：红色条件气泡支持行内直接重试 -->
-          <div
-            v-if="turn.kind === 'reason'"
-            class="pilot-reason"
-            :class="{ 'is-error': isErrorReason(turn.reasonKey) }"
-          >
-            <div class="pilot-reason__body">
-              <svg
-                v-if="isErrorReason(turn.reasonKey)"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="pilot-reason__icon"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <span class="pilot-reason__text">
-                {{ turn.reasonKey ? t(turn.reasonKey) : '' }}
-                <span v-if="turn.cached">({{ t('pilot.cached') }})</span>
-              </span>
-            </div>
-            <button
-              v-if="canRetryTurn(turn)"
-              type="button"
-              class="pilot-reason__retry-btn"
-              :disabled="streaming"
-              :title="t('pilot.retry')"
-              @click="retryTurn(i)"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pilot-reason__retry-icon" aria-hidden="true">
-                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                <path d="M3 3v5h5" />
-                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-                <path d="M16 21h5v-5" />
-              </svg>
-              <span>{{ t('pilot.retry') }}</span>
-            </button>
-          </div>
-
-          <!-- 上游原文：挂在原因气泡下方，先读得懂的结论再给可展开的原文 -->
-          <details v-if="turn.diagnostic" class="pilot-error-diagnostic" open>
-            <summary>{{ t('pilot.error.details') }}</summary>
-            <p>{{ turn.diagnostic.message || t('pilot.error.genericDetail') }}</p>
-            <span>{{ t('pilot.error.diagnosticId', { id: turn.diagnostic.id }) }}</span>
-          </details>
-
-          <div v-else-if="turn.kind === 'candidates'" class="pilot-briefing">
-            <div class="pilot-briefing__title">{{ turn.reasonKey ? t(turn.reasonKey) : '' }}</div>
-            <div class="pilot-cands-grid">
-              <button
-                v-for="(g, gi) in turn.items"
-                :key="gi"
-                type="button"
-                class="pilot-cand"
-                :class="{ 'is-locked': i !== turns.length - 1 }"
-                @click="pickCandidate(turn, gi)"
-              >
-                <span class="pilot-cand__idx">{{ gi + 1 }}</span>
-                <HlImg
-                  :src="pilotCoverUrl(g.appid)"
-                  :alt="g.name || `AppID ${g.appid}`"
-                  loading="lazy"
-                  class="pilot-cand__cover"
-                >
-                  <template #fallback>
-                    <span class="pilot-cand__cover-fallback">{{ (g.name || `AppID ${g.appid}`).slice(0, 2) }}</span>
-                  </template>
-                </HlImg>
-                <div class="pilot-cand__main">
-                  <span class="pilot-cand__name" :title="g.name">{{ g.name }}</span>
-                  <div class="pilot-cand__meta">
-                    <span
-                      v-if="typeof g.positiveRate === 'number' && g.positiveRate > 0"
-                      class="pilot-cand__rating"
-                      :class="ratingClass(g.positiveRate)"
-                    >{{ positivePct(g.positiveRate) }}%</span>
-                    <span class="pilot-cand__price">{{ fen(g.cnyFen) }}</span>
-                    <span v-if="g.discount" class="pilot-cand__disc">-{{ g.discount }}%</span>
-                  </div>
-                </div>
-              </button>
-            </div>
-          </div>
-
-          <HlPilotCards v-else-if="turn.kind === 'action'" :cards="turn.cards ?? []" actions
-            @quote="quoteToComposer" @copy="onCopyText" />
-
-          <HlPilotCards v-else-if="turn.kind === 'price'" :cards="turn.cards ?? []" actions
-            @quote="quoteToComposer" @copy="onCopyText" />
-
-          <HlPilotCards v-else-if="turn.kind === 'games'" :cards="turn.cards ?? []" actions
-            @quote="quoteToComposer" @copy="onCopyText" />
-
-          <!-- 批量提议：清单 + 确认/取消，确认后才真正执行 -->
-          <div v-else-if="turn.kind === 'proposal'" class="pilot-proposal">
-            <HlPilotCards
-              :cards="turn.cards ?? []"
-              actions
-              @proposal="onProposal"
-              @quote="quoteToComposer"
-              @copy="onCopyText"
-            />
-            <HlPilotMarkdown
-              v-if="turn.text"
-              class="pilot-answer"
-              :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              :source="turn.text"
-            />
-            <button
-              v-if="isLongAnswer(turn)"
-              type="button"
-              class="pilot-answer__more"
-              @click="toggleAnswer(turn)"
-            >{{ t(turn.expanded ? 'pilot.answer.collapse' : 'pilot.answer.expand') }}</button>
-          </div>
-
-          <!-- 回答：极简 Markdown 渲染（分点/粗体/行内码/代码块；渲染器内先转义后拼标签）。
-               数据卡先行、终答文字收尾——与流式期布局同序，done 不重排 -->
-          <template v-else-if="turn.kind === 'answer'">
-            <HlPilotCards
-              v-if="turn.cards?.length"
-              :cards="turn.cards"
-              actions
-              @proposal="onProposal"
-              @quote="quoteToComposer"
-              @copy="onCopyText"
-            />
-            <HlPilotMarkdown
-              v-if="turn.text"
-              class="pilot-answer"
-              :class="{ 'is-clamped': isLongAnswer(turn) && !turn.expanded }"
-              :source="turn.text"
-            />
-            <button
-              v-if="isLongAnswer(turn)"
-              type="button"
-              class="pilot-answer__more"
-              @click="toggleAnswer(turn)"
-            >{{ t(turn.expanded ? 'pilot.answer.collapse' : 'pilot.answer.expand') }}</button>
-            <div v-if="turn.stopped" class="pilot-stopped">{{ t('pilot.stopped') }}</div>
-          </template>
-
-          <div v-else-if="turn.kind === 'guide'" class="pilot-guide">
-            <p class="pilot-guide__title">{{ t('pilot.guide.title') }}</p>
-            <p>{{ t('pilot.guide.monitor') }}</p>
-            <p>{{ t('pilot.guide.alert') }}</p>
-            <router-link class="pilot-guide__link" to="/library">{{ t('pilot.guide.link') }}</router-link>
-          </div>
-
-          <!-- 回复动作行：挂在回复正文下方独立一行（左沿对齐），hover 才显形。
-               动作属于它作用的那条回复——不挤在身份标旁边，也不上到提问那一行 -->
-          <div v-if="canRateTurn(turn) || canForkTurn(turn)" class="pilot-acts">
-            <button
-              v-if="turn.text"
-              type="button"
-              class="pilot-act"
-              :title="t('pilot.copy')"
-              :aria-label="t('pilot.copy')"
-              @click="onCopyReply"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="9" y="9" width="11" height="11" rx="2" />
-                <path d="M15 5H6a2 2 0 0 0-2 2v9" />
-              </svg>
-            </button>
-            <button
-              v-if="canRateTurn(turn)"
-              type="button"
-              class="pilot-act pilot-feedback"
-              :class="{ 'is-selected': turn.feedback === 'accepted' }"
-              :title="t('pilot.feedback.accepted')"
-              :aria-label="t('pilot.feedback.accepted')"
-              :aria-pressed="turn.feedback === 'accepted'"
-              :disabled="Boolean(feedbackBusyKey)"
-              @click="rateTurn(turn, 'accepted')"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M7 10v11H4V10h3Zm3 11h7.1a2 2 0 0 0 1.96-1.6l1.5-7.5A2 2 0 0 0 18.6 9H14l.7-3.5A2 2 0 0 0 12.75 3L8 10.2V21Z" />
-              </svg>
-            </button>
-            <button
-              v-if="canRateTurn(turn)"
-              type="button"
-              class="pilot-act pilot-feedback"
-              :class="{ 'is-rejected': turn.feedback === 'rejected' }"
-              :title="t('pilot.feedback.rejected')"
-              :aria-label="t('pilot.feedback.rejected')"
-              :aria-pressed="turn.feedback === 'rejected'"
-              :disabled="Boolean(feedbackBusyKey)"
-              @click="rateTurn(turn, 'rejected')"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M17 14V3h3v11h-3Zm-3-11H6.9a2 2 0 0 0-1.96 1.6l-1.5 7.5A2 2 0 0 0 5.4 15H10l-.7 3.5A2 2 0 0 0 11.25 21L16 13.8V3Z" />
-              </svg>
-            </button>
-            <!-- 话题分叉：从这一轮（含）派生新会话，源会话保留（同走账本记录） -->
-            <button
-              v-if="canForkTurn(turn)"
-              type="button"
-              class="pilot-act"
-              :title="t('pilot.session.forkTitle')"
-              :aria-label="t('pilot.session.fork')"
-              @click="forkFromTurn(i)"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <circle cx="6.5" cy="6" r="2.4" />
-                <circle cx="6.5" cy="18" r="2.4" />
-                <circle cx="17.5" cy="9.5" r="2.4" />
-                <path d="M6.5 8.4v7.2M8.9 6h4.1a4.5 4.5 0 0 1 4.5 1.4" />
-              </svg>
-            </button>
-          </div>
-
-        </div>
-        </template>
+        <HlPilotTurnItem
+          :turn="turn"
+          :index="i"
+          :is-last="i === turns.length - 1"
+          :streaming="streaming"
+          :editing="editingIndex === i"
+          :edit-busy="editBusy"
+          :feedback-busy="Boolean(feedbackBusyKey)"
+          :open-att="openAtt"
+          @copy="onCopyText"
+          @quote="quoteToComposer"
+          @edit-start="startEdit(i)"
+          @edit-submit="(idx, text) => submitEdit(idx, text)"
+          @edit-cancel="cancelEdit"
+          @retry="retryTurn"
+          @rate="rateTurn"
+          @fork="forkFromTurn"
+          @candidate-pick="pickCandidate"
+          @proposal="onProposal"
+          @continue-stopped="continueStopped"
+          @toggle-attachment="toggleAttachment"
+          @more-attachment="loadAttachment"
+          @toggle-answer="toggleAnswer"
+        />
       </div>
 
       <div v-if="streaming" class="pilot-turn">
@@ -2761,7 +2031,7 @@ function triggerFollowUp(prompt: string) {
               class="pilot-act"
               :title="t('pilot.copy')"
               :aria-label="t('pilot.copy')"
-              @click="onCopyReply"
+              @click="onCopyText(liveAnswerSource)"
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="9" y="9" width="11" height="11" rx="2" />
@@ -2856,364 +2126,24 @@ function triggerFollowUp(prompt: string) {
       </div>
     </div>
 
-    <div class="pilot-composer">
-      <!-- 引用区：一次性上下文（当前对象 / 跨会话引用 / 待发引用 / 待发附件 / 页面元素），顶置在输入文本上方，多枚自动换行 -->
-      <div
-        v-if="game || referenceSession || pendingQuotes.length || pendingAttachments.length || attachBusy || pickedElements.length"
-        class="pilot-composer__refs"
-      >
-        <!-- 当前对象上下文：随页面而来，不可移除 -->
-        <span v-if="game" class="pilot-ref" :title="game.name">
-          <HlImg
-            :src="pilotCoverUrl(game.appid)"
-            :alt="game.name"
-            loading="lazy"
-            class="pilot-ref__cover"
-          >
-            <template #fallback>
-              <span class="pilot-ref__cover-fallback">{{ (game.name || '').slice(0, 1) }}</span>
-            </template>
-          </HlImg>
-          <span class="pilot-ref__label">{{ t('pilot.context.of') }} · {{ game.name }}</span>
-        </span>
-        <!-- 跨会话引用：+ 弹最近会话清单（排除当前），选中后下一轮提问携带其要点（一次性） -->
-        <span v-if="referenceSession" class="pilot-ref" :title="referenceSession.title">
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M4 6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H9l-5 4V6z" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ t('pilot.ref.chip', { title: referenceSession.title }) }}</span>
-          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click="referenceSession = null">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-        </span>
-        <!-- 待发引用：拖选后落成带编号的胶囊；编号由用户在正文里摆位置，这里显示同一编号 -->
-        <span
-          v-for="quote in pendingQuotes"
-          :key="quote.id"
-          class="pilot-ref pilot-ref--quote"
-          tabindex="0"
-        >
-          <span class="pilot-ref__no">{{ quote.n }}</span>
-          <span class="pilot-ref__label">{{ quote.title }}</span>
-          <button
-            type="button"
-            class="pilot-ref__x"
-            :aria-label="t('pilot.ref.remove')"
-            @click.stop="removePendingQuote(quote.id)"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <span class="pilot-ref__quote-full">{{ quote.text }}</span>
-        </span>
-        <!-- 待发附件：同类收拢为一颗胶囊，悬停/点击弹清单（面板内单条删除，胶囊 ✕ 全清） -->
-        <div
-          v-if="pendingAttachments.length || attachBusy"
-          class="pilot-ref is-group"
-          :class="{ 'is-busy': !pendingAttachments.length }"
-          @click="attGroupOpen = !attGroupOpen"
-          @mouseenter="attGroupOpen = true"
-          @mouseleave="attGroupOpen = false"
-        >
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ attachGroupLabel }}</span>
-          <button
-            v-if="pendingAttachments.length"
-            type="button"
-            class="pilot-ref__x"
-            :aria-label="t('pilot.ref.remove')"
-            @click.stop="pendingAttachments = []"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <Transition name="hl-pop">
-            <div v-if="attGroupOpen && pendingAttachments.length" class="pilot-ref__panel">
-              <div v-for="a in pendingAttachments" :key="a.id" class="pilot-ref__row" :title="a.name">
-                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <div class="pilot-ref__row-main">
-                  <div class="pilot-ref__row-title">{{ a.name }}</div>
-                  <div class="pilot-ref__row-meta">{{ t('pilot.attach.meta', { chars: fmtChars(a.chars), lines: a.lines }) }}</div>
-                </div>
-                <button
-                  type="button"
-                  class="pilot-ref__row-x"
-                  :aria-label="t('pilot.ref.remove')"
-                  @click.stop="removePendingAttachment(a.id)"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </Transition>
-        </div>
-        <!-- 页面元素引用：同类收拢为一颗胶囊，悬停/点击弹清单；选择模式内再点已选元素仍可取消 -->
-        <div
-          v-if="pickedElements.length"
-          class="pilot-ref is-group"
-          @click="elGroupOpen = !elGroupOpen"
-          @mouseenter="elGroupOpen = true"
-          @mouseleave="elGroupOpen = false"
-        >
-          <svg class="pilot-ref__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
-          <span class="pilot-ref__label">{{ elGroupLabel }}</span>
-          <button type="button" class="pilot-ref__x" :aria-label="t('pilot.ref.remove')" @click.stop="clearPickedEls()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-            </svg>
-          </button>
-          <Transition name="hl-pop">
-            <div v-if="elGroupOpen" class="pilot-ref__panel">
-              <div v-for="el in pickedElements" :key="el.id" class="pilot-ref__row" :title="el.selector">
-                <svg class="pilot-ref__row-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <div class="pilot-ref__row-main">
-                  <div class="pilot-ref__row-title">{{ el.label || el.text }}</div>
-                  <div class="pilot-ref__row-meta">{{ el.tag }} · {{ el.selector }}</div>
-                </div>
-                <button
-                  type="button"
-                  class="pilot-ref__row-x"
-                  :aria-label="t('pilot.ref.remove')"
-                  @click.stop="removePickedEl(el.id)"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
-                    <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </Transition>
-        </div>
-      </div>
-      <HlTextarea
-        ref="composer"
-        v-model="question"
-        :rows="2"
-        class="pilot-composer__input"
-        :placeholder="t('pilot.ask.placeholder')"
-        @keydown="onComposerKeydown"
-        @paste="onComposerPaste"
-      />
-      <div class="pilot-composer__bar">
-        <div class="pilot-composer__chips">
-          <HlDropdown :items="plusMenuItems" trigger="click" direction="up" @select="onMenuSelect">
-            <HlChip tone="neutral" class="pilot-ref-add" :title="t('pilot.ref.add')">
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-              </svg>
-            </HlChip>
-          </HlDropdown>
-          <!-- 页面元素选择：点击进入选择模式，再点已选元素可取消 -->
-          <button
-            type="button"
-            class="pilot-el-pick"
-            :class="{ 'is-active': elPicking }"
-            :title="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
-            :aria-label="elPicking ? t('pilot.elPicker.cancel') : t('pilot.elPicker.start')"
-            @click="elPicking ? cancelElPicking() : startElPicking({ pickedHint: t('pilot.elPicker.picked') })"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M3 3l7 19 2-8 8-2L3 3z" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
-          <div
-            class="pilot-ctxpick"
-            @click.stop
-            @mouseenter="ctxOpen = true"
-            @mouseleave="ctxOpen = false"
-          >
-            <button
-              type="button"
-              class="pilot-ctxpick__btn"
-              :class="{ 'is-warn': ctxPercent > 85 }"
-              :title="ctxTitle"
-              :aria-label="ctxTitle"
-              @click="ctxOpen = !ctxOpen"
-            >
-              <svg class="pilot-ctxpick__ring" viewBox="0 0 20 20" aria-hidden="true">
-                <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor"
-                        stroke-width="2.5" opacity="0.25" />
-                <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor"
-                        stroke-width="2.5" stroke-linecap="round"
-                        stroke-dasharray="50.265 50.265"
-                        :stroke-dashoffset="50.265 * (1 - ctxPercent / 100)"
-                        transform="rotate(-90 10 10)" />
-              </svg>
-              <span v-if="lastCtx" class="pilot-ctxpick__num">{{ `${fmtTokens(lastCtx.tokens)}/${fmtTokens(lastCtx.budget)}` }}</span>
-            </button>
-            <Transition name="hl-pop">
-              <div v-if="ctxOpen" class="pilot-ctxpick__panel">
-                <div class="pilot-ctxpick__head">
-                  <span>{{ t('pilot.ctx.title') }}</span>
-                  <span class="pilot-ctxpick__num">
-                    {{ lastCtx ? `${fmtTokens(lastCtx.tokens)} / ${fmtTokens(lastCtx.budget)}` : t('pilot.ctx.empty') }}
-                  </span>
-                </div>
-                <div class="pilot-ctxpick__track">
-                  <div
-                    class="pilot-ctxpick__fill"
-                    :class="{ 'is-warn': ctxPercent > 85 }"
-                    :style="{ width: ctxPercent + '%' }"
-                  >
-                    <i
-                      v-for="seg in ctxSegments"
-                      :key="seg.source"
-                      :class="`is-${seg.source}`"
-                      :style="{ flexGrow: seg.share }"
-                      aria-hidden="true"
-                    ></i>
-                  </div>
-                </div>
-                <div v-if="ctxSegments.length" class="pilot-ctxpick__legend">
-                  <div v-for="seg in ctxSegments" :key="seg.source" class="pilot-ctxpick__row">
-                    <i :class="`is-${seg.source}`" aria-hidden="true"></i>
-                    <span class="pilot-ctxpick__src">{{ t(`pilot.ctx.src.${seg.source}` as MessageKey) }}</span>
-                    <span class="pilot-ctxpick__pct">{{ fmtPct(seg.share) }}</span>
-                  </div>
-                </div>
-                <div
-                  v-if="typeof lastCtx?.hitRate === 'number'"
-                  class="pilot-ctxpick__cache"
-                  :class="{ 'is-low': !ctxCacheVisible }"
-                >
-                  <span>{{ t('pilot.ctx.cacheHit') }}</span>
-                  <span class="pilot-ctxpick__pct">{{ fmtPct(lastCtx.hitRate) }}</span>
-                </div>
-                <!-- 本会话消耗：账本全轮折叠（用量药丸口径——分桶精确数，
-                     部分命中永不显示 100%；provider 未报告的桶整行不出） -->
-                <div v-if="statsTotal > 0 && sessionStats" class="pilot-ctxpick__usage">
-                  <div class="pilot-ctxpick__usage-head">
-                    <span>{{ t('pilot.usage.title') }}</span>
-                    <span class="pilot-ctxpick__pct">{{ fmtInt(statsTotal) }}</span>
-                  </div>
-                  <div v-if="statsCacheHit != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheHit') }}</span>
-                    <span>{{ fmtHit(statsCacheHit) }}</span>
-                  </div>
-                  <div class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.uncached') }}</span>
-                    <span>{{ fmtInt((sessionStats.cache_base_tokens ?? sessionStats.usage_in) - (sessionStats.cache_read_tokens ?? 0)) }}</span>
-                  </div>
-                  <div v-if="sessionStats.cache_read_tokens != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheRead') }}</span>
-                    <span>{{ fmtInt(sessionStats.cache_read_tokens) }}</span>
-                  </div>
-                  <div v-if="sessionStats.cache_write_tokens != null" class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.cacheWrite') }}</span>
-                    <span>{{ fmtInt(sessionStats.cache_write_tokens) }}</span>
-                  </div>
-                  <div class="pilot-ctxpick__urow">
-                    <span>{{ t('pilot.usage.output') }}</span>
-                    <span>{{ fmtInt(sessionStats.usage_out) }}</span>
-                  </div>
-                </div>
-              </div>
-            </Transition>
-          </div>
-        </div>
-
-        <div class="pilot-composer__right">
-          <!-- 模型就地切换：ghost chip + 向上清单 + 底部管理入口 -->
-          <div v-if="pilotReady" ref="modelPickRoot" class="pilot-modelpick" @click.stop>
-            <button
-              type="button"
-              class="pilot-modelpick__chip"
-              :class="{ 'is-open': modelMenuOpen, 'is-busy': switchingModel }"
-              @click="openModelMenu()"
-            >
-              <span class="pilot-modelpick__name">{{ pilotModel || t('pilot.composer.modelOff') }}</span>
-              <span class="pilot-modelpick__chevron" aria-hidden="true"></span>
-            </button>
-            <Transition name="hl-pop">
-              <div v-if="modelMenuOpen" class="pilot-modelpick__menu">
-                <div class="pilot-modelpick__list">
-                  <div v-for="g in menuGroups" :key="g.id" class="pilot-modelpick__group">
-                    <button
-                      type="button"
-                      class="pilot-modelpick__group-head"
-                      :class="{ 'is-open': openGroups.has(g.id) }"
-                      @click="toggleGroup(g.id)"
-                    >
-                      <span class="pilot-modelpick__group-name" :title="g.name">{{ g.name }}</span>
-                      <span
-                        v-if="g.active"
-                        class="pilot-modelpick__group-badge"
-                      >{{ t('pilot.modelMenu.inUse') }}</span>
-                      <span class="pilot-modelpick__group-chev" aria-hidden="true"></span>
-                    </button>
-                    <template v-if="openGroups.has(g.id)">
-                      <button
-                        v-for="m in g.models"
-                        :key="m"
-                        type="button"
-                        class="pilot-modelpick__item"
-                        :class="{ 'is-on': m === pilotModel && g.active }"
-                        @click="pickModel(g.id, m)"
-                      >
-                        <span class="pilot-modelpick__item-name" :title="m">{{ m }}</span>
-                        <span
-                          v-if="m === pilotModel && g.active"
-                          class="pilot-modelpick__check"
-                          aria-hidden="true"
-                        ></span>
-                      </button>
-                    </template>
-                  </div>
-                </div>
-                <div class="pilot-modelpick__foot">
-                  <button type="button" class="pilot-modelpick__manage" @click="goSettings">
-                    {{ t('pilot.modelMenu.empty') }}
-                  </button>
-                </div>
-              </div>
-            </Transition>
-          </div>
-          <!-- 配置尚未取回（null）时不渲染，避免把「还在取」显示成「未配置」 -->
-          <HlChip v-else-if="pilotReady === false" tone="accent" @click="goSettings">{{ t('pilot.composer.modelOff') }}</HlChip>
-          <button
-            v-if="streaming"
-            type="button"
-            class="pilot-send pilot-send--stop"
-            :title="t('pilot.stop')"
-            :aria-label="t('pilot.stop')"
-            @click="stopPilot"
-          >
-            <span class="pilot-send__square" aria-hidden="true"></span>
-          </button>
-          <HlButton
-            v-else
-            variant="primary"
-            size="sm"
-            class="pilot-send"
-            :disabled="!question.trim()"
-            :title="t('pilot.ask.button')"
-            :aria-label="t('pilot.ask.button')"
-            @click="ask()"
-          >
-            <span class="pilot-send__arrow" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M12 5v14M5 12l7-7 7 7" stroke="currentColor" stroke-width="2.2"
-                      stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </span>
-          </HlButton>
-        </div>
-      </div>
-    </div>
+    <HlPilotComposer
+      ref="composerRef"
+      v-model="question"
+      :game="game"
+      :reference-session="referenceSession"
+      :streaming="streaming"
+      :attach-busy="attachBusy"
+      :last-ctx="lastCtx"
+      :session-stats="sessionStats"
+      :stats-total="statsTotal"
+      :stats-cache-hit="statsCacheHit"
+      :menu-items="plusMenuItems"
+      @send="ask()"
+      @stop="stopPilot"
+      @menu-select="onMenuSelect"
+      @attach="attachText"
+      @remove-reference="referenceSession = null"
+    />
 
     <!-- 拖选浮条：答复里划一段松手即浮出，两个去处——整段拿走 / 带回输入框。
          Teleport 到 body：会话区是滚动容器，浮条在里面会被裁掉 -->
@@ -3250,6 +2180,8 @@ function triggerFollowUp(prompt: string) {
 </template>
 
 <style scoped>
+<style scoped>
+<style scoped>
 .pilot-console {
   position: relative;
   display: flex;
@@ -3259,7 +2191,6 @@ function triggerFollowUp(prompt: string) {
   /* 撑满宿主（抽屉 body）：对话区吃掉剩余空间，输入框恒在底部 */
   height: 100%;
 }
-
 /* ── 整页：会话列 Teleport 到页面级左侧挂点（与对话列布局解耦）；
    head 标题与页面标题重复故整页隐藏 ── */
 /* 高度由宿主（Index 的定高容器）给出：对话记录吃掉剩余空间内滚，
@@ -3267,12 +2198,10 @@ function triggerFollowUp(prompt: string) {
 .pilot-console.is-page {
   height: 100%;
 }
-
 .pilot-console.is-page .pilot-head,
 .pilot-console.is-page .pilot-tabbar {
   display: none;
 }
-
 /* 列体尺寸由宿主挂点（Index 的 .pilot-page__side）约束，这里只管纵向分布 */
 /* 生成中脉动点（标签栏）：accent 圆点呼吸；会话列同类规则在 HlPilotSidebar 内 */
 .pilot-side__running {
@@ -3283,7 +2212,6 @@ function triggerFollowUp(prompt: string) {
   background: var(--accent);
   animation: pilot-running-pulse 1.2s ease-in-out infinite;
 }
-
 @keyframes pilot-running-pulse {
   0%,
   100% {
@@ -3293,13 +2221,11 @@ function triggerFollowUp(prompt: string) {
     opacity: 0.3;
   }
 }
-
 @media (prefers-reduced-motion: reduce) {
   .pilot-side__running {
     animation: none;
   }
 }
-
 /* 派生标记：标题前缀的常驻小图标（会话列 / 标签栏 / 历史面板共用）——
    放前缀是因为窄列会省略标题尾部，后缀标记会被截掉 */
 .pilot-forkmark {
@@ -3312,13 +2238,11 @@ function triggerFollowUp(prompt: string) {
   vertical-align: -1px;
   color: var(--text-muted);
 }
-
 .pilot-forkmark svg {
   width: 11px;
   height: 11px;
   stroke: currentColor;
 }
-
 /* 窄屏整页回落标签栏：左列由 Index 隐藏，tabbar 恢复（会话入口不丢） */
 @media (max-width: 1080px) {
   .pilot-console.is-page .pilot-head {
@@ -3329,19 +2253,16 @@ function triggerFollowUp(prompt: string) {
     display: flex;
   }
 }
-
 .pilot-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
 }
-
 .pilot-head__title {
   font-size: 15px;
   font-weight: 600;
   color: var(--text-primary);
 }
-
 /* 会话标签栏：账本投影小标签（横向滚动，双击重命名，× 两段式删除，+ 即新对话） */
 .pilot-tabbar {
   display: flex;
@@ -3349,7 +2270,6 @@ function triggerFollowUp(prompt: string) {
   gap: 4px;
   padding: 2px;
 }
-
 /* 滚动区只包标签（overflow 会裁剪历史下拉面板，按钮必须在 overflow 之外）；
    scrollbar-width/color 配对取 token——单设 scrollbar-width 会让 Chromium
    绕开全局 ::-webkit-scrollbar 主题出原生细滚条 */
@@ -3364,7 +2284,6 @@ function triggerFollowUp(prompt: string) {
   scrollbar-width: thin;
   scrollbar-color: var(--scroll-thumb) transparent;
 }
-
 .pilot-tabbar__add {
   flex: none;
   display: grid;
@@ -3375,27 +2294,23 @@ function triggerFollowUp(prompt: string) {
   border-radius: 8px;
   color: var(--text-secondary);
 }
-
 /* 当前停留在未落账本的新对话上：+ 即「所在位置」 */
 .pilot-tabbar__add.is-current {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 /* 历史入口：与 + 同语言的方钮，面板向下弹（账本只读投影，找回/删除都在这） */
 .pilot-history {
   position: relative;
   flex: none;
 }
-
 .pilot-tabbar__hist.is-open {
   border-style: solid;
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-history__menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -3414,18 +2329,15 @@ function triggerFollowUp(prompt: string) {
   scrollbar-width: thin;
   scrollbar-color: var(--scroll-thumb) transparent;
 }
-
 .pilot-history__row {
   display: flex;
   align-items: center;
   gap: 2px;
   border-radius: 6px;
 }
-
 .pilot-history__row:hover {
   background: var(--accent-a10);
 }
-
 .pilot-history__item {
   flex: 1;
   min-width: 0;
@@ -3439,7 +2351,6 @@ function triggerFollowUp(prompt: string) {
   cursor: pointer;
   text-align: left;
 }
-
 .pilot-history__name {
   min-width: 0;
   overflow: hidden;
@@ -3448,45 +2359,37 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
   color: var(--text-primary);
 }
-
 .pilot-history__meta {
   flex: none;
   font-size: 11px;
   color: var(--text-secondary);
 }
-
 .pilot-history__row .pilot-tab__x {
   opacity: 0;
   transition: opacity 0.15s;
 }
-
 .pilot-history__row:hover .pilot-tab__x,
 .pilot-history__row .pilot-tab__x.is-armed {
   opacity: 1;
 }
-
 .pilot-history__empty {
   padding: 12px 10px;
   font-size: 12px;
   color: var(--text-secondary);
   text-align: center;
 }
-
 .pilot-tabbar__add:hover:not(:disabled) {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-tabbar__add:disabled {
   opacity: 0.4;
 }
-
 .pilot-tabbar__add svg {
   width: 14px;
   height: 14px;
 }
-
 .pilot-tab {
   flex: none;
   display: flex;
@@ -3498,26 +2401,22 @@ function triggerFollowUp(prompt: string) {
   border-radius: 8px;
   background: var(--bg-card);
 }
-
 .pilot-tab.is-current {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
 }
-
 .pilot-tab__cur {
   flex: none;
   width: 12px;
   height: 12px;
   color: var(--accent);
 }
-
 .pilot-tab__main {
   flex: 1;
   min-width: 0;
   padding: 6px 0;
   text-align: left;
 }
-
 .pilot-tab__name {
   display: block;
   max-width: 118px;
@@ -3527,13 +2426,11 @@ function triggerFollowUp(prompt: string) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 .pilot-tab__rename {
   /* 击穿框架 .hl-input-wrap 的 min-width:180px——否则改名框撑破 172px 标签盒漫过 + 号 */
   width: 118px;
   min-width: 0;
 }
-
 .pilot-tab__x {
   flex: none;
   display: grid;
@@ -3543,610 +2440,30 @@ function triggerFollowUp(prompt: string) {
   border-radius: 6px;
   color: var(--text-secondary);
 }
-
 .pilot-tab__x svg {
   width: 12px;
   height: 12px;
 }
-
 .pilot-tab__x:hover {
   background: var(--accent-a15);
   color: var(--accent);
 }
-
 .pilot-tab__x.is-ok {
   color: var(--success);
 }
-
 .pilot-tab__x.is-armed {
   color: var(--ink-on-fill);
   background: var(--danger);
 }
-
 .pilot-tab__x.is-disabled {
   opacity: 0.4;
   pointer-events: none;
 }
-
-/* 加号引用入口：与右侧 chip 同语言的小方钮 */
-.pilot-ref-add {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  padding: 0;
-}
-
-.pilot-ref-add svg {
-  width: 14px;
-  height: 14px;
-}
-
-/* 页面元素选择按钮：与 + 引用按钮同尺寸同风格，激活时高亮 */
-.pilot-el-pick {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-.pilot-el-pick:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-.pilot-el-pick.is-active {
-  background: var(--accent-a20);
-  color: var(--accent-a);
-}
-.pilot-el-pick svg {
-  width: 14px;
-  height: 14px;
-}
-
 .pilot-head__actions {
   display: flex;
   align-items: center;
   gap: 4px;
 }
-
-/* 输入区 = 唯一 accent 描边面（对话区无 accent 边框），聚焦时亮起光晕——
-   与用户气泡/agent 面板三层互异，抽屉里一眼可辨「这是输入的地方」 */
-.pilot-composer {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid var(--accent-a30);
-  border-radius: 12px;
-  background: var(--bg-base);
-  transition: border-color var(--duration-4) var(--motion-scale),
-              box-shadow var(--duration-4) var(--motion-scale);
-}
-
-.pilot-composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent-a15) inset, 0 0 18px var(--accent-a15);
-}
-
-.pilot-composer .pilot-composer__input {
-  min-height: 0;
-  padding: 2px 4px;
-  background: transparent;
-  border-radius: 0;
-  box-shadow: none;
-  resize: none;
-}
-
-/* 聚焦光晕由容器承载，textarea 自身的内发光关掉 */
-.pilot-composer .pilot-composer__input:focus {
-  box-shadow: none;
-}
-
-/* 圆形发送钮：复用 HlButton（primary 配色 + 内置 loading），这里只改尺寸 */
-.pilot-send {
-  flex: none;
-  width: 34px;
-  height: 34px;
-  padding: 0;
-  border-radius: 50%;
-}
-
-.pilot-send__arrow {
-  display: grid;
-  place-items: center;
-}
-
-.pilot-send__arrow svg {
-  width: 16px;
-  height: 16px;
-}
-
-.pilot-send svg {
-  width: 16px;
-  height: 16px;
-}
-
-.pilot-send--stop {
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--border-soft);
-  background: var(--bg-card);
-  color: var(--danger);
-  cursor: pointer;
-}
-
-.pilot-send--stop:hover {
-  border-color: var(--danger);
-}
-
-.pilot-send__square {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-  background: currentColor;
-}
-
-.pilot-stopped {
-  margin-top: 2px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-/* 引用区：一次性上下文胶囊（当前对象 / 引用 / 附件 / 页面元素），删除钮 hover 显形 */
-.pilot-composer__refs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.pilot-ref {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  padding: 3px 6px 3px 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  background: var(--bg-soft);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.pilot-ref__icon {
-  width: 13px;
-  height: 13px;
-  flex: none;
-  color: var(--text-muted);
-}
-
-.pilot-ref__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 200px;
-}
-
-.pilot-ref__cover {
-  width: 26px;
-  aspect-ratio: 460 / 215;
-  border-radius: var(--radius-xs, 2px);
-  overflow: hidden;
-  background: var(--surface-inset);
-  display: grid;
-  place-items: center;
-  flex: none;
-}
-
-.pilot-ref__cover :deep(img) {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.pilot-ref__cover-fallback {
-  font-size: 9px;
-  font-weight: 700;
-  color: var(--text-muted);
-}
-
-.pilot-ref__x {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
-    background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-
-.pilot-ref:hover .pilot-ref__x,
-.pilot-ref__x:focus-visible {
-  opacity: 1;
-}
-
-.pilot-ref__x:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-.pilot-ref__x svg {
-  width: 9px;
-  height: 9px;
-  display: block;
-}
-
-@media (hover: none) {
-  .pilot-ref__x {
-    opacity: 1;
-  }
-}
-
-.pilot-ref.is-busy {
-  padding: 3px 9px;
-  border-style: dashed;
-  background: transparent;
-  color: var(--text-muted);
-}
-
-/* 收拢组：同类引用一颗胶囊，清单面板向上弹（同上下文环面板语言） */
-.pilot-ref.is-group {
-  position: relative;
-  cursor: default;
-}
-
-.pilot-ref__panel {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 0;
-  z-index: 7;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  width: 320px;
-  max-height: 264px;
-  overflow-y: auto;
-  padding: 6px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-}
-
-.pilot-ref__row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 26px 5px 8px;
-  border-radius: 8px;
-}
-
-.pilot-ref__row:hover {
-  background: var(--bg-hover);
-}
-
-.pilot-ref__row-icon {
-  width: 12px;
-  height: 12px;
-  flex: none;
-  color: var(--text-muted);
-}
-
-.pilot-ref__row-main {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.pilot-ref__row-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  color: var(--text-primary);
-}
-
-.pilot-ref__row-meta {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.pilot-ref__row-x {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity calc(var(--duration-2) * var(--motion-scale)) ease,
-    background calc(var(--duration-2) * var(--motion-scale)) ease,
-    color calc(var(--duration-2) * var(--motion-scale)) ease;
-}
-
-.pilot-ref__row:hover .pilot-ref__row-x,
-.pilot-ref__row-x:focus-visible {
-  opacity: 1;
-}
-
-.pilot-ref__row-x:hover {
-  background: var(--border-soft);
-  color: var(--text-primary);
-}
-
-@media (hover: none) {
-  .pilot-ref__row-x {
-    opacity: 1;
-  }
-}
-
-.pilot-ctxpick {
-  position: relative;
-  min-width: 0;
-}
-
-/* + 菜单向上弹出且不遮按键：bottom 锚在按键上方（同模型菜单），覆盖框架的 top+translate 技巧 */
-.pilot-composer :deep(.hl-dropdown-pop.is-open-up) {
-  top: auto;
-  bottom: calc(100% + 6px);
-  --pop-y: 0px;
-}
-
-.pilot-ctxpick__btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px;
-  font: inherit;
-  font-size: 12px;
-  color: var(--accent);
-  border: none;
-  border-radius: 999px;
-  background: var(--accent-a10);
-  cursor: pointer;
-}
-
-.pilot-ctxpick__btn:hover {
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__btn.is-warn {
-  color: var(--warning);
-}
-
-.pilot-ctxpick__ring {
-  width: 14px;
-  height: 14px;
-}
-
-.pilot-ctxpick__num {
-  font-variant-numeric: tabular-nums;
-}
-
-.pilot-ctxpick__panel {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 0;
-  z-index: 7;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  width: 260px;
-  padding: 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-}
-
-.pilot-ctxpick__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__num,
-.pilot-ctxpick__pct {
-  font-family: var(--font-mono, monospace);
-  font-size: 12px;
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__track {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--accent-a10);
-  overflow: hidden;
-}
-
-.pilot-ctxpick__fill {
-  display: flex;
-  height: 100%;
-  border-radius: 3px;
-  overflow: hidden;
-  min-width: 2px;
-  transition: width calc(var(--duration-4, 0.2s) * var(--motion-scale, 1)) ease;
-}
-
-.pilot-ctxpick__fill.is-warn i {
-  filter: saturate(0.6) brightness(0.9);
-}
-
-.pilot-ctxpick__fill i {
-  display: block;
-  min-width: 2px;
-}
-
-.pilot-ctxpick__fill i.is-system {
-  background: var(--accent);
-}
-
-.pilot-ctxpick__fill i.is-tools {
-  background: color-mix(in oklab, var(--accent) 78%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-summary {
-  background: color-mix(in oklab, var(--accent) 58%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-history {
-  background: color-mix(in oklab, var(--accent) 42%, var(--bg-card));
-}
-
-.pilot-ctxpick__fill i.is-current {
-  background: color-mix(in oklab, var(--accent) 28%, var(--bg-card));
-}
-
-.pilot-ctxpick__legend {
-  display: grid;
-  gap: 4px;
-}
-
-.pilot-ctxpick__row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__row i {
-  flex: none;
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  border: 1px solid var(--border-soft);
-}
-
-.pilot-ctxpick__row i.is-system {
-  background: var(--accent);
-}
-
-.pilot-ctxpick__row i.is-tools {
-  background: color-mix(in oklab, var(--accent) 78%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-summary {
-  background: color-mix(in oklab, var(--accent) 58%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-history {
-  background: color-mix(in oklab, var(--accent) 42%, var(--bg-card));
-}
-
-.pilot-ctxpick__row i.is-current {
-  background: color-mix(in oklab, var(--accent) 28%, var(--bg-card));
-}
-
-.pilot-ctxpick__src {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pilot-ctxpick__pct {
-  margin-left: auto;
-}
-
-.pilot-ctxpick__cache {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border-soft);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__cache.is-low .pilot-ctxpick__pct {
-  color: var(--text-secondary);
-}
-
-/* 本会话消耗段：段头（合计精确数）+ 分桶行，与图例行同字层 */
-.pilot-ctxpick__usage {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-ctxpick__usage-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  padding-bottom: 2px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.pilot-ctxpick__urow {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 2px 0;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.pilot-ctxpick__urow span:last-child {
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
-}
-
-.pilot-composer__bar {
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.pilot-composer__right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-
 /* 压缩分隔线：两侧细线 + 居中状态 pill（账本边界事件，历史不动） */
 .pilot-compact {
   display: flex;
@@ -4154,13 +2471,11 @@ function triggerFollowUp(prompt: string) {
   gap: 10px;
   padding: 4px 0;
 }
-
 .pilot-compact__line {
   flex: 1;
   height: 1px;
   background: var(--border-soft);
 }
-
 .pilot-compact__pill {
   display: inline-flex;
   align-items: center;
@@ -4172,7 +2487,6 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-secondary);
   background: var(--bg-card);
 }
-
 .pilot-queued {
   display: flex;
   align-items: center;
@@ -4180,7 +2494,6 @@ function triggerFollowUp(prompt: string) {
   font-size: 12px;
   color: var(--text-secondary);
 }
-
 .pilot-queued::before {
   content: '';
   flex: none;
@@ -4190,25 +2503,14 @@ function triggerFollowUp(prompt: string) {
   background: var(--warning);
   animation: pilot-queued-pulse 1.2s ease-in-out infinite;
 }
-
 @keyframes pilot-queued-pulse {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
 }
-
 .pilot-compact__pill svg {
   width: 12px;
   height: 12px;
 }
-
-.pilot-composer__chips {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  /* 不能 overflow:hidden：+ 菜单与上下文面板都从这里向上弹出，剪掉=「点了没反应」 */
-}
-
 .pilot-turns {
   display: flex;
   flex-direction: column;
@@ -4219,7 +2521,6 @@ function triggerFollowUp(prompt: string) {
   overflow-y: auto;
   padding-right: 4px;
 }
-
 .pilot-turn {
   display: flex;
   flex-direction: column;
@@ -4227,310 +2528,10 @@ function triggerFollowUp(prompt: string) {
   min-width: 0;
   max-width: 100%;
 }
-
-/* agent 回复统一图层：去盒子化，通透流式布局与 Agent 身份标 */
-.pilot-reply {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 4px 0 10px;
-  background: transparent;
-  border: none;
-  min-width: 0;
-  max-width: 100%;
-  box-sizing: border-box;
-}
-
-.pilot-reply__header {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 2px;
-  align-self: flex-start;
-}
-
-.pilot-reply__avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: var(--surface-chip);
-  border: 1px solid var(--border-soft);
-  color: var(--accent);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.pilot-reply__avatar svg {
-  width: 13px;
-  height: 13px;
-}
-
-.pilot-reply__avatar.is-live {
-  background: var(--accent-a15);
-  border-color: var(--accent);
-  animation: pavatar-pulse 1.8s ease-in-out infinite alternate;
-}
-
 @keyframes pavatar-pulse {
   from { box-shadow: 0 0 0 1px var(--accent-a20); }
   to { box-shadow: 0 0 0 4px var(--accent-a20); }
 }
-
-.pilot-reply__role {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-/* 发言行：气泡 + 复制钮同一行右沿对齐；钮常驻占位，hover 才显形 */
-.pilot-turn__row {
-  display: flex;
-  align-items: flex-end;
-  justify-content: flex-end;
-  gap: 6px;
-  min-width: 0;
-}
-
-.pilot-turn__q {
-  align-self: flex-end;
-  max-width: 82%;
-  margin: 0;
-  padding: 10px 16px;
-  background: linear-gradient(135deg, var(--accent-a20), var(--accent-a10));
-  border: 1px solid var(--accent-a30);
-  border-radius: 18px 18px 4px 18px;
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-primary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  box-shadow: 0 2px 8px var(--surface-inset-sm);
-}
-
-/* 待发引用胶囊的编号徽标：与发出去后的气泡内胶囊同一套编号视觉 */
-.pilot-ref__no {
-  flex: none;
-  display: inline-grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--accent-a20);
-  color: var(--accent);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-}
-
-/* 待发引用胶囊：只露一行标题，完整引用悬停/聚焦才浮出 */
-.pilot-ref--quote {
-  position: relative;
-  cursor: default;
-  outline: none;
-}
-
-.pilot-ref__quote-full {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 7;
-  display: none;
-  max-width: min(420px, 78vw);
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  box-shadow: var(--shadow-lg);
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  text-align: left;
-}
-
-.pilot-ref--quote:hover .pilot-ref__quote-full,
-.pilot-ref--quote:focus-visible .pilot-ref__quote-full {
-  display: block;
-}
-
-/* ── 发出去的提问气泡内：编号引用就地渲染成胶囊（位置即用户在句中摆的位置）── */
-.pilot-qchip {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  max-width: 100%;
-  margin: 0 2px;
-  padding: 1px 7px 1px 3px;
-  border: 1px solid var(--accent-a30);
-  border-radius: 999px;
-  background: var(--surface-panel);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 16px;
-  vertical-align: baseline;
-  cursor: default;
-  outline: none;
-}
-
-.pilot-qchip.is-missing {
-  border-style: dashed;
-  color: var(--text-muted);
-}
-
-.pilot-qchip__no {
-  flex: none;
-  display: inline-grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--accent-a20);
-  color: var(--accent);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-}
-
-.pilot-qchip__title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 180px;
-}
-
-/* 完整引用：只在悬停/聚焦时浮出，默认不占位 */
-.pilot-qchip__full {
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 6px);
-  z-index: 8;
-  display: none;
-  width: max-content;
-  max-width: min(420px, 78vw);
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  box-shadow: var(--shadow-lg);
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  text-align: left;
-}
-
-.pilot-qchip:hover .pilot-qchip__full,
-.pilot-qchip:focus-visible .pilot-qchip__full {
-  display: block;
-}
-
-/* ── 附件：引用芯片 + 展开的内容面板（长文本不进消息体，按需取块） ── */
-.pilot-atts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: flex-end;
-  align-self: flex-end;
-  max-width: 82%;
-  margin-top: 6px;
-}
-
-.pilot-att {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  max-width: 100%;
-  padding: 3px 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  background: var(--bg-soft);
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
-}
-
-.pilot-att:hover,
-.pilot-att.is-open {
-  color: var(--text-primary);
-  border-color: var(--border-strong);
-}
-
-.pilot-att svg {
-  width: 12px;
-  height: 12px;
-  flex: none;
-  display: block;
-}
-
-.pilot-att__name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 150px;
-}
-
-.pilot-att__meta {
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.pilot-att-panel {
-  align-self: stretch;
-  margin-top: 6px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--bg-soft);
-  overflow: hidden;
-}
-
-.pilot-att-panel__body {
-  margin: 0;
-  padding: 8px 10px;
-  max-height: 220px;
-  overflow: auto;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
-.pilot-att-panel__bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 4px 8px;
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-att-panel__note {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.pilot-att-panel__more {
-  flex: none;
-  padding: 2px 8px;
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.pilot-att-panel__more:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
 /* 动作行：挂在它作用的那条消息下方，与消息同侧对齐。
    整行常驻占位（高度恒定）只切透明度——显隐不推动上方内容，
    气泡/正文不因出现动作而位移。 */
@@ -4542,168 +2543,6 @@ function triggerFollowUp(prompt: string) {
   opacity: 0;
   transition: opacity 0.15s ease;
 }
-
-.pilot-acts--end {
-  justify-content: flex-end;
-}
-
-/* 发言动作：鼠标落在提问那一行或动作行自身时显形 */
-.pilot-turn__row:hover ~ .pilot-acts--end,
-.pilot-acts--end:hover,
-.pilot-acts--end:focus-within {
-  opacity: 1;
-}
-
-/* 回复动作：鼠标落在回复层或动作行自身时显形 */
-.pilot-reply:hover .pilot-acts,
-.pilot-reply .pilot-acts:hover,
-.pilot-reply .pilot-acts:focus-within {
-  opacity: 1;
-}
-
-/* 单枚动作钮：复制 / 编辑 / 分叉共用同一形态 */
-.pilot-act {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-
-.pilot-act svg {
-  width: 13px;
-  height: 13px;
-  display: block;
-}
-
-.pilot-act:hover {
-  background: var(--surface-chip);
-  color: var(--text-primary);
-}
-
-.pilot-act:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 1px;
-}
-
-.pilot-feedback.is-selected {
-  color: var(--success);
-}
-
-.pilot-feedback.is-rejected {
-  color: var(--danger-deep);
-}
-
-.pilot-feedback:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
-
-/* 编辑重问：气泡原位换成可改的文本框，其后轮次会被作废（有提示） */
-.pilot-edit {
-  flex: 1;
-  min-width: 0;
-  max-width: 82%;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 10px 12px;
-  background: var(--bg-card);
-  border: 1px solid var(--accent-a40);
-  border-radius: 16px 16px 4px 16px;
-}
-
-.pilot-edit__box {
-  width: 100%;
-  min-height: 50px;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--text-primary);
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1.6;
-  resize: vertical;
-  outline: none;
-}
-
-.pilot-edit__bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.pilot-edit__warn {
-  flex: 1;
-  min-width: 0;
-  font-size: 11px;
-  color: var(--danger-deep);
-}
-
-.pilot-edit__btn {
-  flex: none;
-  padding: 4px 11px;
-  border: 1px solid transparent;
-  border-radius: 7px;
-  background: var(--accent-fill);
-  color: var(--text-on-fill);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.pilot-edit__btn.is-ghost {
-  background: transparent;
-  border-color: var(--border-soft);
-  color: var(--text-secondary);
-}
-
-.pilot-edit__btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.pilot-edit__btn:hover:not(:disabled) {
-  background: var(--accent-fill-hover);
-}
-
-.pilot-edit__btn.is-ghost:hover:not(:disabled) {
-  background: var(--surface-chip);
-  color: var(--text-primary);
-}
-
-/* 中断续跑：答复头上的「继续」，只有被用户停止过的轮才有 */
-.pilot-resume {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: 2px;
-  padding: 3px 9px;
-  border: 1px solid var(--accent-a30);
-  border-radius: 999px;
-  background: var(--accent-a10);
-  color: var(--accent-deep);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
-}
-
-.pilot-resume svg {
-  width: 11px;
-  height: 11px;
-  display: block;
-}
-
-.pilot-resume:hover {
-  background: var(--accent-a20);
-  border-color: var(--accent-a50);
-}
-
 /* 消息队列：生成中提交的问题排队等本轮结束（可改序/取回/移除） */
 .pilot-queue {
   display: flex;
@@ -4714,24 +2553,20 @@ function triggerFollowUp(prompt: string) {
   border-radius: 12px;
   background: var(--bg-soft);
 }
-
 .pilot-queue__head {
   display: flex;
   align-items: center;
   gap: 8px;
 }
-
 .pilot-queue__title {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-secondary);
 }
-
 .pilot-queue__paused {
   font-size: 11px;
   color: var(--danger-deep);
 }
-
 .pilot-queue__resume {
   margin-left: auto;
   padding: 2px 9px;
@@ -4742,18 +2577,15 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   cursor: pointer;
 }
-
 .pilot-queue__resume:hover {
   background: var(--accent-a20);
 }
-
 .pilot-queue__row {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
 }
-
 .pilot-queue__idx {
   flex: none;
   width: 16px;
@@ -4761,7 +2593,6 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   color: var(--text-muted);
 }
-
 .pilot-queue__text {
   flex: 1;
   min-width: 0;
@@ -4771,7 +2602,6 @@ function triggerFollowUp(prompt: string) {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
 .pilot-queue__btn {
   flex: none;
   display: inline-flex;
@@ -4786,23 +2616,19 @@ function triggerFollowUp(prompt: string) {
   color: var(--text-muted);
   cursor: pointer;
 }
-
 .pilot-queue__btn svg {
   width: 12px;
   height: 12px;
   display: block;
 }
-
 .pilot-queue__btn:hover:not(:disabled) {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
 .pilot-queue__btn:disabled {
   opacity: 0.35;
   cursor: default;
 }
-
 /* 拖选浮条：定在选区正上方居中，@mousedown.prevent 保住选区不散 */
 .pilot-selbar {
   position: fixed;
@@ -4817,7 +2643,6 @@ function triggerFollowUp(prompt: string) {
   border: 1px solid var(--border-soft);
   box-shadow: 0 6px 20px var(--surface-inset-sm);
 }
-
 .pilot-selbar__btn {
   display: inline-flex;
   align-items: center;
@@ -4831,119 +2656,20 @@ function triggerFollowUp(prompt: string) {
   white-space: nowrap;
   cursor: pointer;
 }
-
 .pilot-selbar__btn svg {
   width: 13px;
   height: 13px;
 }
-
 .pilot-selbar__btn:hover {
   background: var(--surface-chip);
   color: var(--text-primary);
 }
-
-.pilot-composer .hl-button {
-  flex: none;
-}
-
-.pilot-reason {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--text-secondary);
-  background: var(--bg-card);
-  border: 1px dashed var(--border-soft);
-}
-
-.pilot-reason.is-error {
-  color: var(--danger);
-  background: var(--danger-a15);
-  border: 1px solid var(--danger-a30);
-}
-
-.pilot-reason__body {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1;
-  min-width: 0;
-}
-
-.pilot-reason__icon {
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
-  color: var(--danger);
-}
-
-.pilot-reason__text {
-  flex: 1;
-  word-break: break-word;
-}
-
-.pilot-error-diagnostic {
-  margin: 6px 0 8px 23px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.pilot-error-diagnostic summary {
-  width: fit-content;
-  color: var(--danger);
-  cursor: pointer;
-}
-
-.pilot-error-diagnostic p {
-  margin: 5px 0 2px;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
-.pilot-reason__retry-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 10px;
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: 6px;
-  border: 1px solid var(--danger-a40);
-  background: var(--danger-a20);
-  color: var(--danger);
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: all var(--duration-fast) var(--ease-out);
-}
-
-.pilot-reason__retry-btn:hover:not(:disabled) {
-  background: var(--danger);
-  color: var(--text-on-fill);
-  border-color: var(--danger);
-}
-
-.pilot-reason__retry-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.pilot-reason__retry-icon {
-  width: 13px;
-  height: 13px;
-}
-
 /* 回答排版由 HlPilotMarkdown 组件承载；此处只留折叠裁切等容器行为 */
 .pilot-answer.is-clamped {
   position: relative;
   max-height: 320px;
   overflow: hidden;
 }
-
 .pilot-answer.is-clamped::after {
   content: '';
   position: absolute;
@@ -4954,7 +2680,6 @@ function triggerFollowUp(prompt: string) {
   background: linear-gradient(to bottom, transparent, var(--bg-base));
   pointer-events: none;
 }
-
 .pilot-answer__more {
   align-self: flex-start;
   margin-top: 4px;
@@ -4966,13 +2691,11 @@ function triggerFollowUp(prompt: string) {
   font-size: 11px;
   cursor: pointer;
 }
-
 .pilot-answer__more:hover {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 /* 分叉溯源分隔线：与压缩分隔线同一套「两侧细线 + 居中胶囊」语言——
    派生是本会话的起点事实，占对话流首行；可点跳回源会话，故用按钮而非徽章 */
 .pilot-forkline {
@@ -4985,13 +2708,11 @@ function triggerFollowUp(prompt: string) {
   background: none;
   cursor: pointer;
 }
-
 .pilot-forkline__line {
   flex: 1;
   height: 1px;
   background: var(--border-soft);
 }
-
 .pilot-forkline__pill {
   display: inline-flex;
   align-items: center;
@@ -5008,385 +2729,34 @@ function triggerFollowUp(prompt: string) {
   text-overflow: ellipsis;
   transition: color 0.15s ease, border-color 0.15s ease;
 }
-
 .pilot-forkline:hover .pilot-forkline__pill,
 .pilot-forkline:focus-visible .pilot-forkline__pill {
   border-color: var(--accent-a30);
   background: var(--accent-a10);
   color: var(--accent);
 }
-
 .pilot-forkline:focus-visible {
   outline: none;
 }
-
 .pilot-forkline__pill svg {
   width: 12px;
   height: 12px;
   flex: none;
 }
-
-.pilot-briefing__title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 6px;
-}
-
-.pilot-cands-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.pilot-cand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--surface-card);
-  cursor: pointer;
-  text-align: left;
-  transition: all var(--duration-2) ease;
-}
-
-.pilot-cand:hover:not(.is-locked) {
-  border-color: var(--accent);
-  background: var(--accent-a08);
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-sm);
-}
-
-.pilot-cand.is-locked {
-  cursor: default;
-  opacity: 0.65;
-}
-
-.pilot-cand__idx {
-  flex: none;
-  width: 16px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-faint);
-  text-align: center;
-}
-
-.pilot-cand__cover {
-  flex: none;
-  width: 68px;
-  aspect-ratio: 460 / 215;
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  background: var(--surface-inset);
-  display: grid;
-  place-items: center;
-}
-
-.pilot-cand__cover :deep(img) {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-}
-
-.pilot-cand__cover-fallback {
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--text-muted);
-}
-
-.pilot-cand__main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.pilot-cand__name {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pilot-cand__meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.pilot-cand__price {
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.pilot-cand__disc {
-  padding: 1px 4px;
-  border-radius: var(--radius-sm);
-  background: var(--success);
-  color: var(--ink-on-fill);
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1.2;
-}
-
-.pilot-cand__rating {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--success);
-}
-
-.pilot-cand__rating.medium {
-  color: var(--warning);
-}
-
-.pilot-cand__rating.low {
-  color: var(--text-muted);
-}
-
-.pilot-guide p {
-  margin: 0 0 6px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text-primary);
-}
-
-.pilot-guide__title {
-  font-weight: 600;
-}
-
-.pilot-guide__link {
-  font-size: 13px;
-}
-
-/* 模型就地切换：ghost chip + 向上弹清单 */
-.pilot-modelpick {
-  position: relative;
-}
-
-.pilot-modelpick__chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 220px;
-  padding: 4px 8px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  cursor: pointer;
-}
-
-.pilot-modelpick__chip:hover,
-.pilot-modelpick__chip.is-open {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__chip.is-busy {
-  opacity: 0.6;
-  cursor: wait;
-}
-
-.pilot-modelpick__name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.pilot-modelpick__chip.is-open .pilot-modelpick__name {
-  color: var(--text-primary);
-}
-
-.pilot-modelpick__chevron {
-  flex: none;
-  width: 7px;
-  height: 7px;
-  border-right: 1.5px solid var(--text-faint);
-  border-bottom: 1.5px solid var(--text-faint);
-  transform: rotate(45deg) translateY(-1px);
-  transition: transform 0.2s;
-}
-
-.pilot-modelpick__chip.is-open .pilot-modelpick__chevron {
-  transform: rotate(-135deg) translateY(-2px);
-}
-
-.pilot-modelpick__menu {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  right: 0;
-  z-index: 6;
-  display: flex;
-  flex-direction: column;
-  min-width: 208px;
-  max-width: min(300px, calc(100vw - 3rem));
-  background: var(--bg-card);
-  border: 1px solid var(--border-soft);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
-  overflow: hidden;
-}
-
-.pilot-modelpick__list {
-  max-height: 288px;
-  overflow-y: auto;
-  padding: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.pilot-modelpick__item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  /* 按钮默认按内容收缩：不写 100% 时只有文字那一段可点，行内空白区点不动 */
-  width: 100%;
-  box-sizing: border-box;
-  min-height: 32px;
-  padding: 6px 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-
-.pilot-modelpick__item:hover {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__item-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-family: var(--font-mono, monospace);
-  color: var(--text-primary);
-}
-
-.pilot-modelpick__item.is-on .pilot-modelpick__item-name {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.pilot-modelpick__check {
-  flex: none;
-  width: 10px;
-  height: 5px;
-  border-left: 1.8px solid var(--accent);
-  border-bottom: 1.8px solid var(--accent);
-  transform: rotate(-45deg) translateY(-1px);
-}
-
-.pilot-modelpick__foot {
-  border-top: 1px solid var(--border-soft);
-  padding: 4px;
-}
-
-.pilot-modelpick__manage {
-  width: 100%;
-  padding: 6px 10px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.pilot-modelpick__manage:hover {
-  background: var(--accent-a10);
-  color: var(--text-primary);
-}
-
-
-/* 菜单分组：厂商收敛头 + 组内模型行 */
-.pilot-modelpick__group + .pilot-modelpick__group {
-  border-top: 1px solid var(--border-soft);
-}
-
-.pilot-modelpick__group-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 7px 10px 5px;
-  border: none;
-  background: none;
-  cursor: pointer;
-  text-align: left;
-}
-
-.pilot-modelpick__group-head:hover {
-  background: var(--accent-a10);
-}
-
-.pilot-modelpick__group-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.pilot-modelpick__group-badge {
-  flex: none;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--accent-a10);
-  font-size: 10px;
-  color: var(--accent);
-}
-
-.pilot-modelpick__group-chev {
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-right: 1.5px solid var(--text-faint);
-  border-bottom: 1.5px solid var(--text-faint);
-  transform: rotate(45deg);
-}
-
-.pilot-modelpick__group-head.is-open .pilot-modelpick__group-chev {
-  transform: rotate(-135deg);
-}
-
 .pilot-followups {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-
 /* dock 变体：钉在输入框正上方，位置恒定（间距由 console 的 flex gap 供给） */
 .pilot-followups--dock {
   padding-inline: 2px;
 }
-
 .pilot-followups__label {
   font-size: 11px;
   font-weight: 500;
   color: var(--text-secondary);
 }
-
 .pilot-followups__list {
   display: flex;
   flex-wrap: nowrap;
@@ -5395,11 +2765,9 @@ function triggerFollowUp(prompt: string) {
   gap: 8px;
   padding-bottom: 2px;
 }
-
 .pilot-followups__list::-webkit-scrollbar {
   display: none;
 }
-
 .pilot-followup-chip {
   appearance: none;
   border: 1px solid var(--border-soft);
@@ -5417,20 +2785,17 @@ function triggerFollowUp(prompt: string) {
   flex-shrink: 0;
   transition: all 0.15s ease;
 }
-
 .pilot-followup-chip__icon {
   width: 10px;
   height: 10px;
   color: var(--text-muted);
   transition: transform 0.15s ease, color 0.15s ease;
 }
-
 .pilot-followup-chip:hover {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-a10);
 }
-
 .pilot-followup-chip:hover .pilot-followup-chip__icon {
   color: var(--accent);
   transform: translateX(2px);
