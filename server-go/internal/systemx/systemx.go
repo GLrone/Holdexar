@@ -1,7 +1,4 @@
-// Package systemx：系统面只读端点（info 与 readiness）。
-// 只读无副作用；health 由 httpapi 实现，此处不重复。
-// readiness 当前唯一真实维度是数据库可达；调度 / 采集 / 传输维度未接线，
-// 以显式 false 字段存在，接线后逐字段替换为真实状态。
+// Package systemx 提供系统信息和运行状态的只读端点。
 package systemx
 
 import (
@@ -15,6 +12,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/crawl"
 )
 
 // githubRepo 发布仓库（owner/repo）：前端拼发布页与问题反馈链接的唯一来源。
@@ -48,11 +46,12 @@ type System struct {
 	DB        *sql.DB
 	StartedAt time.Time
 	DataDir   string
+	Readiness func(context.Context) (crawl.Readiness, error)
 }
 
 // Register 装配系统面只读端点：/api/v1/info 与 /api/v1/system/readiness。
-func Register(mux *http.ServeMux, db *sql.DB) {
-	s := &System{DB: db, StartedAt: time.Now(), DataDir: resolveDataDir()}
+func Register(mux *http.ServeMux, db *sql.DB, readiness func(context.Context) (crawl.Readiness, error)) {
+	s := &System{DB: db, StartedAt: time.Now(), DataDir: resolveDataDir(), Readiness: readiness}
 	mux.HandleFunc("/api/v1/info", s.handleInfo)
 	mux.HandleFunc("/api/v1/system/readiness", s.handleReadiness)
 }
@@ -70,19 +69,10 @@ type infoResponse struct {
 	Repo          string  `json:"repo"`
 }
 
-// readinessResponse 就绪快照。strategy 取 KV 缺省值 proxy_first；
-// activeJobId 空闲为 null；未就绪不改变状态码，只由字段与 reason 表达。
 type readinessResponse struct {
-	HTTPReady        bool   `json:"httpReady"`
-	SchedulerReady   bool   `json:"schedulerReady"`
-	CollectionReady  bool   `json:"collectionReady"`
-	WriteProtected   bool   `json:"writeProtected"`
-	AutomaticEnabled bool   `json:"automaticEnabled"`
-	TransportReady   bool   `json:"transportReady"`
-	Strategy         string `json:"strategy"`
-	Lanes            int    `json:"lanes"`
-	Reason           string `json:"reason"`
-	ActiveJobID      *int   `json:"activeJobId"`
+	HTTPReady      bool `json:"httpReady"`
+	WriteProtected bool `json:"writeProtected"`
+	crawl.Readiness
 }
 
 func (s *System) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -110,8 +100,16 @@ func (s *System) handleReadiness(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, detailNull())
 		return
 	}
-	resp := readinessResponse{HTTPReady: true, Strategy: "proxy_first"}
-	if ok, failure := probeDB(s.DB); !ok {
+	resp := readinessResponse{HTTPReady: true, Readiness: crawl.Readiness{Strategy: "proxy_first"}}
+	if s.Readiness != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), dbProbeTimeout)
+		defer cancel()
+		var err error
+		resp.Readiness, err = s.Readiness(ctx)
+		if err != nil {
+			resp.Reason = "读取价格更新状态失败：" + err.Error()
+		}
+	} else if ok, failure := probeDB(s.DB); !ok {
 		resp.Reason = failure
 	}
 	writeJSON(w, http.StatusOK, resp)

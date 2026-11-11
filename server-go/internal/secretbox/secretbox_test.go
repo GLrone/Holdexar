@@ -151,7 +151,11 @@ func TestFormatReject(t *testing.T) {
 	// 篡改密文体：认证标签必须拒绝
 	token, _ := EncryptWith("v", "steam-cookies", master)
 	parts := strings.Split(token, ":")
-	tampered := parts[0] + ":" + parts[1] + ":" + "A" + parts[2][1:]
+	replacement := "A"
+	if parts[2][0] == 'A' {
+		replacement = "B"
+	}
+	tampered := parts[0] + ":" + parts[1] + ":" + replacement + parts[2][1:]
 	if _, err := DecryptWith(tampered, "steam-cookies", master); err == nil {
 		t.Fatal("篡改密文未被拒绝")
 	}

@@ -16,6 +16,7 @@ import (
 // 唯一事实源清单（新增密文列必须登记到这里，否则换钥后读不出）：
 //   - steam_accounts.cookies         用途 steam-cookies
 //   - app_settings.value_json        用途 kv:<key>（account.steam_api_key 等凭据键）
+//   - app_settings.plugins.registry  嵌套 config 密文用途 plugin:<id>:<field>
 //   - proxy_subscriptions.url        用途 proxy-subscription
 //   - subscription_snapshots.url     用途 proxy-subscription
 //   - proxies.username / .password   用途 proxy-credential
@@ -134,6 +135,16 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 			var raw sql.NullString
 			if err := scan(&key, &raw); err != nil {
 				return false, err
+			}
+			if key == "plugins.registry" {
+				updated, err := migratePluginRegistry(raw.String, old, new, migrate)
+				if err != nil {
+					return false, err
+				}
+				if updated != "" {
+					kvUpds = append(kvUpds, struct{ key, raw string }{key, updated})
+				}
+				return true, nil
 			}
 			if !raw.Valid {
 				return true, nil
@@ -281,6 +292,58 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		}
 	}
 	return counts, nil
+}
+
+func migratePluginRegistry(raw string, old, new []byte, migrate func(string, string, []byte, []byte) (string, error)) (string, error) {
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return "", fmt.Errorf("插件配置换钥读取失败: %w", err)
+	}
+	changed := false
+	for _, entry := range entries {
+		var manifest map[string]json.RawMessage
+		if err := json.Unmarshal(entry["manifest"], &manifest); err != nil {
+			return "", fmt.Errorf("插件配置声明无效: %w", err)
+		}
+		var id string
+		if err := json.Unmarshal(manifest["id"], &id); err != nil || id == "" {
+			return "", fmt.Errorf("插件配置标识无效")
+		}
+		var config map[string]json.RawMessage
+		if value, ok := entry["config"]; ok {
+			if err := json.Unmarshal(value, &config); err != nil {
+				return "", fmt.Errorf("插件配置内容无效: %w", err)
+			}
+		}
+		configChanged := false
+		for field, value := range config {
+			token, ok := jsonStringValue(string(value))
+			if !ok || !IsEncrypted(token) {
+				continue
+			}
+			updated, err := migrate(token, "plugin:"+id+":"+field, old, new)
+			if err != nil {
+				return "", fmt.Errorf("插件凭据换钥失败: %w", err)
+			}
+			if updated != "" {
+				config[field] = json.RawMessage(mustJSONString(updated))
+				configChanged = true
+			}
+		}
+		if configChanged {
+			encoded, err := json.Marshal(config)
+			if err != nil {
+				return "", err
+			}
+			entry["config"] = encoded
+			changed = true
+		}
+	}
+	if !changed {
+		return "", nil
+	}
+	encoded, err := json.Marshal(entries)
+	return string(encoded), err
 }
 
 // scanEach 遍历查询结果；fn 返回 false 停止。
