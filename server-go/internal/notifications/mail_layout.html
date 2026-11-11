@@ -1,0 +1,77 @@
+{{define "page"}}<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>{{.App}}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0e1a27;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#0e1a27;font-size:1px;line-height:1px;">{{.Preheader}}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0e1a27" style="background-color:#0e1a27;">
+  <tr>
+    <td align="center" style="padding:34px 12px;">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;">
+        <!-- 品牌头 -->
+        <tr>
+          <td style="padding:0 4px 14px;"><span style="font-size:20px;font-weight:700;color:#66c0f4;letter-spacing:.5px;">Holdexar</span><span style="font-size:11px;color:#8f98a0;margin-left:10px;letter-spacing:1px;">STEAM 多区价格监控终端</span></td>
+        </tr>
+        <!-- 主卡片 -->
+        <tr>
+          <td bgcolor="#1b2838" style="background-color:#1b2838;border:1px solid #2a475e;border-radius:14px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              {{.Card}}
+            </table>
+          </td>
+        </tr>
+        <!-- 页脚 -->
+        <tr>
+          <td align="center" style="padding:16px 4px 0;font-size:11px;line-height:1.9;color:#8f98a0;">此邮件由 {{.App}} 自动发送，请勿直接回复<br /><span style="color:#6b7683;">多区价格仅供参考，最终以下单时的 Steam 商店页为准</span></td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>{{end}}
+{{define "hero"}}<tr><td style="padding:34px 24px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:0 0 14px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#223449" width="56" height="56" style="width:56px;height:56px;border-radius:28px;background-color:#223449;border:1px solid #2a475e;font-size:26px;color:{{.Color}};font-weight:700;line-height:56px;">{{.Badge}}</td></tr></table></td></tr><tr><td align="center" style="padding:0 0 7px;font-size:11px;letter-spacing:2px;color:#6b7683;">{{.Eyebrow}}</td></tr><tr><td align="center" style="padding:0 26px 9px;font-size:20px;font-weight:700;line-height:1.45;color:#d9e3ec;">{{.Title}}</td></tr><tr><td align="center" style="padding:0 34px;font-size:13px;line-height:1.85;color:#8f98a0;">{{.Subtitle}}</td></tr></table></td></tr>{{end}}
+{{define "bullets"}}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">{{range .}}<tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">{{.}}</td></tr>{{end}}</table>{{end}}
+{{define "notice"}}<tr><td style="padding:22px 24px 0;"><div style="font-size:11.5px;line-height:1.7;color:#6b7683;"><span style="color:#66c0f4;">&#9642;</span> {{.}}</div></td></tr>{{end}}
+{{define "cell"}}<td width="50%" valign="top" style="padding:6px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#0e1a27;border-radius:10px;border:1px solid #2a475e;"><tr><td style="padding:12px 14px;"><div style="font-size:11px;color:#8f98a0;">{{.Label}}</div><div style="margin-top:4px;font-size:19px;font-weight:700;color:{{.Color}};font-family:Consolas,monospace;">{{.Value}}</div></td></tr></table></td>{{end}}
+{{define "divider"}}<tr><td style="padding:20px 24px 0;"><div style="height:1px;line-height:1px;font-size:0;background-color:#2e3d4f;">&nbsp;</div></td></tr>{{end}}
+{{define "test"}}<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="color-scheme" content="dark" />
+<title>{{.App}}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0e1a27;">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#0e1a27;font-size:1px;line-height:1px;">邮箱连通性测试通过，Holdexar 推送已就绪</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0e1a27" style="background-color:#0e1a27;">
+  <tr>
+    <td align="center" style="padding:34px 12px;">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;">
+        <!-- 品牌头 -->
+        <tr>
+          <td style="padding:0 4px 14px;"><span style="font-size:20px;font-weight:700;color:#66c0f4;letter-spacing:.5px;">Holdexar</span><span style="font-size:11px;color:#8f98a0;margin-left:10px;letter-spacing:1px;">STEAM 多区价格监控终端</span></td>
+        </tr>
+        <!-- 主卡片 -->
+        <tr>
+          <td bgcolor="#1b2838" style="background-color:#1b2838;border:1px solid #2a475e;border-radius:14px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr><td style="padding:34px 24px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" style="padding:0 0 14px;"><table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td align="center" bgcolor="#223449" width="56" height="56" style="width:56px;height:56px;border-radius:28px;background-color:#223449;border:1px solid #2a475e;font-size:26px;color:#a4d007;font-weight:700;line-height:56px;">&#10003;</td></tr></table></td></tr><tr><td align="center" style="padding:0 0 7px;font-size:11px;letter-spacing:2px;color:#6b7683;">CONNECTION OK</td></tr><tr><td align="center" style="padding:0 26px 9px;font-size:20px;font-weight:700;line-height:1.45;color:#d9e3ec;">连接成功</td></tr><tr><td align="center" style="padding:0 34px;font-size:13px;line-height:1.85;color:#8f98a0;">你的邮箱已成功接入 {{.App}}。此后监控命中时，我们会第一时间把消息送到这个邮箱。</td></tr></table></td></tr><tr><td style="padding:24px 24px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#0e1a27;border-radius:10px;border:1px solid #2a475e;"><tr><td style="padding:9px 14px;font-size:12px;color:#8f98a0;white-space:nowrap;border-bottom:1px solid #2e3d4f;">SMTP 服务器</td><td style="padding:9px 14px;font-size:13px;color:#d9e3ec;font-family:Consolas,monospace;text-align:right;border-bottom:1px solid #2e3d4f;">{{.Host}}:{{.Port}}</td></tr><tr><td style="padding:9px 14px;font-size:12px;color:#8f98a0;white-space:nowrap;border-bottom:1px solid #2e3d4f;">加密方式</td><td style="padding:9px 14px;font-size:13px;color:#d9e3ec;font-family:Consolas,monospace;text-align:right;border-bottom:1px solid #2e3d4f;">{{.Encryption}}</td></tr><tr><td style="padding:9px 14px;font-size:12px;color:#8f98a0;white-space:nowrap;border-bottom:1px solid #2e3d4f;">发件账户</td><td style="padding:9px 14px;font-size:13px;color:#d9e3ec;font-family:Consolas,monospace;text-align:right;border-bottom:1px solid #2e3d4f;">{{.User}}</td></tr><tr><td style="padding:9px 14px;font-size:12px;color:#8f98a0;white-space:nowrap;border-bottom:1px solid #2e3d4f;">收件邮箱</td><td style="padding:9px 14px;font-size:13px;color:#d9e3ec;font-family:Consolas,monospace;text-align:right;border-bottom:1px solid #2e3d4f;">{{.To}}</td></tr><tr><td style="padding:9px 14px;font-size:12px;color:#8f98a0;white-space:nowrap;border-bottom:1px solid #2e3d4f;">测试时间</td><td style="padding:9px 14px;font-size:13px;color:#d9e3ec;font-family:Consolas,monospace;text-align:right;border-bottom:1px solid #2e3d4f;">{{.When}}</td></tr></table></td></tr><tr><td style="padding:26px 24px 0;"><div style="font-size:12px;font-weight:700;letter-spacing:1.5px;color:#8f98a0;">推送范围</div></td></tr><tr><td style="padding:12px 24px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">价格提醒触发：自设目标价 / 折扣率 / 跌破史低命中</td></tr><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">新史低速报：监控池刷新出新的历史最低价</td></tr><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">监控池折扣速报：关注的游戏出现新的折扣</td></tr><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">捆绑包精选：国区最低或高折扣的 Steam 捆绑包</td></tr><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">Epic 喜加一 / Humble Choice 当月包上新</td></tr><tr><td width="14" valign="top" style="padding:5px 0 0;font-size:12px;line-height:1.7;color:#66c0f4;">&#9642;</td><td valign="top" style="padding:5px 0 0 6px;font-size:12.5px;line-height:1.7;color:#8f98a0;">代理通道与系统异常告警（异常时才发，不刷屏）</td></tr></table></td></tr><tr><td style="padding:22px 24px 0;"><div style="font-size:11.5px;line-height:1.7;color:#6b7683;"><span style="color:#66c0f4;">&#9642;</span> 同一类提醒会合并成一封邮件发送，不会逐条打扰。</div></td></tr>
+            </table>
+          </td>
+        </tr>
+        <!-- 页脚 -->
+        <tr>
+          <td align="center" style="padding:16px 4px 0;font-size:11px;line-height:1.9;color:#8f98a0;">此邮件由 {{.App}} 自动发送，请勿直接回复<br /><span style="color:#6b7683;">多区价格仅供参考，最终以下单时的 Steam 商店页为准</span></td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>{{end}}

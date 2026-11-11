@@ -36,7 +36,7 @@ var rejectedDeliveryRe = regexp.MustCompile(rejectedDeliveryExpr)
 
 // deliveryUnknown 结果是否无法确认（进程中断时可能已发出）。
 func deliveryUnknown(errText string) bool {
-	return errText != "" && strings.HasPrefix(errText, unknownDeliveryPrefix)
+	return strings.HasPrefix(errText, unknownDeliveryPrefix) || strings.HasPrefix(errText, "PluginDeliveryUnknown:")
 }
 
 // deliveryRejectionCode 服务器拒绝码；无结构化码回 (0, false)。
