@@ -8,7 +8,7 @@
 用法：
     python run.py                 # 桌面窗口模式（默认）
     python run.py --server        # 只起本地服务，不开窗口
-    python run.py --dev           # 对接 Vite 开发服务器（需另开终端 npm run dev）
+    python run.py --dev           # 前端热更新（Python 版需先运行 npm run dev）
     python run.py --build         # 强制重建前端后启动
     python run.py --port 18888    # 指定端口
 """
@@ -19,7 +19,11 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from queue import Empty, Queue
+from tempfile import TemporaryDirectory
+from threading import Thread
 
 ROOT = Path(__file__).resolve().parent
 SERVER_ROOT = ROOT / "server"
@@ -125,10 +129,40 @@ def build_web() -> None:
         sys.exit("[错误] 前端构建失败（lint 门禁或编译错误），请向上翻日志。")
 
 
+@contextmanager
+def go_dev_frontend(backend_port: str):
+    with subprocess.Popen(
+        ["node", "scripts/dev-desktop.mjs"],
+        cwd=WEB_ROOT,
+        env={**os.environ, "VITE_PROXY_TARGET": f"http://127.0.0.1:{backend_port}"},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    ) as proc:
+        ready = Queue()
+        Thread(target=lambda: ready.put(proc.stdout.readline()), daemon=True).start()
+        try:
+            try:
+                frontend_port = int(ready.get(timeout=30))
+                if not 1 <= frontend_port <= 65535:
+                    raise ValueError(frontend_port)
+            except (Empty, ValueError):
+                sys.exit("[错误] Go 开发前端未能启动，请查看前端输出。")
+            yield f"http://127.0.0.1:{frontend_port}"
+        finally:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} 一键启动")
     parser.add_argument("--server", action="store_true", help="无窗口模式，仅启动本地服务")
-    parser.add_argument("--dev", action="store_true", help="加载 Vite 开发服务器 http://localhost:8080")
+    parser.add_argument("--dev", action="store_true", help="使用前端热更新")
     parser.add_argument("--build", action="store_true", help="强制重建前端产物")
     parser.add_argument("--port", default=DEFAULT_PORT, help=f"服务端口（默认 {DEFAULT_PORT}）")
     args = parser.parse_args()
@@ -142,9 +176,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env[f"{ENV_PREFIX}PORT"] = str(args.port)
-    if args.dev:
-        env[f"{ENV_PREFIX}DEV_URL"] = "http://localhost:8080"
-        print(f"[开发] 窗口将加载 {env[f'{ENV_PREFIX}DEV_URL']}（需确保 npm run dev 已运行）")
+    go_source = env.get(f"{ENV_PREFIX}DEV_WATCH")
 
     print(f"[启动] {APP_NAME} · http://127.0.0.1:{args.port} · Ctrl+C 退出")
     # 开发态防陈旧字节码：__pycache__ 缓存未失效时会加载到旧字节码导致启动即崩，
@@ -164,7 +196,27 @@ def main() -> None:
     # 不留孤儿实例占用服务端口与单实例锁。
     env[f"{ENV_PREFIX}LAUNCHER_PID"] = str(os.getpid())
     try:
-        subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
+        with ExitStack() as resources:
+            if go_source and not env.get(f"{ENV_PREFIX}SERVER_EXE"):
+                if shutil.which("go") is None:
+                    sys.exit("[错误] 未找到 Go，请安装项目所需的 Go 工具链。")
+                build_dir = resources.enter_context(TemporaryDirectory(prefix="holdexar-go-dev-"))
+                exe = Path(build_dir) / "serverd.exe"
+                if _run(["go", "build", "-o", str(exe), "./cmd/serverd"], cwd=go_source):
+                    sys.exit("[错误] Go 后端编译失败，请查看编译输出。")
+                env.setdefault(f"{ENV_PREFIX}INSTALL_ROOT", str(ROOT))
+                env[f"{ENV_PREFIX}SERVER_EXE"] = str(exe)
+            if args.dev:
+                if go_source:
+                    ensure_npm()
+                    ensure_web_deps()
+                    dev_url = resources.enter_context(go_dev_frontend(args.port))
+                    print(f"[开发] Go 前端已就绪：{dev_url}", flush=True)
+                else:
+                    dev_url = "http://localhost:8080"
+                    print(f"[开发] 窗口将加载 {dev_url}（需确保 npm run dev 已运行）")
+                env[f"{ENV_PREFIX}DEV_URL"] = dev_url
+            subprocess.run(cmd, cwd=str(ROOT), env=env, check=True)
     except KeyboardInterrupt:
         print(f"\n[停止] {APP_NAME} 已退出")
     except subprocess.CalledProcessError as e:

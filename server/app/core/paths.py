@@ -101,13 +101,14 @@ def machine_candidates(slug: str = APP_SLUG) -> list[Path]:
 
 
 def dev_machine_candidates(slug: str = APP_SLUG) -> list[Path]:
-    """开发态数据目录候选：`<root>/<slug>-dev`。
+    """开发态目录候选：`<slug>-dev` 或 `<slug>-go-dev`。
 
     **刻意不复用 machine_candidates**：开发态的迁移演练、爬虫基准、browse 测试
     都会往数据目录里写。与用户的正式库同目录，迟早互相污染——一次开发态的
     `PRAGMA user_version` 前向迁移就能把正式库改到不兼容的新 schema。
     """
-    return _candidates_for(f"{slug}-dev")
+    runtime = "-go" if os.environ.get(f"{ENV_PREFIX}DEV_WATCH") else ""
+    return _candidates_for(f"{slug}{runtime}-dev")
 
 
 def data_dir_filename(slug: str = APP_SLUG) -> str:
