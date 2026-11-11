@@ -1,6 +1,4 @@
-// Package account：账户面只读域（MCP account 组读路径的数据面）。
-// 与 Python app.domains.account / wishlist / games 的工具消费链逐字段对齐：
-// 无凭据解密、无出网、无写库；同步/写路径与会话续期不在本包。
+// Package account owns bound accounts, credentials, wallet snapshots and account projections.
 package account
 
 import (
