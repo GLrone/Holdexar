@@ -18,12 +18,14 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { metadataApi, type EpicMobileOffer, type EpicOffer } from '@/api/client'
+import { pluginsApi, pluginsChangedEvent } from '@/lib/pluginsApi'
 import { useI18n } from '@/locales'
 import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const { t } = useI18n()
 
 const offers = ref<EpicOffer[]>([])
+const moduleEnabled = ref(true)
 const mobile = ref<EpicMobileOffer | null>(null)
 const fetchedAt = ref('')
 /** loading=首次拉取中 / ok=有数据（含失败时保留的旧数据）/ failed=无数据可显 */
@@ -66,6 +68,13 @@ function stopStalePoll() {
 
 async function load() {
   try {
+    const modules = await pluginsApi.list()
+    moduleEnabled.value = modules.builtin.find(item => item.id === 'core.epic_free')?.enabled !== false
+    if (!moduleEnabled.value) {
+      stopStalePoll()
+      stale.value = false
+      return
+    }
     const res = await metadataApi.epicOffers()
     if (res.ok) {
       offers.value = res.offers
@@ -85,7 +94,7 @@ async function load() {
 
 /** 手动强刷：绕过快照缓存现拉一次（拿到的就是新鲜数据，无需短轮询） */
 async function refresh() {
-  if (refreshing.value) return
+  if (refreshing.value || !moduleEnabled.value) return
   refreshing.value = true
   stopStalePoll()
   try {
@@ -150,10 +159,12 @@ let timer: number | undefined
 
 onMounted(() => {
   load()
+  window.addEventListener(pluginsChangedEvent, load)
   timer = window.setInterval(load, HOUR_MS)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener(pluginsChangedEvent, load)
   if (timer !== undefined) window.clearInterval(timer)
   stopStalePoll()
 })
@@ -175,6 +186,7 @@ onBeforeUnmount(() => {
           variant="text"
           size="sm"
           :loading="refreshing"
+          :disabled="!moduleEnabled"
           class="epic-free__refresh"
           @click="refresh"
         >{{ refreshing ? t('epicFree.refreshing') : t('epicFree.refresh') }}</HlButton>
@@ -187,8 +199,14 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <HlEmpty
+      v-if="!moduleEnabled"
+      size="sm"
+      icon=""
+      :text="t('plugins.epicDisabled')"
+    />
     <HlSkeleton
-      v-if="state === 'loading'"
+      v-else-if="state === 'loading'"
       variant="card"
       :count="4"
       class="epic-free__skeleton"
