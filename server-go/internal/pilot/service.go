@@ -11,6 +11,9 @@ import (
 	"net/http"
 	"path/filepath"
 	"sync"
+
+	"holdexar/server-go/internal/modulectl"
+	"holdexar/server-go/internal/store"
 )
 
 // ToolBridge 工具执行桥：pilot 工具名 → 归一化结果（kind 键形状，与
@@ -43,6 +46,8 @@ type Deps struct {
 // Service 领航员运行态。
 type Service struct {
 	deps      Deps
+	gate      *store.WriteGate
+	ctl       *modulectl.Control
 	mu        sync.Mutex
 	running   map[string]bool
 	inflight  map[string]int
@@ -54,13 +59,28 @@ type Service struct {
 // New 构造服务（路由装配时创建一次）。
 func New(deps Deps, bridge ToolBridge) *Service {
 	return &Service{
-		deps: deps, bridge: bridge, running: map[string]bool{},
+		deps: deps, bridge: bridge, ctl: modulectl.New(ModuleEnabledKey),
+		running:  map[string]bool{},
 		inflight: map[string]int{}, inflightQ: map[string]string{},
 	}
 }
 
 func (s *Service) SetToolSpecs(fn func() []map[string]any) {
 	s.deps.ToolSpecs = fn
+}
+
+// SetGate 注入写闸（模块开关落库用；路由装配前调用）。
+func (s *Service) SetGate(gate *store.WriteGate) { s.gate = gate }
+
+// inflightTotal 当前全局在飞轮数（锁内求和）。
+func (s *Service) inflightTotal() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, n := range s.inflight {
+		total += n
+	}
+	return total
 }
 
 func (s *Service) log(format string, args ...any) {

@@ -1,11 +1,11 @@
+//go:build windows
+
 package pilot
 
 import (
 	"context"
 	"errors"
 	"time"
-
-	"holdexar/server-go/internal/modulectl"
 )
 
 // ModuleEnabledKey 内部模块开关键（与 Epic/Humble/成就同形）。
