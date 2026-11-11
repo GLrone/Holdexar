@@ -1,5 +1,4 @@
-// Package notifications：通知域只读路径（偏好投影 / 候选账本 / 投递指标 / 事实增量）。
-// 写端点（PUT prefs / POST test）与投递链（dispatch / 认领 / 结算）未迁移，见 deferred 清单。
+// Package notifications provides notification preferences and delivery records.
 // 候选状态是投递状态不是事实状态：pending/suppressed 未投递，sending/unknown
 // 结果未确认（禁止自动重发），delivered 已投递，failed 失败（可重试判定见 stats）。
 package notifications
@@ -10,6 +9,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+
+	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/store"
 )
 
 // prefsKey 用户通知偏好的 KV 键（app_settings.value_json，结构对齐 Python DEFAULT_PREFS）。
@@ -21,9 +23,23 @@ const maxAttempts = 3
 // statusUnknown 投递结果未知（进程中断时可能已发出，不自动重发）。
 const statusUnknown = "unknown"
 
-// Register 挂载 notifications 只读路由；PUT prefs / POST test 未迁移。
-func Register(mux *http.ServeMux, db *sql.DB) {
+type Options struct {
+	Gate     *store.WriteGate
+	Bus      *events.Bus
+	Delivery *DeliveryService
+}
+
+func Register(mux *http.ServeMux, db *sql.DB, options ...Options) {
 	h := &handler{db: db}
+	if len(options) > 0 {
+		h.options = options[0]
+	}
+	if h.options.Gate != nil {
+		mux.HandleFunc("PUT /api/v1/notifications/prefs", h.putPrefs)
+	}
+	if h.options.Delivery != nil {
+		h.registerSMTP(mux)
+	}
 	mux.HandleFunc("GET /api/v1/notifications/prefs", h.getPrefs)
 	mux.HandleFunc("GET /api/v1/notifications/candidates", h.listCandidates)
 	mux.HandleFunc("GET /api/v1/notifications/stats", h.getStats)
@@ -39,7 +55,8 @@ func Register(mux *http.ServeMux, db *sql.DB) {
 }
 
 type handler struct {
-	db *sql.DB
+	db      *sql.DB
+	options Options
 }
 
 // getPrefs 通知偏好投影 + SMTP 出口状态 + 最近一次投递结果（设置页一屏）。
@@ -59,11 +76,25 @@ func (h *handler) getPrefs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
 		return
 	}
-	writeJSON(w, http.StatusOK, prefsView(prefs, smtp, last))
+	region, err := EffectiveRegion(r.Context(), h.db, "", prefs, nil)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"detail": nil})
+		return
+	}
+	view := prefsView(prefs, smtp, last, region)
+	if h.options.Delivery != nil && h.options.Delivery.options.Plugins != nil {
+		active, problem := h.options.Delivery.options.Plugins.Active(r.Context())
+		if problem != nil {
+			view.set("delivery", map[string]any{"kind": "plugin", "configured": false})
+		} else if active != nil {
+			view.set("delivery", map[string]any{"kind": "plugin", "configured": true, "name": active.Manifest.Name})
+		}
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // prefsView 偏好投影；字段值 = 库内补丁值优先，缺省用 Python 默认（逐字段覆盖语义）。
-func prefsView(p map[string]any, smtp *orderedObj, last *orderedObj) *orderedObj {
+func prefsView(p map[string]any, smtp *orderedObj, last *orderedObj, region RegionSelection) *orderedObj {
 	v := newOrderedObj()
 	v.set("enabled", patched(p, "enabled", false))
 	v.set("quietEnabled", patched(p, "quietEnabled", false))
@@ -75,7 +106,7 @@ func prefsView(p map[string]any, smtp *orderedObj, last *orderedObj) *orderedObj
 	v.set("digestTime", patched(p, "digestTime", "08:00"))
 	v.set("digestWeekday", patched(p, "digestWeekday", json.Number("0")))
 	v.set("featured", featuredView(p))
-	v.set("region", regionView(p))
+	v.set("region", region)
 	v.set("types", typeEntries(p))
 	v.set("categories", categoryEntries(p))
 	v.set("smtp", smtp)
@@ -115,23 +146,6 @@ func featuredView(p map[string]any) *orderedObj {
 		v.set(kv.key, val)
 	}
 	return v
-}
-
-// regionView 手动通知地区解析：大写区码 + 币种来源（观测缺席恒走地区映射）。
-func regionView(p map[string]any) *orderedObj {
-	region := ""
-	if s, ok := p["manualRegion"].(string); ok {
-		region = strings.ToUpper(strings.TrimSpace(s))
-	}
-	if region == "" {
-		return kvObj("region", nil, "source", "unknown", "currency", nil, "currencySource", "unknown")
-	}
-	currency, ok := regionToCurrency[region]
-	if !ok {
-		// 写入侧已把 manualRegion 限定在地区清单内，正常库不可达；异常库按 500 出口
-		return nil
-	}
-	return kvObj("region", region, "source", "manual", "currency", currency, "currencySource", "region_mapping")
 }
 
 // typeEntry 单个通知类型的偏好投影。
@@ -190,11 +204,21 @@ func categoryEntries(p map[string]any) []categoryEntry {
 func (h *handler) lastDelivery(r *http.Request) (*orderedObj, error) {
 	var status, deliveredAt, updatedAt, reason, lastError sql.NullString
 	var attempts sql.NullInt64
+	filter := ""
+	var args []any
+	if h.options.Delivery != nil && h.options.Delivery.options.Plugins != nil {
+		recipient, e := savedRecipient(r.Context(), h.db)
+		if e != nil {
+			return nil, e
+		}
+		filter = " AND recipient=?"
+		args = []any{recipient}
+	}
 	err := h.db.QueryRowContext(r.Context(),
 		"SELECT status, CAST(delivered_at AS TEXT), CAST(updated_at AS TEXT),"+
 			" attempts, reason, last_error FROM notification_candidates"+
 			" WHERE status IN ('delivered', 'failed', 'unknown')"+
-			" ORDER BY updated_at DESC LIMIT 1").Scan(&status, &deliveredAt, &updatedAt,
+			filter+" ORDER BY updated_at DESC LIMIT 1", args...).Scan(&status, &deliveredAt, &updatedAt,
 		&attempts, &reason, &lastError)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -217,25 +241,7 @@ func (h *handler) lastDelivery(r *http.Request) (*orderedObj, error) {
 
 // readPrefs 读偏好补丁：value_json 解析为无序映射（仅作键值查表，不再输出）。
 func (h *handler) readPrefs(r *http.Request) (map[string]any, error) {
-	var raw sql.NullString
-	err := h.db.QueryRowContext(r.Context(),
-		"SELECT value_json FROM app_settings WHERE key = ?", prefsKey).Scan(&raw)
-	if err == sql.ErrNoRows {
-		return map[string]any{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !raw.Valid || raw.String == "" {
-		return map[string]any{}, nil
-	}
-	dec := json.NewDecoder(strings.NewReader(raw.String))
-	dec.UseNumber()
-	var value map[string]any
-	if err := dec.Decode(&value); err != nil {
-		return nil, err
-	}
-	return value, nil
+	return LoadPrefs(r.Context(), h.db)
 }
 
 // settingValue 读单个设置的 value_json；行缺席回 (def, false)，NULL 回 (nil, true)。
