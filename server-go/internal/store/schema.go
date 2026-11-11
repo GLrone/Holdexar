@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -68,7 +69,20 @@ func QuickCheck(dbPath string) (string, error) {
 		return "", fmt.Errorf("完整性快检无法执行: %w", err)
 	}
 	defer db.Close()
-	rows, err := db.Query("PRAGMA quick_check")
+	return CheckIntegrity(context.Background(), db, false)
+}
+
+func Snapshot(ctx context.Context, db *sql.DB, destination string) error {
+	_, err := db.ExecContext(ctx, "VACUUM INTO ?", destination)
+	return err
+}
+
+func CheckIntegrity(ctx context.Context, db *sql.DB, deep bool) (string, error) {
+	query := "PRAGMA quick_check"
+	if deep {
+		query = "PRAGMA integrity_check"
+	}
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return "", fmt.Errorf("完整性快检无法执行: %w", err)
 	}
