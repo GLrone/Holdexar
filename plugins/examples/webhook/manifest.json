@@ -1,0 +1,28 @@
+{
+  "id": "example.webhook",
+  "name": "HTTPS notifications",
+  "version": "1.0.0",
+  "description": "Send notifications to a fixed HTTPS JSON endpoint.",
+  "author": "Example author",
+  "apiVersion": 1,
+  "kind": "notification.webhook",
+  "domains": ["hooks.example.com"],
+  "endpoint": "https://hooks.example.com/messages",
+  "headers": {
+    "Authorization": "Bearer {{config.token}}"
+  },
+  "body": {
+    "subject": "{{subject}}",
+    "body": "{{body}}",
+    "topic": "{{config.topic}}"
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "token": {"type": "string", "title": "Access token", "format": "password"},
+      "topic": {"type": "string", "title": "Topic", "default": "Holdexar"}
+    },
+    "required": ["token"],
+    "additionalProperties": false
+  }
+}
