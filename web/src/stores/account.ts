@@ -63,6 +63,10 @@ export const useAccountStore = defineStore('account', () => {
     }
   }
 
+  function refreshAccount(steamId: string) {
+    return accountApi.refreshAccount(steamId)
+  }
+
   async function bindCookies(cookies: string) {
     apply(await accountApi.bindCookies(cookies))
   }
@@ -90,6 +94,6 @@ export const useAccountStore = defineStore('account', () => {
   return {
     status, syncing, loaded, switching,
     accounts, primary, active,
-    load, sync, bindCookies, setActive, removeAccount, unbind,
+    load, sync, bindCookies, setActive, removeAccount, unbind, refreshAccount,
   }
 })

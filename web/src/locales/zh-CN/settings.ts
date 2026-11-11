@@ -78,6 +78,7 @@ const settings = {
   'settings.steam.redeems': '激活',
   'settings.steam.setActive': '设为当前',
   'settings.steam.unbind': '解绑',
+  'settings.steam.syncOne': '同步',
   'settings.steam.syncMeta': '当前账号同步时间：{time} · 钱包每分钟自动轮转刷新（多账号随机错峰）',
 
   /* ── 账户卡片（SteamID64 / Web API Key）── */
@@ -139,6 +140,8 @@ const settings = {
   /* ── 结果提示（一条整句；中英语序不同，不拆片段）── */
   'settings.toast.accountSwitched': '已切换当前账号',
   'settings.toast.accountUnbound': '已解绑 {name}',
+  'settings.toast.accountSyncQueued': '已触发同步：{name}',
+  'settings.toast.accountSyncFailed': '同步失败：{error}',
   'settings.toast.backupCreated': '备份完成：{name}（{size}，{games} 款游戏，校验通过）',
   'settings.toast.backupVerified': '校验通过：{name}（{games} 款游戏）',
   'settings.toast.backupVerifiedDeep': '深度校验通过：{name}（{games} 款游戏，结构与索引全部一致）',
