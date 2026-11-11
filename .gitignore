@@ -214,3 +214,8 @@ scripts/upload_cloud_packs.py
 server/.vite/
 # ZCode 工具的本机排除清单（镜像 .gitignore，工具自动同步生成）
 /.zcodeignore
+
+# ── Go 迁移树本地产物 ──
+release-go/
+*.exe
+g620.json

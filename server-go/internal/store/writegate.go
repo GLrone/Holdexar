@@ -57,7 +57,11 @@ type writeReq struct {
 	priority WritePriority
 	queue    int
 	reply    chan *Lease
+	reject   chan error
 }
+
+// ErrWritesPaused 维护换库窗口内新写请求一律拒绝。
+var ErrWritesPaused = errors.New("数据库正在整理，写入暂不可用")
 
 // Lease 写者位凭证；持有人负责显式 Done 释放，Go 无任务身份故凭证显式传参。
 type Lease struct {
@@ -88,6 +92,8 @@ type WriteGate struct {
 	doneCh  chan uint64
 	abortCh chan uint64
 	warnCh  chan uint64
+	pauseCh chan chan error
+	resumeCh chan struct{}
 	seq     atomic.Uint64
 
 	waitTimeout   time.Duration
@@ -112,6 +118,8 @@ func NewWriteGate(db *sql.DB, dbPath string) *WriteGate {
 		doneCh:        make(chan uint64),
 		abortCh:       make(chan uint64),
 		warnCh:        make(chan uint64, 1),
+		pauseCh:       make(chan chan error),
+		resumeCh:      make(chan struct{}, 1),
 		waitTimeout:   defaultWaitTimeout,
 		lockTimeout:   defaultLockTimeout,
 		holdWarnAfter: defaultHoldWarn,
@@ -138,6 +146,7 @@ func (g *WriteGate) run() {
 	var holdStart time.Time
 	var holdTimer *time.Timer
 	var warned bool
+	var paused bool
 
 	grant := func(req *writeReq) {
 		if holdTimer != nil {
@@ -172,7 +181,21 @@ func (g *WriteGate) run() {
 
 	for {
 		select {
+		case reply := <-g.pauseCh:
+			// 仅在无持闸者且无排队时进入维护窗口；忙碌即拒，由调用方稍后重试
+			if owner == nil && len(queues[0]) == 0 && len(queues[1]) == 0 {
+				paused = true
+				reply <- nil
+			} else {
+				reply <- ErrWritesPaused
+			}
+		case <-g.resumeCh:
+			paused = false
 		case req := <-g.reqCh:
+			if paused {
+				req.reject <- ErrWritesPaused
+				continue
+			}
 			// 写者位空出且无人排队才直接授予，后来者不得插队
 			if owner == nil && len(queues[0]) == 0 && len(queues[1]) == 0 {
 				grant(req)
@@ -224,6 +247,7 @@ func (g *WriteGate) Acquire(ctx context.Context, priority WritePriority) (*Lease
 		priority: priority,
 		queue:    qi,
 		reply:    make(chan *Lease, 1),
+		reject:   make(chan error, 1),
 	}
 	select {
 	case g.reqCh <- req:
@@ -242,10 +266,37 @@ func (g *WriteGate) Acquire(ctx context.Context, priority WritePriority) (*Lease
 		}
 		lease.file = f
 		return lease, nil
+	case err := <-req.reject:
+		return nil, err
 	case <-timer.C:
 		return nil, g.abandon(req, errors.New("等待数据库写入超时"))
 	case <-ctx.Done():
 		return nil, g.abandon(req, ctx.Err())
+	}
+}
+
+// PauseWrites 等写者位排空后进入维护窗口：新写请求一律拒绝，直到 ResumeWrites。
+// 忙碌（仍有持闸者或排队）返回 ErrWritesPaused，由调用方稍后重试。
+func (g *WriteGate) PauseWrites(ctx context.Context) error {
+	reply := make(chan error, 1)
+	select {
+	case g.pauseCh <- reply:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ResumeWrites 解除维护窗口；未在窗口内时安全空操作。
+func (g *WriteGate) ResumeWrites() {
+	select {
+	case g.resumeCh <- struct{}{}:
+	default:
 	}
 }
 
