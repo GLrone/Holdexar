@@ -88,11 +88,11 @@ export function invalidateGetCache(prefix: string): void {
   }
 }
 
-async function request<T>(
+export async function request<T>(
   method: string,
   path: string,
   body?: unknown,
-  opts?: { noCache?: boolean },
+  opts?: { noCache?: boolean; rawBody?: BodyInit; contentType?: string },
 ): Promise<T> {
   const cacheable = method === 'GET' && !opts?.noCache && !isNoCachePath(path)
   if (cacheable) {
@@ -111,8 +111,10 @@ async function request<T>(
       method,
       // 本地会话以 HttpOnly Cookie 承载，同源请求必须显式带上
       credentials: 'same-origin',
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      headers: opts?.rawBody !== undefined
+        ? { 'Content-Type': opts.contentType ?? 'application/octet-stream' }
+        : body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: opts?.rawBody ?? (body !== undefined ? JSON.stringify(body) : undefined),
     })
     if (!response.ok) {
       let detail = `HTTP ${response.status}`
@@ -1196,6 +1198,15 @@ export const accountApi = {
   /** 解绑全部账号（清账号表；手填 SteamID64 / API Key 不动） */
   unbind: () => request<AccountStatus>('DELETE', '/account/cookies'),
   sync: () => request<AccountStatus>('POST', '/account/sync'),
+  refreshAccount: (steamId: string) =>
+    request<AccountRefreshResult>('POST', `/account/steam_id/${steamId}/refresh`),
+}
+
+export interface AccountRefreshResult {
+  ok: boolean
+  steamId: string
+  wallet: { ok: boolean; wallet?: WalletSnapshot; error?: string }
+  queued: string[]
 }
 
 /** 应用内账号密码登录的会话状态快照（后端状态机，见 /account/login/*） */
@@ -2811,6 +2822,7 @@ export interface NotificationPrefs {
   featured: FeaturedConfig
   region: { region: string | null; source: string; currency?: string | null; currencySource?: string | null }
   types: { key: string; label: string; category: string; enabled: boolean; frequency: NotificationFrequency }[]
+  delivery?: { kind: 'smtp' | 'plugin'; configured: boolean; name?: string }
   /** SMTP 的可公开部分：不含密码 / 授权码 */
   smtp: {
     configured: boolean
@@ -2880,7 +2892,7 @@ export interface NotificationStats {
 }
 
 export const notificationsApi = {
-  prefs: () => request<NotificationPrefs>('GET', '/notifications/prefs'),
+  prefs: () => request<NotificationPrefs>('GET', '/notifications/prefs', undefined, { noCache: true }),
   updatePrefs: (payload: NotificationPrefsUpdate) =>
     request<NotificationPrefs & { ok: boolean }>('PUT', '/notifications/prefs', payload),
   candidates: (limit = 100) => request<{ items: NotificationCandidate[] }>('GET', `/notifications/candidates${toQuery({ limit })}`),

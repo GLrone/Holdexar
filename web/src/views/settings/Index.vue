@@ -27,12 +27,14 @@ import { useSettingsStore } from '@/stores/settings'
 import { useTourStore } from '@/stores/tour'
 import { friendCodeOf } from '@/utils/steamId'
 import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
+import { pluginsChangedEvent } from '@/lib/pluginsApi'
 import CurrencyFlag from '@/components/CurrencyFlag.vue'
 import RegionFlag from '@/components/RegionFlag.vue'
 import {
   HlButton, HlCheckbox, HlDialog, HlIcon, HlImg, HlInput, HlSelect, HlSkeleton, HlSwitch, message,
 } from '@/components/ui'
 import HlPilotFlywheel from '@/components/business/HlPilotFlywheel.vue'
+import PluginsSettings from '@/components/business/PluginsSettings.vue'
 
 const { t } = useI18n()
 
@@ -467,6 +469,39 @@ async function removeAccount(steamId: string, label: string) {
     message.success(t('settings.toast.accountUnbound', { name: label }))
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e))
+  }
+}
+
+const syncingSteamId = ref('')
+let snapshotRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let accountRefreshDisposed = false
+
+function scheduleSnapshotRefresh() {
+  if (snapshotRefreshTimer) clearTimeout(snapshotRefreshTimer)
+  snapshotRefreshTimer = setTimeout(() => {
+    snapshotRefreshTimer = null
+    void accountStore.load()
+  }, 4000)
+}
+
+async function refreshOneAccount(acc: SteamAccountItem) {
+  if (syncingSteamId.value) return
+  syncingSteamId.value = acc.steam_id
+  try {
+    const r = await accountStore.refreshAccount(acc.steam_id)
+    if (accountRefreshDisposed) return
+    if (r.ok) {
+      message.success(t('settings.toast.accountSyncQueued', { name: acc.persona_name || acc.friend_code }))
+      scheduleSnapshotRefresh()
+    } else {
+      message.error(t('settings.toast.accountSyncFailed', { error: t('settings.steam.unknown') }))
+    }
+  } catch (e) {
+    if (!accountRefreshDisposed) {
+      message.error(t('settings.toast.accountSyncFailed', { error: e instanceof Error ? e.message : String(e) }))
+    }
+  } finally {
+    syncingSteamId.value = ''
   }
 }
 
@@ -1048,7 +1083,8 @@ async function patchNotifications(patch: NotificationPrefsUpdate) {
 }
 
 /** 通知是否真的可用——开关开了但出口没配好，界面必须说清楚 */
-const notifyReady = computed(() => !!notifyPrefs.value?.smtp.configured)
+const notifyUsesPlugin = computed(() => notifyPrefs.value?.delivery?.kind === 'plugin')
+const notifyReady = computed(() => notifyPrefs.value?.delivery?.configured ?? !!notifyPrefs.value?.smtp.configured)
 const notifyStateIsBad = computed(() => {
   const status = notifyPrefs.value?.lastDelivery?.status
   return !notifyReady.value || status === 'failed' || status === 'unknown'
@@ -1058,14 +1094,14 @@ const notifyStateKey = computed<MessageKey>(() => {
   const prefs = notifyPrefs.value
   if (!prefs) return 'settings.notification.off'
   const last = prefs.lastDelivery
-  if (last?.status === 'unknown') return 'settings.notification.lastUnknown'
-  if (!prefs.smtp.configured) return 'settings.notification.smtpMissing'
+  if (last?.status === 'unknown') return notifyUsesPlugin.value ? 'plugins.deliveryUnknown' : 'settings.notification.lastUnknown'
+  if (!notifyReady.value) return notifyUsesPlugin.value ? 'plugins.deliveryMissing' : 'settings.notification.smtpMissing'
   if (!prefs.enabled) return 'settings.notification.off'
-  if (last?.status === 'delivered') return 'settings.notification.lastOk'
+  if (last?.status === 'delivered') return notifyUsesPlugin.value ? 'plugins.deliveryOk' : 'settings.notification.lastOk'
   if (last?.status === 'failed') {
     return last.retryable
       ? 'settings.notification.lastRetryable'
-      : 'settings.notification.lastPermanent'
+      : notifyUsesPlugin.value ? 'plugins.deliveryFailed' : 'settings.notification.lastPermanent'
   }
   return 'settings.notification.on'
 })
@@ -1242,6 +1278,7 @@ onMounted(() => {
   void settingsStore.load()
   void load()
   void loadNotifications()
+  window.addEventListener(pluginsChangedEvent, loadNotifications)
   void loadPilot()
   void loadSecurity()
   void loadExports()
@@ -1251,7 +1288,12 @@ onMounted(() => {
   })
 })
 
-onUnmounted(stopLoginPolling)
+onUnmounted(() => {
+  window.removeEventListener(pluginsChangedEvent, loadNotifications)
+  stopLoginPolling()
+  accountRefreshDisposed = true
+  if (snapshotRefreshTimer) clearTimeout(snapshotRefreshTimer)
+})
 </script>
 
 <template>
@@ -1265,6 +1307,7 @@ onUnmounted(stopLoginPolling)
     </div>
 
     <template v-else>
+      <PluginsSettings />
       <!-- Steam 账户绑定（Cookie → 钱包/结算区） -->
       <div class="card settings-card" data-section="settings.section.steamAccount">
         <div class="section-title">{{ t('settings.section.steamAccount') }}</div>
@@ -1512,6 +1555,15 @@ onUnmounted(stopLoginPolling)
 
               <!-- 行操作 -->
               <div class="account-row__actions">
+                <HlButton
+                  variant="text"
+                  size="sm"
+                  :disabled="!!syncingSteamId"
+                  :loading="syncingSteamId === acc.steam_id"
+                  @click="refreshOneAccount(acc)"
+                >
+                  {{ t('settings.steam.syncOne') }}
+                </HlButton>
                 <HlButton
                   v-if="!acc.is_active"
                   variant="text"
@@ -2126,7 +2178,7 @@ onUnmounted(stopLoginPolling)
            类别是用户面分类，内部事件枚举不出现在这里。 -->
       <div class="card settings-card" data-section="settings.section.notification">
         <div class="section-title">{{ t('settings.section.notification') }}</div>
-        <div class="section-desc">{{ t('settings.notification.desc') }}</div>
+        <div class="section-desc">{{ t(notifyUsesPlugin ? 'plugins.deliveryDescription' : 'settings.notification.desc') }}</div>
 
         <div class="settings-row">
           <div class="settings-row__line">
@@ -2195,7 +2247,7 @@ onUnmounted(stopLoginPolling)
               :model-value="!!notifyPrefs?.includeDetails"
               accent
               :disabled="notifyBusy || !notifyPrefs?.enabled"
-              :label="t('settings.notification.detailsLabel')"
+              :label="t(notifyUsesPlugin ? 'plugins.includeDetails' : 'settings.notification.detailsLabel')"
               @update:model-value="(on: boolean) => patchNotifications({ includeDetails: on })"
             />
           </div>
@@ -2207,7 +2259,10 @@ onUnmounted(stopLoginPolling)
             <span class="notify-status__dot" />
             <span>{{ t(notifyStateKey, notifyStateParams) }}</span>
           </div>
-          <div v-if="notifyPrefs?.smtp.configured" class="section-desc">
+          <div class="section-desc">
+            {{ t('plugins.currentChannel', { name: notifyUsesPlugin ? notifyPrefs?.delivery?.name || t('plugins.title') : t('plugins.email') }) }}
+          </div>
+          <div v-if="!notifyUsesPlugin && notifyPrefs?.smtp.configured" class="section-desc">
             {{ t('settings.notification.smtpInfo', {
               host: notifyPrefs.smtp.host,
               port: notifyPrefs.smtp.port,
@@ -2225,7 +2280,7 @@ onUnmounted(stopLoginPolling)
             }) }}
           </div>
           <div v-if="notifyStats && notifyStats.unknown > 0" class="section-desc">
-            {{ t('settings.notification.unknownCount', { unknown: notifyStats.unknown }) }}
+            {{ t(notifyUsesPlugin ? 'plugins.deliveryUnknownCount' : 'settings.notification.unknownCount', { unknown: notifyStats.unknown }) }}
           </div>
         </div>
 
