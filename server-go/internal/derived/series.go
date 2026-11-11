@@ -348,7 +348,7 @@ type seriesCluster struct {
 // buildClusters 名称行 → 系列簇；纯启发式簇只含 ≥2 成员。覆盖表成员
 // 先按键预成组（组名以键为准），再叠加名称启发式的边——成员经名称规则
 // 命中的邻居自动并入。
-func buildClusters(rows []SeriesRow, overrides map[string][]int64) []seriesCluster {
+func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder ...[]string) []seriesCluster {
 	var members []seriesMember
 	for _, r := range rows {
 		name := ""
@@ -387,7 +387,17 @@ func buildClusters(rows []SeriesRow, overrides map[string][]int64) []seriesClust
 		for i, m := range members {
 			indexByAppid[m.appid] = i
 		}
-		for key, ids := range overrides {
+		keys := make([]string, 0, len(overrides))
+		if len(overrideOrder) > 0 && len(overrideOrder[0]) > 0 {
+			keys = append(keys, overrideOrder[0]...)
+		} else {
+			for key := range overrides {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+		}
+		for _, key := range keys {
+			ids := overrides[key]
 			for _, appid := range ids {
 				if _, ok := appidKey[appid]; !ok {
 					appidKey[appid] = key
@@ -690,7 +700,7 @@ const savedVersionKey = "games.derived_inputs"
 // RefreshSeries 重算系列归属并写回 games.series_id。changed 非 nil 时
 // 走增量窄化（覆盖版本未变）；覆盖版本变更时全量重算并保存版本。
 // 返回更新行数。事务与写闸由调用方持有。
-func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string, overrides map[string][]int64) (int, error) {
+func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string, overrides map[string][]int64, overrideOrder ...[]string) (int, error) {
 	// rows 序对齐 Python（无 ORDER BY，同库同计划返回序）——簇首成员
 	// 决定 series_id 锚名，两侧必须同序。
 	rows, err := querySeriesRows(ctx, conn, clusterableCond, nil)
@@ -733,7 +743,7 @@ func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string
 		}
 	}
 
-	clusters := buildClusters(rows, overrides)
+	clusters := buildClusters(rows, overrides, overrideOrder...)
 	newMap := map[int64]string{}
 	for _, c := range clusters {
 		for _, aid := range c.ids {

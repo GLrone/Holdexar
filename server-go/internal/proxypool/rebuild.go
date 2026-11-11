@@ -5,6 +5,7 @@ package proxypool
 
 import (
 	"context"
+	"database/sql"
 	"sync/atomic"
 
 	"holdexar/server-go/internal/clashkernel"
@@ -42,7 +43,11 @@ func RunPendingRebuild(ctx context.Context, rebuild func(ctx context.Context) er
 	if rebuild == nil {
 		return false, nil
 	}
-	return true, rebuild(ctx)
+	err := rebuild(ctx)
+	if err != nil && ctx.Err() == nil {
+		RequestRebuild()
+	}
+	return true, err
 }
 
 // ConsumeRebuildAfterCrawl 任务收尾（占用刚释放）立即消费待重建，不等周期拍：
@@ -62,12 +67,12 @@ func ConsumeRebuildAfterCrawl(ctx context.Context, rebuild func(ctx context.Cont
 // 释放后异步消费待重建，重建走标准回调。返回撤销函数，测试复位用。
 // serverd 周期拍消费与 RequestPoolRebuild 的运行时装配，待内核运行时接线批
 // 一并进场（serverd 目前不持内核 Runtime）。
-func WireRebuildPipeline(gate *store.WriteGate, dataDir, exePath string,
-	runtime *clashkernel.Runtime, lanes int) func() {
+func WireRebuildPipeline(db *sql.DB, gate *store.WriteGate, dataDir, exePath string,
+	runtime *clashkernel.Runtime) func() {
 	prev := occupancy.OnCrawlEnd
 	occupancy.OnCrawlEnd = func() {
 		_ = ConsumeRebuildAfterCrawl(context.Background(),
-			KernelRebuildFunc(gate, dataDir, exePath, runtime, lanes), runtime)
+			KernelRebuildFunc(db, gate, dataDir, exePath, runtime), runtime)
 	}
 	return func() { occupancy.OnCrawlEnd = prev }
 }

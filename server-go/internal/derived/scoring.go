@@ -102,8 +102,9 @@ func FamiliarityScore(reviewCount *int64) float64 {
 
 // SmartScore 综合分（0~1）：四因子加权，无隐藏项。
 func SmartScore(diffFen, positiveRate, reviewCount, hlFlag, discountPercent *int64, releaseDate *string, now time.Time) float64 {
-	return wSave*SaveScore(diffFen) +
-		wQuality*QualityScore(positiveRate, reviewCount, releaseDate, now) +
-		wTiming*TimingScore(hlFlag, discountPercent) +
-		wFamiliarity*FamiliarityScore(reviewCount)
+	return BlendScore(SaveScore(diffFen), QualityScore(positiveRate, reviewCount, releaseDate, now), TimingScore(hlFlag, discountPercent), FamiliarityScore(reviewCount))
+}
+
+func BlendScore(save, quality, timing, familiarity float64) float64 {
+	return wSave*save + wQuality*quality + wTiming*timing + wFamiliarity*familiarity
 }

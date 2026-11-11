@@ -1,5 +1,4 @@
-// Package rates：汇率只读查询（实时快照 / 日线历史 / 缺口扫描）。
-// 刷新与历史修复（POST，触网+写库）未迁移，见 deferred 清单。
+// Package rates：汇率快照、日线历史与缺口修复。
 package rates
 
 import (
@@ -52,12 +51,14 @@ func beijingToday() time.Time {
 // beijingTodayFn 时钟入口，测试可替换。
 var beijingTodayFn = beijingToday
 
-// Register 挂载 rates 只读路由；POST refresh / history/repair 未迁移。
-func Register(mux *http.ServeMux, db *sql.DB) {
+func Register(mux *http.ServeMux, db *sql.DB, services ...*Service) {
 	h := &handler{db: db}
 	mux.HandleFunc("GET /api/v1/rates", h.listRates)
 	mux.HandleFunc("GET /api/v1/rates/history", h.rateHistory)
 	mux.HandleFunc("GET /api/v1/rates/history/gaps", h.historyGaps)
+	if len(services) > 0 {
+		services[0].registerWrites(mux)
+	}
 	for _, p := range []string{"/api/v1/rates", "/api/v1/rates/history", "/api/v1/rates/history/gaps"} {
 		mux.HandleFunc(p, methodNotAllowed("GET"))
 	}

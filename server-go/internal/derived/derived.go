@@ -31,6 +31,7 @@ type CatalogRow struct {
 type Options struct {
 	Now           time.Time
 	Overrides     map[string][]int64
+	OverrideOrder []string
 	History       bool
 	CatalogBefore map[int64]CatalogRow
 }
@@ -42,8 +43,8 @@ func CatalogInputs(ctx context.Context, conn *sql.Conn, appids []int64) (map[int
 		return map[int64]CatalogRow{}, nil
 	}
 	q := "SELECT appid, name, name_en, type, positive_rate, review_count, release_date, series_id " +
-		"FROM games WHERE appid IN (" + inPlaceholders(ids) + ")"
-	rows, err := conn.QueryContext(ctx, q, int64sToAny(ids)...)
+		"FROM games WHERE appid IN (SELECT value FROM json_each(?))"
+	rows, err := conn.QueryContext(ctx, q, pyJSONSorted(intSlice(ids)))
 	if err != nil {
 		return nil, fmt.Errorf("目录输入读取失败: %w", err)
 	}
@@ -68,7 +69,7 @@ func CatalogInputs(ctx context.Context, conn *sql.Conn, appids []int64) (map[int
 // UpdatePriceDerived 重算派生列并按需联动系列重算。必须在调用方事务
 // 连接与写闸内执行（前置写入已在同一连接生效）。返回 UPDATE 覆盖行数。
 func UpdatePriceDerived(ctx context.Context, conn *sql.Conn, appids []int64, opts Options) (int64, error) {
-	if len(appids) == 0 {
+	if appids != nil && len(appids) == 0 {
 		return 0, nil
 	}
 	count, err := priceSnapshot(ctx, conn, appids, opts.Now, opts.History)
@@ -97,13 +98,21 @@ func UpdatePriceDerived(ctx context.Context, conn *sql.Conn, appids []int64, opt
 			}
 		}
 		if seriesChanged {
-			if _, err := RefreshSeries(ctx, conn, changed, opts.Overrides); err != nil {
+			if _, err := RefreshSeries(ctx, conn, changed, opts.Overrides, opts.OverrideOrder); err != nil {
 				return 0, err
 			}
 		}
 		// 评测/发行日变化的捆绑包排序缓存联动未迁移（bundles 域未到）
 	}
 	return count, nil
+}
+
+func SaveInputVersion(ctx context.Context, conn *sql.Conn, now time.Time, overrides map[string][]int64) error {
+	if overrides == nil {
+		overrides = map[string][]int64{}
+	}
+	_, err := conn.ExecContext(ctx, "INSERT INTO app_settings(key,value_json) VALUES('games.derived_inputs',?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json", pyJSONSorted(map[string]any{"day": now.Format("2006-01-02"), "series": overrides}))
+	return err
 }
 
 // catalogIdentChanged 系列联动判定：(name, name_en, type) 任一变化。

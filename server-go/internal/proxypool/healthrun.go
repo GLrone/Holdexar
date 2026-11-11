@@ -63,7 +63,8 @@ func StartHealthRun(ctx context.Context, gate *store.WriteGate, channel string, 
 			subArg = *subscriptionID
 		}
 		res, err := conn.ExecContext(ctx,
-			`INSERT INTO health_runs (channel, subscription_id, started_at) VALUES (?, ?, ?)`,
+			`INSERT INTO health_runs (channel, subscription_id, started_at, total, steam_ok, ip_known, failed)
+			 VALUES (?, ?, ?, 0, 0, 0, 0)`,
 			channel, subArg, pyTimeText(now))
 		if err != nil {
 			return err

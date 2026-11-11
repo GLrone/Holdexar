@@ -150,7 +150,7 @@ func newTestHandler(t *testing.T) (*httptest.Server, *sql.DB) {
 	seed(t, db)
 
 	mux := http.NewServeMux()
-	Register(mux, db)
+	Register(mux, db, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, db

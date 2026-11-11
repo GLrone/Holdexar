@@ -169,7 +169,7 @@ func (h *handler) gameDetail(ctx context.Context, appid int64) (*gameDetail, err
 				continue
 			}
 			priceMatrix[code] = []any{
-				formatMinorUnits(e.cents, currency), derefZero(e.cnyFen), e.cents, e.discount,
+				FormatMinorUnits(e.cents, currency), derefZero(e.cnyFen), e.cents, e.discount,
 			}
 			break
 		}

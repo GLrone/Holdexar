@@ -5,15 +5,26 @@ package proxypool
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/store"
 )
 
 func TestStartHealthRunCommitsImmediately(t *testing.T) {
-	db, gate, _ := poolTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "holdexar.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := store.InitializeFreshDatabase(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	gate := store.NewWriteGate(db, path)
 	now := time.Now()
 	runID, err := StartHealthRun(ctx, gate, DefaultScheduleChannel, nil, now)
 	if err != nil {
@@ -25,9 +36,13 @@ func TestStartHealthRunCommitsImmediately(t *testing.T) {
 	// 建轮即提交：闸外读可见（探测的网络段在闸外进行时，台账已在）
 	var channel string
 	var startedAt sql.NullString
-	if err := db.QueryRow(`SELECT channel, CAST(started_at AS TEXT) FROM health_runs WHERE id = ?`, runID).
-		Scan(&channel, &startedAt); err != nil {
+	var totals [4]int64
+	if err := db.QueryRow(`SELECT channel, CAST(started_at AS TEXT), total, steam_ok, ip_known, failed FROM health_runs WHERE id = ?`, runID).
+		Scan(&channel, &startedAt, &totals[0], &totals[1], &totals[2], &totals[3]); err != nil {
 		t.Fatal(err)
+	}
+	if totals != [4]int64{} {
+		t.Fatalf("initial health counters = %v, want zero", totals)
 	}
 	if channel != "scheduled" {
 		t.Fatalf("通道应为 scheduled，实际 %s", channel)

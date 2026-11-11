@@ -75,7 +75,7 @@ func addSubscription(t *testing.T, db *sql.DB, dataDir, url string) int64 {
 }
 
 func TestSyncAppliesSubscription(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	s, probe := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
@@ -131,7 +131,7 @@ func TestSyncAppliesSubscription(t *testing.T) {
 }
 
 func TestSyncFailureKeepsLastGoodSnapshot(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	calls := 0
@@ -192,7 +192,7 @@ func TestSyncFailureKeepsLastGoodSnapshot(t *testing.T) {
 }
 
 func TestSyncURLChangedGuard(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
@@ -223,8 +223,125 @@ func TestSyncURLChangedGuard(t *testing.T) {
 	}
 }
 
+func TestSyncFailedDownloadAfterURLChangeLeavesNewSubscriptionUntouched(t *testing.T) {
+	db, gate, dataDir := newSubscriptionSyncDB(t)
+	oldURL := "https://sub.example.com/old"
+	subID := addSubscription(t, db, dataDir, oldURL)
+	replacement, err := SealURL(dataDir, "https://sub.example.com/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
+		if _, err := db.Exec(`UPDATE proxy_subscriptions SET url = ? WHERE id = ?`, replacement, subID); err != nil {
+			return nil, err
+		}
+		return nil, &FetchFailedError{URL: url}
+	})
+	res, err := s.SyncSubscriptions(context.Background())
+	if err != nil || res.Failures[subID] != messageURLChanged {
+		t.Fatalf("obsolete failed download: result=%+v, err=%v", res, err)
+	}
+	var status sql.NullString
+	if err := db.QueryRow(`SELECT last_fetch_status FROM proxy_subscriptions WHERE id = ?`, subID).Scan(&status); err != nil || status.Valid {
+		t.Fatalf("new URL status = %v, err=%v", status, err)
+	}
+	var snapshots int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM subscription_snapshots WHERE subscription_id = ?`, subID).Scan(&snapshots); err != nil || snapshots != 0 {
+		t.Fatalf("obsolete download produced %d snapshots, err=%v", snapshots, err)
+	}
+}
+
+func newSubscriptionSyncDB(t *testing.T) (*sql.DB, *store.WriteGate, string) {
+	t.Helper()
+	return newOrchestrateDB(t)
+}
+
+func TestSyncTrafficProjectionChangesPoolEligibility(t *testing.T) {
+	db, gate, dataDir := newSubscriptionSyncDB(t)
+	const url = "https://sub.example.com/traffic"
+	subID := addSubscription(t, db, dataDir, url)
+	if _, err := db.Exec(`UPDATE proxy_subscriptions SET admission_status = 'ACTIVE',
+		last_stats = '{"alive": 4}', deprecated = 1, deprecated_at = '2026-10-31 01:00:00', deprecated_reason = '旧资源已到期'
+		WHERE id = ?`, subID); err != nil {
+		t.Fatal(err)
+	}
+	header := "upload=2; download=8; total=10"
+	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
+		result := stubResult(url)
+		result.Userinfo = header
+		return result, nil
+	})
+	ctx := context.Background()
+	for _, step := range []struct {
+		header string
+		stored string
+		count  int
+	}{
+		{header, header, 0},
+		{"", header, 0},
+		{"upload=2; download=8; total=100", "upload=2; download=8; total=100", 1},
+	} {
+		header = step.header
+		res, err := s.SyncSubscriptions(ctx)
+		if err != nil || res.NodeCount[subID] != 1 {
+			t.Fatalf("sync: result=%+v, err=%v", res, err)
+		}
+		var alive int
+		var stored sql.NullString
+		if err := db.QueryRow(`SELECT json_extract(last_stats, '$.alive'), json_extract(last_stats, '$.traffic')
+			FROM proxy_subscriptions WHERE id = ?`, subID).Scan(&alive, &stored); err != nil || alive != 4 || stored.String != step.stored {
+			t.Fatalf("traffic projection: alive=%d, traffic=%v, err=%v", alive, stored, err)
+		}
+		eligible, err := eligibleNodes(ctx, db, s.Now())
+		if err != nil || len(eligible) != step.count {
+			t.Fatalf("eligible nodes = %d, want %d, err=%v", len(eligible), step.count, err)
+		}
+	}
+	var deprecated bool
+	var at, reason sql.NullString
+	if err := db.QueryRow(`SELECT deprecated, CAST(deprecated_at AS TEXT), deprecated_reason FROM proxy_subscriptions WHERE id = ?`, subID).
+		Scan(&deprecated, &at, &reason); err != nil || deprecated || at.Valid || reason.Valid {
+		t.Fatalf("renewed resources still marked deprecated: %v %v %v, err=%v", deprecated, at, reason, err)
+	}
+}
+
+func TestSyncPreservesUserTitleAndAdoptsMatchingLegacyProviderTitle(t *testing.T) {
+	db, gate, dataDir := newSubscriptionSyncDB(t)
+	const url = "https://sub.example.com/title"
+	id := addSubscription(t, db, dataDir, url)
+	if _, err := db.Exec(`UPDATE proxy_subscriptions SET label='Old provider title' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	title := "Old provider title"
+	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
+		result := stubResult(url)
+		result.ProfileTitle = title
+		return result, nil
+	})
+	verify := func(want, source string) {
+		t.Helper()
+		result, err := s.SyncOne(context.Background(), id)
+		if err != nil || len(result.Failures) != 0 {
+			t.Fatalf("sync: result=%+v err=%v", result, err)
+		}
+		var label, labelSource string
+		err = db.QueryRow(`SELECT label,json_extract(last_stats,'$.labelSource') FROM proxy_subscriptions WHERE id=?`, id).Scan(&label, &labelSource)
+		if err != nil || label != want || labelSource != source {
+			t.Fatalf("label %q source %q err %v", label, labelSource, err)
+		}
+	}
+	verify("Old provider title", "panel")
+	title = "Renamed provider"
+	verify("Renamed provider", "panel")
+	if _, err := db.Exec(`UPDATE proxy_subscriptions SET label='User title',
+		last_stats=json_set(last_stats,'$.labelSource','user') WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	verify("User title", "user")
+}
+
 func TestSyncSnapshotRestoreRoundTrip(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
@@ -263,7 +380,7 @@ func TestSyncSnapshotRestoreRoundTrip(t *testing.T) {
 }
 
 func TestSyncDeletedSubscriptionDuringFetch(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
@@ -282,7 +399,7 @@ func TestSyncDeletedSubscriptionDuringFetch(t *testing.T) {
 }
 
 func TestUnreadableURLPath(t *testing.T) {
-	db, gate, dataDir := newTestDB(t)
+	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
 	// 写入一段伪密文（IsEncrypted 命中但解密必败）
 	res, err := db.Exec(`INSERT INTO proxy_subscriptions (url) VALUES (?)`, "enc1:not-a-real-token")

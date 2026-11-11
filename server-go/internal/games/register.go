@@ -1,5 +1,6 @@
-// Package games：games 域只读路径（列表 / 详情 / 目录检索）。
-// 写路径、爬取触发、回填与外部抓取端点不在本包。
+// Package games：games 域只读路径（列表 / 详情 / 目录检索 / 历史走势）。
+// 写路径、爬取触发与外部抓取端点不在本包；历史回填派发只改历史事实与
+// 同步状态，统一写入仍在 dbwriter。
 package games
 
 import (
@@ -10,16 +11,19 @@ import (
 	_ "holdexar/server-go/internal/store" // name_bigram UDF 注册（影子表触发器与检索共用）
 )
 
-// Register 注册 games 域只读端点。其余端点（榜单 / 历史 / 回填 / 移除等）
-// 不在此注册，由装配方决定兜底行为。
-func Register(mux *http.ServeMux, db *sql.DB) {
-	h := &handler{db: db}
+// Register 注册 games 域端点。backfill 为社区历史源回填管理器（nil =
+// 数据源未安装，历史只读照常，回填端点显式拒绝）。
+func Register(mux *http.ServeMux, db *sql.DB, backfill *HistoryBackfill) {
+	h := &handler{db: db, backfill: backfill}
 	mux.HandleFunc("GET /api/v1/games", h.handleList)
 	mux.HandleFunc("GET /api/v1/games/{appid}", h.handleDetail)
+	mux.HandleFunc("GET /api/v1/games/{appid}/history", h.handleHistory)
+	mux.HandleFunc("POST /api/v1/games/{appid}/history/backfill", h.handleBackfill)
 }
 
 type handler struct {
-	db *sql.DB
+	db       *sql.DB
+	backfill *HistoryBackfill
 }
 
 func (h *handler) handleList(w http.ResponseWriter, r *http.Request) {

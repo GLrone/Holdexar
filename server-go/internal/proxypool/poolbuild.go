@@ -114,6 +114,11 @@ type poolNodeRow struct {
 	OriginalName   string
 	SubscriptionID sql.NullInt64
 	Config         map[string]any
+	State          string
+	ExitIP         sql.NullString
+	L0DelayMS      sql.NullInt64
+	LastL1At       sql.NullString
+	LastL2At       sql.NullString
 }
 
 // poolSubscriptionRow 准入判定所需的订阅行投影。
@@ -159,6 +164,10 @@ func SubscriptionBlockReason(lastStatsJSON string, now time.Time) string {
 // 合格 = 状态合格（NEW/ACTIVE/STALE）+ 配置完整 + 仍归属订阅 + 订阅在生产准入
 // 且未资源封锁；信息占位节点（机场公告位）永不合格。
 func EligibleNodes(ctx context.Context, conn *sql.Conn, now time.Time) ([]poolNodeRow, error) {
+	return eligibleNodes(ctx, conn, now)
+}
+
+func eligibleNodes(ctx context.Context, conn queryable, now time.Time) ([]poolNodeRow, error) {
 	subs := map[int64]poolSubscriptionRow{}
 	rows, err := conn.QueryContext(ctx,
 		`SELECT id, admission_status, CAST(last_stats AS TEXT) FROM proxy_subscriptions`)
@@ -180,7 +189,8 @@ func EligibleNodes(ctx context.Context, conn *sql.Conn, now time.Time) ([]poolNo
 	rows.Close()
 
 	nodeRows, err := conn.QueryContext(ctx,
-		`SELECT id, node_id, runtime_name, original_name, subscription_id, CAST(normalized_config AS TEXT)
+		`SELECT id, node_id, runtime_name, original_name, subscription_id, CAST(normalized_config AS TEXT),
+		 state, exit_ip, l0_delay_ms, CAST(last_l1_at AS TEXT), CAST(last_l2_at AS TEXT)
 		 FROM proxy_nodes
 		 WHERE state IN (?, ?, ?) AND subscription_id IS NOT NULL
 		 ORDER BY id`, NodeNew, NodeActive, NodeStale)
@@ -190,18 +200,13 @@ func EligibleNodes(ctx context.Context, conn *sql.Conn, now time.Time) ([]poolNo
 	defer nodeRows.Close()
 	var out []poolNodeRow
 	for nodeRows.Next() {
-		var (
-			id     int64
-			nodeID string
-			name   string
-			orig   sql.NullString
-			sid    sql.NullInt64
-			cfg    sql.NullString
-		)
-		if err := nodeRows.Scan(&id, &nodeID, &name, &orig, &sid, &cfg); err != nil {
+		var node poolNodeRow
+		var orig, cfg sql.NullString
+		if err := nodeRows.Scan(&node.ID, &node.NodeID, &node.RuntimeName, &orig, &node.SubscriptionID, &cfg,
+			&node.State, &node.ExitIP, &node.L0DelayMS, &node.LastL1At, &node.LastL2At); err != nil {
 			return nil, err
 		}
-		sub, ok := subs[sid.Int64]
+		sub, ok := subs[node.SubscriptionID.Int64]
 		if !ok || !IsAdmitted(sub.Admission) {
 			continue
 		}
@@ -215,14 +220,12 @@ func EligibleNodes(ctx context.Context, conn *sql.Conn, now time.Time) ([]poolNo
 			}
 			config = normalizeJSONNumbers(config).(map[string]any)
 		}
-		if !poolConfigComplete(config) || IsInfoPlaceholder(name) {
+		if !poolConfigComplete(config) || IsInfoPlaceholder(node.RuntimeName) {
 			continue
 		}
-		out = append(out, poolNodeRow{
-			ID: id, NodeID: nodeID, RuntimeName: name,
-			OriginalName:   orig.String,
-			SubscriptionID: sid, Config: config,
-		})
+		node.OriginalName = orig.String
+		node.Config = config
+		out = append(out, node)
 	}
 	return out, nodeRows.Err()
 }
@@ -446,9 +449,7 @@ func renderPoolNodes(nodes []poolNodeRow, sourceDocuments map[int64]map[string]a
 	return clashcfg.DumpYAML(doc), names, nil
 }
 
-// PoolSignature 按完整节点参数及必要连接依赖组判定运行集变化。
-// 每个节点一条 `runtime_name:sha256(完整参数)`；连接依赖组与来源错误合成一条
-// `dependencies:sha256(...)`。返回的切片有序（按节点主键）。
+// PoolSignature 按完整节点参数、生产出口槽和必要连接依赖组判定运行集变化。
 func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time.Time) ([]string, error) {
 	nodes, err := EligibleNodes(ctx, conn, now)
 	if err != nil {
@@ -468,6 +469,9 @@ func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time
 		sum := sha256.Sum256([]byte(blob))
 		signatures = append(signatures,
 			node.RuntimeName+":"+hex.EncodeToString(sum[:]))
+	}
+	for _, slot := range selectCrawlSlots(nodes, nil) {
+		signatures = append(signatures, "exit:"+slot.ExitIP+"|"+slot.Node)
 	}
 	sourceErrors := map[int64]string{}
 	sources := loadPoolSourceDocuments(ctx, conn, dataDir, nodes, sourceErrors)

@@ -10,7 +10,9 @@ package proxypool
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,12 +27,14 @@ const messageURLChanged = "订阅地址在刷新期间发生变化，本次结�
 
 // Subscription 同步所需的最小订阅行投影（URL 密文，开封在消费点）。
 type Subscription struct {
-	ID  int64
-	URL string
+	ID     int64
+	URL    string
+	Repull SubRepullInfo
 }
 
 // SyncResult 一轮同步的账目。
 type SyncResult struct {
+	StrategySwitched  bool
 	SubscriptionCount int
 	SnapshotSha256    map[int64]string
 	NodeCount         map[int64]int
@@ -57,42 +61,91 @@ type Syncer struct {
 	Fetch             func(ctx context.Context, url string, channels []Channel, opts FetchOptions) (*FetchResult, error)
 }
 
-var syncMutex sync.Mutex
+var syncSlot = make(chan struct{}, 1)
 
 // ListSubscriptions 读订阅清单（闸外只读）。
 func (s *Syncer) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
-	rows, err := s.DB.QueryContext(ctx,
-		`SELECT id, url FROM proxy_subscriptions ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Subscription
-	for rows.Next() {
-		var sub Subscription
-		if err := rows.Scan(&sub.ID, &sub.URL); err != nil {
-			return nil, err
-		}
-		out = append(out, sub)
-	}
-	return out, rows.Err()
+	return listSyncSources(ctx, s.DB, 0)
 }
 
 // SyncSubscriptions 全量同步：并发抓取（闸外）→ 闸内一次提交。
 func (s *Syncer) SyncSubscriptions(ctx context.Context) (*SyncResult, error) {
-	syncMutex.Lock()
-	defer syncMutex.Unlock()
+	return s.syncSubscriptions(ctx, false, 0)
+}
+
+func (s *Syncer) SyncAutomatic(ctx context.Context) (*SyncResult, error) {
+	return s.syncSubscriptions(ctx, true, 0)
+}
+
+func (s *Syncer) SyncOne(ctx context.Context, id int64) (*SyncResult, error) {
+	if id <= 0 {
+		return nil, errors.New("订阅编号无效")
+	}
+	return s.syncSubscriptions(ctx, false, id)
+}
+
+func (s *Syncer) syncSubscriptions(ctx context.Context, automatic bool, onlyID int64) (*SyncResult, error) {
+	var before Subscription
+	if onlyID != 0 {
+		subs, err := listSyncSources(ctx, s.DB, onlyID)
+		if err != nil {
+			return nil, err
+		}
+		if len(subs) == 1 {
+			before = subs[0]
+		}
+	}
+	select {
+	case syncSlot <- struct{}{}:
+		defer func() { <-syncSlot }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	s.fill()
 	subs, err := s.ListSubscriptions(ctx)
 	if err != nil {
 		return nil, err
 	}
+	selected := subs[:0]
+	now := s.Now()
+	for _, sub := range subs {
+		if onlyID != 0 && sub.ID != onlyID {
+			continue
+		}
+		if automatic {
+			targets, _ := FilterRepullTargets([]SubRepullInfo{sub.Repull}, now, false)
+			if len(targets) == 0 {
+				continue
+			}
+		}
+		selected = append(selected, sub)
+	}
+	subs = selected
 	result := &SyncResult{
 		SubscriptionCount: len(subs),
 		SnapshotSha256:    map[int64]string{},
 		NodeCount:         map[int64]int{},
 		Failures:          map[int64]string{},
 		Snapshots:         map[int64]*Snapshot{},
+	}
+	if len(subs) == 0 {
+		return result, nil
+	}
+	if onlyID != 0 && before.ID == onlyID && before.URL == subs[0].URL && subs[0].Repull.LastFetchStatus == "OK" {
+		current := subs[0].Repull.LastFetchAt
+		old := before.Repull.LastFetchAt
+		if current != nil && (old == nil || !current.Equal(*old)) {
+			conn, err := s.DB.Conn(ctx)
+			if err != nil {
+				return result, err
+			}
+			snap, restoreErr := RestoreLatestSnapshot(ctx, conn, s.DataDir, onlyID, OpenURL(s.DataDir, before.URL))
+			conn.Close()
+			if restoreErr == nil && snap != nil {
+				result.SnapshotSha256[onlyID], result.NodeCount[onlyID], result.Snapshots[onlyID] = snap.Sha256, snap.NodeCount, snap
+				return result, nil
+			}
+		}
 	}
 
 	// 有界并发下载（纯 I/O），落库仍串行（SQLite 单写者）
@@ -108,7 +161,11 @@ func (s *Syncer) SyncSubscriptions(ctx context.Context) (*SyncResult, error) {
 		wg.Add(1)
 		go func(subID int64, subURL string) {
 			defer wg.Done()
-			fetchSlots <- struct{}{}
+			select {
+			case fetchSlots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-fetchSlots }()
 			res, err := s.Fetch(ctx, subURL, s.Channels, FetchOptions{})
 			fetchedMu.Lock()
@@ -117,6 +174,9 @@ func (s *Syncer) SyncSubscriptions(ctx context.Context) (*SyncResult, error) {
 		}(sub.ID, url)
 	}
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 
 	// 落库段进闸：WithWrite 三合一（闸 + 单连接 + BEGIN IMMEDIATE/COMMIT），
 	// 回调内失败整体回滚；单订阅半截写入由 SAVEPOINT 隔离。
@@ -137,6 +197,13 @@ func (s *Syncer) SyncSubscriptions(ctx context.Context) (*SyncResult, error) {
 			live, still := currentByID[sub.ID]
 			if !still {
 				result.Failures[sub.ID] = "订阅在刷新期间已删除，本次结果未应用"
+				continue
+			}
+			if sub.URL != live.URL {
+				result.Failures[sub.ID] = messageURLChanged
+				continue
+			}
+			if automatic && !live.Repull.AutoRefresh {
 				continue
 			}
 			if err := s.applyOne(ctx, conn, live, fetched[sub.ID], now, result); err != nil {
@@ -171,6 +238,9 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 			`UPDATE proxy_subscriptions SET last_fetch_at = ?, last_fetch_status = 'OK',
 			 last_success_at = ?, last_error = NULL, cache_url_identity = ? WHERE id = ?`,
 			pyTimeText(now), pyTimeText(now), identity, subID); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "RELEASE sp_subscription_apply"); err != nil {
 			return err
 		}
 		result.SnapshotSha256[subID] = sha
@@ -241,6 +311,12 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		workRollback()
 		return fail(UnreadableMessage)
 	}
+	if liveURL != subURL {
+		workRollback()
+		rollback()
+		result.Failures[subID] = messageURLChanged
+		return nil
+	}
 	if item.Result == nil && item.Err == nil {
 		// 预取缺失（不可达）：按失败记账，不静默丢
 		workRollback()
@@ -252,11 +328,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 	}
 	// 应用前现读订阅行：抓取可能耗时几十秒，期间地址可能已换——旧链接的
 	// 下载结果不得应用到新地址名下（本分支只记账，不动订阅行）
-	if liveURL != subURL {
-		workRollback()
-		result.Failures[subID] = messageURLChanged
-		return nil
-	}
 	res := item.Result
 	nodes := res.ResolvedNodes
 	if len(nodes) == 0 {
@@ -277,6 +348,10 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		workRollback()
 		return fail(errMessage(err))
 	}
+	if err := projectAcceptedSubscription(ctx, conn, subID, snap, now); err != nil {
+		workRollback()
+		return fail(errMessage(err))
+	}
 	if _, err := conn.ExecContext(ctx, "RELEASE sp_subscription_work"); err != nil {
 		return err
 	}
@@ -284,6 +359,9 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 }
 
 func (s *Syncer) fill() {
+	if len(s.Channels) == 0 {
+		s.Channels = BuildChannels("", nil)
+	}
 	if s.MaxConcurrentSubs <= 0 {
 		s.MaxConcurrentSubs = MaxConcurrentSubscriptionFetches
 	}
@@ -299,7 +377,13 @@ func (s *Syncer) fill() {
 
 // ListSubscriptionsConn 事务内读订阅清单（闸内重读用）。
 func (s *Syncer) ListSubscriptionsConn(ctx context.Context, conn *sql.Conn) ([]Subscription, error) {
-	rows, err := conn.QueryContext(ctx, `SELECT id, url FROM proxy_subscriptions ORDER BY id`)
+	return listSyncSources(ctx, conn, 0)
+}
+
+func listSyncSources(ctx context.Context, q queryable, id int64) ([]Subscription, error) {
+	rows, err := q.QueryContext(ctx, `SELECT id, url, COALESCE(auto_refresh,1),
+		COALESCE(last_fetch_status,''), CAST(last_fetch_at AS TEXT)
+		FROM proxy_subscriptions WHERE kind='clash' AND (?=0 OR id=?) ORDER BY id`, id, id)
 	if err != nil {
 		return nil, err
 	}
@@ -307,12 +391,53 @@ func (s *Syncer) ListSubscriptionsConn(ctx context.Context, conn *sql.Conn) ([]S
 	var out []Subscription
 	for rows.Next() {
 		var sub Subscription
-		if err := rows.Scan(&sub.ID, &sub.URL); err != nil {
+		var fetched sql.NullString
+		if err := rows.Scan(&sub.ID, &sub.URL, &sub.Repull.AutoRefresh, &sub.Repull.LastFetchStatus, &fetched); err != nil {
 			return nil, err
+		}
+		sub.Repull.ID = sub.ID
+		if at, err := parsePyDatetime(fetched.String); err == nil {
+			sub.Repull.LastFetchAt = &at
 		}
 		out = append(out, sub)
 	}
 	return out, rows.Err()
+}
+
+func projectAcceptedSubscription(ctx context.Context, conn *sql.Conn, id int64, snap *Snapshot, now time.Time) error {
+	var stored, label, deprecatedReason sql.NullString
+	if err := conn.QueryRowContext(ctx, `SELECT CAST(last_stats AS TEXT),label,deprecated_reason FROM proxy_subscriptions WHERE id=?`, id).
+		Scan(&stored, &label, &deprecatedReason); err != nil {
+		return err
+	}
+	stats := map[string]any{}
+	_ = json.Unmarshal([]byte(stored.String), &stats)
+	if stats == nil {
+		stats = map[string]any{}
+	}
+	stats["fetched"] = snap.NodeCount
+	if snap.Userinfo != "" {
+		stats["traffic"] = snap.Userinfo
+	}
+	title := truncateRunes(strings.TrimSpace(snap.ProfileTitle), 100)
+	source := stats["labelSource"]
+	if title != "" && source != "user" && (strings.TrimSpace(label.String) == "" || source == "panel" || label.String == title) {
+		label = sql.NullString{String: title, Valid: true}
+		stats["labelSource"] = "panel"
+	}
+	raw, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	reason := deprecatedReason.String
+	renewed := snap.Userinfo != "" && SubscriptionBlockReason(string(raw), now) == "" &&
+		(strings.Contains(reason, "到期") || strings.Contains(reason, "流量已用尽"))
+	_, err = conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET last_stats=?, label=?, last_imported_at=?,
+		deprecated=CASE WHEN ? THEN 0 ELSE deprecated END,
+		deprecated_at=CASE WHEN ? THEN NULL ELSE deprecated_at END,
+		deprecated_reason=CASE WHEN ? THEN NULL ELSE deprecated_reason END WHERE id=?`,
+		string(raw), label, pyTimeText(now), renewed, renewed, renewed, id)
+	return err
 }
 
 // BuildSnapshot 抓取产物 → 不可变快照。

@@ -24,8 +24,7 @@ const (
 	baselineChunkSize = 400  // 基线查询按 appid 分块
 )
 
-// Writer 价格批量写层。Now 可注入便于测试；EventKey 供活动窗口标签接入
-// （未迁移 steam_events 域时保持 nil，观测行不打活动标）。
+// Writer 写入价格批次及其观察时刻对应的活动标签。
 type Writer struct {
 	DB       *sql.DB
 	Gate     *store.WriteGate
@@ -247,7 +246,7 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 	// 派生列维护（hl/史低标记/系列识别/智能评分）：与 Python 同一写事务
 	// 内、批写完成后执行；系列覆盖表由宿主闸外装填
 	if len(okIDs) > 0 {
-		derived.Clock = w.Now
+		derived.SetClock(w.Now)
 		if _, err := derived.UpdatePriceDerived(ctx, conn, okIDs, derived.Options{
 			Now:           w.Now(),
 			Overrides:     w.SeriesOverrides,

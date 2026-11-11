@@ -99,9 +99,9 @@ func newStubProxy(t *testing.T) *httptest.Server {
 // stubController 桩内核控制器：记录各 selector 的选中节点并回读核验，
 // delay 端点按名字给延迟（failDelay 非 0 时对全部名字返回该状态码）。
 type stubController struct {
-	server *httptest.Server
-	mu     sync.Mutex // now 由各请求 goroutine 读写，httptest 每请求独立 goroutine
-	now    map[string]string
+	server    *httptest.Server
+	mu        sync.Mutex // now 由各请求 goroutine 读写，httptest 每请求独立 goroutine
+	now       map[string]string
 	delayFail atomic.Int32 // 0=正常回 delay；非 0 = 返回该 HTTP 状态码
 }
 
@@ -437,7 +437,7 @@ func TestBusinessCommitTransportFailureFailsFast(t *testing.T) {
 	if _, err := h.commitBusinessWave(context.Background(), []struct {
 		row    nodeRow
 		result BusinessResult
-	}{{row: nodeRow{ID: 1, NodeID: "fp-n1", State: NodeActive, SubscriptionID: sql.NullInt64{Int64: 1, Valid: true}}, result: result}}, time.Now(), "target"); err != nil {
+	}{{row: nodeRow{ID: 1, NodeID: "fp-n1", State: NodeActive, SubscriptionID: sql.NullInt64{Int64: 1, Valid: true}}, result: result}}, time.Now(), "target", 0); err != nil {
 		t.Fatal(err)
 	}
 	if state := queryString(t, h.DB, `SELECT state FROM proxy_nodes WHERE runtime_name = 'n1'`); state.String != NodeDead {
@@ -479,7 +479,7 @@ func TestBusinessCommitRollbackAll(t *testing.T) {
 		{row: nodeRow{ID: 2, NodeID: "fp-n2", State: NodeNew, SubscriptionID: sql.NullInt64{Int64: 1, Valid: true}},
 			result: BusinessResult{RuntimeName: "n2", Detail: "BOOM"}},
 	}
-	if _, err := h.commitBusinessWave(context.Background(), probed, time.Now(), "target"); err == nil {
+	if _, err := h.commitBusinessWave(context.Background(), probed, time.Now(), "target", 0); err == nil {
 		t.Fatalf("注入的写入失败必须浮出")
 	}
 	// 整波回滚：n1 的晋升与 n1/n2 的观测行都不存在
