@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/updateguard"
 )
 
 // healthResponse 健康端点响应。可选字段仅在更新交接环境变量存在时出现，
@@ -47,7 +48,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		resp.UpdateDataProtocol = &protocol
 		protected := s.UpdateWriteProtected
 		resp.WriteProtected = &protected
-		pageReady := s.UpdatePageReady
+		// pageReady 由 update-ready 端点翻位（updateguard 内部状态），读取须取现值
+		pageReady := updateguard.PageReady()
 		resp.PageReady = &pageReady
 	}
 	writeJSON(w, http.StatusOK, resp)
