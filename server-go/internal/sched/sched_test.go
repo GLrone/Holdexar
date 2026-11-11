@@ -380,6 +380,112 @@ func TestSetNextExternal(t *testing.T) {
 	}
 }
 
+func TestRunCtxSetJobNextSim(t *testing.T) {
+	start := parseBJ("2026-10-31 17:00")
+	var log evLog
+	s := NewScheduler(WithOnEvent(log.on))
+	var missingErr error
+	if err := s.RegisterInterval("repair", start.Add(10*time.Minute), time.Hour, func(rc *RunCtx) {
+		missingErr = rc.SetJobNext("missing", start)
+		if err := rc.SetJobNext("refresh", rc.Now().Add(2*time.Minute)); err != nil {
+			t.Error(err)
+		}
+		rc.SetNext(start.Add(24 * time.Hour))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterInterval("refresh", start.Add(time.Hour), time.Hour, emptyBody, WithLabel("价格刷新")); err != nil {
+		t.Fatal(err)
+	}
+	s.StartSim(start)
+	s.RunSim(start.Add(65 * time.Minute))
+	if missingErr == nil || missingErr.Error() != "任务 missing 未注册" {
+		t.Fatalf("missing job error = %v", missingErr)
+	}
+	fires := log.of(EventFire, "refresh")
+	if len(fires) != 2 || !fires[0].At.Equal(start.Add(12*time.Minute)) || !fires[1].At.Equal(start.Add(time.Hour)) {
+		t.Fatalf("cross-job reschedule did not advance refresh and restore grid: %v", fires)
+	}
+	events := log.of(EventSetNext, "refresh")
+	if len(events) != 1 || events[0].Label != "价格刷新" || !events[0].Scheduled.Equal(start.Add(12*time.Minute)) || !events[0].At.Equal(start.Add(10*time.Minute)) {
+		t.Fatalf("reschedule event count = %d", len(events))
+	}
+	if len(log.of(EventFire, "repair")) != 1 || len(log.of(EventPanic, "")) != 0 {
+		t.Fatal("existing self-reanchor changed or task panicked")
+	}
+	s.Stop()
+	if err := (&RunCtx{s: s}).SetJobNext("refresh", start); err == nil || err.Error() != "调度器已停止，无法重锚" {
+		t.Fatalf("stopped reschedule error = %v", err)
+	}
+}
+
+func TestRunCtxSetJobNextRealDelegates(t *testing.T) {
+	var log evLog
+	s := NewScheduler(WithOnEvent(log.on))
+	at := time.Now().Add(time.Hour)
+	if err := s.RegisterInterval("refresh", at, time.Hour, emptyBody); err != nil {
+		t.Fatal(err)
+	}
+	rc := &RunCtx{s: s}
+	if err := rc.SetJobNext("refresh", at.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if !s.jobs["refresh"].next.Equal(at.Add(time.Minute)) || len(log.of(EventSetNext, "refresh")) != 1 {
+		t.Fatal("real-mode reschedule did not update existing scheduling state and event")
+	}
+	if err := rc.SetJobNext("missing", at); err == nil {
+		t.Fatal("unregistered real-mode target accepted")
+	}
+	s.Stop()
+	if err := rc.SetJobNext("refresh", at); err == nil {
+		t.Fatal("stopped real-mode scheduler accepted reschedule")
+	}
+}
+
+func TestZeroNextCancelsWithoutRefire(t *testing.T) {
+	for _, crossJob := range []bool{false, true} {
+		name := "self"
+		if crossJob {
+			name = "cross-job"
+		}
+		t.Run(name, func(t *testing.T) {
+			start := parseBJ("2026-10-31 17:00")
+			var log evLog
+			s := NewScheduler(WithOnEvent(log.on))
+			if err := s.RegisterInterval("target", start.Add(10*time.Minute), 10*time.Minute, func(rc *RunCtx) {
+				if !crossJob {
+					rc.SetNext(time.Time{})
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if crossJob {
+				if err := s.RegisterInterval("controller", start.Add(15*time.Minute), time.Hour, func(rc *RunCtx) {
+					if err := rc.SetJobNext("target", time.Time{}); err != nil {
+						t.Error(err)
+					}
+					rc.SetNext(start.Add(24 * time.Hour))
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.StartSim(start)
+			s.RunSim(start.Add(time.Hour))
+			fires := log.of(EventFire, "target")
+			if len(fires) != 1 || !fires[0].At.Equal(start.Add(10*time.Minute)) {
+				t.Fatalf("cancelled target fired %d times, want one", len(fires))
+			}
+			changes := log.of(EventSetNext, "target")
+			if len(changes) != 1 || !changes[0].Scheduled.IsZero() || !s.jobs["target"].next.IsZero() {
+				t.Fatalf("cancellation was not retained: events=%d next=%v", len(changes), s.jobs["target"].next)
+			}
+			if len(log.of(EventPanic, "")) != 0 || len(log.of(EventSkip, "target")) != 0 || len(log.of(EventMissed, "target")) != 0 {
+				t.Fatal("cancelled target produced execution events")
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------- Stop 语义
 
 func TestStopNoWait(t *testing.T) {
