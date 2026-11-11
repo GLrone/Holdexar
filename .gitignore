@@ -219,3 +219,4 @@ server/.vite/
 release-go/
 *.exe
 g620.json
+release-gate/
