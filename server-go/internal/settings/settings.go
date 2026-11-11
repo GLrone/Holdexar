@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/store"
 )
@@ -37,9 +38,6 @@ const (
 	keyMCPEnabled     = "mcp.enabled"
 )
 
-const upsertSQL = `INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)
-ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
-
 // resolveDataDir 数据目录判定（凭据主密钥托管挂在其下），Register 时调用
 // 一次；测试可替换。与 systemx 同款装配。
 var resolveDataDir = func() string {
@@ -50,12 +48,20 @@ var resolveDataDir = func() string {
 	return dir
 }
 
-// Register 装配 settings 域端点：GET/PUT /api/v1/settings。
-// 其余端点（fetch 节奏、steam 本机账号导入）不在此注册。
-func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
+type Options struct {
+	Bus     *events.Bus
+	Changed func(context.Context, []string, []string)
+}
+
+func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, options ...Options) {
 	h := &handler{db: db, gate: gate, dataDir: resolveDataDir()}
+	if len(options) > 0 {
+		h.options = options[0]
+	}
 	mux.HandleFunc("GET /api/v1/settings", h.handleGet)
 	mux.HandleFunc("PUT /api/v1/settings", h.handlePut)
+	mux.HandleFunc("GET /api/v1/settings/fetch", h.handleFetchGet)
+	mux.HandleFunc("PUT /api/v1/settings/fetch", h.handleFetchPut)
 }
 
 // OnMCPEnabledWrite mcp.enabled 落库成功后的运行时重载回调；cmd/serverd 注入
@@ -70,6 +76,7 @@ type handler struct {
 	db      *sql.DB
 	gate    *store.WriteGate
 	dataDir string
+	options Options
 }
 
 type accountPayload struct {
@@ -116,7 +123,7 @@ func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 		resp.Account.SteamID = orEmpty(v)
 	}
 
-	if apiKey, err := h.kvString(ctx, keySteamAPIKey); err != nil {
+	if apiKey, err := ReadSecret(ctx, h.db, h.dataDir, keySteamAPIKey); err != nil {
 		return nil, err
 	} else {
 		resp.Account.SteamAPIKey = maskKey(apiKey)
@@ -200,22 +207,28 @@ func (h *handler) kvValue(ctx context.Context, key string) (kvValue, error) {
 	return kvValue{present: true, val: val}, nil
 }
 
-// kvString 读凭据键明文（Python get_secret_value 同径）：明文原样返回；
-// enc1: 密文解密，解密失败（篡改/密钥不符/格式损坏/锁定态）一律按无凭据
-// 降级返回空串（Python SecretBoxError → default 同径）。
-func (h *handler) kvString(ctx context.Context, key string) (string, error) {
-	v, err := h.kvValue(ctx, key)
-	if err != nil || !v.present {
+// ReadSecret 兼容明文凭据，密文不可解时返回空值。
+func ReadSecret(ctx context.Context, db *sql.DB, dataDir, key string) (string, error) {
+	var raw sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT value_json FROM app_settings WHERE key=?`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !raw.Valid {
+		return "", nil
+	}
+	if err != nil {
 		return "", err
 	}
-	s, ok := v.val.(string)
+	var value any
+	if err = json.Unmarshal([]byte(raw.String), &value); err != nil {
+		return "", err
+	}
+	s, ok := value.(string)
 	if !ok || s == "" {
 		return "", nil
 	}
 	if !secretbox.IsEncrypted(s) {
 		return s, nil
 	}
-	plain, derr := secretbox.DecryptSecretIn(h.dataDir, s, secretbox.SecretPurpose(key))
+	plain, derr := secretbox.DecryptSecretIn(dataDir, s, secretbox.SecretPurpose(key))
 	if derr != nil {
 		return "", nil
 	}
@@ -330,6 +343,7 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		if req.mcpEnabled != nil && OnMCPEnabledWrite != nil {
 			OnMCPEnabledWrite()
 		}
+		h.notify(r.Context(), writes, nil)
 	}
 	resp, err := h.readSettings(r.Context())
 	if err != nil {
@@ -344,20 +358,30 @@ type kvWrite struct {
 	value string // JSON 序列化文本（value_json 存 JSON 文本）
 }
 
-// applyWrites 单事务批量落库（Python set_values 批量同形；一行一 updated_at 快照）。
-func applyWrites(ctx context.Context, conn *sql.Conn, writes []kvWrite) error {
-	stmt, err := conn.PrepareContext(ctx, upsertSQL)
+func WriteValue(ctx context.Context, conn *sql.Conn, key string, value any) error {
+	raw, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
-	now := beijingNow()
-	for _, wr := range writes {
-		if _, err := stmt.ExecContext(ctx, wr.key, wr.value, now); err != nil {
-			return err
-		}
+	return applyWrites(ctx, conn, []kvWrite{{key: key, value: string(raw)}})
+}
+
+// applyWrites 单事务批量落库（Python set_values 批量同形；一行一 updated_at 快照）。
+func applyWrites(ctx context.Context, conn *sql.Conn, writes []kvWrite) error {
+	if len(writes) == 0 {
+		return nil
 	}
-	return nil
+	rows := make([][2]string, 0, len(writes))
+	for _, write := range writes {
+		rows = append(rows, [2]string{write.key, write.value})
+	}
+	raw, err := json.Marshal(rows)
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO app_settings(key,value_json,updated_at) SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]'),? FROM json_each(?) WHERE 1
+ ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`, beijingNow(), string(raw))
+	return err
 }
 
 // beijingNow 本地挂钟北京时间（UTC+8 固定，无夏令时），裸时刻字符串与

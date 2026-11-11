@@ -311,3 +311,6 @@ func mustJSONString(s string) string {
 	}
 	return string(b)
 }
+
+// NewSecretBoxError 供跨包构造锁定态/解密语义错误（HTTP 层按类型映射状态码）。
+func NewSecretBoxError(msg string) error { return secretBoxErr(msg) }

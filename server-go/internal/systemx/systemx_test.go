@@ -157,7 +157,7 @@ func TestReadinessReadyAndNotReady(t *testing.T) {
 func TestRegisterRoutes(t *testing.T) {
 	stubSources(t, t.TempDir(), false)
 	mux := http.NewServeMux()
-	Register(mux, newTestDB(t))
+	Register(mux, newTestDB(t), nil)
 
 	for _, path := range []string{"/api/v1/info", "/api/v1/system/readiness"} {
 		code, body := getJSON(t, mux, path)

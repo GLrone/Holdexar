@@ -1,5 +1,3 @@
-// bills 只读域：本地账单导入记录的聚合读（消费合计），无凭据无出网无写。
-// 对齐 Python bills_service.list_imports（domains/bills/service.py）。
 package bills
 
 import (
