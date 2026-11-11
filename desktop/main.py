@@ -25,6 +25,7 @@ import traceback
 import uuid
 import webbrowser
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlsplit
 
 
 def _ensure_stdio() -> None:
@@ -108,6 +109,8 @@ _PORT_SCAN_SPAN = 20
 # 健康检查等待上限：须覆盖首装时大数据量导入的耗时，兼顾低端机/机械盘。
 HEALTH_TIMEOUT = 90.0
 WINDOW_TITLE = APP_NAME
+if not getattr(sys, "frozen", False) and os.environ.get(f"{ENV_PREFIX}DEV_WATCH"):
+    WINDOW_TITLE = f"{APP_NAME} Go (dev)"
 DEFAULT_SIZE = (1280, 860)
 MIN_SIZE = (960, 600)
 _background_mode = False
@@ -256,6 +259,13 @@ def _stop_server_process() -> None:
         return
     try:
         if proc.poll() is None:
+            if getattr(proc, "stdin", None) is not None:
+                proc.stdin.close()
+                try:
+                    proc.wait(timeout=20)
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
             proc.terminate()
             try:
                 proc.wait(timeout=5)
@@ -292,6 +302,7 @@ def _start_server_process(ready: threading.Event, error_box: list[str]) -> None:
         ticket = _bootstrap_ticket_path()
         ticket.parent.mkdir(parents=True, exist_ok=True)
         _remove_path(ticket)  # 清掉上次实例可能残留的旧票据，避免壳读到已失效 nonce
+        watch = bool(os.environ.get(f"{ENV_PREFIX}DEV_WATCH")) and not getattr(sys, "frozen", False)
         proc = subprocess.Popen(
             [
                 str(exe),
@@ -300,6 +311,8 @@ def _start_server_process(ready: threading.Event, error_box: list[str]) -> None:
                 "--bootstrap-file", str(ticket),
             ],
             cwd=str(exe.parent),
+            stdin=subprocess.PIPE if watch else None,
+            env={**os.environ, f"{ENV_PREFIX}DEV_CHILD": "1"} if watch else None,
             # 独立进程组：控制台 Ctrl+C/Ctrl+Break 只到达壳，子进程的
             # 生命周期由壳的退出路径统一回收（避免双重终止路径）
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
@@ -564,9 +577,32 @@ def _wait_and_navigate(window, app_url: str) -> None:
     if _wait_health(HEALTH_TIMEOUT):
         _install_navigation_guard(window, app_url)
         try:
-            window.load_url(_session_entry_url(app_url))
+            entry = _session_entry_url(app_url)
+            window.load_url(entry)
+            if os.environ.get(f"{ENV_PREFIX}DEV_WATCH") and not getattr(sys, "frozen", False) and _external_server.get("proc") is not None:
+                nonce = parse_qs(urlsplit(entry).query).get("nonce", [""])[0]
+                threading.Thread(target=_watch_server_reload, args=(window, app_url, nonce), daemon=True).start()
         except Exception:  # noqa: BLE001 —— 窗口已销毁（托盘退出）：无需跳转
             pass
+
+
+def _watch_server_reload(window, app_url: str, seen_nonce: str) -> None:
+    while (proc := _external_server.get("proc")) is not None and proc.poll() is None:
+        time.sleep(.25)
+        nonce = _wait_bootstrap_nonce(.05)
+        if not nonce or nonce == seen_nonce or not _wait_health(2.0):
+            continue
+        try:
+            entry = _session_entry_url(app_url)
+            current = urlsplit(getattr(window, "get_current_url", lambda: app_url)() or app_url)
+            base = urlsplit(app_url)
+            if (current.scheme, current.netloc) == (base.scheme, base.netloc) and current.path not in ("", "/"):
+                target = current.path + ("?" + current.query if current.query else "") + ("#" + current.fragment if current.fragment else "")
+                entry += "&next=" + quote(target, safe="")
+            window.load_url(entry)
+        except Exception:
+            return
+        seen_nonce = nonce
 
 
 class DesktopApi:

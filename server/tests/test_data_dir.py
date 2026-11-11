@@ -102,6 +102,15 @@ def test_dev_mode_uses_dev_machine_dir(fake_env, monkeypatch):
     assert not paths.is_inside(resolved, paths.PROJECT_ROOT)
 
 
+def test_go_dev_fallback_has_its_own_directory_and_keeps_the_pointer(fake_env, monkeypatch):
+    _unfreeze(monkeypatch)
+    monkeypatch.setenv(f"{paths.ENV_PREFIX}DEV_WATCH", "go-source")
+    assert paths.resolve_data_dir() == fake_env["local"] / f"{paths.APP_SLUG}-go-dev"
+    pointed = fake_env["tmp"] / "explicit-go-dev"
+    (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(pointed), encoding="utf-8")
+    assert paths.resolve_data_dir() == pointed
+
+
 def test_dev_dir_is_separate_from_packaged_dir(fake_env, monkeypatch):
     """开发态与打包态落点必须互不相同，且互不包含。
 
