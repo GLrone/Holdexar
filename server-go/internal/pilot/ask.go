@@ -387,6 +387,8 @@ func (s *Service) agentStream(ctx context.Context, state *SessionState, question
 		toolLog := []any{}
 		turnStarted := time.Now()
 		var usageIn, usageOut int
+		var cacheRead, cacheWrite, cacheBase int
+		cacheSeen, cacheReadSeen := false, false
 		var answer string
 		reason := ""
 		exhausted := true
@@ -426,6 +428,19 @@ func (s *Service) agentStream(ctx context.Context, state *SessionState, question
 				case "usage":
 					usageIn += event.UsageIn
 					usageOut += event.UsageOut
+				case "cache":
+					// 本轮全部请求聚合（单次请求的比率不代表整轮）；provider 未报则不出
+					if event.Cache != nil {
+						cacheSeen = true
+						if v, ok := event.Cache["read"]; ok && v != nil {
+							cacheReadSeen = true
+							cacheRead += jsonInt(v)
+						}
+						if v, ok := event.Cache["write"]; ok && v != nil {
+							cacheWrite += jsonInt(v)
+						}
+						cacheBase += jsonInt(event.Cache["base"])
+					}
 				}
 			}
 			cancel()
@@ -512,6 +527,28 @@ func (s *Service) agentStream(ctx context.Context, state *SessionState, question
 			"usage_in": usageIn, "usage_out": usageOut,
 			"turn_id": turn, "title": s.GetStore().TitleOf(state),
 			"elapsed_ms": int(time.Since(turnStarted).Milliseconds()),
+		}
+		if cacheSeen {
+			var hitRate any
+			if cacheReadSeen && cacheBase > 0 {
+				rate := float64(cacheRead) / float64(cacheBase)
+				if rate > 1 {
+					rate = 1
+				}
+				hitRate = rate
+			}
+			result["cache_hit_rate"] = hitRate
+			result["cache_read_tokens"] = any(nil)
+			if cacheReadSeen {
+				result["cache_read_tokens"] = cacheRead
+			}
+			result["cache_write_tokens"] = any(nil)
+			if cacheWrite > 0 || cacheReadSeen {
+				result["cache_write_tokens"] = cacheWrite
+			}
+			if cacheBase > 0 {
+				result["cache_base_tokens"] = cacheBase
+			}
 		}
 		if state != nil {
 			result["archived_through"] = state.SummaryThrough
