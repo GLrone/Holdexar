@@ -240,6 +240,7 @@ func main() {
 	var epicService *epicfree.Service
 	var deliveryService *notifications.DeliveryService
 	var achievementService *achievements.SyncService
+	var pilotService *pilot.Service
 	// 内部模块开关登记：名称与提示由后端下发，前端按 id 渲染不加白名单。
 	var humbleService *humblechoice.Service
 	type builtinModule struct {
@@ -260,6 +261,9 @@ func main() {
 		{key: achievements.ModuleEnabledKey, id: "core.achievements", name: "成就同步", logName: "成就",
 			state:   func(ctx context.Context) (bool, bool, error) { return achievementService.State(ctx) },
 			enabled: func(ctx context.Context, on bool) error { return achievementService.SetEnabled(ctx, on) }},
+		{key: pilot.ModuleEnabledKey, id: "core.pilot", name: "领航员", logName: "领航员",
+			state:   func(ctx context.Context) (bool, bool, error) { return pilotService.State(ctx) },
+			enabled: func(ctx context.Context, on bool) error { return pilotService.SetEnabled(ctx, on) }},
 	}
 	pluginManager := plugins.New(db, writeGate, dataDir, plugins.Options{
 		Settings: settings.Options{Bus: bus},
@@ -701,7 +705,7 @@ func main() {
 			settings.OnMCPEnabledWrite = agent.Reapply
 			settings.MCPStatus = agent.MCPStatus
 			// 领航员域：KV 桥直连 app_settings（direct SQL，与 Python settings_service 同口径）
-			pilotService := pilot.New(pilot.Deps{
+			pilotService = pilot.New(pilot.Deps{
 				DB:      db,
 				DataDir: dataDir,
 				Version: config.Version(),
@@ -756,6 +760,7 @@ func main() {
 					return nil
 				},
 			}, pilotToolBridge(db, mux, epicService, monitoringService))
+			pilotService.SetGate(writeGate)
 			pilotService.SetToolSpecs(func() []map[string]any {
 				return agentToolSpecs()
 			})
