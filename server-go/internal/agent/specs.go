@@ -104,6 +104,22 @@ func buildRegistry() (*ToolRegistry, error) {
 			Parameters: `{"type": "object", "properties": {}}`,
 			Handler:    billsSummary,
 		},
+		{
+			Name: "get_user_preferences", Group: GroupRead, Risk: "low",
+			Description: "查询用户已保存的长期偏好清单（如常用区服、类型偏好、预算习惯）。用户询问『我的偏好是什么/你记住了我什么』时调用",
+			Parameters:  `{"type": "object", "properties": {}}`,
+			Handler:     getUserPreferences,
+		},
+		{
+			Name: "set_user_preference", Group: GroupRead, Risk: "medium",
+			Description: "保存或更新用户的长期偏好。用户明确要求『记住我的偏好/记住我喜欢XX/记住我只买XX区』时调用",
+			Parameters: `{"type": "object", "properties": {
+				"category": {"type": "string", "enum": ["region_preference", "genre_preference", "budget_habit", "preference"], "description": "偏好类别"},
+				"key": {"type": "string", "description": "偏好键名（如 preferred_regions, liked_genres, max_budget_cny）"},
+				"value": {"description": "偏好内容（可以是列表、字典或字符串/数值）"}
+			}, "required": ["key", "value"]}`,
+			Handler: setUserPreference,
+		},
 	} {
 		spec.TimeoutS = budgetDefaultS
 		if err := r.register(spec); err != nil {

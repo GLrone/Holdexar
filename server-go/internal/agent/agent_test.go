@@ -182,7 +182,7 @@ func newTestSurface(t *testing.T, flag bool) (*http.ServeMux, *sql.DB, *access.G
 	gate := access.New()
 	regions.Register(mux, db)
 	rates.Register(mux, db)
-	games.Register(mux, db)
+	games.Register(mux, db, games.NewHistoryBackfill(context.Background(), db, nil, func(string, ...any) {}))
 	notifications.Register(mux, db)
 	if err := Register(mux, db, gate, Options{DataDir: dataDir, EnabledByFlag: flag}); err != nil {
 		t.Fatalf("MCP 装配失败: %v", err)
@@ -277,6 +277,7 @@ func TestRegistryFailClosed(t *testing.T) {
 		"notifications_status": true, "notification_history": true,
 		"list_accounts": true, "list_wishlist": true, "list_owned": true,
 		"bills_summary": true,
+		"get_user_preferences": true, "set_user_preference": true,
 	}
 	for _, spec := range r.all() {
 		if spec.Group == GroupWrite {
