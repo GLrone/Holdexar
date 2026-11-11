@@ -56,6 +56,11 @@ type StreamEvent struct {
 
 // AskStream 流式编排入口（在飞登记 + busy 防护 + 受理回执）。
 func (s *Service) AskStream(ctx context.Context, req AskRequest) (<-chan StreamEvent, error) {
+	if enabled, err := s.moduleEnabled(ctx); err != nil {
+		return nil, err
+	} else if !enabled {
+		return nil, ErrModuleDisabled
+	}
 	q := strings.TrimSpace(req.Question)
 	if q == "" && len(req.Attachments) == 0 {
 		return nil, fmt.Errorf("empty question")
