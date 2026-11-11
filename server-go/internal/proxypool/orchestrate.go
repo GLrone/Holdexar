@@ -11,7 +11,10 @@ package proxypool
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -301,10 +304,10 @@ func IngestCrawlExits(ctx context.Context, o *Orchestrator, runID int64,
 // EnsureRunning 热重载（内核进程不动；控制器通路故障由 EnsureRunning 回退重启）。
 // 合格集已空且内核在跑时拒绝物化空池（保留现核等订阅恢复，Python
 // _rebuild_skip_reason 同款守卫）；内核未跑时 EnsureRunning 冷启动拉起。
-func KernelRebuildFunc(gate *store.WriteGate, dataDir, exePath string,
-	runtime *clashkernel.Runtime, lanes int) func(ctx context.Context) error {
+func KernelRebuildFunc(db *sql.DB, gate *store.WriteGate, dataDir, exePath string,
+	runtime *clashkernel.Runtime) func(ctx context.Context) error {
 	return func(ctx context.Context) error {
-		poolSize := 0
+		written := 0
 		err := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 			if err := EnsureSchema(ctx, conn); err != nil {
 				return err
@@ -313,24 +316,45 @@ func KernelRebuildFunc(gate *store.WriteGate, dataDir, exePath string,
 			if err != nil {
 				return err
 			}
-			poolSize = len(eligible)
-			if poolSize == 0 && runtime.Status().Running {
+			if len(eligible) == 0 {
 				return nil
 			}
-			_, err = BuildPool(ctx, conn, dataDir, time.Now())
+			result, err := BuildPool(ctx, conn, dataDir, time.Now())
+			written = result.WrittenCount
 			return err
 		})
 		if err != nil {
 			return err
 		}
-		if poolSize == 0 && runtime.Status().Running {
+		if err := InvalidateCrawlLanes(dataDir); err != nil {
+			return err
+		}
+		if written == 0 {
 			return nil
 		}
-		configPath, _, err := clashcfg.PrepareRuntimeConfig(dataDir, lanes, true)
+		lanes, err := CrawlLaneCount(ctx, db, dataDir)
 		if err != nil {
 			return err
 		}
-		_, err = runtime.EnsureRunning(exePath, configPath, clashkernel.EnsureRunningOptions{})
-		return err
+		wasRunning := runtime.Status().Running
+		oldPID := runtime.ProcessPid()
+		var previous []byte
+		if wasRunning {
+			previous, err = os.ReadFile(filepath.Join(dataDir, "proxypool", clashcfg.RuntimeConfigFilename))
+			if err != nil {
+				return err
+			}
+		}
+		configPath, _, err := clashcfg.PrepareRuntimeConfig(dataDir, lanes, wasRunning)
+		if err != nil {
+			return err
+		}
+		if _, err = runtime.EnsureRunning(exePath, configPath, clashkernel.EnsureRunningOptions{}); err != nil {
+			if wasRunning && runtime.ProcessPid() == oldPID {
+				err = errors.Join(err, os.WriteFile(configPath, previous, 0o644))
+			}
+			return err
+		}
+		return BindCrawlLanes(ctx, db, dataDir, uint32(runtime.ProcessPid()))
 	}
 }

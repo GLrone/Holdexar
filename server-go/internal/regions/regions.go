@@ -1,6 +1,5 @@
-// Package regions：区服元数据只读下发。
+// Package regions：区服元数据与抓取范围配置。
 // 数据源：crawl_regions 表（区服配置唯一事实）+ app_settings 已购抓取区键。
-// 写端点（PUT enabled / PUT owned）未迁移，见 deferred 清单。
 package regions
 
 import (
@@ -9,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"holdexar/server-go/internal/settings"
+	"holdexar/server-go/internal/store"
 	"math"
 	"net/http"
 	"strconv"
@@ -18,15 +19,27 @@ import (
 // ownedRegionsKey 已购游戏专用抓取区设置键；缺省/空 = 跟随全局启用集。
 const ownedRegionsKey = "crawl.owned_regions"
 
-// Register 挂载 regions 只读路由。
-func Register(mux *http.ServeMux, db *sql.DB) {
+type Options struct {
+	Gate     *store.WriteGate
+	Settings settings.Options
+}
+
+func Register(mux *http.ServeMux, db *sql.DB, options ...Options) {
 	h := &handler{db: db}
+	if len(options) > 0 {
+		h.options = options[0]
+	}
 	mux.HandleFunc("GET /api/v1/regions", h.listRegions)
 	mux.HandleFunc("/api/v1/regions", methodNotAllowed("GET"))
+	if h.options.Gate != nil {
+		mux.HandleFunc("PUT /api/v1/regions/enabled", h.updateEnabled)
+		mux.HandleFunc("PUT /api/v1/regions/owned", h.updateOwned)
+	}
 }
 
 type handler struct {
-	db *sql.DB
+	db      *sql.DB
+	options Options
 }
 
 // regionItem 区服元数据行（crawl_regions 投影）。
@@ -46,26 +59,9 @@ type regionsResponse struct {
 
 // listRegions 全量区服（含禁用标记，按 sort 排）+ 已购抓取区。
 func (h *handler) listRegions(w http.ResponseWriter, r *http.Request) {
-	items := []regionItem{}
-	rows, err := h.db.QueryContext(r.Context(),
-		"SELECT code, name, currency, enabled, sort FROM crawl_regions ORDER BY sort, code")
+	items, err := h.regionItems(r.Context())
 	if err != nil {
-		http.Error(w, fmt.Sprintf("区服查询失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var it regionItem
-		var enabled sql.NullInt64
-		if err := rows.Scan(&it.Code, &it.Name, &it.Currency, &enabled, &it.Sort); err != nil {
-			http.Error(w, fmt.Sprintf("区服读取失败：%v", err), http.StatusInternalServerError)
-			return
-		}
-		it.Enabled = enabled.Valid && enabled.Int64 != 0
-		items = append(items, it)
-	}
-	if err := rows.Err(); err != nil {
-		http.Error(w, fmt.Sprintf("区服读取失败：%v", err), http.StatusInternalServerError)
+		http.Error(w, err.Error(), 500)
 		return
 	}
 	owned, err := h.ownedRegions(r.Context())
@@ -74,6 +70,29 @@ func (h *handler) listRegions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, regionsResponse{Regions: items, OwnedRegions: owned})
+}
+
+func (h *handler) regionItems(ctx context.Context) ([]regionItem, error) {
+	items := []regionItem{}
+	rows, err := h.db.QueryContext(ctx,
+		"SELECT code, name, currency, enabled, sort FROM crawl_regions ORDER BY sort, code")
+	if err != nil {
+		return nil, fmt.Errorf("区服查询失败：%w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it regionItem
+		var enabled sql.NullInt64
+		if err := rows.Scan(&it.Code, &it.Name, &it.Currency, &enabled, &it.Sort); err != nil {
+			return nil, fmt.Errorf("区服读取失败：%w", err)
+		}
+		it.Enabled = enabled.Valid && enabled.Int64 != 0
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("区服读取失败：%w", err)
+	}
+	return items, nil
 }
 
 // ownedRegions 读 app_settings 的已购抓取区键：非空列表归一为小写串，其余为 null。

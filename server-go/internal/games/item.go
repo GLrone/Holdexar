@@ -179,7 +179,7 @@ func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []st
 			continue
 		}
 		allPrices[code] = []any{
-			formatMinorUnits(e.cents, currency), derefZero(e.cnyFen), e.cents, e.discount, e.stale,
+			FormatMinorUnits(e.cents, currency), derefZero(e.cnyFen), e.cents, e.discount, e.stale,
 		}
 	}
 	discount := int64(0)

@@ -105,6 +105,30 @@ func insertRegion(t *testing.T, db *sql.DB, appid int64, region string, price in
 func i64(v int64) *int64    { return &v }
 func strp(s string) *string { return &s }
 
+func TestUpdatePriceDerivedNilAllAndEmptyNoop(t *testing.T) {
+	db := newDerivedDB(t)
+	insertGame(t, db, 1, nil, 9000, 100)
+	insertRegion(t, db, 1, "US", 100, 725)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if count, err := UpdatePriceDerived(context.Background(), conn, []int64{}, Options{Now: cmpNow}); err != nil || count != 0 {
+		t.Fatalf("empty update=%d, %v", count, err)
+	}
+	var minimum sql.NullInt64
+	if err := conn.QueryRowContext(context.Background(), "SELECT min_cny_fen FROM games WHERE appid=1").Scan(&minimum); err != nil || minimum.Valid {
+		t.Fatalf("empty update changed minimum: %v, %v", minimum, err)
+	}
+	if count, err := UpdatePriceDerived(context.Background(), conn, nil, Options{Now: cmpNow}); err != nil || count != 1 {
+		t.Fatalf("all update=%d, %v", count, err)
+	}
+	if err := conn.QueryRowContext(context.Background(), "SELECT min_cny_fen FROM games WHERE appid=1").Scan(&minimum); err != nil || !minimum.Valid || minimum.Int64 != 725 {
+		t.Fatalf("all update minimum: %v, %v", minimum, err)
+	}
+}
+
 func TestSaveScoreBoundaries(t *testing.T) {
 	cases := []struct {
 		in   *int64
@@ -227,9 +251,8 @@ func gameCols(t *testing.T, db *sql.DB, appid int64) (hl, pp int64, changed any,
 
 func TestPriceHistoryLowMatrix(t *testing.T) {
 	db := newDerivedDB(t)
-	prev := Clock
-	Clock = func() time.Time { return cmpNow }
-	t.Cleanup(func() { Clock = prev })
+	prev := SetClock(func() time.Time { return cmpNow })
+	t.Cleanup(func() { SetClock(prev) })
 
 	var hid int64
 	days := func(d int64) string {
@@ -298,9 +321,8 @@ func TestPriceHistoryLowMatrix(t *testing.T) {
 
 func TestPriceSnapshotNonHistoryKeepsFlags(t *testing.T) {
 	db := newDerivedDB(t)
-	prev := Clock
-	Clock = func() time.Time { return cmpNow }
-	t.Cleanup(func() { Clock = prev })
+	prev := SetClock(func() time.Time { return cmpNow })
+	t.Cleanup(func() { SetClock(prev) })
 
 	insertGame(t, db, 3001, strp("2024-01-01"), 0, 0)
 	mustExec(t, db, `UPDATE games SET hl_flag = 2 WHERE appid = 3001`)

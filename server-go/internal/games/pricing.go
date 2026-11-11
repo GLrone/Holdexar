@@ -56,8 +56,8 @@ var defaultExchangeRates = map[string]float64{
 	"GBP": 9.20, "NOK": 0.66, "ILS": 1.95, "CHF": 8.10,
 }
 
-// formatMinorUnits cents → 本币字符串（"¥42.00" / "608" 前置符号 / "55.00 ₽" 后置符号）。
-func formatMinorUnits(minor int64, currency string) string {
+// FormatMinorUnits cents → 本币字符串（"¥42.00" / "608" 前置符号 / "55.00 ₽" 后置符号）。
+func FormatMinorUnits(minor int64, currency string) string {
 	c := strings.ToUpper(currency)
 	symbol := currencySymbols[c]
 	decimals, ok := displayDecimals[c]

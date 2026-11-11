@@ -49,7 +49,8 @@ func newOrchestrateDB(t *testing.T) (*sql.DB, *store.WriteGate, string) {
 		url TEXT NOT NULL,
 		kind VARCHAR(10) NOT NULL DEFAULT 'clash',
 		admission_status VARCHAR(16) NOT NULL DEFAULT 'CANDIDATE',
-		last_stats JSON,
+		last_stats JSON, label TEXT, last_imported_at DATETIME,
+		deprecated BOOLEAN DEFAULT 0, deprecated_at DATETIME, deprecated_reason TEXT,
 		last_fetch_at DATETIME, last_fetch_status VARCHAR(32),
 		last_success_at DATETIME, last_error VARCHAR(500), cache_url_identity VARCHAR(64),
 		auto_refresh BOOLEAN NOT NULL DEFAULT 1)`); err != nil {
@@ -118,6 +119,35 @@ func stubSubBodyAt(ports []int, names []string) string {
 		fmt.Fprintf(&b, "  - {name: %s, type: socks5, server: 127.0.0.1, port: %d}\n", name, ports[i])
 	}
 	return b.String()
+}
+
+func TestLiveRebuildBootstrapsMissingRuntimeConfig(t *testing.T) {
+	exe := liveKernelExe(t)
+	ctx := context.Background()
+	db, gate, dataDir := newOrchestrateDB(t)
+	sealed, err := SealURL(dataDir, "https://provider.example.com/live-sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Exec(`INSERT INTO proxy_subscriptions (url, kind, admission_status)
+		VALUES (?, 'clash', 'ACTIVE')`, sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPoolNode(t, db, "Cold-01", "ACTIVE", subID, fmt.Sprintf(
+		`{"name":"Cold-01","type":"socks5","server":"127.0.0.1","port":%d}`, minimalSocks5Server(t)))
+	var runtime clashkernel.Runtime
+	t.Cleanup(func() { runtime.Stop() })
+	if err := KernelRebuildFunc(db, gate, dataDir, exe, &runtime)(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !runtime.Status().Running || !runtime.EntryListening() {
+		t.Fatal("cold start did not prepare a listening kernel")
+	}
 }
 
 func stubFetchResult(body string) *FetchResult {
@@ -445,7 +475,7 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 
 	checker := &HealthChecker{DB: db, Gate: gate, DataDir: dataDir,
 		ControllerURL: runtime.ControllerURL, Secret: runtime.Secret, ConfigPath: configPath}
-	kernelRebuild := KernelRebuildFunc(gate, dataDir, exe, &runtime, 0)
+	kernelRebuild := KernelRebuildFunc(db, gate, dataDir, exe, &runtime)
 	rebuildCalls := 0
 	o := &Orchestrator{
 		DB: db, Gate: gate, DataDir: dataDir, Syncer: syncer, Health: checker,
@@ -459,7 +489,7 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 
 	pid0 := runtime.ProcessPid()
 
-	// 第一轮：同步幂等、健康波次真探（回环沙箱全通）、签名不变、不重建
+	// 第一轮健康波次产生此前未知的出口，通道签名随即重建。
 	r1, err := RunPoolMaintenance(ctx, o)
 	if err != nil {
 		t.Fatal(err)
@@ -470,8 +500,8 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 	if r1.HealthSummary.Total != 2 || r1.HealthSummary.SteamOK != 2 || r1.HealthSummary.IPKnown != 2 {
 		t.Fatalf("回环沙箱两节点应全通：%+v", r1.HealthSummary)
 	}
-	if r1.SignatureChanged || r1.Rebuild.Ran || rebuildCalls != 0 {
-		t.Fatalf("签名未变不得触发重建：%+v calls=%d", r1, rebuildCalls)
+	if !r1.SignatureChanged || !r1.Rebuild.Ran || r1.Rebuild.Error != "" || rebuildCalls != 1 {
+		t.Fatalf("首次识别出口应触发重建：%+v calls=%d", r1, rebuildCalls)
 	}
 	if got := queryInt(t, db, `SELECT COUNT(*) FROM proxy_nodes WHERE state = 'ACTIVE'`); got != 2 {
 		t.Fatalf("健康波次应晋升两节点，实际 %d", got)
@@ -489,8 +519,8 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 	if !r2.SignatureChanged || !r2.Rebuild.Ran || r2.Rebuild.Error != "" {
 		t.Fatalf("新节点应触发重建：%+v", r2)
 	}
-	if rebuildCalls != 1 {
-		t.Fatalf("重建回调应恰好调用一次，实际 %d", rebuildCalls)
+	if rebuildCalls != 2 {
+		t.Fatalf("新增节点应再触发一次重建，累计 %d", rebuildCalls)
 	}
 	names := PoolFileNames(dataDir)
 	if len(names) != 3 {
@@ -579,7 +609,7 @@ func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 	pid0 := runtime.ProcessPid()
 
 	// 一键接线（serverd 同款形态）：释放钩子消费待重建。
-	restore := WireRebuildPipeline(gate, dataDir, exe, &runtime, 0)
+	restore := WireRebuildPipeline(db, gate, dataDir, exe, &runtime)
 	defer restore()
 
 	// 占用期间请求重建 → 释放即异步消费：池跟上合格集、进程不动、待办位清空。
@@ -624,7 +654,7 @@ func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 		t.Fatalf("让路时池不得变动：%v", names)
 	}
 	occupancy.EndMaintenance()
-	ran, err := RunPendingRebuild(ctx, KernelRebuildFunc(gate, dataDir, exe, &runtime, 0))
+	ran, err := RunPendingRebuild(ctx, KernelRebuildFunc(db, gate, dataDir, exe, &runtime))
 	if err != nil || !ran {
 		t.Fatalf("空闲拍应消费待重建：ran=%v err=%v", ran, err)
 	}

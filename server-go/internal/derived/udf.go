@@ -2,14 +2,24 @@ package derived
 
 import (
 	"database/sql/driver"
+	"fmt"
+	"math"
+	"sync/atomic"
 	"time"
 
 	"modernc.org/sqlite"
 )
 
-// Clock 评分「发行年龄」基准挂钟（UDF 闭包读取）；宿主注入冻结点对齐
-// Python 侧可冻结时钟，缺省 UTC+8 实时。
-var Clock = func() time.Time { return time.Now().UTC().Add(8 * time.Hour) }
+var scoreClock = func() *atomic.Value {
+	v := &atomic.Value{}
+	v.Store(func() time.Time { return time.Now().UTC().Add(8 * time.Hour) })
+	return v
+}()
+
+func Clock() time.Time { return scoreClock.Load().(func() time.Time)() }
+func SetClock(clock func() time.Time) func() time.Time {
+	return scoreClock.Swap(clock).(func() time.Time)
+}
 
 func udfInt(v driver.Value) *int64 {
 	switch t := v.(type) {
@@ -53,4 +63,30 @@ func smartScoreUDF(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value
 
 func init() {
 	sqlite.MustRegisterDeterministicScalarFunction("game_smart_score", 6, smartScoreUDF)
+	sqlite.MustRegisterDeterministicScalarFunction("bundle_quality_score", 3, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		return QualityScore(udfInt(args[0]), udfInt(args[1]), udfStr(args[2]), Clock()), nil
+	})
+	sqlite.MustRegisterDeterministicScalarFunction("bundle_familiarity_score", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		return FamiliarityScore(udfInt(args[0])), nil
+	})
+	sqlite.MustRegisterDeterministicScalarFunction("bundle_smart_score", 4, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		return BlendScore(SaveScore(udfInt(args[0])), udfFloat(args[1]), udfFloat(args[2]), udfFloat(args[3])), nil
+	})
+	sqlite.MustRegisterDeterministicScalarFunction("price_cny_fen", 2, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		value := math.RoundToEven(udfFloat(args[0]) * udfFloat(args[1]))
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < math.MinInt64 || value >= 9223372036854775808.0 {
+			return nil, fmt.Errorf("人民币价格超出整数范围")
+		}
+		return int64(value), nil
+	})
+}
+
+func udfFloat(value driver.Value) float64 {
+	switch value := value.(type) {
+	case int64:
+		return float64(value)
+	case float64:
+		return value
+	}
+	return 0
 }

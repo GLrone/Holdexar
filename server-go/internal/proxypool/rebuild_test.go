@@ -4,11 +4,27 @@ package proxypool
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"holdexar/server-go/internal/occupancy"
 )
+
+func TestFailedPendingRebuildRetriesOnNextCycle(t *testing.T) {
+	defer TakeRebuildPending()
+	RequestRebuild()
+	failure := errors.New("controlled kernel failure")
+	if ran, err := RunPendingRebuild(context.Background(), func(context.Context) error { return failure }); !ran || !errors.Is(err, failure) {
+		t.Fatalf("ran=%v err=%v", ran, err)
+	}
+	if ran, err := RunPendingRebuild(context.Background(), func(context.Context) error { return nil }); !ran || err != nil {
+		t.Fatalf("rebuild was not retried: ran=%v err=%v", ran, err)
+	}
+	if RebuildPending() {
+		t.Fatal("successful rebuild left a pending request")
+	}
+}
 
 func TestRebuildPendingStateMachine(t *testing.T) {
 	defer rebuildPending.Store(false)

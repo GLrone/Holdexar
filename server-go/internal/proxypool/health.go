@@ -140,6 +140,8 @@ type BusinessResult struct {
 // L1 与 L2 共用这一步。成功返回空串。
 func selectSelector(ctx context.Context, controllerURL, secret, selector, runtimeName string, timeout time.Duration) string {
 	client := probeHTTPClient(timeout)
+	defer client.CloseIdleConnections()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	doJSON := func(method, path string, body string) (int, []byte, error) {
 		var reader *strings.Reader
 		if body != "" {
@@ -179,12 +181,15 @@ func selectSelector(ctx context.Context, controllerURL, secret, selector, runtim
 	if err != nil {
 		return fmt.Sprintf("%s: 控制器不可达（%T）", NodeProbeFailed, err)
 	}
-	if status >= 400 {
+	if status < 200 || status >= 300 {
 		return fmt.Sprintf("%s: 选择节点失败（HTTP %d）", NodeProbeFailed, status)
 	}
-	_, raw, err := doJSON(http.MethodGet, "/proxies/"+pyURLPathEscape(selector), "")
+	status, raw, err := doJSON(http.MethodGet, "/proxies/"+pyURLPathEscape(selector), "")
 	if err != nil {
 		return fmt.Sprintf("%s: 控制器不可达（%T）", NodeProbeFailed, err)
+	}
+	if status != http.StatusOK {
+		return fmt.Sprintf("%s: 回读节点失败（HTTP %d）", NodeProbeFailed, status)
 	}
 	var payload struct {
 		Now string `json:"now"`
@@ -294,6 +299,7 @@ type ExitProbeOptions struct {
 	Selector string // 缺省 GLOBAL
 	URL      string // 缺省公网回显服务
 	Timeout  time.Duration
+	RunID    int64
 }
 
 // ProbeExitIP 选中节点并经其 listener 探出口身份；共享 selector 的调用必须串行。
@@ -341,6 +347,7 @@ type BusinessProbeOptions struct {
 	URL      string // 缺省按 appid 拼 StoreBrowse 探针 URL
 	AppID    int64
 	Timeout  time.Duration
+	RunID    int64
 }
 
 // ProbeBusiness 选中节点并经其 listener 做一次 StoreBrowse 业务探测。
@@ -707,7 +714,7 @@ func (h *HealthChecker) ExitIPCheckPool(ctx context.Context, names []string, opt
 				ExitIP: r.result.ExitIP, Detail: r.result.Detail, LatencyMS: r.result.LatencyMS,
 			})
 		}
-		if err := h.commitExitIPWave(ctx, probed, now, target); err != nil {
+		if err := h.commitExitIPWave(ctx, probed, now, target, opts.RunID); err != nil {
 			return outcomes, err
 		}
 	}
@@ -718,7 +725,7 @@ func (h *HealthChecker) ExitIPCheckPool(ctx context.Context, names []string, opt
 func (h *HealthChecker) commitExitIPWave(ctx context.Context, probed []struct {
 	row    nodeRow
 	result ExitIPResult
-}, now time.Time, target string) error {
+}, now time.Time, target string, runID int64) error {
 	if len(probed) == 0 {
 		return nil
 	}
@@ -749,7 +756,7 @@ func (h *HealthChecker) commitExitIPWave(ctx context.Context, probed []struct {
 			if err := insertObservation(ctx, conn, HealthObservationRow{
 				NodeID: row.NodeID, Level: ProbeLevelL1, OK: p.result.OK,
 				LatencyMS: p.result.LatencyMS, Detail: p.result.Detail,
-				ObservedAt: now, Channel: DefaultScheduleChannel, Target: target,
+				ObservedAt: now, RunID: runID, Channel: DefaultScheduleChannel, Target: target,
 			}); err != nil {
 				return err
 			}
@@ -851,7 +858,7 @@ func (h *HealthChecker) BusinessCheckPool(ctx context.Context, names []string, o
 				result BusinessResult
 			}{row, r.result})
 		}
-		waveOutcomes, err := h.commitBusinessWave(ctx, probed, now, target)
+		waveOutcomes, err := h.commitBusinessWave(ctx, probed, now, target, opts.RunID)
 		if err != nil {
 			return outcomes, err
 		}
@@ -884,7 +891,7 @@ func businessProbeOK(result BusinessResult) (bool, bool) {
 func (h *HealthChecker) commitBusinessWave(ctx context.Context, probed []struct {
 	row    nodeRow
 	result BusinessResult
-}, now time.Time, targetURL string) ([]BusinessOutcome, error) {
+}, now time.Time, targetURL string, runID int64) ([]BusinessOutcome, error) {
 	if len(probed) == 0 {
 		return nil, nil
 	}
@@ -941,7 +948,7 @@ func (h *HealthChecker) commitBusinessWave(ctx context.Context, probed []struct 
 			if err := insertObservation(ctx, conn, HealthObservationRow{
 				NodeID: row.NodeID, Level: ProbeLevelL2, OK: p.result.OK,
 				LatencyMS: p.result.LatencyMS, Detail: p.result.Detail,
-				ObservedAt: now, Channel: DefaultScheduleChannel, Target: targetURL,
+				ObservedAt: now, RunID: runID, Channel: DefaultScheduleChannel, Target: targetURL,
 			}); err != nil {
 				return err
 			}
@@ -1210,7 +1217,7 @@ func IngestNodeCheck(ctx context.Context, conn *sql.Conn, subscriptionID int64, 
 			 exit_ip = COALESCE(?, exit_ip),
 			 last_l1_at = CASE WHEN ? IS NOT NULL THEN ? ELSE last_l1_at END
 			 WHERE id = ?`,
-			target, lastL2Arg, exitIPArg, exitIPArg, exitIPArg, node.ID); err != nil {
+			target, lastL2Arg, exitIPArg, exitIPArg, pyTimeText(now), node.ID); err != nil {
 			return outcome, err
 		}
 		// 带 run_id 的轮次逐节点落明细；周期账本（run_id=0）只在变化时落。
@@ -1259,10 +1266,10 @@ const ddlHealthRuns = `CREATE TABLE IF NOT EXISTS health_runs (
 	started_at DATETIME NOT NULL,
 	finished_at DATETIME,
 	duration_ms INTEGER,
-	total INTEGER,
-	steam_ok INTEGER,
-	ip_known INTEGER,
-	failed INTEGER,
+	total INTEGER NOT NULL,
+	steam_ok INTEGER NOT NULL,
+	ip_known INTEGER NOT NULL,
+	failed INTEGER NOT NULL,
 	end_reason VARCHAR(30),
 	PRIMARY KEY (id)
 )`

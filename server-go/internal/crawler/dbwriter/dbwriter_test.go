@@ -241,6 +241,7 @@ func TestReplayKeepsRowIdentity(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
 	w.FxRates = map[string]float64{"USD": 7.25}
+	w.EventKey = func(time.Time) *string { return strPtr("seasonal_fixture") }
 
 	p := priceRow(1001, "CN", 19900)
 	p.DiscountDesc = strPtr("首个折扣")
@@ -260,6 +261,7 @@ func TestReplayKeepsRowIdentity(t *testing.T) {
 	p2.DiscountPercent = i64Ptr(10)
 	p2.DiscountDesc = nil
 	p2.BundleID = i64Ptr(77)
+	w.EventKey = func(time.Time) *string { return strPtr("revised_fixture") }
 	runBatch(t, w, []BatchEntry{{Game: gameData(1001, "游戏甲"), Prices: []PriceRow{p2}}})
 
 	second := dumpHistory(t, db)
@@ -277,6 +279,9 @@ func TestReplayKeepsRowIdentity(t *testing.T) {
 	}
 	if second[0]["bundle_id"] != int64(77) {
 		t.Fatalf("重放应更新 bundle_id，实际 %v", second[0]["bundle_id"])
+	}
+	if second[0]["steam_event_key"] != "seasonal_fixture" {
+		t.Fatalf("重放改写已记录的活动标签：%v", second[0]["steam_event_key"])
 	}
 }
 
