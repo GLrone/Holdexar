@@ -103,15 +103,15 @@ test('idle island status：空闲价格状态可关闭并在新活动到达后�
   assert.match(islandSource, /watch\([\s\S]*?idleStatusDismissed\.value = false/)
 })
 
-test('idle price expansion：紧凑岛体直接形变为卡片且不重复保留主岛', () => {
+test('single island expansion：紧凑岛体直接形变为卡片且不补空闲主岛', () => {
   const compactIsland = islandSource.match(/<div[\s\S]*?data-island-slot="main"[\s\S]*?>/)?.[0] ?? ''
 
-  assert.match(islandSource, /const showCompactMain = computed\(\(\) => !\(showingPrice\.value && islandController\.isIdleExpanded\)\)/)
+  assert.match(islandSource, /const showCompactMain = computed\(\(\) => Boolean\(primaryAct\.value\) \|\| !islandController\.isExpanded\.value\)/)
   assert.match(compactIsland, /v-if="showCompactMain"/)
   assert.match(islandSource, /:data-activity-id="mainDataId"[\s\S]*?data-island-slot="main"/)
   assert.match(islandSource, /:data-activity-id="islandController\.expandedId"[\s\S]*?data-island-slot="expanded"/)
-  assert.match(islandSource, /'is-idle-expanded': expandedShowingPrice/)
-  assert.match(islandStyle, /\.hl-expanded-island\.is-idle-expanded\s*\{[^}]*top:\s*var\(--island-top\)/s)
+  assert.match(islandSource, /'is-solo-expanded': !showCompactMain/)
+  assert.match(islandStyle, /\.hl-expanded-island\.is-solo-expanded\s*\{[^}]*top:\s*var\(--island-top\)/s)
 })
 
 test('expanded main interaction：只触发 Main 与 Expanded 身份交换', () => {

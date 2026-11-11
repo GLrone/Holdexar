@@ -417,7 +417,7 @@ export class IslandController {
     const urgent = this.sortedActivities.find((activity) => activity.needsAttention)?.id ?? null
     if (urgent) {
       this._moveToFront(urgent)
-      if (this._mainId.value !== urgent) this._putInMain(urgent)
+      if (urgent !== this._lastUrgentId && this._mainId.value !== urgent) this._putInMain(urgent)
       this._lastUrgentId = urgent
     } else {
       if (this._lastUrgentId && !this._pinnedId.value && !this._userSelectedId.value) {
@@ -425,7 +425,7 @@ export class IslandController {
       }
       this._lastUrgentId = null
       const preferred = this._pinnedId.value ?? this._userSelectedId.value
-      if (preferred && active.has(preferred) && this._mainId.value !== preferred) this._putInMain(preferred)
+      if (preferred && active.has(preferred) && this._mainId.value !== preferred && this._expandedId.value !== preferred) this._putInMain(preferred)
     }
 
     this._repairSlots()
