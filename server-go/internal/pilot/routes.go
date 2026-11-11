@@ -7,6 +7,7 @@ package pilot
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -434,6 +435,10 @@ func Register(mux *http.ServeMux, service *Service) {
 		}
 		events, err := service.AskStream(r.Context(), req)
 		if err != nil {
+			if errors.Is(err, ErrModuleDisabled) {
+				writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
+				return
+			}
 			writeErr(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
@@ -466,6 +471,10 @@ func Register(mux *http.ServeMux, service *Service) {
 		}
 		events, err := service.AskStream(r.Context(), req)
 		if err != nil {
+			if errors.Is(err, ErrModuleDisabled) {
+				writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
+				return
+			}
 			writeErr(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
