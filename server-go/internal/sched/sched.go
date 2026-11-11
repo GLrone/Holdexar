@@ -73,6 +73,22 @@ func (rc *RunCtx) SetNext(t time.Time) {
 	rc.s.setNextExternal(rc.j, t)
 }
 
+// SetJobNext：运行体重锚指定任务，模拟运行体复用已持有的调度锁。
+func (rc *RunCtx) SetJobNext(id string, t time.Time) error {
+	if !rc.s.sim {
+		return rc.s.SetNext(id, t)
+	}
+	j, ok := rc.s.jobs[id]
+	if !ok {
+		return fmt.Errorf("任务 %s 未注册", id)
+	}
+	if rc.s.stopped {
+		return errors.New("调度器已停止，无法重锚")
+	}
+	rc.s.applySetNextLocked(j, t)
+	return nil
+}
+
 type job struct {
 	id       string
 	label    string
@@ -149,6 +165,12 @@ func NewScheduler(opts ...SchedulerOption) *Scheduler {
 		o(s)
 	}
 	return s
+}
+
+func (s *Scheduler) Running() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started && !s.stopped
 }
 
 // Register：注册任务。重复 ID、空 ID、空运行体、调度器已停止均报错；
@@ -411,7 +433,7 @@ func (s *Scheduler) processAllDueLocked(now time.Time) {
 			if j.next.IsZero() {
 				continue
 			}
-			for n := 0; !j.next.After(now) && !s.stopped && n < 1000; n++ {
+			for n := 0; !j.next.IsZero() && !j.next.After(now) && !s.stopped && n < 1000; n++ {
 				s.processDueLocked(j, now)
 				due = true
 			}

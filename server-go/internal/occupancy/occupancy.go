@@ -14,11 +14,13 @@ import (
 const (
 	MaintenanceHealth  = "health"
 	MaintenanceRebuild = "rebuild"
+	MaintenanceStorage = "storage"
 )
 
 var maintenanceReasons = map[string]string{
 	MaintenanceHealth:  "代理体检进行中",
 	MaintenanceRebuild: "代理通道正在重建",
+	MaintenanceStorage: "数据库正在整理",
 }
 
 // ErrCrawlerBusy 占用冲突哨兵；具体拒因在错误值文案里，errors.Is 判别。
