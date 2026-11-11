@@ -12,9 +12,8 @@ import (
 
 const (
 	// 品牌常量（库文件名、数据目录名、环境变量前缀同源）
-	AppSlug    = "holdexar"
-	AppVersion = "0.3.6-beta"
-	EnvPrefix  = "HOLDEXAR_"
+	AppSlug   = "holdexar"
+	EnvPrefix = "HOLDEXAR_"
 	DBFileName = AppSlug + ".db"
 
 	// 便携模式显式标记（程序目录内放一个同名空文件即启用）
@@ -22,6 +21,9 @@ const (
 	// 开发态数据目录指针（程序目录内的文本文件，内容一行绝对路径即生效）
 	DevPointer = AppSlug + "-dev-home.txt"
 )
+
+// AppVersion 构建期经 -ldflags -X 注入（-X 对 const 无效）；缺省为开发态版本。
+var AppVersion = "0.3.6-beta"
 
 // AppName 品牌名；环境变量 HOLDEXAR_APP_NAME 显式设置时优先（空串同为显式值）。
 func AppName() string {
@@ -65,13 +67,31 @@ func installRootFromExe(exeDir string) string {
 	return exeDir
 }
 
-// WebDistDir 前端构建产物目录：安装根下 web/dist。
+// WebDistDir 前端构建产物目录：优先安装根 web/dist（根级共享布局），
+// 缺失时回退本版本目录内 web/dist（版本自带布局——跨运行时换装只装版本
+// 目录，根级 dist 在旧版安装里不存在）。
 func WebDistDir() (string, error) {
 	root, err := InstallRoot()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "web", "dist"), nil
+	rootDist := filepath.Join(root, "web", "dist")
+	if distReady(rootDist) {
+		return rootDist, nil
+	}
+	exe, err := os.Executable()
+	if err == nil {
+		versionDist := filepath.Join(filepath.Dir(filepath.Dir(exe)), "web", "dist")
+		if distReady(versionDist) {
+			return versionDist, nil
+		}
+	}
+	return rootDist, nil
+}
+
+func distReady(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "index.html"))
+	return err == nil && info.Mode().IsRegular()
 }
 
 // ReadDevPointer 指针文件里写明的开发态数据目录；缺失、空行、注释行、
