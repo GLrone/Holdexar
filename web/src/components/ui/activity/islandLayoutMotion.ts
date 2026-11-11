@@ -141,7 +141,7 @@ function sameRect(first: IslandMotionRect, second: IslandMotionRect): boolean {
 
 function collectVisuals(host: HTMLElement): Map<string, IslandVisual> {
   const visuals = new Map<string, IslandVisual>()
-  host.querySelectorAll<HTMLElement>('[data-activity-id][data-island-slot]').forEach((shell) => {
+  host.querySelectorAll<HTMLElement>('[data-activity-id][data-island-slot]:not(.secondary-island-pop-leave-active)').forEach((shell) => {
     const id = shell.dataset.activityId
     if (!id) return
     const shellRect = rectOf(shell)
@@ -164,7 +164,7 @@ function collectVisuals(host: HTMLElement): Map<string, IslandVisual> {
 
 function readTargets(host: HTMLElement): Map<string, { shell: HTMLElement; logo: HTMLElement | null; content: HTMLElement | null; slot: string }> {
   const targets = new Map<string, { shell: HTMLElement; logo: HTMLElement | null; content: HTMLElement | null; slot: string }>()
-  host.querySelectorAll<HTMLElement>('[data-activity-id][data-island-slot]').forEach((shell) => {
+  host.querySelectorAll<HTMLElement>('[data-activity-id][data-island-slot]:not(.secondary-island-pop-leave-active)').forEach((shell) => {
     const id = shell.dataset.activityId
     if (!id) return
     targets.set(id, {
@@ -206,6 +206,9 @@ export class IslandLayoutMotion {
     }
 
     const targets = readTargets(this.host)
+    this.host.querySelectorAll<HTMLElement>('.secondary-island-pop-leave-active').forEach((shell) => {
+      this.setTemporaryStyle(shell, 'visibility', 'hidden')
+    })
     for (const [id, visual] of this.source) {
       if (!targets.has(id)) {
         this.removeVisual(visual)
@@ -217,6 +220,7 @@ export class IslandLayoutMotion {
 
     for (const [id, target] of targets) {
       const source = this.source.get(id)
+      this.setTemporaryStyle(target.shell, 'transition', 'none')
       const targetShellRect = rectOf(target.shell)
       const targetLogoRect = target.logo ? rectOf(target.logo) : null
       const isNewCandidate = !source && id !== '@price-status' && this.queueOrigin !== null
@@ -238,7 +242,6 @@ export class IslandLayoutMotion {
         continue
       }
 
-      this.setTemporaryStyle(target.shell, 'transition', 'none')
       const shellClone = source?.shell ?? createOverlay(target.shell, sourceRect, 'shell')
       this.overlays.add(shellClone)
       this.setTemporaryStyle(target.shell, 'background-color', 'transparent')
@@ -281,10 +284,10 @@ export class IslandLayoutMotion {
       }
 
       if (target.content) {
+        const contentClone = createOverlay(target.content, targetShellRect, 'content')
         this.setTemporaryStyle(target.content, 'opacity', '0')
         this.setTemporaryStyle(target.content, 'transition', 'none')
 
-        const contentClone = createOverlay(target.content, targetShellRect, 'content')
         this.overlays.add(contentClone)
         Object.assign(contentClone.style, {
           position: 'absolute',

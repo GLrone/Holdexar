@@ -71,6 +71,7 @@ import steamEvents from './steamEvents'
 import pilot from './pilot'
 // ── 统一结构化展示系统（components/structured/*）──
 import structured from './structured'
+import plugins from './plugins'
 
 /** 全量中文词典 */
 export const messages = {
@@ -121,6 +122,7 @@ export const messages = {
   ...steamEvents,
   ...pilot,
   ...structured,
+  ...plugins,
 } as const
 
 export type MessageKey = keyof typeof messages

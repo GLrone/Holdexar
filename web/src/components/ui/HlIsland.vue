@@ -51,7 +51,7 @@ const mode = computed<'idle' | 'notice' | 'task'>(() => {
 
 const showingPrice = computed(() => !primaryAct.value && !legacyNotice.value && !crawlRunning.value && !legacyTask.value)
 const visible = computed(() => !idleStatusDismissed.value && (mode.value !== 'idle' || priceStale.value || islandController.isExpanded.value))
-const showCompactMain = computed(() => !(showingPrice.value && islandController.isIdleExpanded))
+const showCompactMain = computed(() => Boolean(primaryAct.value) || !islandController.isExpanded.value)
 const waiting = computed(() => islandController.waitingCount)
 const isDevExpanded = computed(() => expandedAct.value?.id.startsWith('dev:') ?? false)
 
@@ -167,7 +167,7 @@ const expandedToneClass = computed(() => {
   return legacyNotice.value ? 'is-' + legacyNotice.value.tone : 'is-progress'
 })
 const expandedIsTask = computed(() => {
-  if (expandedAct.value) return expandedAct.value.kind === 'task' && expandedAct.value.source === 'crawler' && !expandedAct.value.id.startsWith('dev:')
+  if (expandedAct.value) return expandedAct.value.status === 'running' && expandedAct.value.kind === 'task' && expandedAct.value.source === 'crawler' && !expandedAct.value.id.startsWith('dev:')
   return !legacyNotice.value && crawlRunning.value
 })
 const expandedCanRetry = computed(() => Boolean(expandedAct.value?.retry || legacyNotice.value?.retry))
@@ -190,19 +190,13 @@ const expandedTrailing = computed(() => {
   if (expandedProgress.value !== null) return String(expandedProgress.value) + '%'
   return waiting.value ? t('island.more', { n: waiting.value }) : ''
 })
-const expandedHeadLines = computed(() => Math.min(4, headLineCount(expandedText.value, 350)))
 const expandedHeadStyle = computed(() => {
   const style: Record<string, string> = { webkitLineClamp: '4' }
   if (expandedShowingPrice.value) style.color = priceColor.value
   return style
 })
-const expandedHeight = computed(() => {
-  const row = Math.max(26, expandedHeadLines.value * 17)
-  return 63 + row + (expandedDetail.value ? 39 : 0) + (expandedShowBar.value ? 12 : 0)
-})
 const expandedStyle = computed(() => ({
   width: 'min(420px, calc(100vw - 24px))',
-  height: String(expandedHeight.value) + 'px',
   borderRadius: '24px',
 }))
 
@@ -217,18 +211,11 @@ const size = computed(() => {
   return { w: noticeWidth.value, h: 36, r: 18 }
 })
 const islandStyle = computed(() => ({
-  width: String(size.value.w) + 'px',
+  width: islandController.hasSecondary ? 'min(240px, calc(100vw - 192px))' : String(size.value.w) + 'px',
   height: String(size.value.h) + 'px',
   borderRadius: String(size.value.r) + 'px',
 }))
 const mainDataId = computed(() => primaryAct.value?.id ?? (showingPrice.value ? IDLE_EXPANDED_ID : undefined))
-
-function headLineCount(text: string, wrapWidth: number): number {
-  const wideGlyph = /[\u1100-\u115F\u2E80-\uA4CF\uAC00-\uD7FF\uF900-\uFAFA\uFE30-\uFE6F\uFF00-\uFFEF]/
-  let width = 0
-  for (const character of text) width += wideGlyph.test(character) ? 13 : 10
-  return Math.max(1, Math.ceil(width / wrapWidth))
-}
 
 let activeMotion: IslandLayoutMotion | null = null
 let applyingControllerMutation = false
@@ -256,8 +243,13 @@ async function transitionLayout(change: () => void) {
   if (activeMotion === motion) activeMotion = null
 }
 
-function onIslandClick() {
-  void transitionLayout(() => islandController.openMain())
+async function onIslandClick() {
+  await transitionLayout(() => islandController.openMain())
+}
+
+async function onIslandKeydown() {
+  await onIslandClick()
+  rootEl.value?.querySelector<HTMLElement>('[data-island-slot="expanded"] button')?.focus()
 }
 
 function onSecondaryAction() {
@@ -269,8 +261,10 @@ function returnToPreviousLayout() {
   void transitionLayout(() => islandController.returnPreviousLayout())
 }
 
-function collapseExpanded() {
-  void transitionLayout(() => islandController.collapseExpanded())
+async function collapseExpanded() {
+  const restoreFocus = rootEl.value?.querySelector('[data-island-slot="expanded"]')?.contains(document.activeElement)
+  await transitionLayout(() => islandController.collapseExpanded())
+  if (restoreFocus) rootEl.value?.querySelector<HTMLElement>('[data-island-slot="main"]')?.focus()
 }
 
 function dismiss() {
@@ -329,15 +323,15 @@ function goTask() {
   void router.push(target)
 }
 
-async function cancelTask() {
-  const act = expandedAct.value ?? primaryAct.value
-  islandController.collapseExpanded()
-  syncExpandedBridge()
+async function cancelTask(act: Activity | null) {
+  const id = crawl.activeJobId
+  if (act?.id === islandController.expandedId) {
+    void transitionLayout(() => islandController.collapseExpanded())
+  }
   if (act?.id.startsWith('dev:')) {
     activityManager.fail(act.id, { detail: 'Cancelled in test' })
     return
   }
-  const id = crawl.activeJobId
   if (id === null) return
   try {
     await crawlApi.stop(id)
@@ -429,6 +423,9 @@ onBeforeUnmount(() => {
       v-if="visible"
       ref="rootEl"
       class="hl-island-host"
+      :class="{ 'has-secondary': islandController.hasSecondary }"
+      :style="{ '--island-main-width': islandStyle.width }"
+      @keydown.esc.stop="collapseExpanded"
     >
       <!-- 主岛容器 -->
       <div
@@ -438,13 +435,17 @@ onBeforeUnmount(() => {
         :style="islandStyle"
         :data-activity-id="mainDataId"
         data-island-slot="main"
-        role="status"
+        role="button"
+        tabindex="0"
+        :aria-expanded="islandController.isExpanded.value"
         aria-live="polite"
         :aria-label="t('island.label')"
         :title="mode === 'idle' ? priceTip || undefined : undefined"
         @mouseenter="setHovered(true)"
         @mouseleave="setHovered(false)"
         @click="onIslandClick"
+        @keydown.enter.self.prevent="onIslandKeydown"
+        @keydown.space.self.prevent="onIslandKeydown"
       >
         <PrimaryIsland
           :activity="primaryAct"
@@ -471,7 +472,7 @@ onBeforeUnmount(() => {
           :can-retry="canRetry"
           :goto="goto"
           :goto-label="gotoLabel"
-          @cancel="cancelTask"
+          @cancel="cancelTask(primaryAct)"
           @retry="retry"
           @dismiss="dismiss"
           @go-detail="goDetail"
@@ -486,6 +487,7 @@ onBeforeUnmount(() => {
           v-if="islandController.hasSecondary"
           :activity="secondaryAct"
           :extra-count="islandController.waitingCount"
+          :preview-enabled="!islandController.isExpanded.value && !islandController.isOverviewOpen.value"
           @swap="onSecondaryAction"
           @open-overview="openOverview"
         />
@@ -494,7 +496,7 @@ onBeforeUnmount(() => {
       <div
         v-if="islandController.isExpanded.value"
         class="hl-island hl-expanded-island hl-island--expanded"
-        :class="{ 'is-stacked': expandedHeadLines > 1, 'is-idle-expanded': expandedShowingPrice }"
+        :class="{ 'is-solo-expanded': !showCompactMain }"
         :style="expandedStyle"
         :data-activity-id="islandController.expandedId"
         data-island-slot="expanded"
@@ -514,7 +516,7 @@ onBeforeUnmount(() => {
           :price-color="priceColor"
           :head-text="expandedText"
           :head-text-style="expandedHeadStyle"
-          :head-truncated="expandedHeadLines >= 4"
+          :head-truncated="true"
           :trailing="expandedTrailing"
           :crawl-only-task="expandedIsTask"
           :show-bar="expandedShowBar"
@@ -527,7 +529,7 @@ onBeforeUnmount(() => {
           :can-retry="expandedCanRetry"
           :goto="expandedGoto"
           :goto-label="expandedGotoLabel"
-          @cancel="cancelTask"
+          @cancel="cancelTask(expandedAct)"
           @retry="retry"
           @dismiss="dismiss"
           @go-detail="goDetail"
@@ -597,7 +599,7 @@ onBeforeUnmount(() => {
 :deep(.hl-secondary-island) {
   position: absolute;
   top: 0;
-  left: 128px;
+  left: calc(var(--island-main-width) / 2 + 8px);
   --text-primary: var(--island-shell-fg);
   --text-secondary: var(--island-shell-fg);
   --text-muted: var(--island-shell-muted);
@@ -618,7 +620,18 @@ onBeforeUnmount(() => {
   cursor: default;
 }
 
-.hl-expanded-island.is-idle-expanded {
+.hl-island:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 430px) {
+  .has-secondary :deep(.hl-island__btn.is-tiny) {
+    display: none;
+  }
+}
+
+.hl-expanded-island.is-solo-expanded {
   top: var(--island-top);
 }
 
@@ -635,6 +648,8 @@ onBeforeUnmount(() => {
 }
 
 .hl-island--expanded :deep(.hl-island__body) {
+  position: relative;
+  min-height: 92px;
   justify-content: flex-start;
   padding: 14px 18px 13px;
 }
@@ -739,7 +754,7 @@ onBeforeUnmount(() => {
   text-overflow: clip;
 }
 
-.hl-island--expanded.is-stacked :deep(.hl-island__row) {
+.hl-island--expanded :deep(.hl-island__row) {
   align-items: flex-start;
 }
 
@@ -771,7 +786,7 @@ onBeforeUnmount(() => {
 }
 
 :deep(.hl-island__fold) {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;

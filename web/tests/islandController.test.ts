@@ -21,6 +21,30 @@ function assertNoDuplicateSlots(controller: IslandController) {
   assert.equal(allIds.length, controller.count)
 }
 
+test('IslandController: progress updates keep a pinned activity in its opened slot', () => {
+  const { manager, controller } = setup(['A', 'B', 'C'])
+  controller.pin('A')
+  controller.openMain()
+  const opened = controller.layout
+  manager.update('A', { progress: 55 })
+  assert.deepEqual(controller.layout, opened)
+  manager.update('B', { progress: 70 })
+  assert.deepEqual(controller.layout, opened)
+  controller.collapseExpanded()
+  assert.equal(controller.primaryId, 'A')
+  assert.equal(controller.pinnedId, 'A')
+  assertNoDuplicateSlots(controller)
+})
+
+test('IslandController: an opened error stays expanded when its details refresh', () => {
+  const { manager, controller } = setup(['A', 'B'])
+  manager.register({ id: 'error', source: 'test', title: 'Error', status: 'failed' })
+  controller.openMain()
+  const opened = controller.layout
+  manager.update('error', { detail: 'Updated details' })
+  assert.deepEqual(controller.layout, opened)
+})
+
 test('IslandController: urgent activity preempts main while keeping other slots unique', () => {
   const { manager, controller } = setup(['crawl-task', 'secondary-task'])
   controller.openSecondary()

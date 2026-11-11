@@ -4,7 +4,7 @@
  * 双任务时呈现为 36px 完整圆形模块徽标；三任务及以上延伸为 36px 高、至少 58px 宽的小胶囊。
  * 绝不用通用 Spinner 覆盖模块图标；支持悬停预览详情、点击余量进入总览面板、全套键盘快捷交互与空间切移动画。
  */
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 import { useI18n } from '@/locales'
 
@@ -16,6 +16,7 @@ const props = defineProps<{
   activity: Activity | null
   extraCount?: number
   isSwapHidden?: boolean
+  previewEnabled?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,6 +28,11 @@ const { t } = useI18n()
 
 const showPreview = ref(false)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
+
+watch(() => props.previewEnabled, () => {
+  if (previewTimer) clearTimeout(previewTimer)
+  showPreview.value = false
+})
 
 /** 模块视觉呈现解析 */
 const presentation = computed(() => resolvePresentation(props.activity))
@@ -40,11 +46,14 @@ const tooltipText = computed(() => {
 
 function onSecondaryClick(e: MouseEvent) {
   e.stopPropagation()
+  if (previewTimer) clearTimeout(previewTimer)
   showPreview.value = false
   emit('swap')
 }
 
 function onSecondaryKeydown(e: KeyboardEvent) {
+  if (e.target !== e.currentTarget) return
+  if (previewTimer) clearTimeout(previewTimer)
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault()
     e.stopPropagation()
@@ -62,6 +71,7 @@ function onSecondaryKeydown(e: KeyboardEvent) {
 
 function onMouseEnter() {
   if (previewTimer) clearTimeout(previewTimer)
+  if (props.previewEnabled === false) return
   previewTimer = setTimeout(() => {
     showPreview.value = true
   }, 180)
@@ -129,7 +139,7 @@ onBeforeUnmount(() => {
     <!-- 悬停即时预览浮层 -->
     <Transition name="secondary-preview-fade">
       <div
-        v-if="showPreview && activity"
+        v-if="showPreview && activity && previewEnabled !== false"
         class="hl-secondary-preview"
         role="tooltip"
         @click.stop
@@ -137,7 +147,6 @@ onBeforeUnmount(() => {
         <div class="hl-secondary-preview__header">
           <div class="hl-secondary-preview__title-wrap">
             <span class="hl-secondary-preview__title">{{ activity.title }}</span>
-            <span class="hl-secondary-preview__source">{{ activity.source }}</span>
           </div>
           <span v-if="activity.progress !== undefined && activity.progress !== null" class="hl-secondary-preview__pct">
             {{ activity.progress }}%
@@ -285,12 +294,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.hl-secondary-preview__source {
-  font-size: 10px;
-  color: var(--text-muted);
-  text-transform: uppercase;
 }
 
 .hl-secondary-preview__pct {
