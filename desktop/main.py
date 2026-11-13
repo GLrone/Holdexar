@@ -96,7 +96,8 @@ _SPLASH_HTML = (
     f"{APP_NAME} 启动中，请稍候…</div></body></html>"
 )
 
-SERVER_HOST = "127.0.0.1"
+# 绑定地址可配（NAS/局域网场景）：默认回环，行为与历史版本一致
+SERVER_HOST = os.environ.get(f"{ENV_PREFIX}HOST", "127.0.0.1")
 # 端口协商结果：默认取环境变量（HOLDEXAR_PORT/HOLDEXAR_LOCK_PORT），
 # main() 启动时被占则按 DEV/FROZEN 态分流协商（见 _negotiate_ports）
 SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))

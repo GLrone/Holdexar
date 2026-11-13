@@ -34,6 +34,8 @@ import {
 
 const route = useRoute()
 const router = useRouter()
+// 解锁页裸渲染（脱离主壳）：壳内各 store 的启动调用在未解锁时会成片 401
+const isBareRoute = computed(() => route.path === '/unlock')
 
 /* 关窗幕布开关：桌面壳通过 window.__hlxCloseCurtain(bool) 驱动（后台线程派发，
    见 desktop/main.py）。挂载点由 App 提供，壳里拿不到页面时静默放弃。 */
@@ -348,7 +350,9 @@ async function switchWalletAccount(acc: SteamAccountItem) {
 </script>
 
 <template>
-  <div class="app-shell" :class="{ 'is-curtained': closeCurtain }">
+  <!-- 局域网解锁页：不套主壳 -->
+  <router-view v-if="isBareRoute" />
+  <div v-else class="app-shell" :class="{ 'is-curtained': closeCurtain }">
     <!-- 侧边栏（HlSideNav：分组导航 + 收拢按键；收起态品牌区悬停换
          「侧边栏」图标，点击展开——新手引导入口在「关于」页 logo） -->
     <HlSideNav

@@ -14,14 +14,16 @@
 """
 from __future__ import annotations
 
+import hmac
 import secrets
 import sys
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
-from app.core import access
+from app.core import access, lan_access
 from app.core.logging import log_event
 
 router = APIRouter(tags=["session"])
@@ -77,13 +79,53 @@ async def session_dev(request: Request):
     """
     if is_packaged():
         raise HTTPException(status_code=404, detail="Not Found")
-    from fastapi.responses import JSONResponse
-
     log_event(
         __import__("logging").getLogger(__name__),
         "开发态会话已发放（发行版无此入口）",
         level=__import__("logging").WARNING,
     )
+    response = JSONResponse({"ok": True})
+    access.issue_session(response)
+    return response
+
+
+class _UnlockBody(BaseModel):
+    password: str
+
+
+async def ensure_lan_password() -> str:
+    """访问密码解析：环境变量优先，其次设置凭据 KV；都没有则生成并落库。"""
+    from app.domains.settings import service as settings_service
+
+    env_pw = lan_access.env_password()
+    if env_pw:
+        return env_pw
+    stored = await settings_service.get_secret_value(settings_service.LAN_PASSWORD_KEY)
+    if stored:
+        return stored
+    generated = lan_access.generate_password()
+    await settings_service.set_values(
+        {}, secret_values={settings_service.LAN_PASSWORD_KEY: generated}
+    )
+    return generated
+
+
+@router.post("/session/unlock")
+async def session_unlock(body: _UnlockBody):
+    """局域网自助解锁：访问密码换会话 Cookie（仅局域网模式存在此入口）。
+
+    密码常数时间比较；连续失败达阈值后全局限速，防局域网内穷举。
+    """
+    if not lan_access.is_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    locked = lan_access.unlock_locked_seconds()
+    if locked > 0:
+        raise HTTPException(status_code=429, detail=f"尝试过于频繁，请 {int(locked) + 1} 秒后再试")
+    expected = await ensure_lan_password()
+    if not expected or not hmac.compare_digest(body.password.strip(), expected):
+        lan_access.unlock_record_failure()
+        raise HTTPException(status_code=401, detail="访问密码不正确")
+    lan_access.unlock_record_success()
     response = JSONResponse({"ok": True})
     access.issue_session(response)
     return response

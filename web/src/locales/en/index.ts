@@ -72,6 +72,7 @@ import steamEvents from './steamEvents'
 import pilot from './pilot'
 // ── Structured UI System ──
 import structured from './structured'
+import access from './access'
 
 const messages: Partial<Record<MessageKey, string>> = {
   ...common,
@@ -121,6 +122,7 @@ const messages: Partial<Record<MessageKey, string>> = {
   ...steamEvents,
   ...pilot,
   ...structured,
+  ...access,
 }
 
 export default messages

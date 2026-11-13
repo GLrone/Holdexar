@@ -88,6 +88,9 @@ export function invalidateGetCache(prefix: string): void {
   }
 }
 
+// 401 退解锁页的一次性闸（见 request 内注释）
+let redirectingToUnlock = false
+
 async function request<T>(
   method: string,
   path: string,
@@ -121,6 +124,18 @@ async function request<T>(
         if (data?.detail) detail = formatApiDetail(data.detail)
       } catch {
         /* 忽略解析失败 */
+      }
+      // 局域网模式会话失效时退到解锁页；桌面/开发态 bootstrap 先行不会命中。
+      // 一次页面生命周期只导航一次：启动风暴里并发的多个 401 各自 assign
+      // 会排队重复导航，竞态下浏览器可能落在空白页。
+      if (
+        response.status === 401 &&
+        !path.startsWith('/session/') &&
+        window.location.pathname !== '/unlock' &&
+        !redirectingToUnlock
+      ) {
+        redirectingToUnlock = true
+        window.location.assign('/unlock')
       }
       throw new ApiError(response.status, detail)
     }
@@ -1029,6 +1044,11 @@ export interface PilotElementRef {
 export interface PilotQuoteRef {
   n: number
   text: string
+}
+
+/** 局域网访问解锁：访问密码换会话 Cookie（局域网模式关闭时后端 404） */
+export async function unlockAccess(password: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('POST', '/session/unlock', { password }, { noCache: true })
 }
 
 export async function askPilotStream(

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
+from app.core import access, lan_access
 from . import service
 from . import steam_local
 
@@ -25,6 +26,21 @@ class AccountPayload(BaseModel):
 
 class LocalSteamAccountImport(BaseModel):
     steam_id: str = Field(min_length=17, max_length=17)
+
+
+class LanAccessUpdate(BaseModel):
+    enabled: bool | None = None
+    # 空串=清空（下次解锁自动重生成）；**** 前缀的掩码回显不回写
+    password: str | None = None
+
+
+class LanAccessState(BaseModel):
+    enabled: bool
+    # 环境变量强制开启时设置页开关只是显示值，关闭不生效
+    env_forced: bool = False
+    has_password: bool = False
+    # 仅回环请求回显明文（桌面端可看）；局域网请求一律掩码
+    password: str = ""
 
 
 class SettingsUpdate(BaseModel):
@@ -53,6 +69,8 @@ class SettingsUpdate(BaseModel):
     theme: str | None = None
     # MCP 服务开关（外部 AI 接入面；写入即运行时启停，非重启生效）
     mcp_enabled: bool | None = None
+    # 局域网访问模式（开关 + 访问密码；写入即生效，运行状态见 LanAccessState）
+    lan_access: LanAccessUpdate | None = None
 
 
 class SettingsPayload(BaseModel):
@@ -73,6 +91,7 @@ class SettingsPayload(BaseModel):
     mcp_running: bool = False
     mcp_error: str = ""
     mcp_forced_by_env: bool = False
+    lan_access: LanAccessState
 
 
 # 「自动抓取」页的六个内容源开关：payload 字段 → app_settings KV。
@@ -145,8 +164,29 @@ class FetchSettingsUpdate(BaseModel):
     epic_schedule: ContentSchedule | None = None
 
 
+async def _lan_state(request: Request | None) -> LanAccessState:
+    """局域网访问模式状态：明文密码只回显给回环请求（桌面端）。
+
+    request 为 None 仅出现在测试直调（视为回环视角）；真实请求由 FastAPI
+    注入，局域网来源一律掩码。
+    """
+    loopback = (
+        access.is_loopback_host(request.headers.get("host") or "")
+        if request is not None
+        else True
+    )
+    stored = await service.get_secret_value(service.LAN_PASSWORD_KEY, "")
+    password = lan_access.env_password() or (stored or "")
+    return LanAccessState(
+        enabled=lan_access.is_enabled(),
+        env_forced=lan_access.env_forced(),
+        has_password=bool(password),
+        password=password if loopback else "",
+    )
+
+
 @router.get("")
-async def get_settings() -> SettingsPayload:
+async def get_settings(request: Request = None) -> SettingsPayload:
     steam_id = await service.get_value("account.steam_id", "")
     api_key = await service.get_secret_value("account.steam_api_key", "")
     onboarding_done = await service.get_value("ui.onboarding_done", False)
@@ -180,11 +220,12 @@ async def get_settings() -> SettingsPayload:
         mcp_running=bool(mcp_state["running"]),
         mcp_error=str(mcp_state["error"]),
         mcp_forced_by_env=bool(mcp_state["forcedByEnv"]),
+        lan_access=await _lan_state(request),
     )
 
 
 @router.put("")
-async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
+async def update_settings(payload: SettingsUpdate, request: Request = None) -> SettingsPayload:
     if payload.account:
         if payload.account.steam_id is not None:
             await service.set_value(
@@ -232,7 +273,20 @@ async def update_settings(payload: SettingsUpdate) -> SettingsPayload:
         await service.set_value("mcp.enabled", bool(payload.mcp_enabled))
         await agent_mcp.reapply(get_app_settings().data_dir)
 
-    return await get_settings()
+    if payload.lan_access is not None:
+        if payload.lan_access.enabled is not None:
+            await service.set_value(
+                service.LAN_ENABLED_KEY, bool(payload.lan_access.enabled)
+            )
+            lan_access.set_enabled(bool(payload.lan_access.enabled))
+        if payload.lan_access.password is not None:
+            password = payload.lan_access.password.strip()
+            # 前端掩码回显不回写，避免把掩码存成真值
+            if password and not password.startswith("****"):
+                await service.set_secret_value(service.LAN_PASSWORD_KEY, password)
+        lan_access.refresh_extra_hosts()
+
+    return await get_settings(request)
 
 
 @router.get("/steam-local-accounts")

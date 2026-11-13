@@ -44,6 +44,11 @@ const router = createRouter({
   routes: [
     { path: '/', redirect: '/dashboard' },
     {
+      path: '/unlock',
+      component: () => import('@/views/AccessUnlock.vue'),
+      meta: titleKey('access.title'),
+    },
+    {
       path: '/dashboard',
       component: () => import('@/views/dashboard/Index.vue'),
       meta: titleKey('nav.dashboard'),
