@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	healthTimeout     = 90 * time.Second
 	waitPIDTimeout    = 15 * time.Second
 	registrationWait  = 3 * time.Second
 	probePollInterval = 500 * time.Millisecond
@@ -59,48 +58,6 @@ func versionFromTag(tag string) string {
 		return text[1:]
 	}
 	return text
-}
-
-func versionGT(first, second string) bool {
-	parse := func(v string) ([]int, string) {
-		main_, pre := v, ""
-		if idx := strings.IndexAny(v, "-+"); idx >= 0 {
-			main_, pre = v[:idx], v[idx+1:]
-		}
-		var parts []int
-		for _, piece := range strings.Split(main_, ".") {
-			value := 0
-			for _, r := range piece {
-				if r < '0' || r > '9' {
-					break
-				}
-				value = value*10 + int(r-'0')
-			}
-			parts = append(parts, value)
-		}
-		return parts, pre
-	}
-	left, leftPre := parse(first)
-	right, rightPre := parse(second)
-	for i := 0; i < len(left) || i < len(right); i++ {
-		l, r := 0, 0
-		if i < len(left) {
-			l = left[i]
-		}
-		if i < len(right) {
-			r = right[i]
-		}
-		if l != r {
-			return l > r
-		}
-	}
-	if leftPre == "" && rightPre != "" {
-		return true
-	}
-	if leftPre != "" && rightPre != "" {
-		return leftPre > rightPre
-	}
-	return false
 }
 
 func logUpdate(root, message string) {

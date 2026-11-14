@@ -779,7 +779,17 @@ func main() {
 		go func() {
 			txPath := filepath.Join(installRoot, "state", "transaction.json")
 			for lifetime.Err() == nil {
-				if raw, err := os.ReadFile(txPath); err == nil {
+				raw, err := os.ReadFile(txPath)
+				// 事务文件被清场（只发生在提交/恢复终态，验收必然已提交）时
+				// 解除写保护，避免错过轮询窗导致保护滞留
+				if os.IsNotExist(err) {
+					writeGate.ResumeWrites()
+					updateguard.ClearProtection()
+					server.UpdateWriteProtected = false
+					logLine("更新事务已终态清场，写入保护解除")
+					return
+				}
+				if err == nil {
 					var tx map[string]any
 					if json.Unmarshal(raw, &tx) == nil {
 						attempt, _ := tx["attemptId"].(string)
