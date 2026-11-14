@@ -34,12 +34,16 @@ PUBLIC_PATHS = frozenset(
         "/api/v1/system/update-ready",
         "/api/v1/session/bootstrap",
         "/api/v1/session/dev",
+        "/api/v1/session/unlock",
     }
 )
 
 _API_PREFIX = "/api/"
 
 _token: str | None = None
+
+# 局域网模式放行的本机地址集合（字面量、小写、无端口）；空＝默认回环-only。
+_extra_hosts: frozenset[str] = frozenset()
 
 # MCP 路由闸（由 agent 域 mcp 模块注册）：Host/Origin 闸之后、会话闸之前生效。
 # 外部本机进程拿不到进程内会话令牌，凭数据目录令牌文件准入；
@@ -96,20 +100,42 @@ def _authorized(scope: Scope) -> bool:
 
 
 def host_allowed(host: str) -> bool:
-    """只接受回环 Host，挡住 DNS 重绑定。
+    """接受回环 Host 与本机网卡地址，挡住 DNS 重绑定。
 
-    重绑定的本质是让攻击者域名解析到 127.0.0.1——浏览器随后发出的请求
-    带的是**攻击者域名**作为 Host。因此 Host 必须是本机回环名；端口不限
-    （端口协商会换）。
+    重绑定的本质是让攻击者域名解析到本机——浏览器随后发出的请求带的是
+    **攻击者域名**作为 Host，永远不在白名单里；白名单只收字面地址。默认
+    模式白名单为空＝历史行为（仅回环）；局域网模式启动/开关时写入本机
+    网卡地址（`set_extra_hosts`）。端口不限（端口协商会换）。
     """
+    return _hostname(host) in _extra_hosts or is_loopback_host(host)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Host 是否指向本机回环（默认模式唯一放行面）。"""
+    return _hostname(host) in {"127.0.0.1", "localhost", "::1"}
+
+
+def set_extra_hosts(hosts) -> None:
+    """更新局域网模式放行的本机地址集合；空集合＝回环-only 默认模式。"""
+    global _extra_hosts
+    normalized = set()
+    for host in hosts or ():
+        hostname = _hostname(host)
+        if hostname:
+            normalized.add(hostname)
+    _extra_hosts = frozenset(normalized)
+
+
+def _hostname(host: str) -> str:
+    """取 Host 头的主机名部分（剥离端口；IPv6 字面量剥方括号）。"""
     host = (host or "").strip().lower()
     if not host:
-        return False
-    # IPv6 字面量形如 [::1]:port
+        return ""
     if host.startswith("["):
-        return host.startswith("[::1]")
-    hostname = host.rsplit(":", 1)[0] if ":" in host else host
-    return hostname in {"127.0.0.1", "localhost"}
+        return host[1 : host.find("]")] if "]" in host else ""
+    if host.count(":") > 1:
+        return host  # 裸 IPv6 字面量（该形态本就不带端口）
+    return host.rsplit(":", 1)[0] if ":" in host else host
 
 
 def _is_api(path: str) -> bool:
@@ -228,8 +254,10 @@ __all__ = [
     "SESSION_COOKIE",
     "SESSION_HEADER",
     "host_allowed",
+    "is_loopback_host",
     "origin_allowed",
     "issue_session",
     "reset_token",
     "session_token",
+    "set_extra_hosts",
 ]

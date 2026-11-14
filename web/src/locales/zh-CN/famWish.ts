@@ -27,7 +27,7 @@ const famWish = {
 
   /* 空态 / 加载态 */
   'famWish.empty.loading': '家庭愿望单聚合中…',
-  'famWish.empty.noData': '暂无愿望单数据——家庭成员同步愿望单后展示（监控池页可手动同步）',
+  'famWish.empty.noData': '暂无愿望单数据——家庭成员同步愿望单后展示（我的关注页可手动同步）',
   'famWish.empty.noMemberData': '暂无成员数据',
   'famWish.empty.noTagData': '暂无标签数据',
   'famWish.empty.noMatch': '没有匹配的愿望单游戏',

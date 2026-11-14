@@ -12,7 +12,7 @@ const pool = {
 
   /* ── Steam 账户分节 ── */
   'pool.account.desc':
-    '绑定后自动同步该账户的愿望单与已购游戏库进监控池（需对方资料公开），作为爬取的数据源。',
+    '绑定后自动同步该账户的愿望单与已购游戏库进我的关注（需对方资料公开），作为爬取的数据源。',
   'pool.account.steamidPlaceholder': 'Steam 好友码 / SteamID64 / 个人资料 URL',
   'pool.account.labelPlaceholder': '备注名（可选）',
   'pool.account.bind': '绑定',
@@ -22,7 +22,7 @@ const pool = {
   'pool.account.sync': '同步',
   'pool.account.syncAdded': '同步完成：新增 {n} 款',
   'pool.account.syncAddedCrawling': '同步完成：新增 {n} 款，已自动开始爬取',
-  'pool.account.syncNoNew': '同步完成：监控池 {n} 款，无新增',
+  'pool.account.syncNoNew': '同步完成：我的关注共 {n} 款，无新增',
   'pool.account.neverSynced': '未同步',
   'pool.account.friendCode': '好友码 {code}',
   'pool.account.kindWishlist': '愿望单',
@@ -34,18 +34,18 @@ const pool = {
 
   /* ── 监控地区分节 ── */
   'pool.regions.desc':
-    '价格抓取严格按勾选的区服执行，未勾选的区一律不爬；全部清空后爬取任务会拒绝启动。',
+    '价格抓取严格按勾选的地区执行，未勾选的区一律不爬；全部清空后爬取任务会拒绝启动。',
   'pool.regions.selected': '已选 {n} / {total} 区',
-  'pool.regions.savedNone': '已保存：未启用任何区服，爬取任务将拒绝启动',
-  'pool.regions.savedStrict': '已保存：爬取将严格按启用的区服执行',
+  'pool.regions.savedNone': '已保存：未启用任何地区，爬取任务将拒绝启动',
+  'pool.regions.savedStrict': '已保存：爬取将严格按启用的地区执行',
   'pool.regions.searchPlaceholder': '搜索地区名或代码',
-  'pool.regions.noMatch': '没有匹配的区服',
+  'pool.regions.noMatch': '没有匹配的地区',
 
   /* ── 监控条目分节的标题区 ── */
   'pool.items.matchCount': '匹配 {matched} / 共 {total} 款',
   'pool.items.totalHint': '共 {total} 款 —— 点击查看价格详情。',
   'pool.items.searchPlaceholder': '搜索游戏名或 AppID',
-  'pool.items.crawlAll': '全量爬取监控池',
+  'pool.items.crawlAll': '全量爬取我的关注',
 
   /* ── 监控池管理（条目增删 + 批量操作）──
      类别词条 `pool.items.kind.*` 一处三用：筛选 chips 的标签、条目标记、
@@ -60,14 +60,14 @@ const pool = {
   'pool.items.add': '添加条目',
   'pool.items.addTitle': '添加监控条目',
   'pool.items.addHint':
-    '加入监控池的条目全部参与价格爬取；Steam 愿望单里的游戏与点星标关注的游戏优先爬取。支持粘贴或「选择文件」导入（JSON 数组 / 链接 / 裸 AppID 均可），文件导入的 appid 同时计入预设游戏池。',
+    '加入我的关注的条目全部参与价格爬取；Steam 愿望单里的游戏与点星标关注的游戏优先爬取。支持粘贴或「选择文件」导入（JSON 数组 / 链接 / 裸 AppID 均可），文件导入的 appid 同时计入预设游戏池。',
   'pool.items.addPlaceholder': '粘贴 Steam 商店 / SteamDB 链接或裸 AppID（空格、逗号、换行分隔均可）',
   'pool.items.importFile': '选择文件',
   'pool.items.importFileLoaded': '已载入 {name}',
-  'pool.items.addSubmit': '加入监控池',
+  'pool.items.addSubmit': '加入我的关注',
   'pool.items.addNoValid': '没有识别到有效 AppID',
   'pool.items.addResult':
-    '已加入监控池：新增 {added} · 恢复 {restored} · 已在池 {exists} · 未识别 {invalid}',
+    '已加入我的关注：新增 {added} · 恢复 {restored} · 已在关注 {exists} · 未识别 {invalid}',
   'pool.items.manage': '管理',
   'pool.items.manageDone': '完成',
   'pool.items.manageHint': '勾选条目后批量移除；移除后不再参与价格爬取。',
@@ -76,8 +76,8 @@ const pool = {
   'pool.items.unselectPage': '取消本页',
   'pool.items.clearSelection': '清空选择',
   'pool.items.removeSelected': '移除选中',
-  'pool.items.removeConfirm': '从监控池移除选中的 {n} 款游戏？',
-  'pool.items.removeResult': '已移出监控池 {n} 款',
+  'pool.items.removeConfirm': '从我的关注移除选中的 {n} 款游戏？',
+  'pool.items.removeResult': '已移出我的关注 {n} 款',
 
   /* ── 条目格子与空态 ── */
   'pool.items.pendingName': '未抓取（新绑定条目）',

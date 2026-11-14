@@ -71,6 +71,7 @@ import steamEvents from './steamEvents'
 import pilot from './pilot'
 // ── 统一结构化展示系统（components/structured/*）──
 import structured from './structured'
+import access from './access'
 import plugins from './plugins'
 
 /** 全量中文词典 */
@@ -122,6 +123,7 @@ export const messages = {
   ...steamEvents,
   ...pilot,
   ...structured,
+  ...access,
   ...plugins,
 } as const
 

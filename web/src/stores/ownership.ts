@@ -1,12 +1,14 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 
 import { ownershipApi, type OwnershipInfo } from '@/api/client'
+import { useCrawlStatusStore } from '@/stores/crawlStatus'
 
 /**
  * 游戏归属（游戏卡左上角状态徽章数据源：已拥有/家庭共享/愿望单 + 归属账号）。
  * 卡片按需 ensure(appid)，同一帧内的请求合并为一次批量拉取（一页 40 张卡 = 1 个请求），
- * 结果常驻缓存；会话内账户同步后可 invalidate 重取。
+ * 结果常驻缓存；账户同步是任务账本里的 job，其终态推进 dataEpoch——纪元一推进即整批
+ * 重取原缓存清单，徽章响应式跟随。
  */
 export const useOwnershipStore = defineStore('ownership', () => {
   const map = ref<Record<number, OwnershipInfo>>({})
@@ -44,5 +46,20 @@ export const useOwnershipStore = defineStore('ownership', () => {
     }
   }
 
-  return { map, ensure }
+  /** 账户数据任务终态后的整批重取：清空缓存并按原清单重拉（徽章响应式跟随） */
+  function refresh() {
+    const ids = Object.keys(map.value).map(Number)
+    map.value = {}
+    ids.forEach((id) => ensure(id))
+  }
+
+  const crawl = useCrawlStatusStore()
+  watch(
+    () => crawl.dataEpoch,
+    () => {
+      if (Object.keys(map.value).length > 0) refresh()
+    },
+  )
+
+  return { map, ensure, refresh }
 })

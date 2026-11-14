@@ -88,6 +88,9 @@ export function invalidateGetCache(prefix: string): void {
   }
 }
 
+// 401 退解锁页的一次性闸（见 request 内注释）
+let redirectingToUnlock = false
+
 export async function request<T>(
   method: string,
   path: string,
@@ -123,6 +126,18 @@ export async function request<T>(
         if (data?.detail) detail = formatApiDetail(data.detail)
       } catch {
         /* 忽略解析失败 */
+      }
+      // 局域网模式会话失效时退到解锁页；桌面/开发态 bootstrap 先行不会命中。
+      // 一次页面生命周期只导航一次：启动风暴里并发的多个 401 各自 assign
+      // 会排队重复导航，竞态下浏览器可能落在空白页。
+      if (
+        response.status === 401 &&
+        !path.startsWith('/session/') &&
+        window.location.pathname !== '/unlock' &&
+        !redirectingToUnlock
+      ) {
+        redirectingToUnlock = true
+        window.location.assign('/unlock')
       }
       throw new ApiError(response.status, detail)
     }
@@ -1033,6 +1048,11 @@ export interface PilotQuoteRef {
   text: string
 }
 
+/** 局域网访问解锁：访问密码换会话 Cookie（局域网模式关闭时后端 404） */
+export async function unlockAccess(password: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>('POST', '/session/unlock', { password }, { noCache: true })
+}
+
 export async function askPilotStream(
   question: string,
   appid: number | undefined,
@@ -1198,14 +1218,18 @@ export const accountApi = {
   /** 解绑全部账号（清账号表；手填 SteamID64 / API Key 不动） */
   unbind: () => request<AccountStatus>('DELETE', '/account/cookies'),
   sync: () => request<AccountStatus>('POST', '/account/sync'),
+  /** 按账号聚合刷新：钱包+资料同步完成在响应内；queued 是后台受理标记，
+   *  完成与否要靠随后的账号快照重拉（GET /account）确认。400=steamid 非数字，404=账号不存在 */
   refreshAccount: (steamId: string) =>
     request<AccountRefreshResult>('POST', `/account/steam_id/${steamId}/refresh`),
 }
 
+/** 按账号聚合刷新响应（受理式：wallet 即时结果 + queued 后台受理标记） */
 export interface AccountRefreshResult {
   ok: boolean
   steamId: string
-  wallet: { ok: boolean; wallet?: WalletSnapshot; error?: string }
+  wallet: { ok: boolean; wallet: WalletSnapshot }
+  /** 后台受理的同步项（wishlist / family / bills） */
   queued: string[]
 }
 
@@ -2202,7 +2226,7 @@ export const crawlApi = {
   cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
   /** 全库最近一次成功价格观察（灵动岛时钟事实源，活表 last_success_at 的 MAX；
    *  自动轮/手动/补抓/回填的成功写入同样推进；null=从未成功观察） */
-  latestObservation: () => request<{ lastSuccessAt: string | null }>(
+  latestObservation: () => request<{ lastSuccessAt: string | null; serverNow: string | null }>(
     'GET',
     '/crawl/freshness/latest',
   ),

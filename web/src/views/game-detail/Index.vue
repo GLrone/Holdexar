@@ -22,9 +22,11 @@ import {
 } from '@/lib/priceEvents'
 import { selectableVariants, versionSelectOptions } from '@/lib/versions'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
+import { useFollowsStore } from '@/stores/follows'
 import { useLocaleStore } from '@/stores/locale'
 import { usePilotStore } from '@/stores/pilot'
 import { useRegionsStore } from '@/stores/regions'
+import { message } from '@/components/ui'
 import { useI18n, useLocaleFormat, type MessageKey } from '@/locales'
 import RegionFlag from '@/components/RegionFlag.vue'
 import HlSelect from '@/components/ui/HlSelect.vue'
@@ -67,6 +69,30 @@ const detail = ref<GameDetail | null>(null)
 
 /* 领航台：详情页入口带游戏上下文（全局单例抽屉经 store 开启） */
 const pilotStore = usePilotStore()
+
+/* ── 头部动作位：关注星标（与游戏卡同一事实源 followsStore，乐观切换失败回滚）── */
+const followsStore = useFollowsStore()
+const isFollowed = computed(() => followsStore.has(appid.value))
+
+async function onToggleFollow() {
+  try {
+    await followsStore.toggle(appid.value)
+  } catch (e) {
+    message.error(e instanceof Error && e.message ? e.message : t('gameCard.follow.fail'))
+  }
+}
+
+/** 返回：SPA 内有来源栈则回退（关注/账单等入口自然回原地），深链直达回落游戏库 */
+function goBack() {
+  if (window.history.state?.back) router.back()
+  else router.push('/library')
+}
+
+/** 设价格提醒：带 appid+name 跳提醒页预选本游戏（规则表单只在提醒页，不建第二套） */
+function goAlert() {
+  router.push({ path: '/alerts', query: { appid: String(appid.value), name: detail.value?.name ?? '' } })
+}
+
 const loading = ref(true)
 const errorMsg = ref('')
 
@@ -542,7 +568,10 @@ const bundleMustText = (m: number) =>
       ? t('gameDetail.bundle.wholeOnly')
       : t('gameDetail.bundle.unknown')
 
-onMounted(load)
+onMounted(() => {
+  void followsStore.ensure()
+  load()
+})
 </script>
 
 <template>
@@ -558,13 +587,22 @@ onMounted(load)
     </div>
 
     <template v-else-if="detail">
-      <!-- 返回键 -->
-      <button class="gd-back-btn" @click="router.push('/library')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M19 12H5M12 19l-7-7 7-7" />
-        </svg>
-        {{ t('gameDetail.header.back') }}
-      </button>
+      <!-- 顶栏：返回（来源感知）+ 动作位（关注星标 / 设价格提醒） -->
+      <div class="gd-topbar">
+        <button class="gd-back-btn" @click="goBack">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+          {{ t('gameDetail.header.back') }}
+        </button>
+        <div class="gd-topbar-actions">
+          <button class="star-btn" :class="{ active: isFollowed }" :title="t('gameCard.follow.tip')" @click="onToggleFollow">
+            <span class="star-empty">☆</span>
+            <span class="star-filled">★</span>
+          </button>
+          <HlButton size="sm" @click="goAlert">{{ t('gameDetail.header.setAlert') }}</HlButton>
+        </div>
+      </div>
 
       <!-- ① 渐变头部：封面铺底 + 渐变遮罩 -->
       <div class="gd-header" data-section="gameDetail.section.header">
@@ -998,9 +1036,19 @@ onMounted(load)
   gap: 12px;
 }
 
-/* ── 返回键 ── */
+/* ── 顶栏：返回 + 动作位（星标形态复用 hl-gamecard.css 的 .star-btn）── */
+.gd-topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.gd-topbar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .gd-back-btn {
-  align-self: flex-start;
   display: inline-flex;
   align-items: center;
   gap: 6px;

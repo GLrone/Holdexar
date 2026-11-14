@@ -279,6 +279,13 @@ def session_running(sid: str) -> bool:
     return sid in _RUNNING_SIDS
 
 
+def session_busy(sid: str) -> bool:
+    """会话写闸统一判据（rewind/fork/run_tool 等会话级写操作共用）：有在飞轮
+    或会话流在挂（任一）即拒。ask_stream 的并发轮判定不在此列——流在挂但
+    空闲的会话允许发起新一轮，只拒真正并发的轮。"""
+    return _INFLIGHT_TURNS.get(sid, 0) > 0 or session_running(sid)
+
+
 def set_inflight_question(sid: str, question: str) -> None:
     if sid:
         _INFLIGHT_QUESTIONS[sid] = question or ""
@@ -1708,7 +1715,7 @@ async def rewind_session(sid: str, keep_turns: int) -> dict:
     """编辑重问：账本保留前 keep_turns 轮，其后轮次作废（追加软截断记录）。
 
     生成中拒绝——轮次边界与在途生成不能同时改。返回机器码供前端翻用户语言。"""
-    if _INFLIGHT_TURNS.get(sid, 0) > 0 or session_running(sid):
+    if session_busy(sid):
         return {"ok": False, "reason": "busy", "turn_total": 0}
     store = get_store()
     state = await store.load(sid)
@@ -1746,7 +1753,7 @@ async def fork_session(src_sid: str, keep_turns: int) -> dict:
     """话题分叉：从源会话前 keep_turns 轮派生新会话（源账本零改动）。
 
     生成中拒绝——轮次边界与在途生成不能同时改。返回新会话 id 供前端切换。"""
-    if _INFLIGHT_TURNS.get(src_sid, 0) > 0 or session_running(src_sid):
+    if session_busy(src_sid):
         return {"ok": False, "reason": "busy", "sid": "", "turn_total": 0}
     store = get_store()
     state = await store.load(src_sid)
@@ -2010,7 +2017,7 @@ async def run_tool(name: str, *, label: str, session_id: str | None) -> dict:
     if name not in pilot_tools.QUICK_TOOLS:
         raise ValueError("unknown_tool")
     # 与流式问答同一会话闸：快捷直达不得与在飞轮并发写会话账本
-    if session_id and (_INFLIGHT_TURNS.get(session_id, 0) > 0 or session_running(session_id)):
+    if session_id and session_busy(session_id):
         raise ValueError("busy")
     state = await get_store().load_or_new(session_id) if session_id else None
     result = await pilot_tools.execute_tool(name, {}, guarded=False, sid=session_id)
