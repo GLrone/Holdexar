@@ -25,12 +25,12 @@ const (
 	dataDirName      = "data"
 	envPrefix        = "HOLDEXAR_"
 
-	stageStaged     = "staged"
-	stageSwitching  = "switching"
-	stageVerifying  = "verifying"
-	stageCommitted  = "committed"
-	stageFailed     = "failed"
-	stageRolledBack = "rolled_back"
+	stageStaged           = "staged"
+	stageSwitching        = "switching"
+	stageVerifying        = "verifying"
+	stageCommitted        = "committed"
+	stageRolledBack       = "rolled_back"
+	stageRecoveryRequired = "recovery_required" // 恢复失败需人工处理的第六态（fail-closed 保留现场）
 
 	updateDataProtocol = 1
 )
@@ -285,6 +285,12 @@ func updateTransaction(root, stage string, kwargs map[string]any) error {
 		tx[key] = value
 	}
 	return atomicJSON(filepath.Join(root, stateDirName, transactionF), tx)
+}
+
+// clearTransaction 事务终态清场：提交与恢复收尾后指针与相容记录已落 current.json，
+// 事务档案使命结束（缺失即无事务，不报错）。
+func clearTransaction(root string) {
+	_ = os.Remove(filepath.Join(root, stateDirName, transactionF))
 }
 
 // ───────────────────────── 数据相容记录 ─────────────────────────
