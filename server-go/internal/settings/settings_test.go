@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/store"
 )
@@ -67,7 +68,7 @@ func seedKV(t *testing.T, db *sql.DB, key, jsonText string) {
 const defaultBody = `{"account":{"steam_id":"","steam_api_key":"","has_api_key":false},` +
 	`"onboarding_done":false,"auto_price":true,"backup_auto":true,"update_notified":"",` +
 	`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
-	`"theme":"dark","mcp_enabled":false,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
+	`"theme":"dark","mcp_enabled":false,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false,"lan_access":{"enabled":false,"env_forced":false,"has_password":false,"password":""}}`
 
 func TestGetSettingsDefaults(t *testing.T) {
 	_, h := newTestEnv(t)
@@ -96,7 +97,7 @@ func TestGetSettingsSeeded(t *testing.T) {
 	want := `{"account":{"steam_id":"76561198000000000","steam_api_key":"****efgh","has_api_key":true},` +
 		`"onboarding_done":true,"auto_price":true,"backup_auto":true,"update_notified":"1.2.3",` +
 		`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
-		`"theme":"light","mcp_enabled":true,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
+		`"theme":"light","mcp_enabled":true,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false,"lan_access":{"enabled":false,"env_forced":false,"has_password":false,"password":""}}`
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("种子形状不一致\n got: %s\nwant: %s", got, want)
 	}
@@ -518,5 +519,136 @@ func TestGetMCPStatusProjection(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("运行态投影缺 %s：%s", want, body)
 		}
+	}
+}
+
+// lanStateCleanup 测试隔离：清空局域网内存态（settings PUT 会写入 access 包状态）。
+func lanStateCleanup(t *testing.T) {
+	t.Helper()
+	access.ResetLANState()
+	t.Cleanup(access.ResetLANState)
+}
+
+// settingsRequest 带 Host 的请求：回环视角拿明文，局域网视角拿掩码。
+func settingsRequest(t *testing.T, h http.Handler, method, target, host, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Host = host
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestLANAccessGetPut 全链：PUT 开关+密码 → 库内密文 → 回环视角明文回显 →
+// 局域网视角掩码 → 掩码回显不回写 → 关闭后开关与白名单回落。
+func TestLANAccessGetPut(t *testing.T) {
+	db, h := newTestEnv(t)
+	lanStateCleanup(t)
+
+	// 局域网视角 GET：无密码缺省形状。
+	rec := settingsRequest(t, h, http.MethodGet, "/api/v1/settings", "192.168.1.5:28765", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d", rec.Code)
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if resp.LANAccess.Enabled || resp.LANAccess.EnvForced || resp.LANAccess.HasPassword || resp.LANAccess.Password != "" {
+		t.Fatalf("缺省局域网状态不符：%+v", resp.LANAccess)
+	}
+
+	// PUT 开关 + 密码：写入即生效（内存态与 Host 闸白名单同步）。
+	rec = settingsRequest(t, h, http.MethodPut, "/api/v1/settings", "127.0.0.1:28765",
+		`{"lan_access":{"enabled":true,"password":" my-secret-pw "}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT 状态码 = %d body %s", rec.Code, rec.Body.String())
+	}
+	if !access.IsEnabled() {
+		t.Fatalf("PUT 开关后局域网模式应生效")
+	}
+	for _, ip := range access.LocalIPs() {
+		if !access.HostAllowed("["+ip+"]:28765") {
+			t.Fatalf("本机地址 %s 应入白名单", ip)
+		}
+	}
+
+	// 库内是 enc1: 密文（JSON 字符串），开关是 JSON 布尔。
+	var stored string
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", LANPasswordKey).Scan(&stored); err != nil {
+		t.Fatalf("密码读回失败：%v", err)
+	}
+	if !strings.HasPrefix(strings.Trim(stored, `"`), secretbox.Prefix) {
+		t.Fatalf("密码应为 enc1: 密文，实际 %s", stored)
+	}
+	var enabled bool
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", LANEnabledKey).Scan(&enabled); err != nil || !enabled {
+		t.Fatalf("开关应落库为 true：%v", err)
+	}
+
+	// 回环视角明文回显；局域网视角掩码但 has_password 照实。
+	rec = settingsRequest(t, h, http.MethodGet, "/api/v1/settings", "127.0.0.1:28765", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if !resp.LANAccess.Enabled || resp.LANAccess.Password != "my-secret-pw" {
+		t.Fatalf("回环视角应回显明文：%+v", resp.LANAccess)
+	}
+	rec = settingsRequest(t, h, http.MethodGet, "/api/v1/settings", "192.168.1.5:28765", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if resp.LANAccess.Password != "" || !resp.LANAccess.HasPassword || !resp.LANAccess.Enabled {
+		t.Fatalf("局域网视角应掩码且照实存在性：%+v", resp.LANAccess)
+	}
+
+	// 掩码回显不回写：库内密文不变。
+	before := stored
+	if rec := settingsRequest(t, h, http.MethodPut, "/api/v1/settings", "127.0.0.1:28765",
+		`{"lan_access":{"password":"****-pw"}}`); rec.Code != http.StatusOK {
+		t.Fatalf("掩码 PUT 状态码 = %d", rec.Code)
+	}
+	var after string
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", LANPasswordKey).Scan(&after); err != nil {
+		t.Fatalf("掩码回写检查读回失败：%v", err)
+	}
+	if after != before {
+		t.Fatalf("掩码回显不应落库")
+	}
+
+	// 关闭开关：内存态与白名单回落，库内开关 false。
+	if rec := settingsRequest(t, h, http.MethodPut, "/api/v1/settings", "127.0.0.1:28765",
+		`{"lan_access":{"enabled":false}}`); rec.Code != http.StatusOK {
+		t.Fatalf("关闭 PUT 状态码 = %d", rec.Code)
+	}
+	if access.IsEnabled() || access.HostAllowed("192.168.1.5:28765") {
+		t.Fatalf("关闭后局域网模式应回落回环-only")
+	}
+	if err := db.QueryRow(
+		"SELECT value_json FROM app_settings WHERE key = ?", LANEnabledKey).Scan(&enabled); err != nil || enabled {
+		t.Fatalf("开关应落库为 false：%v", err)
+	}
+}
+
+// TestLANAccessEnvPasswordOverrides 环境变量密码优先于凭据 KV 回显。
+func TestLANAccessEnvPasswordOverrides(t *testing.T) {
+	db, h := newTestEnv(t)
+	lanStateCleanup(t)
+	seedKV(t, db, LANPasswordKey, `"stored-pw"`)
+	t.Setenv(access.EnvAccessPassword, "env-pw")
+	access.SetEnabled(true)
+	rec := settingsRequest(t, h, http.MethodGet, "/api/v1/settings", "127.0.0.1:28765", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d", rec.Code)
+	}
+	var resp settingsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应解析失败：%v", err)
+	}
+	if resp.LANAccess.Password != "env-pw" {
+		t.Fatalf("环境变量密码应优先回显：%+v", resp.LANAccess)
 	}
 }

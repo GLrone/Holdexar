@@ -232,6 +232,14 @@ func main() {
 	} else if count > 0 {
 		logLine("存量设置凭据已加密保存 │ 条数=%d", count)
 	}
+	// 局域网访问模式初始化：读设置开关并同步 Host 闸白名单；环境变量
+	// HOLDEXAR_ACCESS=lan 强制开启，失败按关闭处理（fail-closed）。
+	unlockDeps := systemx.UnlockDeps{DB: db, WriteGate: writeGate, DataDir: dataDir}
+	if lanMode, err := systemx.InitLANAccess(backgroundCtx, unlockDeps); err != nil {
+		logFail("局域网访问模式初始化失败，按关闭处理：%v", err)
+	} else if lanMode {
+		logLine("局域网访问模式已开启，本机地址已加入访问白名单")
+	}
 	var priceRuntime *crawl.Runtime
 	steamEvents := steamevents.New(db, writeGate, steamevents.Options{DataDir: dataDir, Recorder: jobRecorder, Log: logLine})
 	if err := steamEvents.Windows.Reload(backgroundCtx); err != nil {
@@ -673,7 +681,7 @@ func main() {
 			proxypool.RegisterProxyList(mux, db, dataDir)
 			manualHealth.Register(mux)
 			proxypool.RegisterSubscriptionRoutes(mux, db, writeGate, dataDir, subscriptionSchedule.Refresh, proxySchedule.requestRebuild)
-			systemx.RegisterSession(mux, gate, *devSession)
+			systemx.RegisterSession(mux, gate, *devSession, unlockDeps)
 			mux.HandleFunc("POST /api/v1/system/update-ready", updateguard.HandleUpdateReady)
 			updater.Register(mux, updater.Deps{
 				DataDir:     dataDir,
