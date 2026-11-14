@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/secretbox"
@@ -36,6 +37,12 @@ const (
 	keyDirectNotice   = "ui.direct_notice_seen"
 	keyTheme          = "ui.theme"
 	keyMCPEnabled     = "mcp.enabled"
+)
+
+// 局域网访问模式持久化键（内存态在 internal/access，这里持持久化事实）。
+const (
+	LANEnabledKey  = "access.lan_enabled"
+	LANPasswordKey = "access.lan_password"
 )
 
 // resolveDataDir 数据目录判定（凭据主密钥托管挂在其下），Register 时调用
@@ -102,10 +109,21 @@ type settingsResponse struct {
 	MCPRunning     bool   `json:"mcp_running"`
 	MCPError       string `json:"mcp_error"`
 	MCPForcedByEnv bool   `json:"mcp_forced_by_env"`
+	// 局域网访问模式状态（内存态在 access 包；密码明文只回显给回环请求）。
+	LANAccess lanAccessState `json:"lan_access"`
+}
+
+// lanAccessState 局域网访问模式状态（Python LanAccessState 同形）。
+type lanAccessState struct {
+	Enabled     bool   `json:"enabled"`
+	EnvForced   bool   `json:"env_forced"`
+	HasPassword bool   `json:"has_password"`
+	// 仅回环请求回显明文（桌面端可看）；局域网请求一律掩码（空串）。
+	Password string `json:"password"`
 }
 
 func (h *handler) handleGet(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.readSettings(r.Context())
+	resp, err := h.readSettings(r.Context(), access.IsLoopbackHost(r.Host))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, detailNull())
 		return
@@ -114,7 +132,8 @@ func (h *handler) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // readSettings 聚合 GET 全量形状：KV 各键 + 缺省（Python get_settings 同源）。
-func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
+// loopback 决定局域网访问密码是否回显明文。
+func (h *handler) readSettings(ctx context.Context, loopback bool) (*settingsResponse, error) {
 	resp := &settingsResponse{}
 
 	if v, err := h.kvValue(ctx, keySteamID); err != nil {
@@ -175,6 +194,24 @@ func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 	}
 	if MCPStatus != nil {
 		resp.MCPRunning, resp.MCPError, resp.MCPForcedByEnv = MCPStatus()
+	}
+	// 局域网访问模式状态：环境变量密码优先于凭据 KV（Python _lan_state 同径）。
+	lanPassword := access.EnvPassword()
+	if lanPassword == "" {
+		stored, err := ReadSecret(ctx, h.db, h.dataDir, LANPasswordKey)
+		if err != nil {
+			return nil, err
+		}
+		lanPassword = stored
+	}
+	resp.LANAccess = lanAccessState{
+		Enabled:     access.IsEnabled(),
+		EnvForced:   access.EnvForced(),
+		HasPassword: lanPassword != "",
+		Password:    lanPassword,
+	}
+	if !loopback {
+		resp.LANAccess.Password = ""
 	}
 	return resp, nil
 }
@@ -343,9 +380,16 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		if req.mcpEnabled != nil && OnMCPEnabledWrite != nil {
 			OnMCPEnabledWrite()
 		}
+		// 局域网开关写入即生效：内存态与 Host 闸白名单同步（Python 同径）。
+		if req.lanAccess != nil {
+			if req.lanAccess.enabled != nil {
+				access.SetEnabled(*req.lanAccess.enabled)
+			}
+			access.RefreshExtraHosts()
+		}
 		h.notify(r.Context(), writes, nil)
 	}
-	resp, err := h.readSettings(r.Context())
+	resp, err := h.readSettings(r.Context(), access.IsLoopbackHost(r.Host))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, detailNull())
 		return
@@ -430,6 +474,12 @@ const (
 	errJSONInvalidMsg = "JSON decode error"
 )
 
+// lanAccessUpdate 局域网访问模式写入意图；nil 成员表示该字段不在请求中。
+type lanAccessUpdate struct {
+	enabled  *bool
+	password *string // 已 strip 的明文；加密在 buildWrites 闸外完成
+}
+
 // updateReq 校验后的写入意图；nil 表示该字段不在请求中（含显式 null）。
 type updateReq struct {
 	steamID          *string
@@ -444,6 +494,7 @@ type updateReq struct {
 	directNoticeSeen *bool
 	theme            *string
 	mcpEnabled       *bool
+	lanAccess        *lanAccessUpdate
 }
 
 // parseUpdate 解析并校验 PUT 请求体：全部字段错误合并上报（Pydantic 非短路同径）。
@@ -486,6 +537,30 @@ func parseUpdate(body []byte) (*updateReq, []valErr, *valErr) {
 					req.steamAPIKey = &trimmed
 				}
 			}
+		}
+	}
+	if raw, ok := fields["lan_access"]; ok && raw != nil {
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			vErrs = append(vErrs, valErr{Type: errModelType, Loc: []any{"body", "lan_access"}, Msg: errModelTypeMsg, Input: raw})
+		} else {
+			la := &lanAccessUpdate{}
+			if v, present := obj["enabled"]; present && v != nil {
+				if b, e := wantBool(v, "lan_access", "enabled"); e != nil {
+					vErrs = append(vErrs, *e)
+				} else {
+					la.enabled = &b
+				}
+			}
+			if v, present := obj["password"]; present && v != nil {
+				if s, e := wantStr(v, "lan_access", "password"); e != nil {
+					vErrs = append(vErrs, *e)
+				} else {
+					trimmed := strings.TrimSpace(s)
+					la.password = &trimmed
+				}
+			}
+			req.lanAccess = la
 		}
 	}
 	boolSpecs := []struct {
@@ -594,6 +669,22 @@ func (h *handler) buildWrites(req *updateReq) ([]kvWrite, error) {
 	}
 	if req.mcpEnabled != nil {
 		push(keyMCPEnabled, *req.mcpEnabled)
+	}
+	if req.lanAccess != nil {
+		if req.lanAccess.enabled != nil {
+			push(LANEnabledKey, *req.lanAccess.enabled)
+		}
+		if req.lanAccess.password != nil {
+			// 掩码回显与空串不落库，避免把掩码存成真值（Python 同径）。
+			password := *req.lanAccess.password
+			if password != "" && !strings.HasPrefix(password, "****") {
+				sealed, err := secretbox.EncryptSecretIn(h.dataDir, password, secretbox.SecretPurpose(LANPasswordKey))
+				if err != nil {
+					return nil, err
+				}
+				push(LANPasswordKey, sealed)
+			}
+		}
 	}
 	return writes, nil
 }

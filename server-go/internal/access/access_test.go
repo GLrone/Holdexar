@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -171,5 +172,119 @@ func TestMiddlewareGate(t *testing.T) {
 	}
 	if len(g.Token()) != 43 {
 		t.Fatalf("令牌长度=%d，应为 43（32 字节 urlsafe 无填充）", len(g.Token()))
+	}
+}
+
+// resetLAN 测试隔离：清空局域网模式全部内存态。
+func resetLAN(t *testing.T) {
+	t.Helper()
+	ResetLANState()
+	t.Cleanup(ResetLANState)
+}
+
+func TestLANExtraHostsWhitelist(t *testing.T) {
+	resetLAN(t)
+	SetExtraHosts([]string{"192.168.1.5", "FE80::1"})
+	// 白名单只收字面地址（端口不限、大小写与 IPv6 括号归一）。
+	for _, host := range []string{"192.168.1.5:28765", "192.168.1.5", "[fe80::1]:28765", "LOCALHOST:9999", "127.0.0.1:28765"} {
+		if !HostAllowed(host) {
+			t.Errorf("HostAllowed(%q)=false，应为 true", host)
+		}
+	}
+	if IsLoopbackHost("192.168.1.5:28765") {
+		t.Errorf("额外地址不应波及回环判定")
+	}
+	SetExtraHosts(nil)
+	if HostAllowed("192.168.1.5:28765") {
+		t.Errorf("清空白名单后局域网地址应被拒绝")
+	}
+	if !HostAllowed("127.0.0.1:28765") {
+		t.Errorf("回环放行面不应随白名单变化")
+	}
+}
+
+func TestLANModeMiddleware(t *testing.T) {
+	resetLAN(t)
+	SetEnabled(true)
+	SetExtraHosts([]string{"192.168.1.5"})
+	g, h := newGateHandler(t)
+	// 局域网模式：本机网卡地址过 Host 闸，落到会话闸（401 而非 421）。
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/regions", nil)
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatalf("局域网直连状态码=%d，应为 401（会话闸）", rec.Code)
+	}
+	// 同源局域网请求穿过 Origin 闸。
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/regions", nil)
+	req.Host = "192.168.1.5:28765"
+	req.Header.Set("Origin", "http://192.168.1.5:28765")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatalf("局域网同源状态码=%d，应为 401", rec.Code)
+	}
+	// 重绑定防线不放宽：攻击者域名 Host 仍 421。
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://evil.com/api/v1/health", nil)
+	h.ServeHTTP(rec, req)
+	if rec.Code != 421 {
+		t.Fatalf("攻击者域名状态码=%d，应为 421", rec.Code)
+	}
+	// 会话 Cookie 在局域网直连形态下照常准入。
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/regions", nil)
+	req.Host = "192.168.1.5:28765"
+	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: g.Token()})
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("局域网直连带会话状态码=%d，应为 200", rec.Code)
+	}
+}
+
+func TestLANEnabledChannels(t *testing.T) {
+	resetLAN(t)
+	if IsEnabled() {
+		t.Fatalf("默认应为关闭")
+	}
+	// 环境变量强制开启优先于设置 KV 缓存。
+	t.Setenv(EnvAccess, "LAN")
+	if !IsEnabled() {
+		t.Fatalf("环境变量 lan 应强制开启")
+	}
+	if !SetEnabled(false) {
+		t.Fatalf("环境变量开启时 SetEnabled(false) 生效状态应恒真")
+	}
+	orig := LocalIPs
+	LocalIPs = func() []string { return []string{"127.0.0.1", "192.168.1.5"} }
+	t.Cleanup(func() { LocalIPs = orig })
+	RefreshExtraHosts()
+	if !HostAllowed("192.168.1.5:28765") {
+		t.Fatalf("强制开启时刷新白名单应放行本机地址")
+	}
+	os.Unsetenv(EnvAccess)
+	if IsEnabled() {
+		t.Fatalf("环境变量撤除且开关关闭应为关闭")
+	}
+	RefreshExtraHosts()
+	if HostAllowed("192.168.1.5:28765") {
+		t.Fatalf("关闭时白名单应回退回环-only")
+	}
+}
+
+func TestUnlockRateLimit(t *testing.T) {
+	resetLAN(t)
+	for i := 0; i < unlockMaxFails; i++ {
+		if UnlockLockedSeconds() > 0 {
+			t.Fatalf("第 %d 次失败前不应锁定", i+1)
+		}
+		UnlockRecordFailure()
+	}
+	if UnlockLockedSeconds() <= 0 {
+		t.Fatalf("连续失败达阈值后应进入锁定窗口")
+	}
+	UnlockRecordSuccess()
+	if UnlockLockedSeconds() > 0 {
+		t.Fatalf("成功一次即清零锁定")
 	}
 }

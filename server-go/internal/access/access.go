@@ -30,6 +30,7 @@ var PublicPaths = map[string]bool{
 	"/api/v1/system/update-ready": true,
 	"/api/v1/session/bootstrap":   true,
 	"/api/v1/session/dev":         true,
+	"/api/v1/session/unlock":      true,
 }
 
 // Gate 持有进程内会话令牌与 MCP 闸挂点。MCP 面未接线时 MCP 前缀为空。
@@ -107,21 +108,18 @@ func (g *Gate) authorized(r *http.Request) bool {
 	return false
 }
 
-// HostAllowed 只接受回环 Host，挡住 DNS 重绑定：重绑定后浏览器带来的 Host
-// 是攻击者域名，端口不限（端口协商会换），只看回环名。
+// HostAllowed 接受回环 Host 与局域网模式放行的本机地址，挡住 DNS 重绑定：
+// 重绑定后浏览器带来的 Host 是攻击者域名，端口不限（端口协商会换），白名单
+// 只收字面地址。默认模式白名单为空＝历史行为（仅回环）。
 func HostAllowed(host string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" {
+	name := hostname(host)
+	if name == "" {
 		return false
 	}
-	// IPv6 字面量形如 [::1]:port
-	if strings.HasPrefix(host, "[") {
-		return strings.HasPrefix(host, "[::1]")
-	}
-	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
-	}
-	return host == "127.0.0.1" || host == "localhost"
+	lanMu.Lock()
+	_, extra := extraHosts[name]
+	lanMu.Unlock()
+	return extra || IsLoopbackHost(name)
 }
 
 // OriginAllowed 请求来源是否属于本应用自身。Cookie 作用域不含端口，跨端口
