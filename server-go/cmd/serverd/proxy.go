@@ -6,15 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"holdexar/server-go/internal/clashkernel"
+	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/jobrun"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/occupancy"
 	"holdexar/server-go/internal/proxypool"
 	"holdexar/server-go/internal/sched"
+	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
 	"holdexar/server-go/internal/updater"
 	"strconv"
@@ -35,6 +38,10 @@ type proxySchedule struct {
 	wake      chan struct{}
 	tick      chan struct{}
 	done      chan struct{}
+	// started 标记 run 已开跑：验收期提前退场时 run 可能从未启动，
+	// 等待方据此直接闭合 done，不死等（见 waitDone）。
+	started  atomic.Bool
+	stopOnce sync.Once
 }
 
 func newProxySchedule(db *sql.DB, gate *store.WriteGate, dataDir, bundleDir string, recorder *jobrun.Recorder, log func(string, ...any)) *proxySchedule {
@@ -80,7 +87,8 @@ func (p *proxySchedule) currentLanes(ctx context.Context) ([]proxypool.CrawlLane
 }
 
 func (p *proxySchedule) run(ctx context.Context, clock *sched.Scheduler) {
-	defer close(p.done)
+	p.started.Store(true)
+	defer p.closeDone()
 	defer func() {
 		if p.pid.Swap(0) != 0 {
 			if err := proxypool.InvalidateCrawlLanes(p.cycle.DataDir); err != nil {
@@ -121,6 +129,66 @@ func (p *proxySchedule) afterCrawl() {
 	if proxypool.RebuildPending() {
 		signalProxy(p.wake)
 	}
+}
+
+func (p *proxySchedule) closeDone() { p.stopOnce.Do(func() { close(p.done) }) }
+
+// maybeRevertToDirect 无可用代理出口时回退默认直连（自动切换的反面对称
+// 动作）。三重护栏：用户显式选过策略不动；只回退依赖代理池的策略
+// （proxy_first/proxy_only）；出口只看稳定事实——未废弃订阅与手动池启用
+// 节点计数，不看节点瞬时存活（体检抖动不该把策略永久打回直连）。
+func maybeRevertToDirect(ctx context.Context, db *sql.DB, gate *store.WriteGate, bus *events.Bus, log func(string, ...any)) bool {
+	switched := false
+	err := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
+		var strategy string
+		var explicit bool
+		if err := conn.QueryRowContext(ctx, `SELECT
+			COALESCE((SELECT json_extract(value_json,'$') FROM app_settings WHERE key='proxy.strategy'),'direct_only'),
+			COALESCE((SELECT json_extract(value_json,'$')=1 FROM app_settings WHERE key='proxy.strategy_explicit'),0)`).
+			Scan(&strategy, &explicit); err != nil {
+			return err
+		}
+		if explicit || (strategy != "proxy_first" && strategy != "proxy_only") {
+			return nil
+		}
+		var liveSubs, enabledPool int
+		if err := conn.QueryRowContext(ctx,
+			`SELECT (SELECT COUNT(*) FROM proxy_subscriptions WHERE deprecated=0),
+			        (SELECT COUNT(*) FROM proxies WHERE enabled=1)`).
+			Scan(&liveSubs, &enabledPool); err != nil {
+			return err
+		}
+		if liveSubs > 0 || enabledPool > 0 {
+			return nil
+		}
+		if err := settings.WriteValue(ctx, conn, "proxy.strategy", "direct_only"); err != nil {
+			return err
+		}
+		switched = true
+		return nil
+	})
+	if err != nil {
+		if ctx.Err() == nil {
+			log("默认代理策略回退未完成：%v", err)
+		}
+		return false
+	}
+	if switched {
+		if bus != nil {
+			bus.Publish("settings.changed", events.KV{Key: "keys", Val: []string{"proxy.strategy"}})
+		}
+		log("无可用代理出口，策略已回退直连")
+	}
+	return switched
+}
+
+// waitDone 等待代理周期退出；run 从未开跑（验收期提前退场）时直接闭合 done。
+func (p *proxySchedule) waitDone() {
+	if p.started.CompareAndSwap(false, true) {
+		p.closeDone()
+		return
+	}
+	<-p.done
 }
 
 func (p *proxySchedule) runCycle(ctx context.Context, clock *sched.Scheduler) (map[string]any, error) {
@@ -230,5 +298,17 @@ func updateChannels(schedule *proxySchedule) func() []updater.Channel {
 		}
 		channels = append(channels, updater.Channel{Label: "直连"})
 		return channels
+	}
+}
+
+// subscriptionKernelProxy 订阅内核混合口借道通道（对齐 Python
+// default_kernel_proxy：入口没在听不交假通道；仅作订阅获取第二通道）。
+func subscriptionKernelProxy(kernel *clashkernel.Runtime) func(ctx context.Context) string {
+	return func(ctx context.Context) string {
+		status := kernel.Status()
+		if status.Running && status.Port > 0 && clashkernel.PortListening(status.Port) {
+			return fmt.Sprintf("http://127.0.0.1:%d", status.Port)
+		}
+		return ""
 	}
 }

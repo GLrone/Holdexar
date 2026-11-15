@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -27,9 +28,12 @@ import (
 	"holdexar/server-go/internal/bills"
 	"holdexar/server-go/internal/boards"
 	"holdexar/server-go/internal/bundles"
+	"holdexar/server-go/internal/clashkernel"
+	"holdexar/server-go/internal/clashservice"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/contentsched"
 	"holdexar/server-go/internal/crawl"
+	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/devwatch"
 	"holdexar/server-go/internal/epicfree"
 	"holdexar/server-go/internal/events"
@@ -38,7 +42,10 @@ import (
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/httpapi"
 	"holdexar/server-go/internal/humblechoice"
+	"holdexar/server-go/internal/instance"
 	"holdexar/server-go/internal/jobrun"
+	"holdexar/server-go/internal/logredact"
+	"holdexar/server-go/internal/metadata"
 	"holdexar/server-go/internal/middleware"
 	"holdexar/server-go/internal/migration"
 	"holdexar/server-go/internal/miniseed"
@@ -50,6 +57,7 @@ import (
 	"holdexar/server-go/internal/plugins"
 	"holdexar/server-go/internal/proxypool"
 	"holdexar/server-go/internal/rates"
+	"holdexar/server-go/internal/redeem"
 	"holdexar/server-go/internal/regions"
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/secretbox"
@@ -64,6 +72,17 @@ import (
 
 var restartRequested atomic.Bool
 
+// processStartedAt 进程启动锚点：收尸只认上一进程遗留的未终态运行，
+// 开门后新建的是活运行不得误收敛。
+var processStartedAt = time.Now()
+
+// injectedPassphrase 服务器场景的口令免交互注入源：HOLDEXAR_PASSPHRASE
+// （systemd 部署经 EnvironmentFile=/etc/holdexar/holdexar.env 0600 下发）。
+// 未设置返回空串＝无免交互通道，凭据保持锁定（可在设置页手动解锁）。
+func injectedPassphrase() string {
+	return strings.TrimSpace(os.Getenv("HOLDEXAR_PASSPHRASE"))
+}
+
 func main() {
 	// 恢复换库后的重启交棒：清理级联走完（含代理子进程回收）后以 75 退出，
 	// 窗口宿主/开发监视据此重启服务（跨进程契约，见 internal/systemx/data.go）。
@@ -72,7 +91,7 @@ func main() {
 			os.Exit(systemx.RestartExitCode)
 		}
 	}()
-	addr := flag.String("addr", "127.0.0.1:28765", "监听地址")
+	addr := flag.String("addr", config.ServerAddr(), "监听地址（默认回环；HOLDEXAR_HOST 可回退绑定面）")
 	dataDirFlag := flag.String("data-dir", "", "显式数据目录，跳过自动判定")
 	devSession := flag.Bool("dev-session", false, "开放开发态会话发放通道（发行版无此入口）")
 	mcpEnabled := flag.Bool("mcp", false, "启用 MCP 面（等价环境变量 HOLDEXAR_MCP=1）")
@@ -98,12 +117,14 @@ func main() {
 	// 日志接线点：stderr 之外同步写入环形缓冲（日志页 SSE 的回放事实源）。
 	// 行格式对齐 py HumanFormatter：HH:MM:SS [结果词] 模块中文名 · 主句——
 	// 前端日志页按行首结果词分色（失败/严重→error，注意→warning，其余 info）；
-	// 模块中文名服务端面统一「服务端」。
+	// 模块中文名服务端面统一「服务端」。出口统一过脱敏链（Ring 写入前另有
+	// 同链兜底，双过幂等）。
 	bus := events.NewBus()
 	ring := eventstream.NewRing(2000)
 	logLineAt := func(level string, format string, args ...any) {
 		msg := fmt.Sprintf(format, args...)
 		line := time.Now().Format("15:04:05") + " [" + level + "] 服务端 · " + msg
+		line = logredact.Redact(line)
 		fmt.Fprintln(os.Stderr, line)
 		ring.Write(line)
 	}
@@ -118,6 +139,13 @@ func main() {
 		logFail("%v", err)
 		os.Exit(1)
 	}
+	// 生产单实例：同一数据目录只允许一个后台服务进程（先于升级验收授权）。
+	releaseInstance, err := instance.AcquireProductionLock(dataDir)
+	if err != nil {
+		logFail("%v", err)
+		os.Exit(1)
+	}
+	defer releaseInstance()
 	distDir, err := config.WebDistDir()
 	if err != nil {
 		logFail("%v", err)
@@ -142,6 +170,51 @@ func main() {
 	writeGate := store.NewWriteGate(db, dbPath)
 	backgroundCtx, stopBackground := context.WithCancel(lifetime)
 	defer stopBackground()
+	// 局域网访问模式初始化：库就绪后、路由装配前（Python init_db 后同位）；
+	// 失败按关闭处理（fail-closed），不影响正常启动。
+	initLANAccess(backgroundCtx, db, writeGate, dataDir, logLine, logFail)
+	// 密钥免交互注入（服务器场景）：HOLDEXAR_PASSPHRASE_FILE（systemd
+	// LoadCredential 挂载路径，文件内容即口令）优先于 HOLDEXAR_PASSPHRASE。
+	// 解锁失败不阻断启动（fail-closed：应用照常运行、凭据面保持锁定，
+	// 可在设置页手动解锁）；仅口令模式有意义，其余模式静默跳过。
+	if injected := injectedPassphrase(); injected != "" {
+		if mode, _ := secretbox.ModeOf(dataDir); mode == secretbox.ModePassphrase {
+			unlocked, err := secretbox.Unlock(dataDir, injected)
+			switch {
+			case err != nil:
+				logLine("密钥自动解锁失败，凭据保持锁定 │ 原因=%v", err)
+			case unlocked:
+				logLine("密钥已解锁（凭据注入通道）")
+			default:
+				logLine("密钥自动解锁未通过（口令不符），凭据保持锁定")
+			}
+		}
+	}
+	// 换钥续跑：崩溃遗留的过渡记录在此收尾（Python 同语义：无验收令牌立即
+	// 续跑；验收期等验收提交后再跑，不在受保护窗口动库）。失败只记日志
+	// 保留过渡记录，启动不中断。
+	resumeKeys := func() {
+		resume, err := secretbox.ResumePendingMigration(backgroundCtx, writeGate, dataDir, "")
+		if err != nil {
+			logFail("密钥换装收尾失败，保留过渡记录待下次续跑：%v", err)
+			return
+		}
+		if !resume.Resumed {
+			if resume.Reason == "过渡记录需要口令解锁" {
+				logLine("存在未完成的密钥换装，需解锁后才能继续")
+			}
+			return
+		}
+		migrated := resume.Counts.AccountCookies + resume.Counts.SettingSecrets + resume.Counts.Subscriptions + resume.Counts.Snapshots + resume.Counts.ProxyCredentials
+		if migrated > 0 {
+			logLine("上次中断的密钥换装已续完 │ 迁移条数=%d", migrated)
+		} else {
+			logLine("上次密钥换装未生效，已清理过渡记录")
+		}
+	}
+	if !updateguard.Active() {
+		resumeKeys()
+	}
 	jobRecorder := jobrun.New(db, writeGate, time.Now, logLine)
 	walAutomation := &contentsched.Automation{
 		Job: "wal_truncate", Label: "数据库日志收缩", Daily: sched.DailyTrigger{Hour: 4, Minute: 30},
@@ -164,6 +237,12 @@ func main() {
 		os.Exit(1)
 	}
 	proxySchedule := newProxySchedule(db, writeGate, dataDir, filepath.Join(installRoot, "assets", "clash"), jobRecorder, logLine)
+	// 订阅内核：与池内核结构性分离的第二个 Runtime（共用 exe，-d 工作目录不同——
+	// 订阅=data/clash，池=data/proxypool；共用实例会让一次池重建停掉订阅内核）
+	subKernel := clashkernel.Runtime{}
+	clashSvc := clashservice.New(db, writeGate, &subKernel, filepath.Join(installRoot, "assets", "clash"), dataDir)
+	clashSvc.Logf = logLine
+	clashSvc.Channels = func() []proxypool.Channel { return proxySchedule.subscriptionChannels(context.Background()) }
 	seedAutomation := &contentsched.Automation{
 		Job: miniseed.Job, Label: "基础资料同步", Interval: 30 * time.Minute, FirstAfter: 25 * time.Second,
 		Recorder: jobRecorder, Log: logLine,
@@ -200,12 +279,29 @@ func main() {
 	proxySchedule.cycle.Bus = bus
 	subscriptionSchedule := newSubscriptionSchedule(proxySchedule)
 	rateService := rates.NewService(db, writeGate, rates.ServiceOptions{Log: logLine, Recorder: jobRecorder, Revalue: bills.RevalueAffected})
-	boardClient := boards.New(boards.Options{Log: logLine, Proxy: netenv.ResolveSystemProxy})
+	// Steam 出站走策略引擎（GET /proxies/resolve 同链）：裸系统代理解析在
+	// 系统代理关闭时直连 Steam，续期二跳（store/community 域）必败。
+	kernelPort := func() (bool, int) {
+		status := subKernel.Status()
+		return status.Running, status.Port
+	}
+	steamProxy := func(ctx context.Context) (string, error) {
+		proxyURL, _, err := proxypool.ResolveStrategyProxy(ctx, db, writeGate, dataDir, kernelPort)
+		if err != nil {
+			return "", nil
+		}
+		return proxyURL, nil
+	}
+	boardClient := boards.New(boards.Options{Log: logLine, Proxy: steamProxy})
 	monitoringService := monitoring.New(db, writeGate)
 	monitoringService.Log = logLine
+	bundleSvc := bundles.NewService(db, writeGate, monitoringService)
+	bundleSvc.LoadOverrides = func() (map[string][]int64, []string) { return derived.LoadSeriesOverrides(dataDir) }
+	bundleSvc.Logf = logLine
+	derived.RefreshBundleSortCache = bundleSvc.RefreshSortCacheHook
 	pool := wishlist.NewPool(db, writeGate, monitoringService)
 	pool.Log = logLine
-	steamClient := account.NewSteamClient(account.SteamOptions{Proxy: netenv.ResolveSystemProxy})
+	steamClient := account.NewSteamClient(account.SteamOptions{Proxy: steamProxy})
 	steamAPIKey := func(ctx context.Context) (string, error) {
 		return settings.ReadSecret(ctx, db, dataDir, "account.steam_api_key")
 	}
@@ -213,14 +309,21 @@ func main() {
 	var familyService *family.Service
 	var billService *bills.Service
 	var steamLists *wishlist.Steam
+	var redeemService *redeem.Service
 	accountService := account.NewService(backgroundCtx, db, writeGate, account.ServiceOptions{DataDir: dataDir, Steam: steamClient, Recorder: jobRecorder, Log: logLine, Pool: pool, APIKey: steamAPIKey, Summaries: func(ctx context.Context, ids []string, key string) (map[string]wishlist.PlayerSummary, error) {
 		return steamLists.PlayerSummaries(ctx, "", ids, key)
+	}, RedeemUsed: func(steamID string) int {
+		if redeemService == nil {
+			return 0
+		}
+		return redeemService.AccountUsage(steamID)
 	}, AfterBind: func(sid string) {
 		wishlistService.RequestSync(sid, true)
 		familyService.RequestSync(sid)
 		billService.RequestSync(sid)
 	}})
 	billService = bills.NewService(backgroundCtx, db, writeGate, bills.SyncOptions{Accounts: accountService, Steam: steamClient, Recorder: jobRecorder, Log: logLine})
+	redeemService = redeem.NewService(db, writeGate, redeem.ServiceOptions{Accounts: accountService, Proxy: steamProxy, Log: logLine})
 	if _, err := accountService.MigrateLegacyKV(backgroundCtx); err != nil {
 		logFail("旧账号设置接管未完成，原数据已保留：%v", err)
 	}
@@ -231,6 +334,25 @@ func main() {
 		logFail("设置凭据封存未完成，保留兼容读取：%v", err)
 	} else if count > 0 {
 		logLine("存量设置凭据已加密保存 │ 条数=%d", count)
+	}
+	// 无可用代理出口时回退默认直连（降级提示走注意级）。
+	maybeRevertToDirect(backgroundCtx, db, writeGate, bus, func(format string, args ...any) {
+		logLineAt("注意", format, args...)
+	})
+	// 节点凭证明文落盘约束：权限收紧（Windows 走用户目录 ACL，no-op）+
+	// 崩溃残留清扫（此刻内核尚未启动，运行配置可安全清除——总是从原文
+	// 缓存重渲染）。
+	if tightened := clashservice.TightenAll(dataDir); tightened > 0 {
+		logLine("节点凭证明文权限已收紧 │ 文件数=%d", tightened)
+	}
+	if swept := clashservice.SweepTransient(dataDir); swept > 0 {
+		logLine("已清理可重建的节点配置明文件 │ 条数=%d", swept)
+	}
+	// 启动链收尸：重启前遗留的未终态运行一律收敛（失败不中断启动）。
+	if converged, err := agent.ReconcileOrphanRuns(backgroundCtx, db, writeGate, processStartedAt); err != nil {
+		logFail("启动收尸暂未完成：%v", err)
+	} else if converged > 0 {
+		logLine("启动收尸：%d 条重启前遗留的未完成运行已收敛为已取消", converged)
 	}
 	var priceRuntime *crawl.Runtime
 	steamEvents := steamevents.New(db, writeGate, steamevents.Options{DataDir: dataDir, Recorder: jobRecorder, Log: logLine})
@@ -296,7 +418,7 @@ func main() {
 	})
 	deliveryService = notifications.NewDelivery(db, writeGate, notifications.DeliveryOptions{Plugins: pluginManager, DataDir: dataDir, Log: logLine, Watched: func(ctx context.Context) ([]int64, error) { return priceRuntime.PoolAppIDs(ctx) }})
 	dispatchPending := func(ctx context.Context) error { _, e := deliveryService.Dispatch(ctx, nil); return e }
-	alertService := alerts.New(db, writeGate, alerts.Options{Log: logLine, Dispatch: dispatchPending})
+	alertService := alerts.New(db, writeGate, alerts.Options{Log: logLine, Dispatch: dispatchPending, Proxy: steamProxy})
 	backupService := backup.New(db, dbPath, time.Now, writeGate)
 	backupAutomation := &contentsched.Automation{
 		Job: backup.Job, Label: "自动备份", Interval: 24 * time.Hour, FirstAfter: 5 * time.Minute,
@@ -371,9 +493,13 @@ func main() {
 		}
 		return result, nil
 	}}
-	priceRuntime = crawl.New(db, writeGate, bus, crawl.Options{Board: boardClient.Get, Recorder: jobRecorder, Log: logLine, EventKey: steamEvents.Windows.KeyAt, ProxyLanes: proxySchedule.Lanes, NetworkBlocked: netenv.NetworkTakenOver, AfterRepair: dispatchPending, AfterCycle: func(ctx context.Context, id int64) error {
+	priceRuntime = crawl.New(db, writeGate, bus, crawl.Options{Board: boardClient.Get, Recorder: jobRecorder, Log: logLine, EventKey: steamEvents.Windows.KeyAt, ProxyLanes: proxySchedule.Lanes, NetworkBlocked: netenv.NetworkTakenOver, DataDir: dataDir, AfterRepair: dispatchPending, AfterCycle: func(ctx context.Context, id int64) error {
 		_, sendErr := deliveryService.Dispatch(ctx, &id)
 		_, featuredErr := alertService.CheckFeatured(ctx, nil)
+		// 主轮链尾捆绑包刷新：异常只记日志不外溢（对齐 Python 链尾 try/except）
+		if _, bundleErr := bundleSvc.RefreshWithEnqueue(ctx); bundleErr != nil {
+			logLine("捆绑包链尾刷新未完成 │ 原因=%v", bundleErr)
+		}
 		return errors.Join(sendErr, featuredErr)
 	}, AfterIdle: func(stopped bool) { wishlistService.PricesIdle(stopped) }, AfterJob: func(ctx context.Context, ids []int64) error {
 		_, alertErr := alertService.CheckAppIDs(ctx, ids)
@@ -381,6 +507,11 @@ func main() {
 		_, releaseErr := pool.ReleaseFree(ctx, ids)
 		return errors.Join(releaseErr, alertErr, featuredErr)
 	}})
+	bundleSvc.Discovery = priceRuntime.RunDiscovery
+	// 目录导入分类出口注入（games 包；经注入避免 crawl→games→wishlist 生产环）
+	priceRuntime.ImportAppids = func(ctx context.Context, appids []any) (map[string]any, error) {
+		return games.ImportAppids(ctx, db, appids)
+	}
 	jobRetention := &contentsched.Automation{
 		Job: jobrun.RetentionJob, Label: "运行记录清理", Daily: sched.DailyTrigger{Hour: 4, Minute: 36},
 		Recorder: jobRecorder, Log: logLine,
@@ -416,7 +547,7 @@ func main() {
 			return summary, err
 		},
 	}
-	humble := humblechoice.New(db, writeGate, humblechoice.Options{Crawl: priceRuntime.RunHumbleBackfill, AutoPrice: priceRuntime.AutoEnabled, Log: logLine})
+	humble := humblechoice.New(db, writeGate, humblechoice.Options{Crawl: priceRuntime.RunHumbleBackfill, AutoPrice: priceRuntime.AutoEnabled, Log: logLine, Proxy: clashSvc.ResolveOutboundProxy})
 	humbleService = humble
 	humbleAutomation := &contentsched.Automation{Job: "hb_choice", Label: "Humble Choice 每月合集", Field: "hb_schedule", Key: settings.HumbleChoiceScheduleKey, DB: db, Recorder: jobRecorder, Log: logLine, Run: func(ctx context.Context) (map[string]any, error) {
 		result, err := humble.Run(ctx, false)
@@ -437,7 +568,7 @@ func main() {
 		_, e := priceRuntime.StartJob(backgroundCtx, "appids", ids, nil, "pool_add", nil)
 		return e == nil, e
 	}
-	steamLists = wishlist.NewSteam(wishlist.SteamOptions{Proxy: netenv.ResolveSystemProxy, Token: accountService.OwnedToken, APIKey: steamAPIKey})
+	steamLists = wishlist.NewSteam(wishlist.SteamOptions{Proxy: steamProxy, Token: accountService.OwnedToken, APIKey: steamAPIKey})
 	wishlistService = wishlist.NewService(backgroundCtx, pool, wishlist.ServiceOptions{Steam: steamLists, Persona: steamClient.ProfilePreview, Avatar: account.NormalizeAvatar, Crawl: func(_ context.Context, wished, owned []int64) (bool, error) {
 		return priceRuntime.StartAccountDiscovery(backgroundCtx, wished, owned)
 	}, CrawlBusy: func(e error) bool { return errors.Is(e, crawl.ErrBusy) || errors.Is(e, occupancy.ErrCrawlerBusy) }, Recorder: jobRecorder, Log: logLine})
@@ -450,7 +581,7 @@ func main() {
 	challengeService := achievements.ChallengeService{DB: db, Gate: writeGate}
 	achievementService = achievements.NewSync(backgroundCtx, db, writeGate, achievements.SyncOptions{
 		APIKey: steamAPIKey, Token: accountService.BoundToken, HasToken: accountService.HasStoredToken,
-		Shared: familyService.AchievementCandidates, Recorder: jobRecorder, Log: logLine,
+		Proxy: steamProxy, Shared: familyService.AchievementCandidates, Recorder: jobRecorder, Log: logLine,
 		Award: func(ctx context.Context, sid string) error {
 			return errors.Join(levelService.AwardSync(ctx, sid), challengeService.Recompute(ctx, sid))
 		},
@@ -562,7 +693,7 @@ func main() {
 		// 失败日志——任务停止交给 stopBackground，代理子进程照常回收
 		drain := !restartRequested.Load()
 		if !drain {
-			<-proxySchedule.done
+			proxySchedule.waitDone()
 			return
 		}
 		if err := epicAutomation.Close(ctx); err != nil {
@@ -625,7 +756,7 @@ func main() {
 		if err := priceRuntime.Close(ctx); err != nil {
 			logFail("价格任务退出未完成：%v", err)
 		}
-		<-proxySchedule.done
+		proxySchedule.waitDone()
 		if err := deliveryService.Close(ctx); err != nil {
 			logFail("提醒发送退出未完成：%v", err)
 		}
@@ -641,10 +772,12 @@ func main() {
 		Register: func(mux *http.ServeMux) {
 			monitoringService.Register(mux)
 			pool.Register(mux)
+			registerRecovery(mux, accountService, db, gate, logLine)
 			accountService.Register(mux)
 			wishlistService.Register(mux)
 			familyService.Register(mux)
 			billService.Register(mux)
+			redeemService.Register(mux)
 			achievementService.Register(mux)
 			achievementReader.Register(mux)
 			achievementReader.RegisterCareer(mux)
@@ -655,9 +788,20 @@ func main() {
 			epicService.Register(mux)
 			humble.Register(mux)
 			bundleCounts.Register(mux)
+			// 派生列日切换维护：bundles/games 读取面入口与补抓拍点共用
+			// （版本一致零重算；系列覆盖表闸外装填）
+			maintainDerived := func(ctx context.Context) {
+				overrides, order := derived.LoadSeriesOverrides(dataDir)
+				if err := derived.MaintainDerived(ctx, db, writeGate, time.Now(), overrides, order); err != nil {
+					logLine("派生列日切换维护未完成：%v", err)
+				}
+			}
+			bundleSvc.Register(mux, bundles.RegisterOptions{Accounting: func(ctx context.Context, job string, body func() (map[string]any, error)) (map[string]any, error) {
+				return jobRecorder.RunManual(ctx, job, "manual_refresh_button", body)
+			}, Maintain: maintainDerived})
 			alertService.Register(mux)
 			backupService.Register(mux)
-			systemx.RegisterData(mux, db, writeGate, dataDir, backupService, func() {
+			systemx.RegisterData(mux, db, writeGate, gate, dataDir, backupService, func() {
 				restartRequested.Store(true)
 				stopLifetime()
 			})
@@ -665,15 +809,70 @@ func main() {
 			regions.Register(mux, db, regions.Options{Gate: writeGate, Settings: settings.Options{Bus: bus}})
 			rates.Register(mux, db, rateService)
 			historyBackfill := games.NewHistoryBackfill(backgroundCtx, db, writeGate, logLine)
-			games.Register(mux, db, historyBackfill)
+			historyBackfill.SetSource(&pluginHistorySource{manager: pluginManager})
+			games.Register(mux, db, historyBackfill, games.Options{
+				BoardGet:        boardClient.Get,
+				Proxy:           steamProxy,
+				MaintainDerived: maintainDerived,
+				Writes: &games.WriteDeps{
+					Gate:    writeGate,
+					Monitor: monitoringService,
+					// 爬取派发挂进程级 lifetime（与 crawl 路由同口径）：
+					// 请求断开不中断后台任务，入参 ctx 不透传。
+					StartJob: func(_ context.Context, scope string, ids []int64, kind string) (map[string]any, error) {
+						return priceRuntime.StartJob(backgroundCtx, scope, ids, nil, kind, nil)
+					},
+					Log: logLine,
+				},
+			})
 			systemx.Register(mux, db, func(ctx context.Context) (crawl.Readiness, error) {
 				return priceRuntime.Readiness(ctx, proxySchedule.currentLanes)
 			})
+			// 三诊断面（write-scheduler/logs/diagnostics）：日志环与订阅内核
+			// 运行态在此注入。
+			systemx.RegisterDiagnostics(mux, db, systemx.DiagnosticsDeps{
+				Gate:         writeGate,
+				Ring:         ring,
+				ClashRunning: func() bool { return subKernel.Status().Running },
+				ClashSubID:   clashSvc.SelectedSubID,
+			})
+			metadata.Register(mux, db, writeGate)
 			proxypool.RegisterRuns(mux, db)
 			proxypool.RegisterProxyList(mux, db, dataDir)
+			proxypool.RegisterUserProxyRoutes(mux, db, writeGate, dataDir, proxypool.UserProxyOptions{
+				KernelStatus: func() (bool, int) {
+					status := subKernel.Status()
+					return status.Running, status.Port
+				},
+			})
 			manualHealth.Register(mux)
-			proxypool.RegisterSubscriptionRoutes(mux, db, writeGate, dataDir, subscriptionSchedule.Refresh, proxySchedule.requestRebuild)
-			systemx.RegisterSession(mux, gate, *devSession)
+			proxypool.RegisterSubscriptionRoutes(mux, db, writeGate, dataDir, proxypool.SubscriptionRouteOptions{
+				Refresh:   subscriptionSchedule.Refresh,
+				OnChanged: proxySchedule.requestRebuild,
+				BeforeAdd: func(ctx context.Context, _ string) error { return clashSvc.EnsureKernelForAdd(ctx) },
+				AfterAdd:  clashSvc.EffectuateNewSubscription,
+				// 删除订阅收尾链：缓存原文与运行配置随行回收（面板名/流量头
+				// Go 侧入库，无 meta sidecar）；删到无出口回退直连。
+				AfterDelete: func(_ context.Context, subID int64, _ string) {
+					cache := clashservice.SubscriptionConfigPath(dataDir, subID)
+					_ = os.Remove(cache)
+					_ = os.Remove(strings.TrimSuffix(cache, ".yaml") + ".runtime.yaml")
+				},
+				RevertToDirect: func(ctx context.Context) {
+					maybeRevertToDirect(ctx, db, writeGate, bus, func(format string, args ...any) {
+						logLineAt("注意", format, args...)
+					})
+				},
+				Channels:    proxySchedule.subscriptionChannels,
+				KernelProxy: subscriptionKernelProxy(&subKernel),
+			})
+			clashSvc.Register(mux)
+			systemx.RegisterSession(mux, gate, *devSession, systemx.UnlockDeps{
+				Enabled:  access.LANEnabled,
+				Password: unlockPasswordResolver(db, writeGate, dataDir),
+				Fail:     access.RecordUnlockFailure,
+				Success:  access.RecordUnlockSuccess,
+			})
 			mux.HandleFunc("POST /api/v1/system/update-ready", updateguard.HandleUpdateReady)
 			updater.Register(mux, updater.Deps{
 				DataDir:     dataDir,
@@ -693,14 +892,28 @@ func main() {
 			notifications.Register(mux, db, notifications.Options{Gate: writeGate, Bus: bus, Delivery: deliveryService})
 			pluginManager.Register(mux)
 			eventstream.Register(mux, bus, ring)
+			agentDeps := &agent.Deps{
+				LogRing:      ring,
+				WriteGate:    writeGate,
+				ResolveProxy: clashSvc.ResolveOutboundProxy,
+				ImportAppids: func(ctx context.Context, appids []any) (map[string]any, error) {
+					return games.ImportAppids(ctx, db, appids)
+				},
+				AppIDFreshness: priceRuntime.AppIDFreshness,
+			}
 			if err := agent.Register(mux, db, gate, agent.Options{
 				DataDir:       dataDir,
 				EnabledByFlag: *mcpEnabled,
 				Log:           logLine,
+				// 工具共享依赖面：日志环（read_logs）、写闸（write_gate_status）、
+				// 出站代理解析（search_steam/web_search）、目录导入与对象新鲜度。
+				Deps: agentDeps,
 			}); err != nil {
 				logFail("%v", err)
 				os.Exit(1)
 			}
+			// agent 读面五端点（tasks/runs/events/cancel）：与 MCP MountPath 共存。
+			agent.RegisterHTTPRead(mux, db, agentDeps)
 			// mcp.enabled 运行时重载与运行态投影：函数字段注入，settings 不反向依赖 agent
 			settings.OnMCPEnabledWrite = agent.Reapply
 			settings.MCPStatus = agent.MCPStatus
@@ -759,7 +972,7 @@ func main() {
 					}
 					return nil
 				},
-			}, pilotToolBridge(db, mux, epicService, monitoringService))
+			}, pilotToolBridge(db, writeGate, mux, epicService, monitoringService, redeemService))
 			pilotService.SetGate(writeGate)
 			pilotService.SetToolSpecs(func() []map[string]any {
 				return agentToolSpecs()
@@ -772,6 +985,13 @@ func main() {
 		},
 	}
 
+	// 启动链尾：调度器与代理周期只在验收流程收尾（或无验收）后开跑——
+	// Python 验收窗口期 HTTP 已开但零调度，此处对齐。EnsureClashRunning
+	// 不写库、失败不影响服务，保留原位（登记为已接受差异）。
+	startupTail := func() {
+		go proxySchedule.run(backgroundCtx, scheduler)
+		scheduler.Start()
+	}
 	if updateguard.Active() {
 		// 验收期写保护：全库写入闸暂停，直到验收提交（事务 dataAccepted 轮询）
 		writeGate.PauseWrites(lifetime)
@@ -789,6 +1009,8 @@ func main() {
 							updateguard.ClearProtection()
 							server.UpdateWriteProtected = false
 							logLine("更新验收已提交，写入保护解除")
+							resumeKeys()
+							startupTail()
 							return
 						}
 					}
@@ -840,8 +1062,12 @@ func main() {
 		logLine("引导票据就绪：%s", *bootstrapFileFlag)
 	}
 	occupancy.OnCrawlEnd = proxySchedule.afterCrawl
-	go proxySchedule.run(backgroundCtx, scheduler)
-	scheduler.Start()
+	if !updateguard.Active() {
+		startupTail()
+	}
+	// Clash 订阅内核自启：按自启开关与本地订阅快照拉起（对齐启动链尾
+	// ensure_clash_running；snapshot_only 不在线拉取，失败不影响服务）
+	go clashSvc.EnsureClashRunning(backgroundCtx, true)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -853,7 +1079,7 @@ func main() {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logFail("服务启动失败：%v", err)
 			stopBackground()
-			<-proxySchedule.done
+			proxySchedule.waitDone()
 			os.Exit(1)
 		}
 	case <-lifetime.Done():
@@ -863,7 +1089,7 @@ func main() {
 		if err := httpServer.Shutdown(ctx); err != nil {
 			logLine("服务关闭未完成：%v", err)
 			stopBackground()
-			<-proxySchedule.done
+			proxySchedule.waitDone()
 			os.Exit(1)
 		}
 	}
