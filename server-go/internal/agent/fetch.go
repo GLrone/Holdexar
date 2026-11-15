@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -21,6 +22,23 @@ func newMuxFetcher(mux *http.ServeMux) muxFetcher {
 		if err != nil {
 			return 0, nil, err
 		}
+		rec := &recorder{header: http.Header{}}
+		mux.ServeHTTP(rec, req)
+		return rec.status, rec.body.Bytes(), nil
+	}
+}
+
+// muxPoster 经主 mux 进程内转发 POST：与 muxFetcher 同一 mux 基址与超时口径
+// （超时由 ctx 与执行器预算承载），端点仍走各自处理器，不产生第二套口径。
+type muxPoster func(ctx context.Context, path string, body []byte) (int, []byte, error)
+
+func newMuxPoster(mux *http.ServeMux) muxPoster {
+	return func(ctx context.Context, path string, body []byte) (int, []byte, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://agent.internal"+path, bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
 		rec := &recorder{header: http.Header{}}
 		mux.ServeHTTP(rec, req)
 		return rec.status, rec.body.Bytes(), nil
@@ -64,6 +82,32 @@ func (c *CallContext) getJSON(path string, out any) error {
 		return err
 	}
 	return nil
+}
+
+// postJSON 进程内 POST 并解析（同步/刷新类端点通道）：body 序列化为 JSON
+// 请求体，状态码非 200 按带状态码的错误返回（需按 409/400 分支的工具改用
+// c.post 原语自取状态码）。out 为 nil 时跳过解码。
+func (c *CallContext) postJSON(path string, body any, out any) error {
+	if c.post == nil {
+		return errors.New("执行环境未注入 POST 通道")
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	status, respBody, err := c.post(c.Ctx, path, encoded)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("内部请求失败（%d）：%s", status, strings.TrimSpace(string(respBody)))
+	}
+	if out == nil {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(respBody))
+	dec.UseNumber()
+	return dec.Decode(out)
 }
 
 // pyBool Python bool() 语义：None/False/0/空串/空容器为假，其余为真

@@ -10,6 +10,9 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+
+	"holdexar/server-go/internal/eventstream"
+	"holdexar/server-go/internal/store"
 )
 
 // MCP 挂载路径与令牌头；与现网 Python 侧逐字对齐。
@@ -59,6 +62,25 @@ type ToolSpec struct {
 // 回灌，绝不终结调用。
 type HandlerFunc func(c *CallContext) (*ToolResult, error)
 
+// Deps MCP 工具共享依赖面（serverd 经 Options 注入，CallContext 透传给全部
+// handler）。零值字段 = 该件未装配，handler 走不可用语义（不得 panic）：
+// LogRing nil = 运行日志不可读；WriteGate nil = 写闸诊断不可用；
+// ResolveProxy nil = 出站一律直连；ImportAppids / AppIDFreshness nil = 对应
+// 工具回 not available 形状。
+type Deps struct {
+	// LogRing 运行日志环形缓冲（read_logs 快照事实源，Ring.Snapshot(limit)）。
+	LogRing *eventstream.Ring
+	// WriteGate 单写者闸句柄（write_gate_status 诊断快照）。
+	WriteGate *store.WriteGate
+	// ResolveProxy 出站代理解析（search_steam/web_search 等出网工具）：
+	// ok=true 用 proxyURL，ok=false 直连；实现方自行回落，不返回错误。
+	ResolveProxy func(ctx context.Context) (proxyURL string, ok bool)
+	// ImportAppids 目录导入分类（games.ImportAppids 装配形态）。
+	ImportAppids func(ctx context.Context, appids []any) (map[string]any, error)
+	// AppIDFreshness 对象级价格新鲜度（crawl Runtime.AppIDFreshness 装配形态）。
+	AppIDFreshness func(ctx context.Context, appids []int64) ([]map[string]any, error)
+}
+
 // CallContext 单次工具调用的执行环境。
 type CallContext struct {
 	Ctx context.Context
@@ -66,8 +88,12 @@ type CallContext struct {
 	Args map[string]any
 	// fetch 经主 mux 进程内调用已迁移只读端点（GET，返回状态码与响应体）。
 	fetch func(ctx context.Context, path string) (int, []byte, error)
+	// post 经主 mux 进程内转发 POST（同步/刷新类端点通道）。
+	post func(ctx context.Context, path string, body []byte) (int, []byte, error)
 	// db 业务库句柄（注册表自述类小查询直接走 SQL）。
 	db *sql.DB
+	// deps 共享依赖面（D2/D3/D4/D7/D8 注入件）；直建 CallContext 的测试为 nil。
+	deps *Deps
 }
 
 // ToolResult 归一化工具结果：Data 的 kind 键决定终态

@@ -27,13 +27,18 @@ type Options struct {
 	EnabledByFlag bool
 	// Log 非致命事件出口（MCP 启用失败不拖垮主程序，与现网同语义）；可空。
 	Log func(format string, args ...any)
+	// Deps 工具共享依赖面（D2 日志环/D3 写闸/D4 出站代理/D7 目录导入/D8
+	// 新鲜度）；nil = 全部按不可用语义处理。
+	Deps *Deps
 }
 
 // Surface MCP 面运行态：协议服务器、令牌与启用态的唯一持有者。
 type Surface struct {
 	registry *ToolRegistry
 	fetcher  muxFetcher
+	poster   muxPoster
 	db       *sql.DB
+	deps     *Deps
 	handler  http.Handler
 
 	dataDir      string
@@ -57,8 +62,12 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) e
 	if err != nil {
 		return err
 	}
+	deps := opts.Deps
+	if deps == nil {
+		deps = &Deps{}
+	}
 	s := &Surface{
-		registry: registry, fetcher: newMuxFetcher(mux), db: db,
+		registry: registry, fetcher: newMuxFetcher(mux), poster: newMuxPoster(mux), db: db, deps: deps,
 		dataDir: opts.DataDir, logf: opts.Log, forcedByFlag: opts.EnabledByFlag,
 	}
 	Default = s
@@ -289,7 +298,7 @@ func (s *Surface) callHandler(spec *ToolSpec) mcp.ToolHandler {
 				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
 			}, nil
 		}
-		result := Execute(&CallContext{Ctx: ctx, Args: args, fetch: s.fetcher, db: s.db}, spec, false)
+		result := Execute(&CallContext{Ctx: ctx, Args: args, fetch: s.fetcher, post: s.poster, db: s.db, deps: s.deps}, spec, false)
 		payload := newObj()
 		payload.set("status", string(result.Status))
 		for i, k := range result.Data.keys {

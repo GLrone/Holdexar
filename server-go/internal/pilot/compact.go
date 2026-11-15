@@ -166,11 +166,48 @@ func (s *Service) compactIfNeeded(ctx context.Context, state *SessionState, cfg 
 		if s.deps.DB != nil {
 			exCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			agent.ExtractPreferencesFromText(exCtx, s.deps.DB, text, fmt.Sprintf("compact:%s", state.Sid))
+			agent.ExtractPreferencesFromText(exCtx, s.deps.DB, s.gate, text, fmt.Sprintf("compact:%s", state.Sid))
 		}
 		return true, nil
 	}
 	return false, nil
+}
+
+// CompactNow 手动压缩（Python compact_session_now 同构）：不看预算闸，只要
+// 蒸得动就蒸；成功重置该会话压缩连败熔断。机器码响应与 Python 逐字对齐，
+// 异常路径由路由层兜 502。
+func (s *Service) CompactNow(ctx context.Context, state *SessionState, cfg ConfigPayload) map[string]any {
+	plan := compactPlan(state)
+	if plan == nil {
+		return map[string]any{"ok": false, "reason": "nothing_to_distill"}
+	}
+	preTokens := EstimateMessages(fullView(state, "", reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil))
+	baseURL := EffectiveBaseURL(cfg.Protocol, cfg.BaseURL)
+	apiKey := s.activeAPIKey(cfg)
+	text, through, usage, err := s.compact(ctx, state, cfg, cfg.Protocol, baseURL, apiKey, cfg.Model, SystemPrompt)
+	if err != nil {
+		return map[string]any{"ok": false, "reason": "compact_failed"}
+	}
+	// 先估后账：压缩后体量必须比压缩前小，否则拒绝存档
+	state.Summary = text
+	state.SummaryThrough = through
+	postTokens := EstimateMessages(fullView(state, "", reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil))
+	state.Summary = ""
+	state.SummaryThrough = 0
+	if postTokens >= preTokens {
+		return map[string]any{"ok": false, "reason": "not_smaller"}
+	}
+	if usage[0] != 0 || usage[1] != 0 {
+		s.AddUsage(ctx, usage[0], usage[1])
+	}
+	if s.GetStore().AppendSummary(state.Sid, text, through, "manual", preTokens, postTokens) {
+		state.Summary = text
+		state.SummaryThrough = through
+		delete(compactFailures, state.Sid)
+		return map[string]any{"ok": true, "summary_through": through, "turn_total": len(state.Turns),
+			"pre_tokens": preTokens, "post_tokens": postTokens}
+	}
+	return map[string]any{"ok": false, "reason": "compact_failed"}
 }
 
 // reqAppID 从配置取当前 appid（压缩时通常无上下文 appid）。

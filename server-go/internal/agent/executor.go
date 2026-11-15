@@ -20,6 +20,9 @@ func Execute(cctx *CallContext, spec *ToolSpec, guarded bool) *ToolResult {
 	if cctx.fetch == nil {
 		cctx.fetch = noFetch
 	}
+	if cctx.post == nil {
+		cctx.post = noPost
+	}
 	type outcome struct {
 		res *ToolResult
 	}
@@ -101,5 +104,9 @@ func typeName(cause any) string {
 }
 
 func noFetch(context.Context, string) (int, []byte, error) {
+	return 0, nil, errNoFetch
+}
+
+func noPost(context.Context, string, []byte) (int, []byte, error) {
 	return 0, nil, errNoFetch
 }

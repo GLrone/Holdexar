@@ -14,11 +14,13 @@ import (
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/monitoring"
 	"holdexar/server-go/internal/pilot"
+	"holdexar/server-go/internal/redeem"
+	"holdexar/server-go/internal/store"
 )
 
 // pilotToolBridge 领航员工具执行桥：工具名 → 归一化结果。
 // 核心只读工具直查 Go 域数据（与 agent MCP 面同源），写工具走业务域服务。
-func pilotToolBridge(db *sql.DB, mux *http.ServeMux, epic *epicfree.Service, monitor *monitoring.Service) pilot.ToolBridge {
+func pilotToolBridge(db *sql.DB, gate *store.WriteGate, mux *http.ServeMux, epic *epicfree.Service, monitor *monitoring.Service, redeemSvc *redeem.Service) pilot.ToolBridge {
 	return func(ctx *pilot.CallCtx, name string, args map[string]any, guarded bool) map[string]any {
 		// 守卫：写工具 + 守卫问句 → 拒绝
 		if guarded && isPilotWriteTool(name) {
@@ -46,7 +48,7 @@ func pilotToolBridge(db *sql.DB, mux *http.ServeMux, epic *epicfree.Service, mon
 		case "get_user_preferences":
 			return pilotUserPreferences(ctx, db)
 		case "set_user_preference":
-			return pilotSetUserPreference(ctx, db, args)
+			return pilotSetUserPreference(ctx, db, gate, args)
 		case "epic_free":
 			return pilotEpicFree(ctx, epic)
 		case "rates_overview":
@@ -136,7 +138,7 @@ func pilotToolBridge(db *sql.DB, mux *http.ServeMux, epic *epicfree.Service, mon
 		case "challenges_overview":
 			return pilotChallengesOverview(ctx, db)
 		case "redeem_quota":
-			return pilotRedeemQuota(ctx, db)
+			return pilotRedeemQuota(ctx, redeemSvc)
 		case "achievements_near_completion":
 			return pilotAchievementsNearCompletion(ctx, db)
 		case "achievements_game_detail":
@@ -559,13 +561,13 @@ func pilotUserPreferences(ctx *pilot.CallCtx, db *sql.DB) map[string]any {
 }
 
 // pilotSetUserPreference 显式保存一条长期偏好（来源 user_explicit）。
-func pilotSetUserPreference(ctx *pilot.CallCtx, db *sql.DB, args map[string]any) map[string]any {
+func pilotSetUserPreference(ctx *pilot.CallCtx, db *sql.DB, gate *store.WriteGate, args map[string]any) map[string]any {
 	category := stringOr(args["category"], "preference")
 	key := stringOr(args["key"], "")
 	if key == "" {
 		return map[string]any{"kind": "empty", "note": "key_required"}
 	}
-	saved, err := agent.UpsertMemory(ctx.Ctx, db, category, key,
+	saved, err := agent.UpsertMemory(ctx.Ctx, db, gate, category, key,
 		args["value"], 1.0, "user_explicit")
 	if err != nil {
 		return map[string]any{"kind": "failed", "tool": "set_user_preference", "note": err.Error()}
@@ -1139,9 +1141,29 @@ func pilotChallengesOverview(ctx *pilot.CallCtx, db *sql.DB) map[string]any {
 	return map[string]any{"kind": "rows", "titleKey": "pilot.challenges", "rows": items}
 }
 
-func pilotRedeemQuota(ctx *pilot.CallCtx, db *sql.DB) map[string]any {
-	return map[string]any{"kind": "rows", "titleKey": "pilot.redeemQuota",
-		"rows": []map[string]any{{"k": "quota", "v": "N/A"}}}
+// pilotRedeemQuota CDK 激活额度（账号维度 used/limit，只读前提状态）。
+// 行形状对齐 Python agent/tools/builtin/account.py redeem_quota：
+// 未绑定 Cookie → redeemNoCookie 警示行；已绑定 → redeemQuota 数据行
+// （tone 按是否还有余量）。
+func pilotRedeemQuota(ctx *pilot.CallCtx, redeemSvc *redeem.Service) map[string]any {
+	if redeemSvc == nil {
+		return map[string]any{"kind": "empty", "tool": "redeem_quota"}
+	}
+	quota, err := redeemSvc.QuotaStatus(ctx.Ctx)
+	if err != nil {
+		return map[string]any{"kind": "empty", "tool": "redeem_quota"}
+	}
+	if !quota.HasCookie {
+		return map[string]any{"kind": "rows", "titleKey": "redeem",
+			"rows": []map[string]any{{"k": "", "vKey": "redeemNoCookie", "tone": "warn"}}}
+	}
+	tone := "warn"
+	if quota.Used < quota.Limit {
+		tone = "ok"
+	}
+	return map[string]any{"kind": "rows", "titleKey": "redeem",
+		"rows": []map[string]any{{"k": "", "vKey": "redeemQuota",
+			"data": map[string]any{"used": quota.Used, "limit": quota.Limit}, "tone": tone}}}
 }
 
 func pilotAchievementsNearCompletion(ctx *pilot.CallCtx, db *sql.DB) map[string]any {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -499,6 +500,136 @@ func Register(mux *http.ServeMux, service *Service) {
 			flusher.Flush()
 		}
 	})
+	mux.HandleFunc("POST /api/v1/pilot/sessions/{session_id}/compact", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("session_id")
+		state := service.GetStore().Load(sid)
+		if state == nil {
+			writeErr(w, http.StatusNotFound, "session not found")
+			return
+		}
+		cfg := service.LoadConfig()
+		if !cfg.LlmReady() {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reason": "llm_off"})
+			return
+		}
+		if service.OverCap() {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reason": "cap_reached"})
+			return
+		}
+		writeJSON(w, http.StatusOK, service.CompactNow(r.Context(), state, cfg))
+	})
+	mux.HandleFunc("POST /api/v1/pilot/sessions/{session_id}/rewind", func(w http.ResponseWriter, r *http.Request) {
+		keepTurns, verr := parseKeepTurns(w, r)
+		if verr != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []valErr{*verr}})
+			return
+		}
+		sid := r.PathValue("session_id")
+		type rewindOut struct {
+			OK        bool    `json:"ok"`
+			TurnTotal int     `json:"turn_total"`
+			Reason    *string `json:"reason"`
+		}
+		busyReason := "busy"
+		noSessionReason := "no_session"
+		writeFailedReason := "write_failed"
+		if service.SessionBusy(sid) {
+			writeJSON(w, http.StatusOK, rewindOut{OK: false, Reason: &busyReason})
+			return
+		}
+		state := service.GetStore().Load(sid)
+		if state == nil {
+			writeJSON(w, http.StatusOK, rewindOut{OK: false, Reason: &noSessionReason})
+			return
+		}
+		keep := minInt(keepTurns, len(state.Turns))
+		if !service.GetStore().Truncate(sid, keep) {
+			writeJSON(w, http.StatusOK, rewindOut{OK: false, TurnTotal: len(state.Turns), Reason: &writeFailedReason})
+			return
+		}
+		writeJSON(w, http.StatusOK, rewindOut{OK: true, TurnTotal: keep})
+	})
+}
+
+// valErr 校验错误项（形状对齐 FastAPI/Pydantic 实测锚点）。
+type valErr struct {
+	Type  string `json:"type"`
+	Loc   []any  `json:"loc"`
+	Msg   string `json:"msg"`
+	Input any    `json:"input"`
+	Ctx   map[string]any `json:"ctx,omitempty"`
+}
+
+// parseKeepTurns keep_turns 校验（Pydantic int 宽松强转 + ge=0 le=999；
+// venv 实测锚点：缺值 missing、串/浮点按 int_parsing/int_from_float、
+// 越界 greater_than_equal/less_than_equal）。
+func parseKeepTurns(w http.ResponseWriter, r *http.Request) (int, *valErr) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		return 0, &valErr{Type: "missing", Loc: []any{"body"}, Msg: "Field required"}
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return 0, &valErr{Type: "missing", Loc: []any{"body"}, Msg: "Field required"}
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var top any
+	if err := dec.Decode(&top); err != nil {
+		return 0, &valErr{Type: "json_invalid", Loc: []any{"body"}, Msg: "JSON decode error", Input: map[string]any{}}
+	}
+	fields, ok := top.(map[string]any)
+	if !ok {
+		return 0, &valErr{Type: "model_attributes_type", Loc: []any{"body"},
+			Msg: "Input should be a valid dictionary or object to extract fields from", Input: top}
+	}
+	raw, present := fields["keep_turns"]
+	if !present || raw == nil {
+		return 0, &valErr{Type: "missing", Loc: []any{"body", "keep_turns"}, Msg: "Field required", Input: fields}
+	}
+	var n int64
+	switch v := raw.(type) {
+	case json.Number:
+		if i, e := strconv.ParseInt(v.String(), 10, 64); e == nil {
+			n = i
+			break
+		}
+		if f, e := strconv.ParseFloat(v.String(), 64); e == nil && f == float64(int64(f)) {
+			n = int64(f)
+			break
+		}
+		return 0, &valErr{Type: "int_from_float", Loc: []any{"body", "keep_turns"},
+			Msg: "Input should be a valid integer, got a number with a fractional part", Input: raw}
+	case string:
+		i, e := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if e != nil {
+			return 0, &valErr{Type: "int_parsing", Loc: []any{"body", "keep_turns"},
+				Msg: "Input should be a valid integer, unable to parse string as an integer", Input: raw}
+		}
+		n = i
+	case float64:
+		if v != float64(int64(v)) {
+			return 0, &valErr{Type: "int_from_float", Loc: []any{"body", "keep_turns"},
+				Msg: "Input should be a valid integer, got a number with a fractional part", Input: raw}
+		}
+		n = int64(v)
+	case bool:
+		if v {
+			n = 1
+		}
+	default:
+		return 0, &valErr{Type: "int_parsing", Loc: []any{"body", "keep_turns"},
+			Msg: "Input should be a valid integer, unable to parse string as an integer", Input: raw}
+	}
+	if n < 0 {
+		return 0, &valErr{Type: "greater_than_equal", Loc: []any{"body", "keep_turns"},
+			Msg: "Input should be greater than or equal to 0", Input: n, Ctx: map[string]any{"ge": 0}}
+	}
+	if n > 999 {
+		return 0, &valErr{Type: "less_than_equal", Loc: []any{"body", "keep_turns"},
+			Msg: "Input should be less than or equal to 999", Input: n, Ctx: map[string]any{"le": 999}}
+	}
+	return int(n), nil
 }
 
 func eventMap(event StreamEvent) map[string]any {

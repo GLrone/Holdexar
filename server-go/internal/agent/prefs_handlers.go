@@ -3,6 +3,8 @@
 // prefs_handlers.go 偏好工具：用户长期偏好的查询与显式保存（agent_memory 账本）。
 package agent
 
+import "holdexar/server-go/internal/store"
+
 // getUserPreferences 用户已保存的长期偏好清单。
 func getUserPreferences(c *CallContext) (*ToolResult, error) {
 	memories, err := ListMemories(c.Ctx, c.db)
@@ -43,7 +45,11 @@ func setUserPreference(c *CallContext) (*ToolResult, error) {
 		out.set("note", "key_required")
 		return &ToolResult{Status: StatusEmpty, Data: out}, nil
 	}
-	saved, err := UpsertMemory(c.Ctx, c.db, category, key, value, 1.0, "user_explicit")
+	var gate *store.WriteGate
+	if c.deps != nil {
+		gate = c.deps.WriteGate
+	}
+	saved, err := UpsertMemory(c.Ctx, c.db, gate, category, key, value, 1.0, "user_explicit")
 	if err != nil {
 		return nil, err
 	}

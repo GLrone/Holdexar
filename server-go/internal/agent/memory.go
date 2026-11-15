@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/store"
 )
 
 func newMemoryID() string {
@@ -27,8 +29,18 @@ func memoryStamp() string {
 	return time.Now().UTC().Add(8 * time.Hour).Format("2006-01-02 15:04:05.000000")
 }
 
-// UpsertMemory 写入或更新记忆项（category+key 唯一确定一行）。
-func UpsertMemory(ctx context.Context, db *sql.DB, category, key string,
+const memoryUpsertSQL = `
+INSERT INTO agent_memories(id,category,"key",value,confidence,source,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?)
+ON CONFLICT(category,"key") DO UPDATE SET
+	value=excluded.value, confidence=excluded.confidence,
+	source=CASE WHEN excluded.source!='' THEN excluded.source ELSE agent_memories.source END,
+	updated_at=excluded.updated_at`
+
+// UpsertMemory 写入或更新记忆项（category+key 唯一确定一行）。gate 非空时
+// 写路径经写闸交互优先级排队（对齐 Python write_session(INTERACTIVE,
+// "agent_memory")）；nil 兜底直写（无闸装配的调用面）。
+func UpsertMemory(ctx context.Context, db *sql.DB, gate *store.WriteGate, category, key string,
 	value any, confidence float64, source string) (map[string]any, error) {
 	if key == "" {
 		return nil, fmt.Errorf("memory key required")
@@ -44,14 +56,16 @@ func UpsertMemory(ctx context.Context, db *sql.DB, category, key string,
 	}
 	ts := memoryStamp()
 	id := newMemoryID()
-	_, err = db.ExecContext(ctx, `
-INSERT INTO agent_memories(id,category,"key",value,confidence,source,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?)
-ON CONFLICT(category,"key") DO UPDATE SET
-	value=excluded.value, confidence=excluded.confidence,
-	source=CASE WHEN excluded.source!='' THEN excluded.source ELSE agent_memories.source END,
-	updated_at=excluded.updated_at`,
-		id, category, key, string(payload), confidence, source, ts, ts)
+	if gate != nil {
+		err = gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			_, err := conn.ExecContext(ctx, memoryUpsertSQL,
+				id, category, key, string(payload), confidence, source, ts, ts)
+			return err
+		})
+	} else {
+		_, err = db.ExecContext(ctx, memoryUpsertSQL,
+			id, category, key, string(payload), confidence, source, ts, ts)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +204,8 @@ var genreKeywords = []string{
 var budgetRe = regexp.MustCompile(`(?:预算|价格)(?:不超过|低于|在)\s*(\d+)\s*(?:块|元)?`)
 
 // ExtractPreferencesFromText 从文本启发式提取显式偏好并写入记忆账本。
-func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, text, source string) []map[string]any {
+// gate 语义同 UpsertMemory（nil 兜底直写）。
+func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, gate *store.WriteGate, text, source string) []map[string]any {
 	if text == "" {
 		return nil
 	}
@@ -207,7 +222,7 @@ func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, text, source st
 		}
 	}
 	if len(regions) > 0 {
-		if rec, err := UpsertMemory(ctx, db, "region_preference", "preferred_regions",
+		if rec, err := UpsertMemory(ctx, db, gate, "region_preference", "preferred_regions",
 			regions, 0.85, source); err == nil {
 			extracted = append(extracted, rec)
 		}
@@ -220,21 +235,21 @@ func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, text, source st
 		}
 	}
 	if len(genres) > 0 {
-		if rec, err := UpsertMemory(ctx, db, "genre_preference", "preferred_genres",
+		if rec, err := UpsertMemory(ctx, db, gate, "genre_preference", "preferred_genres",
 			genres, 0.8, source); err == nil {
 			extracted = append(extracted, rec)
 		}
 	}
 	// 史低 / 预算偏好
 	if strings.Contains(text, "史低") {
-		if rec, err := UpsertMemory(ctx, db, "budget_habit", "deal_timing",
+		if rec, err := UpsertMemory(ctx, db, gate, "budget_habit", "deal_timing",
 			"史低优先", 0.8, source); err == nil {
 			extracted = append(extracted, rec)
 		}
 	}
 	if m := budgetRe.FindStringSubmatch(text); m != nil {
 		limit := pyIntOf(m[1])
-		if rec, err := UpsertMemory(ctx, db, "budget_habit", "max_budget_cny",
+		if rec, err := UpsertMemory(ctx, db, gate, "budget_habit", "max_budget_cny",
 			limit, 0.9, source); err == nil {
 			extracted = append(extracted, rec)
 		}

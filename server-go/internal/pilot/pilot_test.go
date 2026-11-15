@@ -3,12 +3,42 @@
 package pilot
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"holdexar/server-go/internal/store"
 )
+
+// newTestPilotService 构造带写闸的最小服务（模块开关联通用）。
+func newTestPilotService(t *testing.T, dbPath string) *Service {
+	t.Helper()
+	db, e := openPilotTestDB(dbPath)
+	if e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { db.Close() })
+	service := New(Deps{DB: db, DataDir: t.TempDir()}, nil)
+	service.SetGate(store.NewWriteGate(db, dbPath))
+	return service
+}
+
+func openPilotTestDB(dbPath string) (*sql.DB, error) {
+	db, e := sql.Open("sqlite", dbPath)
+	if e != nil {
+		return nil, e
+	}
+	if _, e = db.Exec(`CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value_json TEXT,updated_at TEXT)`); e != nil {
+		db.Close()
+		return nil, e
+	}
+	return db, nil
+}
 
 func TestIntentRouting(t *testing.T) {
 	cases := []struct {
@@ -344,5 +374,41 @@ func TestAnthropicConvertShapes(t *testing.T) {
 	}
 	if third[1]["tool_use_id"] != "c2" {
 		t.Fatalf("第二条 tool 结果应并入同 user 消息: %v", third)
+	}
+}
+
+func TestSetEnabledWaitsForInflightTurn(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "holdexar.db")
+	service := newTestPilotService(t, dbPath)
+
+	// 占一个在飞轮（同包直接登记，模拟进行中的一轮问答）。
+	service.mu.Lock()
+	service.inflight["sess-1"] = 1
+	service.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- service.SetEnabled(ctx, false) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("SetEnabled returned while a turn was inflight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 在飞轮收尾后 SetEnabled 才返回。
+	service.releaseTurn("sess-1")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetEnabled after drain: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetEnabled never returned after inflight drain")
+	}
+	enabled, running, err := service.State(ctx)
+	if err != nil || enabled || running {
+		t.Fatalf("state=%t/%t err=%v", enabled, running, err)
 	}
 }

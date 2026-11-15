@@ -182,7 +182,7 @@ func newTestSurface(t *testing.T, flag bool) (*http.ServeMux, *sql.DB, *access.G
 	gate := access.New()
 	regions.Register(mux, db)
 	rates.Register(mux, db)
-	games.Register(mux, db, games.NewHistoryBackfill(context.Background(), db, nil, func(string, ...any) {}))
+	games.Register(mux, db, games.NewHistoryBackfill(context.Background(), db, nil, func(string, ...any) {}), games.Options{})
 	notifications.Register(mux, db)
 	if err := Register(mux, db, gate, Options{DataDir: dataDir, EnabledByFlag: flag}); err != nil {
 		t.Fatalf("MCP 装配失败: %v", err)
@@ -279,6 +279,36 @@ func TestRegistryFailClosed(t *testing.T) {
 		"bills_summary": true,
 		"get_user_preferences": true, "set_user_preference": true,
 	}
+	// 准入面 66 工具（阶段 6 三批补齐，清单=Python 准入 80 的差额；分批清单
+	// 见 docs/migration/MCP_TOOLS_SPEC.md §四）
+	for _, name := range []string{
+		// 批一：目录/价格/捆绑/优惠/汇率/日历（16）
+		"top_games", "get_price_briefing", "get_region_prices", "compare_games",
+		"diagnose_price", "game_price_history", "game_versions", "bundle_detail",
+		"list_bundles", "list_bundle_follows", "rates_overview", "hb_monthly",
+		"epic_free", "steam_free", "price_drops", "calendar_events",
+		// 批二：账户/成就/账单/兑换/同步/会话/元信息（25）
+		"account_status", "list_follows", "list_alerts", "alert_history",
+		"audit_follows_workflow", "achievements_summary", "level_profile",
+		"challenges_overview", "achievements_near_completion", "achievements_game_detail",
+		"list_family_library", "family_status", "bills_spend_query", "redeem_quota",
+		"sync_wallet", "sync_library", "sync_achievements", "sync_bills",
+		"sync_family", "refresh_rates", "list_sessions", "read_session",
+		"agent_runs_list", "agent_run_events", "list_tools",
+		// 批三：爬取运维/代理面/诊断/网络/运行时（25）
+		"crawl_active", "price_freshness", "recent_cycles", "price_events",
+		"crawl_stop", "recent_job_failures", "write_gate_status", "read_logs",
+		"system_diagnostics", "subscriptions_list", "subscription_sync",
+		"pool_health_history", "pool_job_runs", "proxy_pool_status",
+		"proxy_exit_detail", "proxy_latency_test", "sync_subscriptions",
+		"web_search", "refresh_game_price", "notify_test", "update_status",
+		"list_tasks", "cancel_task", "search_steam", "ingest_appids",
+	} {
+		if want[name] {
+			t.Errorf("准入清单重名: %s", name)
+		}
+		want[name] = true
+	}
 	for _, spec := range r.all() {
 		if spec.Group == GroupWrite {
 			t.Errorf("写组工具混入注册表: %s", spec.Name)
@@ -289,8 +319,8 @@ func TestRegistryFailClosed(t *testing.T) {
 		if !want[spec.Name] {
 			t.Errorf("未核对过调用链的工具混入注册表: %s", spec.Name)
 		}
-		if spec.TimeoutS != budgetDefaultS {
-			t.Errorf("%s 预算与现网缺省档不一致: %v", spec.Name, spec.TimeoutS)
+		if spec.TimeoutS != budgetFor(spec.Name) {
+			t.Errorf("%s 预算与分档表不一致: %v", spec.Name, spec.TimeoutS)
 		}
 	}
 	if len(r.all()) != len(want) {
