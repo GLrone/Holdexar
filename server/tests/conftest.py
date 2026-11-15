@@ -18,6 +18,64 @@ for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     os.environ.pop(_proxy_key, None)
 
 
+def _holdexar_temp_base():
+    r"""专用临时基地：HOLDEXAR_TEMP_BASE 优先，缺省 E:\HoldexarData\tmp（专用盘），
+    不可用回落系统临时目录；只取绝对路径，非 Windows 机器不误建相对目录。"""
+    env_base = os.environ.get("HOLDEXAR_TEMP_BASE")
+    if env_base:
+        candidates = [Path(env_base)]
+    else:
+        default = Path("E:/HoldexarData/tmp")
+        candidates = [default] if default.is_absolute() else []
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+_TEMP_BASE = _holdexar_temp_base()
+if _TEMP_BASE is not None:
+    # pytest 的 pytest-of-* 根与全部 tempfile 产物随此钉进专用基地
+    tempfile.tempdir = str(_TEMP_BASE)
+
+_TEMP_LEFTOVER_PREFIXES = ("holdexar-", "hx-", "hx_", "a2a_", "pytest-of-")
+_TEMP_STALE_SECONDS = 6 * 3600
+
+
+def _sweep_stale_temp_leftovers() -> None:
+    """清扫基地内超过 6 小时无动静的本项目家族残留：时间闸门保护并行
+    会话在途目录；夹具只管本进程产物，这里兜手工验证与打包链残留。"""
+    import shutil
+    import time
+
+    if _TEMP_BASE is None or not _TEMP_BASE.is_dir():
+        return
+    now = time.time()
+    try:
+        entries = list(os.scandir(_TEMP_BASE))
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.startswith(_TEMP_LEFTOVER_PREFIXES):
+            continue
+        try:
+            if now - entry.stat().st_mtime < _TEMP_STALE_SECONDS:
+                continue
+        except OSError:
+            continue
+        path = Path(entry.path)
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink()
+        except OSError:
+            pass
+
+
 @pytest.fixture(autouse=True)
 def _sanitize_db_lru_caches():
     """检测并清除 get_engine / get_session_factory 的 lru_cache 毒化。
@@ -306,6 +364,12 @@ def pytest_sessionfinish(session, exitstatus):
     for d in _ISOLATED_DIRS:
         shutil.rmtree(d, ignore_errors=True)
     _ISOLATED_DIRS.clear()
+    _sweep_stale_temp_leftovers()
+
+
+def pytest_sessionstart(session):
+    """会话开始也清扫一次：上次会话被硬终止时收尾钩子不会跑。"""
+    _sweep_stale_temp_leftovers()
 
 
 @pytest.fixture(autouse=True)
