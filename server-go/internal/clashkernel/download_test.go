@@ -98,7 +98,7 @@ func TestDownloadAllMirrorsFail(t *testing.T) {
 	if res.OK {
 		t.Fatalf("全部源失败应 OK=false")
 	}
-	if res.Error != "所有下载源均失败，可手动放置内核到 data/clash/" {
+	if res.Error != "所有下载源均失败，可手动放置内核到 data/clash/（文件名 holdexar-mihomo.exe）" {
 		t.Fatalf("终态文案不符：%q", res.Error)
 	}
 	if aHits != 1 || bHits != 1 {

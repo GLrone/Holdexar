@@ -64,9 +64,11 @@ func TestSubscriptionRoutesSaveRefreshAndReveal(t *testing.T) {
 	t.Cleanup(provider.Close)
 	syncer := Syncer{DB: db, Gate: gate, DataDir: dir}
 	mux := http.NewServeMux()
-	RegisterSubscriptionRoutes(mux, db, gate, dir, func(ctx context.Context, _ int64) (*SyncResult, error) {
-		return syncer.SyncSubscriptions(ctx)
-	}, nil)
+	RegisterSubscriptionRoutes(mux, db, gate, dir, SubscriptionRouteOptions{
+		Refresh: func(ctx context.Context, _ int64) (*SyncResult, error) {
+			return syncer.SyncSubscriptions(ctx)
+		},
+	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
@@ -122,9 +124,12 @@ func TestSubscriptionRoutesReplaceURLAndRetainUserInputWhenFetchFails(t *testing
 	syncer := Syncer{DB: db, Gate: gate, DataDir: dir}
 	mux := http.NewServeMux()
 	var invalidations atomic.Int32
-	RegisterSubscriptionRoutes(mux, db, gate, dir, func(ctx context.Context, _ int64) (*SyncResult, error) {
-		return syncer.SyncSubscriptions(ctx)
-	}, func() { invalidations.Add(1) })
+	RegisterSubscriptionRoutes(mux, db, gate, dir, SubscriptionRouteOptions{
+		Refresh: func(ctx context.Context, _ int64) (*SyncResult, error) {
+			return syncer.SyncSubscriptions(ctx)
+		},
+		OnChanged: func() { invalidations.Add(1) },
+	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	newURL := provider.URL + "/new-fixture-credential"

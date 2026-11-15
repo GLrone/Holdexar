@@ -280,6 +280,9 @@ type FetchOptions struct {
 	MaxParallelChannels int
 	PreferredEgress     string
 	EgressScores        map[string]float64
+	// ResponseParser 明文代理行解析器（Python response_parser 同位）：内容
+	// 判为 uri/unknown 格式时交由它解析，解析出非空行集即视为有效订阅。
+	ResponseParser func(raw []byte, fmtStr string) ([]map[string]any, error)
 }
 
 func (o *FetchOptions) fill() {
@@ -550,7 +553,7 @@ func fetchOne(ctx context.Context, urlStr string, channel Channel, opts FetchOpt
 	elapsedMS := int(time.Since(channelStarted) / time.Millisecond)
 	result, attempt, issue := validateFetchResponse(resp.StatusCode, resp.Header.Get("Content-Type"), raw,
 		resp.Header.Get("subscription-userinfo"), resp.Header.Get("profile-title"), resp.Header.Get("content-disposition"),
-		channel, elapsedMS, egressID)
+		channel, elapsedMS, egressID, opts.ResponseParser)
 	if attempt != nil {
 		return channelOutcome{result: result, attempt: *attempt, issue: issue}
 	}
@@ -597,6 +600,7 @@ func isConnectError(err error) bool {
 func validateFetchResponse(statusCode int, contentType string, raw []byte,
 	userinfo, profileTitle, contentDisposition string,
 	channel Channel, elapsedMS int, egressID string,
+	responseParser func(raw []byte, fmtStr string) ([]map[string]any, error),
 ) (*FetchResult, *FetchAttempt, string) {
 	att := func(ok bool, fmtStr, errMsg, stage string, issue string) (*FetchAttempt, string) {
 		return &FetchAttempt{
@@ -627,6 +631,28 @@ func validateFetchResponse(statusCode int, contentType string, raw []byte,
 			a, _ := att(false, fmtStr, "invalid_subscription_yaml", "validation", "")
 			return nil, a, fmtStr
 		}
+	} else if responseParser != nil && (fmtStr == FormatURI || fmtStr == FormatUnknown) {
+		parsedNodes, perr := responseParser(raw, fmtStr)
+		if perr != nil || len(parsedNodes) == 0 {
+			a, _ := att(false, fmtStr, "invalid_subscription_content", "validation", "")
+			return nil, a, "invalid_subscription_content"
+		}
+		a, _ := att(true, fmtStr, "", "complete", "")
+		result := &FetchResult{
+			Raw:                raw,
+			HTTPStatus:         statusCode,
+			ContentType:        contentType,
+			Channel:            channel.Name,
+			Fmt:                fmtStr,
+			Userinfo:           userinfo,
+			ProfileTitle:       profileTitle,
+			ContentDisposition: contentDisposition,
+			EgressID:           egressID,
+			DurationMS:         elapsedMS,
+			ResolvedNodes:      parsedNodes,
+			Attempts:           []FetchAttempt{*a},
+		}
+		return result, nil, ""
 	} else {
 		a, _ := att(false, fmtStr, "unsupported_subscription_format", "validation", "")
 		return nil, a, fmtStr

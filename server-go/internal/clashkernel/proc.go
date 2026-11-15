@@ -123,7 +123,7 @@ func KillOrphanKernelsExclude(imageName, configPath string, excludePid uint32) (
 	}
 	killed := 0
 	wantConfig := strings.ToLower(configPath)
-	for _, pid := range ImageProcessPIDs(imageName) {
+	for _, pid := range orphanProcessPIDs(imageName) {
 		if pid == excludePid || pid == uint32(os.Getpid()) {
 			continue
 		}
@@ -139,6 +139,27 @@ func KillOrphanKernelsExclude(imageName, configPath string, excludePid uint32) (
 		killed++
 	}
 	return killed, nil
+}
+
+// orphanProcessPIDs 目标映像名（含改名前旧名）的全部进程号，去重。
+// shortcut: 旧名分支是改名迁移期的收编兜底，改名已被存量安装消化后可移除。
+func orphanProcessPIDs(imageName string) []uint32 {
+	seen := map[uint32]bool{}
+	var pids []uint32
+	names := []string{imageName}
+	if legacy := legacyKernelFilename(); !strings.EqualFold(imageName, legacy) &&
+		strings.EqualFold(imageName, KernelFilename()) {
+		names = append(names, legacy)
+	}
+	for _, name := range names {
+		for _, pid := range ImageProcessPIDs(name) {
+			if !seen[pid] {
+				seen[pid] = true
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return pids
 }
 
 func terminateProcess(pid uint32) error {

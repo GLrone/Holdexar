@@ -1,0 +1,185 @@
+// 每订阅缓存文件：原文缓存 clash-sub-{id}.yaml 与项目渲染的运行配置
+// clash-sub-{id}.runtime.yaml。命名与 Python clash_manager.py 逐字符对齐
+// （_subscription_id_of 反解依赖这份命名约定）。
+package clashservice
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"holdexar/server-go/internal/clashcfg"
+	"holdexar/server-go/internal/clashkernel"
+	"holdexar/server-go/internal/proxypool"
+)
+
+const runtimeSuffix = ".runtime.yaml"
+
+// SubscriptionConfigPath 每条订阅各存一份配置缓存（data/clash/clash-sub-{id}.yaml）。
+// 这份文件是原始订阅正文：来源证据与离线缓存，不直接交给内核。
+func SubscriptionConfigPath(dataDir string, subID int64) string {
+	return filepath.Join(clashkernel.KernelDir(dataDir), fmt.Sprintf("clash-sub-%d.yaml", subID))
+}
+
+// SubscriptionIDOf 从缓存路径反解订阅 id（clash-sub-{id}.yaml）；
+// 共享单文件与非法命名返回 false——没有订阅身份就没有归属对象。
+func SubscriptionIDOf(configPath string) (int64, bool) {
+	stem := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
+	if !strings.HasPrefix(stem, "clash-sub-") {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(stem[len("clash-sub-"):], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+// MaterializeSubscriptionConfig 原始订阅缓存 → 内核实际加载的运行配置。
+// 原文保持不动（来源证据，同一份原文总渲染出同一份运行配置）；
+// 入参已是运行配置时优先从配对原文重新生成。渲染失败按 400 语义返回
+// （Python ValueError → switch 400 / 启动候选淘汰）。
+func MaterializeSubscriptionConfig(rawPath string) (string, error) {
+	out := rawPath
+	source := rawPath
+	if strings.HasSuffix(filepath.Base(rawPath), runtimeSuffix) {
+		base := strings.TrimSuffix(filepath.Base(rawPath), runtimeSuffix) + ".yaml"
+		paired := filepath.Join(filepath.Dir(rawPath), base)
+		if fileExists(paired) {
+			source = paired
+		}
+	} else {
+		out = strings.TrimSuffix(rawPath, filepath.Ext(rawPath)) + runtimeSuffix
+	}
+	raw, err := os.ReadFile(source)
+	if err != nil {
+		return "", fmt.Errorf("订阅缓存不可读：%w", err)
+	}
+	rendered, err := clashcfg.RenderSubscriptionConfig(toValidUTF8(raw))
+	if err != nil {
+		return "", statusErr(400, "%s", err.Error())
+	}
+	if err := atomicWriteFile(out, []byte(rendered)); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// FetchSubscriptionToCache 从库内最近一次成功快照恢复订阅缓存正文
+// （在线拉取失败/无需联网时的兜底）。含「订阅地址与缓存归属不一致」守卫。
+func (s *Service) FetchSubscriptionToCache(ctx context.Context, subID int64, subURL string) (*SubscriptionFetch, error) {
+	var stored string
+	err := s.DB.QueryRowContext(ctx, `SELECT url FROM proxy_subscriptions WHERE id=?`, subID).Scan(&stored)
+	if err != nil {
+		return nil, statusErr(400, "订阅地址与缓存归属不一致")
+	}
+	if proxypool.OpenURL(s.DataDir, stored) != subURL {
+		return nil, statusErr(400, "订阅地址与缓存归属不一致")
+	}
+	conn, err := s.DB.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	snapshot, err := proxypool.RestoreLatestSnapshot(ctx, conn, s.DataDir, subID, subURL)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, fmt.Errorf("没有可恢复的成功快照或有效订阅缓存")
+	}
+	return s.writeCacheFromSnapshot(subID, subURL, snapshot.RawContent, snapshot.ProfileTitle, snapshot.Userinfo, snapshot.NodeCount)
+}
+
+func (s *Service) writeCacheFromSnapshot(subID int64, subURL string, raw []byte, title, userinfo string, nodes int) (*SubscriptionFetch, error) {
+	cachePath := SubscriptionConfigPath(s.DataDir, subID)
+	if err := atomicWriteFile(cachePath, raw); err != nil {
+		return nil, err
+	}
+	if title == "" {
+		title = subscriptionAutoNameFromURL(subURL)
+	}
+	return &SubscriptionFetch{Raw: raw, Title: title, Userinfo: userinfo, Nodes: nodes}, nil
+}
+
+// subscriptionAutoNameFromURL 无面板名时的取名兜底：URL 末段（去 query，percent
+// 解码）；末段是看不出含义的凭据时返回空串——「无名称」比假名字诚实。
+func subscriptionAutoNameFromURL(rawURL string) string {
+	path := rawURL
+	if idx := strings.Index(path, "?"); idx >= 0 {
+		path = path[:idx]
+	}
+	if strings.Count(path, "/") > 2 {
+		rest := ""
+		if _, tail, found := strings.Cut(path, "//"); found {
+			rest = tail
+		}
+		if idx := strings.Index(rest, "/"); idx >= 0 {
+			path = "/" + rest[idx+1:]
+		} else {
+			path = "/"
+		}
+	} else {
+		path = "/"
+	}
+	last := strings.TrimRight(path, "/")
+	if idx := strings.LastIndex(last, "/"); idx >= 0 {
+		last = last[idx+1:]
+	}
+	if last == "" {
+		return ""
+	}
+	if decoded, err := url.PathUnescape(last); err == nil {
+		last = decoded
+	}
+	if looksLikeOpaqueToken(last) {
+		return ""
+	}
+	return last
+}
+
+var opaqueTokenRe = regexp.MustCompile(`^[A-Za-z0-9_\-=]+$`)
+
+func looksLikeOpaqueToken(text string) bool {
+	if len([]rune(text)) < 16 {
+		return false
+	}
+	for _, ch := range text {
+		if ch <= ' ' {
+			return false
+		}
+		if ch >= 0x4E00 && ch <= 0x9FFF {
+			return false
+		}
+	}
+	return opaqueTokenRe.MatchString(text)
+}
+
+// ─── 文件小工具 ──────────────────────────────────────────────
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func toValidUTF8(raw []byte) string {
+	return strings.ToValidUTF8(string(raw), "")
+}
+
+// atomicWriteFile tmp + replace 原子落盘（权限收紧到属主，对齐 node_secret_files.tighten）。
+func atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("缓存写入失败：%w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("缓存落盘失败：%w", err)
+	}
+	return nil
+}

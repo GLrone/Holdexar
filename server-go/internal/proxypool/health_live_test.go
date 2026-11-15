@@ -1,11 +1,11 @@
 package proxypool
 
-// 真内核三层体检验收（核心门禁）：随包 mihomo.exe 真实拉起（24 节点 + 20 探测
+// 真内核三层体检验收（核心门禁）：随包 holdexar-mihomo.exe 真实拉起（24 节点 + 20 探测
 // lane + 独立混合口），节点类型 http → 本桩 HTTP 代理 → 本桩目标，链路全程真实。
 // ①L0 经 lane 混合口与控制器 /delay 双路传输探测；②L1 经 lane 出口身份（回环
 // 拓扑下身份 = 回环地址，语义正确）；③L2 StoreBrowse 形状本地桩（成功晋升 /
 // 目标失败不罚 / 隧道失败判死）；④20 lane 并发两波不饥饿。
-// 内核不随仓库分发：assets/clash/mihomo.exe 缺失时整组 skip，不伪装通过。
+// 内核不随仓库分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
 
 import (
 	"bufio"
@@ -35,7 +35,7 @@ const liveWorktreeRoot = `E:\Holdexar-go-migration`
 
 func liveKernelExe(t *testing.T) string {
 	t.Helper()
-	exe := filepath.Join(liveWorktreeRoot, "assets", "clash", "mihomo.exe")
+	exe := filepath.Join(liveWorktreeRoot, "assets", "clash", "holdexar-mihomo.exe")
 	if _, err := os.Stat(exe); err != nil {
 		t.Skip("随包内核缺失，跳过真内核三层体检验收")
 	}

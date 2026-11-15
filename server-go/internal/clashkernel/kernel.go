@@ -86,7 +86,17 @@ func KernelEnv(base []string) []string {
 const MIHOMOVersion = "v1.19.32"
 
 // KernelFilename 内核可执行文件名（Windows 带 .exe）。
+// 带应用前缀，与用户机器上其他软件启动的 mihomo 内核进程隔离：
+// 按名查/杀进程、误杀防护都以这个名字为准。
 func KernelFilename() string {
+	if isWindows() {
+		return "holdexar-mihomo.exe"
+	}
+	return "holdexar-mihomo"
+}
+
+// legacyKernelFilename 改名前的内核文件名（迁移收编期兜底）。
+func legacyKernelFilename() string {
 	if isWindows() {
 		return "mihomo.exe"
 	}
@@ -195,6 +205,7 @@ type EnsureResult struct {
 	Copied      []string
 	Missing     []string
 	Upgraded    string
+	Adopted     string // 改名收编：本次被改名为现名的旧文件名（未收编为空）
 	BundleDir   string
 }
 
@@ -207,11 +218,30 @@ func KernelDir(dataDir string) string {
 
 func KernelExe(dataDir string) string { return joinPath(KernelDir(dataDir), KernelFilename()) }
 
+// AdoptLegacyKernel 改名迁移：把改名前落位的旧名内核改名为现名，用户免重新下载。
+// 仅在新名缺失而旧名文件就位时执行；旧内核进程仍占着文件（运行中的 exe 不可
+// 改名）等 rename 失败场景静默跳过，留给下次启动。返回旧文件名（未收编返回空）。
+func AdoptLegacyKernel(kernelPath string) string {
+	legacy := legacyKernelFilename()
+	legacyPath := joinPath(kernelPath, legacy)
+	current := joinPath(kernelPath, KernelFilename())
+	if !fileExists(legacyPath) || fileExists(current) {
+		return ""
+	}
+	if err := os.Rename(legacyPath, current); err != nil {
+		return ""
+	}
+	return legacy
+}
+
 // EnsureKernel 随包内核就位（data_dir 版本）：把内核补进 data/clash/（同名不
-// 覆盖），随包版本高于就位版本时替换（升级不夺回）。发行包缺内核时
-// KernelReady=false，由调用方决定回退下载还是提示用户。
+// 覆盖），随包版本高于就位版本时替换（升级不夺回）。改名前的旧名内核先收编
+// （免重新下载）。发行包缺内核时 KernelReady=false，由调用方决定回退下载还是
+// 提示用户。
 func EnsureKernel(bundledDir, dataDir string) (EnsureResult, error) {
+	adopted := AdoptLegacyKernel(KernelDir(dataDir))
 	result := EnsureKernelFiles(KernelDir(dataDir), bundledDir)
+	result.Adopted = adopted
 	result.KernelReady = fileExists(KernelExe(dataDir))
 	result.BundleDir = bundledDir
 	return result, nil

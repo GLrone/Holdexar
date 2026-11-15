@@ -1,8 +1,8 @@
 package clashkernel
 
-// 真内核行为验收（核心门禁）：用 worktree 随包 mihomo.exe 真实跑通
+// 真内核行为验收（核心门禁）：用 worktree 随包 holdexar-mihomo.exe 真实跑通
 // 预检 → spawn → 混合口归属 → 控制器 → 热重载 → 停止 → 孤儿清理。
-// 内核不随仓库分发：assets/clash/mihomo.exe 缺失时整组 skip，不伪装通过。
+// 内核不随仓库分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
 // 孤儿清理测试只用改名副本内核，绝不匹配真映像名。
 
 import (
@@ -22,7 +22,7 @@ const worktreeRoot = `E:\Holdexar-go-migration`
 
 func liveKernelAsset(t *testing.T) string {
 	t.Helper()
-	exe := filepath.Join(worktreeRoot, "assets", "clash", "mihomo.exe")
+	exe := filepath.Join(worktreeRoot, "assets", "clash", "holdexar-mihomo.exe")
 	if _, err := os.Stat(exe); err != nil {
 		t.Skip("随包内核缺失，跳过真内核行为验收")
 	}

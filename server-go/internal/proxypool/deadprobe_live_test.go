@@ -3,7 +3,7 @@ package proxypool
 // 真内核恢复探测与池构建验收（核心门禁）：DeadProbeRunner 拉起真内核对沙箱
 // SOCKS5 节点做整链恢复探测（无主节点归因、DEAD 复活落账、工作目录清理）；
 // BuildPool 产物经真内核预检、拉起、控制器逐名对账并实测可达。内核不随仓库
-// 分发：assets/clash/mihomo.exe 缺失时整组 skip，不伪装通过。
+// 分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
 
 import (
 	"context"

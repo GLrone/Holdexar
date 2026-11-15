@@ -148,3 +148,45 @@ func TestEnsureKernelPlaceAndSkip(t *testing.T) {
 		t.Fatalf("缺随包应报 missing 且 not ready：%+v", res)
 	}
 }
+
+func TestEnsureKernelAdoptsLegacyKernel(t *testing.T) {
+	dir := t.TempDir()
+	bundledDir := filepath.Join(dir, "assets")
+	dataDir := filepath.Join(dir, "data")
+	kernelPath := filepath.Join(dataDir, "clash")
+	if err := os.MkdirAll(kernelPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 改名前落位的旧名内核：收编改名后免重新下载
+	legacy := filepath.Join(kernelPath, legacyKernelFilename())
+	if err := os.WriteFile(legacy, []byte("legacy-kernel-bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := EnsureKernel(bundledDir, dataDir)
+	if err != nil {
+		t.Fatalf("收编就位失败：%v", err)
+	}
+	if res.Adopted != legacyKernelFilename() {
+		t.Fatalf("旧名内核应被收编：%+v", res)
+	}
+	if !fileExists(filepath.Join(kernelPath, KernelFilename())) {
+		t.Fatal("收编后现名内核应就位")
+	}
+	if fileExists(legacy) {
+		t.Fatal("收编后旧名文件应不存在")
+	}
+	// 新名已就位时用户自备的旧名文件不被触碰
+	if err := os.WriteFile(legacy, []byte("user-custom"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err = EnsureKernel(bundledDir, dataDir)
+	if err != nil {
+		t.Fatalf("二次就位失败：%v", err)
+	}
+	if res.Adopted != "" {
+		t.Fatalf("新名已就位不应收编：%+v", res)
+	}
+	if !fileExists(legacy) {
+		t.Fatal("用户自备旧名文件应保留")
+	}
+}

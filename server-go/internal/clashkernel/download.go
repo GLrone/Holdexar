@@ -110,7 +110,8 @@ func downloadKernelZip(ctx context.Context, dataDir, base string, opts DownloadO
 		}
 		opts.logf("内核下载失败：镜像 %s 经 直连 未成功，换下一通道（%v）", source, err)
 	}
-	return failed(opts, "所有下载源均失败，可手动放置内核到 data/clash/")
+	return failed(opts, fmt.Sprintf(
+		"所有下载源均失败，可手动放置内核到 data/clash/（文件名 %s）", KernelFilename()))
 }
 
 func downloadKernelGz(ctx context.Context, dataDir, base string, opts DownloadOptions) DownloadResult {
