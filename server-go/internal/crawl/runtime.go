@@ -13,6 +13,7 @@ import (
 
 	"holdexar/server-go/internal/crawler"
 	"holdexar/server-go/internal/crawler/dbwriter"
+	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/jobrun"
 	"holdexar/server-go/internal/occupancy"
@@ -40,6 +41,8 @@ type Options struct {
 	ProxyLanes     func(context.Context) ([]proxypool.CrawlLane, error)
 	NetworkBlocked func(context.Context) bool
 	StoreBrowseURL string
+	// DataDir 数据目录（系列覆盖文件 series_overrides.json 装填源；空 = 无覆盖）。
+	DataDir string
 }
 
 type Runtime struct {
@@ -59,6 +62,11 @@ type Runtime struct {
 	owner          context.Context
 	jobID, cycleID int64
 	scheduler      *sched.Scheduler
+
+	// ImportAppids 目录导入分类出口（serverd 注入 games.ImportAppids；nil =
+	// 端点按未装配 503 拒绝）。经注入而非直调 games 包：crawl→games→wishlist
+	// 的生产依赖边会让 wishlist 测试面成环。
+	ImportAppids func(ctx context.Context, appids []any) (map[string]any, error)
 }
 
 func New(db *sql.DB, gate *store.WriteGate, bus *events.Bus, opts Options) *Runtime {
@@ -71,7 +79,7 @@ func New(db *sql.DB, gate *store.WriteGate, bus *events.Bus, opts Options) *Runt
 	if bus == nil {
 		bus = events.NewBus()
 	}
-	return &Runtime{db: db, gate: gate, bus: bus, opts: opts, planner: &Planner{DB: db, Gate: gate, Now: opts.Now, Board: opts.Board}}
+	return &Runtime{db: db, gate: gate, bus: bus, opts: opts, planner: &Planner{DB: db, Gate: gate, Now: opts.Now, Board: opts.Board, Log: opts.Log}}
 }
 
 func (r *Runtime) now() time.Time  { return r.opts.Now().In(beijing) }
@@ -558,6 +566,7 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 	writer.Now = r.now
 	writer.EventKey = r.opts.EventKey
 	writer.Log = r.opts.Log
+	writer.SeriesOverrides, _ = derived.LoadSeriesOverrides(r.opts.DataDir)
 	if e := writer.LoadFxRates(ctx); e != nil {
 		r.opts.Log("汇率读取失败：%v", e)
 	}
@@ -585,6 +594,7 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 		clearMissing := []dbwriter.RegionPair{}
 		types := map[int64]string{}
 		tags := map[int64][][2]int64{}
+		discoveries := map[int64]dbwriter.BundleDiscovery{}
 		for _, id := range task.AppIDs {
 			game, known := games[id]
 			if !known {
@@ -610,7 +620,31 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 				resultMu.Unlock()
 				continue
 			}
+			// 即将推出且该区无购买答复（未开放预购）→ COMING_SOON 暂缓：
+			// 无价格付费游戏不入库，重探通道按 type=COMING_SOON 选候选，
+			// 开放预购/上线后正常入库转正（Python browse_store 判定序）
+			if (state == "missing" || state == "locked") && storebrowse.ComingSoon(item) {
+				if e := writer.MarkComingSoon(workCtx, id); e != nil {
+					r.opts.Log("标记即将推出暂缓失败：%v", e)
+				}
+				clearMissing = append(clearMissing, dbwriter.RegionPair{AppID: id, RegionCode: task.Region})
+				resultMu.Lock()
+				skipped = append(skipped, fmt.Sprintf("%d:%s", id, strings.ToUpper(task.Region)))
+				resultMu.Unlock()
+				continue
+			}
 			if state == "missing" {
+				// 库内已知行未发售（release_date 在未来）：跳过落账只清账，
+				// 不走 COMING_SOON——那会把 import 分类覆写成暂缓；日期过后
+				// 自然恢复定价，误标的 missing 陈欠行一并清除（否则补抓每拍
+				// 重拾、永不收敛）
+				if releaseInFuture(game.ReleaseDate, r.now()) {
+					clearMissing = append(clearMissing, dbwriter.RegionPair{AppID: id, RegionCode: task.Region})
+					resultMu.Lock()
+					skipped = append(skipped, fmt.Sprintf("%d:%s", id, strings.ToUpper(task.Region)))
+					resultMu.Unlock()
+					continue
+				}
 				missing = append(missing, dbwriter.RegionPair{AppID: id, RegionCode: task.Region})
 				continue
 			}
@@ -631,6 +665,24 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 				resultMu.Lock()
 				unpersisted = append(unpersisted, fmt.Sprintf("%d:%s", entries[i].Game.AppID, strings.ToUpper(task.Region)))
 				resultMu.Unlock()
+				continue
+			}
+			// 仅价格保存成功的条目收集捆绑包发现；按批去重（bundle_id）
+			for _, d := range storebrowse.BundleDiscoveries(items[entries[i].Game.AppID]) {
+				if _, dup := discoveries[d.BundleID]; !dup {
+					discoveries[d.BundleID] = d
+				}
+			}
+		}
+		// 捆绑包发现桩落库：游戏条目 purchase_options 白送的数据，失败仅记
+		// 日志不拖垮价格链路（发现渠道只负责把新包带进门，无价桩不随轮刷新）
+		if len(discoveries) > 0 {
+			list := make([]dbwriter.BundleDiscovery, 0, len(discoveries))
+			for _, d := range discoveries {
+				list = append(list, d)
+			}
+			if _, e := writer.RecordBundleDiscoveries(workCtx, list); e != nil {
+				r.opts.Log("捆绑包发现桩落库失败：%v", e)
 			}
 		}
 		if writeErr != nil {
@@ -692,6 +744,24 @@ func uniqueStrings(s []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// releaseInFuture 库内 release_date（YYYY-MM-DD）落在本日之后（未发售判据）；
+// 无法解析 = 不在未来（对齐 Python _release_in_future）。
+func releaseInFuture(releaseDate *string, now time.Time) bool {
+	if releaseDate == nil || *releaseDate == "" {
+		return false
+	}
+	raw := *releaseDate
+	if len(raw) > 10 {
+		raw = raw[:10]
+	}
+	day, err := time.ParseInLocation("2006-01-02", raw, time.UTC)
+	if err != nil {
+		return false
+	}
+	today := now.In(beijing)
+	return day.After(time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC))
 }
 func nullableID(id int64) any {
 	if id == 0 {

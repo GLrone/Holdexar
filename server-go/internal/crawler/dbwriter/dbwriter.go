@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"holdexar/server-go/internal/derived"
@@ -22,7 +23,17 @@ const (
 	insertChunkRows   = 2000 // 批量参数列表分块，限制单段内存与驱动调用规模
 	missingMaxRetries = 5    // 连续「真实响应缺价」次数上限，穷尽转 blocked
 	baselineChunkSize = 400  // 基线查询按 appid 分块
+
+	// 写闸积压背压：后台等待超过阈值后，抓取提交按深度线性退避（事实流
+	// 只降速不丢弃）；写段中位等待不再随积压无界增长。阈值高于常态满载
+	// 深度，只在写侧真的跟不上时生效。
+	backpressureDepth = 32
+	backpressureStep  = 50 * time.Millisecond
+	backpressureCap   = 2 * time.Second
 )
+
+// backpressureActive 进/退场日志各一条的包级开关（atomic 只记一次）。
+var backpressureActive atomic.Bool
 
 // Writer 写入价格批次及其观察时刻对应的活动标签。
 type Writer struct {
@@ -35,6 +46,8 @@ type Writer struct {
 	// SeriesOverrides 系列覆盖表（数据目录文件在闸外由宿主装填；
 	// nil = 无覆盖）。派生链闸内零文件 IO。
 	SeriesOverrides map[string][]int64
+	// Diag 写闸诊断面注入（测试假闸；nil = Gate.Diagnostics）。
+	Diag func(context.Context) map[string]any
 }
 
 // NewWriter 构造写层。
@@ -74,24 +87,77 @@ func (w *Writer) LoadFxRates(ctx context.Context) error {
 
 // UpsertTaskBatch 一区一批（≤300 款）写完：拆 ~100 款的段逐段过写闸提交。
 // 每段独立事务（基线一次 + 决策纯函数化 + 四条批量语句 games / 现价 /
-// 欠账结转 / history，段内含收尾保存点），段与段之间写者位空出。
-// 返回逐款写入结果：段体失败整段作废（逐款隔离写回退未迁移）。
+// 欠账结转 / history，段内含收尾保存点），段与段之间写者位空出；段前按
+// 写闸积压深度退避（背压）。段体失败 → 本段转逐款隔离写（writeChunkSlow）。
 func (w *Writer) UpsertTaskBatch(ctx context.Context, entries []BatchEntry) ([]bool, error) {
 	results := make([]bool, len(entries))
 	for start := 0; start < len(entries); start += batchWriteChunk {
 		end := min(start+batchWriteChunk, len(entries))
 		chunk := entries[start:end]
-		ok, err := w.writeChunk(ctx, chunk)
+		w.backpressurePace(ctx)
+		ok, degraded, err := w.writeChunk(ctx, chunk)
 		if err != nil {
 			return nil, err
+		}
+		if degraded {
+			// 段体失败：本段回退逐款隔离写（慢 ~10 倍，只兜坏段；慢路径
+			// 自带分段闸与完成日志，段间交还写者位）
+			slow, err := w.writeChunkSlow(ctx, chunk)
+			if err != nil {
+				return nil, err
+			}
+			copy(results[start:], slow)
+			continue
 		}
 		copy(results[start:], ok)
 	}
 	return results, nil
 }
 
+// gateDiagnostics 写闸诊断快照（背压事实源；测试经 Diag 注入假闸）。
+func (w *Writer) gateDiagnostics(ctx context.Context) map[string]any {
+	if w.Diag != nil {
+		return w.Diag(ctx)
+	}
+	if w.Gate == nil {
+		return nil
+	}
+	return w.Gate.Diagnostics(ctx)
+}
+
+// backpressurePace 段提交前的到达率闸：写闸后台积压过深时让抓取侧先睡
+// min((深度-阈值)*步长, 上限)；进/退场日志各一条（atomic 只记一次）。
+func (w *Writer) backpressurePace(ctx context.Context) {
+	depth := 0
+	switch v := w.gateDiagnostics(ctx)["waiting_background"].(type) {
+	case int:
+		depth = v
+	case int64:
+		depth = int(v)
+	case float64:
+		depth = int(v)
+	}
+	if depth <= backpressureDepth {
+		if backpressureActive.CompareAndSwap(true, false) {
+			w.Log("写库积压回落，抓取提交恢复正常节奏 │ 积压段数=%d", depth)
+		}
+		return
+	}
+	if backpressureActive.CompareAndSwap(false, true) {
+		w.Log("写库积压 %d 段，抓取提交自行放慢（背压生效） │ 积压段数=%d", depth, depth)
+	}
+	sleep := min(time.Duration(depth-backpressureDepth)*backpressureStep, backpressureCap)
+	timer := time.NewTimer(sleep)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
 // writeChunk 单段写入（≤batchWriteChunk 款）一次事务写完（含收尾保存点）。
-func (w *Writer) writeChunk(ctx context.Context, entries []BatchEntry) ([]bool, error) {
+// degraded=true = 段体失败整段回滚（调用方转逐款隔离回退）。
+func (w *Writer) writeChunk(ctx context.Context, entries []BatchEntry) ([]bool, bool, error) {
 	results := make([]bool, len(entries))
 	for i := range results {
 		results[i] = true
@@ -103,16 +169,16 @@ func (w *Writer) writeChunk(ctx context.Context, entries []BatchEntry) ([]bool, 
 	})
 	if err != nil {
 		if bodyErr != nil {
-			// 段体失败：整段作废不落半批（逐款隔离写回退未迁移）
+			// 段体失败：整段作废不落半批，交由调用方逐款隔离回退
 			w.Log("价格批量写段失败，整段作废（%d 款）: %v", len(entries), bodyErr)
 			for i := range results {
 				results[i] = false
 			}
-			return results, nil
+			return results, true, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return results, nil
+	return results, false, nil
 }
 
 func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []BatchEntry) error {

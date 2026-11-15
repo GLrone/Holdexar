@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +17,8 @@ import (
 
 func plannerFixture(t *testing.T) *Planner {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "planning.db"))
+	path := filepath.Join(t.TempDir(), "planning.db")
+	db, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +26,7 @@ func plannerFixture(t *testing.T) *Planner {
 	if _, err = db.Exec(store.CurrentSchemaSQL()); err != nil {
 		t.Fatal(err)
 	}
-	return &Planner{DB: db, Now: func() time.Time { return time.Date(2026, 11, 6, 12, 0, 0, 0, time.FixedZone("CST", 8*3600)) }}
+	return &Planner{DB: db, Gate: store.NewWriteGate(db, path), Now: func() time.Time { return time.Date(2026, 11, 6, 12, 0, 0, 0, time.FixedZone("CST", 8*3600)) }}
 }
 
 func planExec(t *testing.T, db *sql.DB, q string, args ...any) {
@@ -184,5 +187,54 @@ func TestPlanningFrozenEmptyScopeSurvivesJSON(t *testing.T) {
 	}
 	if _, exists := unfrozen["resolved_appids"]; exists {
 		t.Fatalf("unfrozen scope marked frozen: %s", raw)
+	}
+}
+
+// B3 空区行即拾即清：missing 过冷却、blocked 过 7 天老化窗的空区行删除；
+// 新鲜行保留、非空区行不动、结果集不含空区。
+func TestMissingClearsStaleEmptyRegionRows(t *testing.T) {
+	p := plannerFixture(t)
+	ctx := context.Background()
+	logs := []string{}
+	p.Log = func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }
+	planExec(t, p.DB, `INSERT INTO game_current_prices(appid,region_code,price_status,updated_at,discount_percent,fail_count) VALUES
+ (1001,'','missing','2026-11-05 10:00:00.000000',0,0),
+ (1002,'','missing','2026-11-06 11:58:00.000000',0,0),
+ (1003,'','blocked','2026-10-01 10:00:00.000000',0,0),
+ (1004,'','blocked','2026-11-04 10:00:00.000000',0,0),
+ (1005,'cn','missing','2026-11-05 10:00:00.000000',0,0),
+ (1006,'cn','blocked','2026-10-01 10:00:00.000000',0,0)`)
+	got, err := p.Missing(ctx, 4*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n1001, n1002, n1003, n1004, n1005, n1006 int
+	if err := p.DB.QueryRow(`SELECT
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1001),
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1002),
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1003),
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1004),
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1005),
+ (SELECT COUNT(*) FROM game_current_prices WHERE appid=1006)`).Scan(&n1001, &n1002, &n1003, &n1004, &n1005, &n1006); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{n1001, n1003} {
+		if n != 0 {
+			t.Fatalf("过期空区行应被清除")
+		}
+	}
+	for id, n := range map[string]int{"1002": n1002, "1004": n1004, "1005": n1005, "1006": n1006} {
+		if n != 1 {
+			t.Fatalf("行 %s 应保留（新鲜或非空区）: %d", id, n)
+		}
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "已清除 2 行空区") {
+		t.Fatalf("删除行数日志缺失: %v", logs)
+	}
+	for _, batch := range got {
+		if batch.Region == "" {
+			t.Fatalf("结果集不应含空区: %#v", got)
+		}
 	}
 }

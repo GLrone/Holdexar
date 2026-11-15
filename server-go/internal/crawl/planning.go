@@ -56,6 +56,7 @@ type Planner struct {
 	Gate  *store.WriteGate
 	Now   func() time.Time
 	Board func(context.Context, string) ([]int64, error)
+	Log   func(string, ...any)
 }
 
 func (p *Planner) planNow() time.Time {
@@ -227,6 +228,30 @@ func (p *Planner) ResolveScope(ctx context.Context, scope string, ids []int64) (
 	return p.planIDs(ctx, query)
 }
 
+// clearEmptyRegionRows 空区行即拾即清（写闸 BACKGROUND 事务）：missing 过
+// 补抓冷却、blocked 过 7 天老化窗（BLOCKED_REPROBE_DAYS）的空区行删除；
+// 删除行数>0 记日志。
+func (p *Planner) clearEmptyRegionRows(ctx context.Context, missingCutoff, blockedCutoff string) error {
+	deleted := int64(0)
+	err := p.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
+		result, e := conn.ExecContext(ctx, `DELETE FROM game_current_prices WHERE region_code='' AND
+ ((price_status='missing' AND updated_at<?) OR (price_status='blocked' AND updated_at<?))`,
+			missingCutoff, blockedCutoff)
+		if e != nil {
+			return e
+		}
+		deleted, e = result.RowsAffected()
+		return e
+	})
+	if err != nil {
+		return err
+	}
+	if deleted > 0 && p.Log != nil {
+		p.Log("已清除 %d 行空区的补抓尝试痕迹 │ 行数=%d", deleted, deleted)
+	}
+	return nil
+}
+
 func (p *Planner) planIDs(ctx context.Context, query string, args ...any) ([]int64, error) {
 	rows, err := p.DB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -348,6 +373,14 @@ SELECT DISTINCT appid,region FROM unit_results WHERE settled=0 AND threshold<?2`
 func (p *Planner) Missing(ctx context.Context, cooldown time.Duration) ([]TargetBatch, error) {
 	now := p.planNow().In(time.FixedZone("Asia/Shanghai", 8*3600))
 	format := "2006-01-02 15:04:05.000000"
+	// 空区行是「全球不可见」的尝试痕迹（无对应真实区服），发给 Steam 的
+	// country_code 会是空串，一发必 400，且永远没有 bump fail_count 的路径
+	// ——留在账本只会永久占位，即拾即清；与选取解耦（不占 LIMIT 槽位），
+	// 冷却窗内的新鲜空区行等过冷却再清（Python generate_missing_tasks 开头同款）
+	if err := p.clearEmptyRegionRows(ctx, now.Add(-cooldown).Format(format),
+		now.Add(-7*24*time.Hour).Format(format)); err != nil {
+		return nil, err
+	}
 	excluded, err := p.planIDs(ctx, `SELECT t.target_id FROM monitor_targets t WHERE t.target_type='game' AND
  (NOT EXISTS(SELECT 1 FROM monitor_sources s WHERE s.target_type=t.target_type AND s.target_id=t.target_id AND s.active=1)
  OR EXISTS(SELECT 1 FROM monitor_exclusions e WHERE e.target_type=t.target_type AND e.target_id=t.target_id AND e.active=1))

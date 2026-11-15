@@ -8,11 +8,144 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"holdexar/server-go/internal/crawler"
 	"holdexar/server-go/internal/occupancy"
 )
+
+// freshnessMaxAppids 新鲜度查询一次最多问多少个对象（Python FRESHNESS_MAX_APPIDS）。
+const freshnessMaxAppids = 200
+
+// validationError 校验错误项：type/loc/msg/input 与 Pydantic 输出逐字段一致。
+type validationError struct {
+	Type  string         `json:"type"`
+	Loc   []any          `json:"loc"`
+	Msg   string         `json:"msg"`
+	Input any            `json:"input"`
+	Ctx   map[string]any `json:"ctx,omitempty"`
+}
+
+// decodeImportBody POST /crawl/import 请求体校验（形状对齐 Pydantic venv 实测锚点）：
+// 通过校验的元素归一为整数列表（bool→0/1、可解析串与整值浮点同收）。
+func decodeImportBody(w http.ResponseWriter, req *http.Request) ([]any, bool) {
+	respond := func(errs []validationError) {
+		response(w, 422, map[string]any{"detail": errs})
+	}
+	raw, e := io.ReadAll(http.MaxBytesReader(w, req.Body, 1<<20))
+	if e != nil {
+		respond([]validationError{{Type: "json_invalid", Loc: []any{"body"},
+			Msg: "JSON decode error", Input: map[string]any{}}})
+		return nil, false
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		respond([]validationError{{Type: "missing", Loc: []any{"body"}, Msg: "Field required", Input: nil}})
+		return nil, false
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.UseNumber()
+	var top any
+	if e := dec.Decode(&top); e != nil {
+		respond([]validationError{{Type: "json_invalid", Loc: []any{"body"},
+			Msg: "JSON decode error", Input: map[string]any{}}})
+		return nil, false
+	}
+	fields, ok := top.(map[string]any)
+	if !ok {
+		respond([]validationError{{Type: "model_attributes_type", Loc: []any{"body"},
+			Msg: "Input should be a valid dictionary or object to extract fields from", Input: top}})
+		return nil, false
+	}
+	rawItems, present := fields["appids"]
+	if !present || rawItems == nil {
+		respond([]validationError{{Type: "missing", Loc: []any{"body", "appids"}, Msg: "Field required", Input: fields}})
+		return nil, false
+	}
+	items, ok := rawItems.([]any)
+	if !ok {
+		respond([]validationError{{Type: "list_type", Loc: []any{"body", "appids"},
+			Msg: "Input should be a valid list", Input: rawItems}})
+		return nil, false
+	}
+	// 单批上限 100（Python Field(min_length=1, max_length=100) 实测形状）
+	if len(items) < 1 {
+		respond([]validationError{{Type: "too_short", Loc: []any{"body", "appids"},
+			Msg: "List should have at least 1 item after validation, not 0", Input: items,
+			Ctx: map[string]any{"field_type": "List", "min_length": 1, "actual_length": len(items)}}})
+		return nil, false
+	}
+	if len(items) > 100 {
+		respond([]validationError{{Type: "too_long", Loc: []any{"body", "appids"},
+			Msg: fmt.Sprintf("List should have at most 100 items after validation, not %d", len(items)), Input: items,
+			Ctx: map[string]any{"field_type": "List", "max_length": 100, "actual_length": len(items)}}})
+		return nil, false
+	}
+	var errs []validationError
+	out := []any{}
+	for i, item := range items {
+		n, e := pyIntLax(item)
+		if e != nil {
+			errs = append(errs, validationError{Type: e.errType, Loc: []any{"body", "appids", i},
+				Msg: e.msg, Input: item})
+			continue
+		}
+		out = append(out, n)
+	}
+	if len(errs) > 0 {
+		respond(errs)
+		return nil, false
+	}
+	return out, true
+}
+
+// pyIntLax Pydantic int 宽松强转（venv 实测锚点）：bool→0/1；整值浮点收下；
+// 带小数浮点 int_from_float；可解析整串（含首尾空白）收下，其余 int_parsing。
+func pyIntLax(v any) (int64, *struct {
+	errType string
+	msg     string
+}) {
+	fail := func(errType, msg string) (int64, *struct {
+		errType string
+		msg     string
+	}) {
+		return 0, &struct {
+			errType string
+			msg     string
+		}{errType, msg}
+	}
+	switch x := v.(type) {
+	case bool:
+		if x {
+			return 1, nil
+		}
+		return 0, nil
+	case json.Number:
+		if i, e := strconv.ParseInt(x.String(), 10, 64); e == nil {
+			return i, nil
+		}
+		if f, e := strconv.ParseFloat(x.String(), 64); e == nil && f == float64(int64(f)) {
+			return int64(f), nil
+		}
+		return fail("int_from_float", "Input should be a valid integer, got a number with a fractional part")
+	case string:
+		trimmed := strings.TrimSpace(x)
+		if i, e := strconv.ParseInt(trimmed, 10, 64); e == nil {
+			return i, nil
+		}
+		return fail("int_parsing", "Input should be a valid integer, unable to parse string as an integer")
+	case float64:
+		if x == float64(int64(x)) {
+			return int64(x), nil
+		}
+		return fail("int_from_float", "Input should be a valid integer, got a number with a fractional part")
+	case int64:
+		return x, nil
+	case int:
+		return int64(x), nil
+	}
+	return fail("int_parsing", "Input should be a valid integer, unable to parse string as an integer")
+}
 
 func response(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -112,6 +245,60 @@ func (r *Runtime) Register(mux *http.ServeMux, lifetime context.Context) {
 			return
 		}
 		response(w, 200, v)
+	})
+	mux.HandleFunc("GET /api/v1/crawl/freshness", func(w http.ResponseWriter, req *http.Request) {
+		raws := req.URL.Query()["appid"]
+		ids := []int64{}
+		seen := map[int64]bool{}
+		var errs []validationError
+		for i, raw := range raws {
+			n, e := strconv.ParseInt(raw, 10, 64)
+			if e != nil {
+				errs = append(errs, validationError{
+					Type: "int_parsing", Loc: []any{"query", "appid", i},
+					Msg: "Input should be a valid integer, unable to parse string as an integer", Input: raw,
+				})
+				continue
+			}
+			if !seen[n] {
+				seen[n] = true
+				ids = append(ids, n)
+			}
+		}
+		if len(errs) > 0 {
+			response(w, 422, map[string]any{"detail": errs})
+			return
+		}
+		if len(ids) == 0 {
+			response(w, 400, map[string]any{"detail": "缺少 appid 参数"})
+			return
+		}
+		if len(ids) > freshnessMaxAppids {
+			response(w, 400, map[string]any{"detail": fmt.Sprintf("一次最多查询 %d 个 appid", freshnessMaxAppids)})
+			return
+		}
+		items, e := r.AppIDFreshness(req.Context(), ids)
+		if e != nil {
+			responseError(w, e)
+			return
+		}
+		response(w, 200, map[string]any{"items": items})
+	})
+	mux.HandleFunc("POST /api/v1/crawl/import", func(w http.ResponseWriter, req *http.Request) {
+		body, ok := decodeImportBody(w, req)
+		if !ok {
+			return
+		}
+		if r.ImportAppids == nil {
+			response(w, 503, map[string]any{"detail": "目录导入未装配"})
+			return
+		}
+		result, e := r.ImportAppids(req.Context(), body)
+		if e != nil {
+			response(w, 400, map[string]any{"detail": e.Error()})
+			return
+		}
+		response(w, 200, result)
 	})
 	mux.HandleFunc("GET /api/v1/crawl/active", func(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()

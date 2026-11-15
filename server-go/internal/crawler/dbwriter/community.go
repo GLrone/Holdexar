@@ -132,7 +132,7 @@ func (w *Writer) validateCommunityRow(obs CommunityObservation) (communityRow, e
 	if row.source == "" {
 		row.source = "community"
 	}
-	if len(row.source) > 32 {
+	if len(row.source) > 128 {
 		return row, errors.New("来源标注过长")
 	}
 	row.currency = strings.ToUpper(strings.TrimSpace(obs.Currency))

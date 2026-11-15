@@ -9,10 +9,20 @@ import (
 	"strconv"
 	"time"
 
+	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/occupancy"
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/store"
 )
+
+// maintainDerived 派生列日切换维护：系列覆盖表闸外装填后进入版本比对，
+// 命中日切换才开写闸全库重算；失败只记日志。
+func (r *Runtime) maintainDerived(ctx context.Context) {
+	overrides, order := derived.LoadSeriesOverrides(r.opts.DataDir)
+	if err := derived.MaintainDerived(ctx, r.db, r.gate, r.now(), overrides, order); err != nil {
+		r.opts.Log("派生列日切换维护未完成：%v", err)
+	}
+}
 
 func nextPriceGrid(now time.Time, hours int) time.Time {
 	if hours < 1 {
@@ -122,6 +132,9 @@ func (r *Runtime) RegisterSchedules(ctx context.Context, s *sched.Scheduler) err
 		if e = r.RunRepair(ctx, 4*time.Minute); e != nil && !errors.Is(e, ErrBusy) {
 			r.opts.Log("自动补抓未完成：%v", e)
 		}
+		// 派生列日切换维护：补抓拍点尾部全库重算（对齐 Python core/scheduler.py
+		// price_repair 尾的 maintain_derived）；版本一致零重算，失败不拖垮排程
+		r.maintainDerived(ctx)
 	}, sched.WithMisfireUnlimited())
 	if err == nil {
 		err = r.registerRechecks(ctx, s)

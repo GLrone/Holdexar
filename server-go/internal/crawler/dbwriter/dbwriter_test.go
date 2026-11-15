@@ -106,6 +106,42 @@ COALESCE(price, 0), COALESCE(is_gold, 0))`,
 	updated_at DATETIME,
 	PRIMARY KEY (key)
 )`,
+	// 捆绑包排序缓存联动的关联查询表（派生链 UpdateMemberBundles 依赖；
+	// 与现网 DDL 逐字一致，缺表会让所有触发派生重算的写批失败）
+	`CREATE TABLE bundle_region_prices (
+	id INTEGER NOT NULL,
+	bundle_id INTEGER NOT NULL,
+	region_code VARCHAR(10) NOT NULL,
+	currency VARCHAR(10),
+	price BIGINT,
+	original_price BIGINT,
+	discount_percent INTEGER NOT NULL,
+	bundle_base_discount INTEGER NOT NULL,
+	price_status VARCHAR(20) NOT NULL,
+	cny_fen BIGINT,
+	discount_end_ts INTEGER,
+	app_ids JSON,
+	crawled_at DATETIME,
+	PRIMARY KEY (id)
+)`,
+	`CREATE TABLE bundles (
+	id INTEGER NOT NULL,
+	bundle_id INTEGER NOT NULL,
+	name VARCHAR(512) NOT NULL,
+	must_purchase_as_set INTEGER NOT NULL,
+	item_kind INTEGER NOT NULL,
+	header_image VARCHAR(1024),
+	is_lowest BOOLEAN NOT NULL,
+	min_cny_fen BIGINT,
+	diff_fen INTEGER DEFAULT '0' NOT NULL,
+	smart_score FLOAT,
+	url VARCHAR(1024),
+	app_ids JSON,
+	view_count INTEGER NOT NULL,
+	updated_at DATETIME,
+	PRIMARY KEY (id),
+	UNIQUE (bundle_id)
+)`,
 	`CREATE TABLE fx_rates (
 	currency_code VARCHAR(10) NOT NULL,
 	rate_to_cny REAL NOT NULL,
@@ -421,7 +457,8 @@ func TestFreeKindGrouping(t *testing.T) {
 	}
 }
 
-// TestChunkRollbackNoPartialBatch 段内任意语句失败整段回退，不落半批。
+// TestChunkRollbackNoPartialBatch 段体失败整段回滚后转逐款隔离回退：坏款
+// 单独失败标记 false，好款照常落库——整段作废不放大为整段丢账（B1）。
 func TestChunkRollbackNoPartialBatch(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -434,19 +471,21 @@ func TestChunkRollbackNoPartialBatch(t *testing.T) {
 		{Game: broken, Prices: []PriceRow{priceRow(3002, "CN", 9900)}},
 	})
 	if err != nil {
-		t.Fatalf("段体失败应吞掉转结果标记，不应上抛: %v", err)
+		t.Fatalf("段体失败应经逐款回退吸收，不应上抛: %v", err)
 	}
-	if results[0] || results[1] {
-		t.Fatalf("整段失败应全部标记未写入，实际 %v", results)
+	if !results[0] || results[1] {
+		t.Fatalf("坏款应隔离失败，好款应落库，实际 %v", results)
 	}
-	for table, want := range map[string]int{"games": 0, "game_current_prices": 0, "game_price_history": 0} {
-		var n int
-		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil {
-			t.Fatalf("计数失败: %v", err)
-		}
-		if n != want {
-			t.Fatalf("%s 应为空（不落半批），实际 %d 行", table, n)
-		}
+	var games, prices, history int
+	if err := db.QueryRow("SELECT (SELECT COUNT(*) FROM games), (SELECT COUNT(*) FROM game_current_prices), (SELECT COUNT(*) FROM game_price_history)").Scan(&games, &prices, &history); err != nil {
+		t.Fatal(err)
+	}
+	if games != 1 || prices != 1 || history != 1 {
+		t.Fatalf("好款应完整落库：games=%d prices=%d history=%d", games, prices, history)
+	}
+	var name string
+	if err := db.QueryRow("SELECT name FROM games WHERE appid=3001").Scan(&name); err != nil || name != "好行" {
+		t.Fatalf("落库行不符: %q %v", name, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package dbwriter
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,6 +21,18 @@ func communityFixture(t *testing.T) *Writer {
 		t.Fatal(e)
 	}
 	return w
+}
+
+func TestMergeCommunityKeepsFullPluginSource(t *testing.T) {
+	w := communityFixture(t)
+	source := "plugin:" + strings.Repeat("a", 80)
+	if n, e := w.MergeCommunityHistory(context.Background(), 872410, "CN", []CommunityObservation{{SnapshotAt: beiTime("2026-01-02 00:00:00"), PriceMinor: int64p(100), Currency: "CNY", ProductUnknown: true, Source: source}}); e != nil || n != 1 {
+		t.Fatalf("valid plugin source rejected: %d %v", n, e)
+	}
+	var stored string
+	if e := w.DB.QueryRow(`SELECT source FROM game_price_history WHERE source=?`,source).Scan(&stored); e != nil || stored != source {
+		t.Fatalf("source=%q err=%v", stored, e)
+	}
 }
 
 func beiTime(s string) time.Time {

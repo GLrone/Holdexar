@@ -139,3 +139,85 @@ func TestMetadataReplaceTagsPresenceAndRollback(t *testing.T) {
 		t.Fatal("failed replacement lost old tags")
 	}
 }
+
+// TestMarkComingSoonCreatesPlaceholderRow B5①：新 appid 落 type=COMING_SOON
+// 挂名行（updated_at 落值脱首爬候选池）。
+func TestMarkComingSoonCreatesPlaceholderRow(t *testing.T) {
+	w, db := newTestWriter(t)
+	w.Now = testNow
+	if err := w.MarkComingSoon(context.Background(), 990101); err != nil {
+		t.Fatal(err)
+	}
+	var name, typ, updatedAt string
+	if err := db.QueryRow(`SELECT name, type, CAST(updated_at AS TEXT) FROM games WHERE appid=990101`).Scan(&name, &typ, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if name != "AppID_990101" || typ != "COMING_SOON" || updatedAt != "2026-10-31 12:30:45.123456" {
+		t.Fatalf("挂名行不符: %q %q %q", name, typ, updatedAt)
+	}
+}
+
+// TestMarkComingSoonConflictKeepsNameAndClearsRemoved B5②：冲突只更
+// type/updated_at 并清复活痕迹，名字保持库内原值。
+func TestMarkComingSoonConflictKeepsNameAndClearsRemoved(t *testing.T) {
+	w, db := newTestWriter(t)
+	w.Now = testNow
+	metadataExec(t, db, `INSERT INTO games (appid, name, family_sharing, trading_cards, is_epic, is_hb, hl_flag, pp_flag, diff_fen, is_adult, is_visual_novel, removed_strikes, positive_reviews, review_count, view_count, removed_at, created_at)
+		VALUES (990102, '真名游戏', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, '2026-01-01 00:00:00', '2025-01-01 00:00:00')`)
+	if err := w.MarkComingSoon(context.Background(), 990102); err != nil {
+		t.Fatal(err)
+	}
+	var name, typ, removedAt, createdAt any
+	var removedStrikes int64
+	if err := db.QueryRow(`SELECT name, type, removed_at, removed_strikes, CAST(created_at AS TEXT) FROM games WHERE appid=990102`).Scan(&name, &typ, &removedAt, &removedStrikes, &createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if name != "真名游戏" || typ != "COMING_SOON" {
+		t.Fatalf("冲突覆盖不符: name=%v type=%v", name, typ)
+	}
+	if removedAt != nil || removedStrikes != 0 {
+		t.Fatalf("复活痕迹应一并清除: %v %v", removedAt, removedStrikes)
+	}
+	if createdAt != "2025-01-01 00:00:00" {
+		t.Fatalf("created_at 冲突应保留原值: %v", createdAt)
+	}
+}
+
+// TestRecordBundleDiscoveries B6 四案：空输入 0；已知包跳过；新包落桩
+// （updated_at NULL、app_ids 单种子）；冲突幂等。
+func TestRecordBundleDiscoveries(t *testing.T) {
+	w, db := newTestWriter(t)
+	w.Now = testNow
+	ctx := context.Background()
+	if n, err := w.RecordBundleDiscoveries(ctx, nil); err != nil || n != 0 {
+		t.Fatalf("空输入应 0: %d %v", n, err)
+	}
+	metadataExec(t, db, `INSERT INTO bundles (bundle_id, name, must_purchase_as_set, item_kind, is_lowest, diff_fen, app_ids, view_count, updated_at)
+		VALUES (111, '既有完整主档', 0, 0, 0, 0, '[220,440]', 5, '2026-01-01 00:00:00')`)
+	discoveries := []BundleDiscovery{
+		{BundleID: 111, Name: "已知包", MPS: 1, ItemKind: 0, AppIDs: []int64{220}},
+		{BundleID: 222, Name: "新发现包", MPS: 0, ItemKind: 0, AppIDs: []int64{220}},
+	}
+	n, err := w.RecordBundleDiscoveries(ctx, discoveries)
+	if err != nil || n != 1 {
+		t.Fatalf("新插数应为 1: %d %v", n, err)
+	}
+	var name, appIDs, updatedAt any
+	var mps, itemKind, viewCount int64
+	if err := db.QueryRow(`SELECT name, app_ids, updated_at, must_purchase_as_set, item_kind, view_count FROM bundles WHERE bundle_id=222`).Scan(&name, &appIDs, &updatedAt, &mps, &itemKind, &viewCount); err != nil {
+		t.Fatal(err)
+	}
+	if name != "新发现包" || appIDs != "[220]" || updatedAt != nil || mps != 0 || itemKind != 0 || viewCount != 0 {
+		t.Fatalf("发现桩形状不符: %v %v %v %v %v %v", name, appIDs, updatedAt, mps, itemKind, viewCount)
+	}
+	if n, err = w.RecordBundleDiscoveries(ctx, discoveries); err != nil || n != 0 {
+		t.Fatalf("冲突幂等应 0: %d %v", n, err)
+	}
+	if _, err := db.Exec(`SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	var rowCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM bundles`).Scan(&rowCount); err != nil || rowCount != 2 {
+		t.Fatalf("不应新增行: %d %v", rowCount, err)
+	}
+}
