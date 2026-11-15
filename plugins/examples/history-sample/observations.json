@@ -1,0 +1,10 @@
+{
+  "appid": 10,
+  "region": "cn",
+  "observations": [
+    {"date": "2026-06-01", "priceMinor": 8800},
+    {"date": "2026-06-15", "priceMinor": 6600},
+    {"date": "2026-07-01", "priceMinor": 6600},
+    {"date": "2026-07-20", "priceMinor": 5500}
+  ]
+}

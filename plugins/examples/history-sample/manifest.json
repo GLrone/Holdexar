@@ -1,0 +1,14 @@
+{
+  "id": "example.history",
+  "name": "Community price history",
+  "version": "1.0.0",
+  "description": "Supplies a static set of historical price observations for one game and region.",
+  "author": "Example author",
+  "apiVersion": 1,
+  "kind": "datasource.community_history",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}
