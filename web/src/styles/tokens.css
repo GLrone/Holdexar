@@ -1138,6 +1138,8 @@ html.dark {
   overflow-y: auto;
   overscroll-behavior: contain;
   scroll-behavior: smooth;
+  /* 页尾留白：滚动到底后内容与窗口下缘保留一段空白，避免误以为下面还有内容 */
+  padding-bottom: 56px;
   /* 行布局中让出定位轨宽度 */
   flex: 1;
   min-width: 0;

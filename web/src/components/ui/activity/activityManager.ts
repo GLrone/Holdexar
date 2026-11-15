@@ -61,6 +61,7 @@ export class ActivityManager {
         retry: reg.retry !== undefined ? reg.retry : existing.retry,
         to: reg.to !== undefined ? reg.to : existing.to,
         toLabel: reg.toLabel !== undefined ? reg.toLabel : existing.toLabel,
+        onOpen: reg.onOpen !== undefined ? reg.onOpen : existing.onOpen,
         metadata: reg.metadata ? { ...existing.metadata, ...reg.metadata } : existing.metadata,
       }
 
@@ -91,6 +92,7 @@ export class ActivityManager {
       retry: reg.retry ?? null,
       to: reg.to ?? '',
       toLabel: reg.toLabel ?? '',
+      onOpen: reg.onOpen ?? null,
       metadata: reg.metadata ?? {},
     }
 
@@ -128,6 +130,7 @@ export class ActivityManager {
       ...(patch.retry !== undefined ? { retry: patch.retry } : {}),
       ...(patch.to !== undefined ? { to: patch.to } : {}),
       ...(patch.toLabel !== undefined ? { toLabel: patch.toLabel } : {}),
+      ...(patch.onOpen !== undefined ? { onOpen: patch.onOpen } : {}),
       ...(patch.metadata ? { metadata: { ...existing.metadata, ...patch.metadata } } : {}),
       updatedAt: Date.now(),
     }

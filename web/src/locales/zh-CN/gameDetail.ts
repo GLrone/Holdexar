@@ -84,6 +84,8 @@ const gameDetail = {
   /* 地区下拉选项：地区名与货币码都是数据，但全角括号是中文排版——英文侧换半角 */
   'gameDetail.region.option': '{name}（{currency}）',
   'gameDetail.trend.steamNow': 'Steam 现价',
+  'gameDetail.trend.latestObserved': '最近观测价',
+  'gameDetail.trend.firstObserved': '最早观测',
   'gameDetail.trend.discount': '▼ -{pct}% · 折扣中',
   'gameDetail.trend.noDiscount': '未打折',
   'gameDetail.trend.emptyRegion': '该地区暂无历史数据 —— 随着定时爬取积累，走势图会逐渐成形。',

@@ -1,6 +1,6 @@
-/* 更新模块文案：左上角气泡（components/business/UpdateBubble.vue）、
-   更新报告窗口（components/business/UpdateDialog.vue）、更新内容渲染
-   （components/business/UpdateNotes.vue）。设置页不再有常驻更新面板。 */
+/* 更新模块文案：更新报告窗口（components/business/UpdateDialog.vue）、更新内容
+   渲染（components/business/UpdateNotes.vue）。常驻提示由灵动岛更新活动承担，
+   设置页不再有常驻更新面板。 */
 export default {
   'updateDialog.title': '应用更新',
   'updateDialog.notesTitle': 'v{version} 更新内容',

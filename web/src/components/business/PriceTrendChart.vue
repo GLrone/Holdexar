@@ -40,6 +40,7 @@ const props = withDefaults(
     withKeyLine?: boolean
     /** Key 店查价用 appid（withKeyLine 时必传） */
     appid?: number
+    unknownProduct?: boolean
   }>(),
   { height: '300px', windowDays: 0, withKeyLine: false, appid: 0 },
 )
@@ -657,7 +658,7 @@ watch(
     </div>
     <!-- 图例（详情页大图随 key 线显示；抽屉窄图用自身的 pc-legend） -->
     <div v-if="hasPoints && withKeyLine" class="trend-chart__legend">
-      <span class="lg-item"><i class="lg-steam"></i>{{ t('trendChart.legend.steam') }}</span>
+      <span class="lg-item"><i class="lg-steam"></i>{{ t(unknownProduct ? 'trendChart.legend.history' : 'trendChart.legend.steam') }}</span>
       <span v-if="keyPriceYuan != null" class="lg-item"><i class="lg-key"></i>{{ t('trendChart.legend.keyStore') }}</span>
       <span v-if="lowYuan != null" class="lg-item"><i class="lg-low"></i>{{ t('trendChart.legend.lowest') }}</span>
     </div>

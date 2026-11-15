@@ -186,6 +186,14 @@ export interface SettingsPayload {
   mcp_error: string
   /** 环境变量强制开启（界面开关不可用） */
   mcp_forced_by_env: boolean
+  /** 局域网访问模式状态（Host 闸 + /session/unlock 自助解锁） */
+  lan_access: {
+    enabled: boolean
+    /** 环境变量强制开启：设置开关不可用 */
+    env_forced: boolean
+    /** 是否已设置访问密码（密码原文不回显到界面） */
+    has_password: boolean
+  }
 }
 
 // ─── regions（区服元数据单一来源：服务端下发，前端零硬编码）───
@@ -273,6 +281,8 @@ export const settingsApi = {
     direct_notice_seen?: boolean
     /** MCP 服务开关（写入即运行时启停） */
     mcp_enabled?: boolean
+    /** 局域网访问：开关即时生效；密码只写不回读（空串不落库，掩码 **** 不回写） */
+    lan_access?: { enabled?: boolean; password?: string }
   }) => request<SettingsPayload>('PUT', '/settings', payload),
   getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
   updateFetch: (payload: Partial<FetchSettingsPayload>) =>
@@ -3228,10 +3238,10 @@ export const redeemApi = {
   activateKeys: (keys: string[]) =>
     request<RedeemBatchResult>('POST', '/redeem/keys', { keys }),
   quota: () => request<RedeemQuota>('GET', '/redeem/quota'),
-  activations: (q: { limit?: number; offset?: number } = {}) =>
+  activations: (q: { limit?: number; offset?: number; status?: string; q?: string; key?: string } = {}) =>
     request<RedeemActivationList>(
       'GET',
-      `/redeem/activations${toQuery({ limit: q.limit, offset: q.offset })}`,
+      `/redeem/activations${toQuery({ limit: q.limit, offset: q.offset, status: q.status, q: q.q, key: q.key })}`,
       undefined,
       { noCache: true },
     ),
@@ -3338,6 +3348,9 @@ export interface HbChoiceGame {
   discount: number
   /** 非 CN 区最低 CNY 分（games.min_cny_fen 预计算列）；null = 无 */
   lowestCnyFen: number | null
+  /** 非 Steam 平台标识（blizzard/epic/ubisoft/gog/origin/ea/itch/drm-free…原值，
+   *  展示层本地化）；Steam 游戏无此字段。appid=0（非 Steam 游戏无 Steam 页面） */
+  platform?: string
 }
 
 export interface HbChoiceOffersPayload {
@@ -3360,10 +3373,14 @@ export interface HbRefreshPayload {
   ok: boolean
   /** true = 月包标识未变且未强刷，跳过打标 */
   skipped?: boolean
+  /** 模块停用时的跳过原因（Go 端返回字符串形态） */
+  skippedReason?: string
   /** 本轮新标记的条目（appid + 官方条目名） */
   marked?: { appid: number; title: string }[]
   /** 未能匹配出 appid 的条目名（次日自动重试） */
   unresolved?: string[]
+  /** 刷新失败的用户可见原因（ok=false 时下发） */
+  error?: string
 }
 
 // ─── 成就殿堂（奖杯）────────────────────────────────────

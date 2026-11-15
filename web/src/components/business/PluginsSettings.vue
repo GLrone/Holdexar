@@ -29,6 +29,13 @@ const visible = computed(() => {
   return list.filter(p => `${p.manifest.name} ${p.manifest.id} ${p.manifest.description}`.toLocaleLowerCase().includes(q))
 })
 
+// 内置功能名：词条命中用词条（含英文界面），缺词条回退后端下发名，再退 id。
+function builtinName(item: { id: string; name?: string }) {
+  const key = `plugins.builtin.${item.id}` as Parameters<typeof t>[0]
+  const localized = t(key)
+  return localized === key ? item.name || item.id : localized
+}
+
 function messageOf(problem: unknown) {
   return problem instanceof Error ? problem.message : t('plugins.failed')
 }
@@ -170,7 +177,7 @@ onMounted(async () => {
     <HlPaneSwitch v-else :pane-key="tab">
       <div v-if="tab === 'builtin'" class="plugins-settings__list">
         <div v-for="item in state.builtin" :key="item.id" class="plugins-settings__item">
-          <div><strong>{{ item.name || item.id }}</strong><p class="section-desc">{{ item.id === 'core.epic_free' ? t('plugins.epicHint') : t('plugins.builtinHint') }}</p><span class="section-desc">{{ item.running ? t('plugins.running') : t('plugins.stopped') }}</span></div>
+          <div><strong>{{ builtinName(item) }}</strong><p class="section-desc">{{ item.id === 'core.epic_free' ? t('plugins.epicHint') : t('plugins.builtinHint') }}</p><span class="section-desc">{{ item.running ? t('plugins.running') : t('plugins.stopped') }}</span></div>
           <HlButton size="sm" :disabled="busy" @click="run(() => pluginsApi.builtin(item.id, !item.enabled))">{{ item.enabled ? t('plugins.disable') : t('plugins.enable') }}</HlButton>
         </div>
       </div>
@@ -200,8 +207,9 @@ onMounted(async () => {
         <p>{{ selected.manifest.description }}</p>
         <dl><dt>{{ t('plugins.author') }}</dt><dd>{{ selected.manifest.author }}</dd><dt>{{ t('plugins.version') }}</dt><dd>{{ selected.manifest.version }}</dd></dl>
         <a v-if="homepage(selected)" :href="homepage(selected)" target="_blank" rel="noopener noreferrer">{{ t('plugins.homepage') }}</a>
-        <p>{{ t('plugins.kind') }}</p>
-        <p>{{ t('plugins.permissions') }}</p><ul><li v-for="domain in selected.manifest.domains" :key="domain">{{ domain }}</li></ul>
+        <p>{{ t(selected.manifest.kind === 'datasource.community_history' ? 'plugins.historyKind' : 'plugins.kind') }}</p>
+        <template v-if="selected.manifest.kind === 'notification.webhook'"><p>{{ t('plugins.permissions') }}</p><ul><li v-for="domain in selected.manifest.domains" :key="domain">{{ domain }}</li></ul></template>
+        <p v-else>{{ t('plugins.historyPermissions') }}</p>
         <p class="plugins-settings__warning">{{ t('plugins.trust') }}</p>
         <p class="section-desc">{{ selected.trust === 'verified' ? t('plugins.verified') : t('plugins.unsigned') }}</p>
         <p v-if="!selected.compatible" class="plugins-settings__error">{{ t('plugins.incompatible') }}</p>
@@ -214,7 +222,7 @@ onMounted(async () => {
             <HlCheckbox v-else-if="field.type === 'boolean'" :model-value="draft[key] === true" @update:model-value="value => draft[key] = value" />
             <HlInput v-else :model-value="String(draft[key] ?? '')" :type="field.type === 'number' ? 'number' : 'text'" :show-password="field.format === 'password'" :placeholder="field.format === 'password' && installed.configured ? t('plugins.secret') : ''" @update:model-value="value => draft[key] = value" />
           </label>
-          <div class="plugins-settings__tools"><HlButton :disabled="busy" @click="saveConfig">{{ t('plugins.save') }}</HlButton><HlButton :disabled="busy || !installed.configured" @click="run(() => pluginsApi.test(selected!.manifest.id), t('plugins.testSent'))">{{ t('plugins.test') }}</HlButton></div>
+          <div v-if="selected.manifest.kind === 'notification.webhook'" class="plugins-settings__tools"><HlButton v-if="fields.length" :disabled="busy" @click="saveConfig">{{ t('plugins.save') }}</HlButton><HlButton :disabled="busy || !installed.enabled || !installed.configured" @click="run(() => pluginsApi.test(selected!.manifest.id), t('plugins.testSent'))">{{ t('plugins.test') }}</HlButton></div>
           <p class="section-desc">{{ t('plugins.removeHint') }}</p>
           <div class="plugins-settings__tools"><HlButton :disabled="busy || !selected.compatible" @click="run(() => pluginsApi.update(selected!.manifest.id, { enabled: !installed!.enabled }))">{{ installed.enabled ? t('plugins.disable') : t('plugins.enable') }}</HlButton><HlButton v-if="selected.manifest.version !== installed.manifest.version" :disabled="busy || !selected.compatible" @click="installSelected">{{ t('plugins.update') }}</HlButton><HlButton variant="danger" :disabled="busy" @click="removeOpen = true">{{ t('plugins.remove') }}</HlButton></div>
         </template>

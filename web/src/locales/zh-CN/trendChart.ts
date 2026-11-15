@@ -8,6 +8,7 @@ const trendChart = {
 
   /* 详情页大图下方的 HTML 图例 */
   'trendChart.legend.steam': 'Steam 价',
+  'trendChart.legend.history': '历史观测价',
   'trendChart.legend.keyStore': 'Key 店',
   'trendChart.legend.lowest': '历史最低',
 

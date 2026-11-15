@@ -1,6 +1,6 @@
-/* Update module strings: the top-left bubble (UpdateBubble.vue), the update report
-   window (UpdateDialog.vue) and the release-notes renderer (UpdateNotes.vue).
-   The settings page no longer hosts a resident update panel. */
+/* Update module strings: the update report window (UpdateDialog.vue) and the
+   release-notes renderer (UpdateNotes.vue). The persistent notice lives on the
+   dynamic island; the settings page no longer hosts a resident update panel. */
 export default {
   'updateDialog.title': 'App Update',
   'updateDialog.notesTitle': "What's new in v{version}",

@@ -6,6 +6,7 @@ const trendChart: Partial<Record<MessageKey, string>> = {
   'trendChart.empty': 'No price history yet — the chart takes shape as scheduled crawls accumulate.',
 
   'trendChart.legend.steam': 'Steam price',
+  'trendChart.legend.history': 'Observed historical price',
   'trendChart.legend.keyStore': 'Key store',
   /* 与 trendDrawer.legend.lowest 是同一条曲线上的同一件东西（zh 都是「历史最低」），
      两处英文必须一致——否则详情页大图说 All-time low、抽屉里说 Lowest。 */

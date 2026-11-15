@@ -38,6 +38,7 @@ const props = defineProps<{
   canRetry: boolean
   goto?: string
   gotoLabel?: string
+  dismissible?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -47,7 +48,6 @@ const emit = defineEmits<{
   (e: 'goDetail'): void
   (e: 'goTask'): void
   (e: 'openTask'): void
-  (e: 'return'): void
   (e: 'collapse'): void
 }>()
 
@@ -112,14 +112,14 @@ const compactPercent = computed<number | null>(() => {
       <span v-if="trailing" class="hl-island__trail">{{ trailing }}</span>
 
       <button
-        v-if="mode === 'expanded'"
+        v-if="mode === 'expanded' && dismissible"
         class="hl-island__slot-control"
         type="button"
-        :title="t('island.returnToPrevious')"
-        :aria-label="t('island.returnToPrevious')"
-        @click.stop="emit('return')"
+        :title="t('island.dismiss')"
+        :aria-label="t('island.dismiss')"
+        @click.stop="emit('dismiss')"
       >
-        <HlIcon name="chevron-left" :size="12" />
+        <HlIcon name="close" :size="12" />
       </button>
       <button
         v-if="mode === 'expanded'"
@@ -205,7 +205,6 @@ const compactPercent = computed<number | null>(() => {
               >
                 {{ gotoLabel }}
               </button>
-              <button class="hl-island__btn" @click.stop="emit('dismiss')">{{ t('island.dismiss') }}</button>
             </template>
           </div>
         </template>

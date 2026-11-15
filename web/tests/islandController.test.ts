@@ -150,25 +150,6 @@ test('IslandController: a single activity expands while the compact anchor remai
   assert.equal(controller.count, 1)
 })
 
-test('IslandController: return restores only the previous layout snapshot', () => {
-  const { controller } = setup(['A', 'B', 'C', 'D'])
-  const initial = controller.layout
-  controller.openSecondary()
-  controller.openMain()
-  assert.equal(controller.primaryId, 'B')
-
-  controller.returnPreviousLayout()
-  assert.deepEqual(controller.layout, {
-    mainId: 'A',
-    secondaryId: 'C',
-    expandedId: 'B',
-    waitingIds: ['D'],
-  })
-
-  controller.returnPreviousLayout()
-  assert.deepEqual(controller.layout, initial)
-})
-
 test('IslandController: collapse returns the expanded task to its origin slot', () => {
   const { controller } = setup(['A', 'B', 'C', 'D'])
   controller.openSecondary()
@@ -238,7 +219,6 @@ test('IslandController: repeated transitions do not duplicate or lose activities
   for (let index = 0; index < 25; index += 1) {
     controller.openSecondary()
     controller.openMain()
-    if (index % 2 === 0) controller.returnPreviousLayout()
     assertNoDuplicateSlots(controller)
     assert.equal(controller.count, 6)
     assert.equal(controller.layout.waitingIds.length + [controller.primaryId, controller.secondaryId, controller.expandedId].filter((id) => id && !id.startsWith('@')).length, 6)

@@ -81,3 +81,25 @@ test('islandBridge：pushNotice 与 dropNotice/updateNotice 正确桥接至 Acti
   assert.equal(island.notices.length, 0)
   assert.equal(activityManager.get(`notice:${id}`), undefined)
 })
+
+test('islandBridge：管理器侧移除后队列自愈，不留死记录占位', () => {
+  activityManager.clear()
+  island.notices = []
+  island.tasks = []
+
+  const a = pushNotice({ tone: 'success', text: '第一条', detail: '', sticky: false, duration: 0, retry: null, to: '', toLabel: '' })
+  pushNotice({ tone: 'success', text: '第二条', detail: '', sticky: false, duration: 0, retry: null, to: '', toLabel: '' })
+  beginTask('cdk-redeem', '激活中', { percent: 10, to: '/toolbox' })
+
+  // 管理器侧时钟先删记录（到期定时/忽略等任何路径），队列必须同步逐出
+  activityManager.remove(`notice:${a}`)
+  assert.equal(island.notices.some((n) => n.id === a), false)
+  endTask('cdk-redeem')
+  assert.equal(island.tasks.some((t) => t.key === 'cdk-redeem'), false)
+
+  // 队列里不存在任何失去管理器记录的死项（视图不再渲染占位僵尸）
+  assert.ok(island.notices.every((n) => activityManager.get(`notice:${n.id}`)))
+  assert.ok(island.tasks.every((t) => activityManager.get(`task:${t.key}`)))
+  island.notices = []
+  island.tasks = []
+})

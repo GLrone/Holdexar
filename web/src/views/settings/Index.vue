@@ -636,8 +636,8 @@ async function removeBackup(name: string) {
 }
 
 /* ── 应用更新 ──
- * 更新交互已全部收进全局更新弹窗（components/business/UpdateDialog.vue）与
- * 左上角气泡（UpdateBubble.vue），本页不设常驻更新面板。
+ * 更新交互已全部收进全局更新弹窗（components/business/UpdateDialog.vue），
+ * 常驻提示由灵动岛的更新活动承担，本页不设常驻更新面板。
  * 手动「检查更新」入口在「关于」页版本徽标旁。 */
 
 /* ── 更新行为开关 ──
@@ -699,6 +699,68 @@ async function toggleMcp(on: boolean) {
   }
 }
 
+/* ── 局域网访问（LAN）：开关 + 访问密码 + 本机地址投影 ──
+ * 密码只写不回读：输入框永不预填服务端回显值，空值不提交——服务端对空串与
+ * 掩码 **** 一律不落库，前端不参与掩码语义。本机地址来自桌面宿主桥（仅
+ * 桌面壳内可用），浏览器/旧宿主保持通用指引文案。 */
+const lanEnabled = ref(false)
+const lanForced = ref(false)
+const lanHasPassword = ref(false)
+const lanToggling = ref(false)
+const lanSaving = ref(false)
+const lanPasswordInput = ref('')
+const lanHosts = ref<string[]>([])
+
+function applyLanPayload(data: SettingsPayload) {
+  if (!data.lan_access) return
+  lanEnabled.value = data.lan_access.enabled
+  lanForced.value = data.lan_access.env_forced
+  lanHasPassword.value = data.lan_access.has_password
+}
+
+async function toggleLan(on: boolean) {
+  if (lanToggling.value || lanForced.value) return
+  lanToggling.value = true
+  try {
+    applyLanPayload((await settingsApi.update({ lan_access: { enabled: on } })).lan_access)
+    message.success(t(on ? 'settings.lan.onPost' : 'settings.lan.offPost'))
+  } catch {
+    message.error(t('settings.update.switchFailed'))
+  } finally {
+    lanToggling.value = false
+  }
+}
+
+async function saveLanPassword() {
+  const value = lanPasswordInput.value.trim()
+  if (!value || lanSaving.value) return
+  lanSaving.value = true
+  try {
+    applyLanPayload((await settingsApi.update({ lan_access: { password: value } })).lan_access)
+    lanPasswordInput.value = ''
+    message.success(t('settings.lan.passwordSaved'))
+  } catch {
+    message.error(t('settings.update.switchFailed'))
+  } finally {
+    lanSaving.value = false
+  }
+}
+
+async function loadLanHosts() {
+  const bridge = (
+    window as unknown as {
+      pywebview?: { api?: { lan_hosts?: () => Promise<{ hosts?: string[] }> } }
+    }
+  ).pywebview
+  if (!bridge?.api?.lan_hosts) return
+  try {
+    const res = await bridge.api.lan_hosts()
+    lanHosts.value = res.hosts ?? []
+  } catch {
+    /* 宿主不支持：保持通用指引文案 */
+  }
+}
+
 async function load() {
   loading.value = true
   errorMsg.value = ''
@@ -713,6 +775,7 @@ async function load() {
     apiKeyMasked.value = data.account.steam_api_key
     hasApiKey.value = data.account.has_api_key
     applyMcpPayload(data)
+    applyLanPayload(data)
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -1282,6 +1345,7 @@ onMounted(() => {
   void loadPilot()
   void loadSecurity()
   void loadExports()
+  void loadLanHosts()
   /* 登录会话在后端存续：进页先对状态快照，进行中就恢复状态卡并续上轮询 */
   void refreshLoginState().then(() => {
     if (loginActive.value) startLoginPolling()
@@ -2172,7 +2236,7 @@ onUnmounted(() => {
         <div v-else class="section-desc">{{ t('settings.export.empty') }}</div>
       </div>
 
-      <!-- 应用更新不设常驻面板：更新交互收进左上角气泡与全局更新弹窗 -->
+      <!-- 应用更新不设常驻面板：常驻提示在灵动岛，交互收进全局更新弹窗 -->
 
       <!-- 价格事件通知：总开关 + 用户类别 + 静默窗 + 出口状态 + 测试邮件。
            类别是用户面分类，内部事件枚举不出现在这里。 -->
@@ -2344,6 +2408,68 @@ onUnmounted(() => {
             <div class="section-desc">{{ t('settings.mcp.helpNote') }}</div>
           </div>
         </HlDialog>
+      </div>
+
+      <!-- 局域网访问：手机/其他电脑凭「本机地址 + 访问密码」经浏览器使用应用；
+           关闭 = 仅本机回环访问（默认）。密码只写不回读。 -->
+      <div class="card settings-card" data-section="settings.section.lan">
+        <div class="section-title">{{ t('settings.section.lan') }}</div>
+        <div class="section-desc">{{ t('settings.lan.desc') }}</div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlSwitch
+              :model-value="lanEnabled"
+              accent
+              :disabled="lanToggling || lanForced"
+              :label="t('settings.lan.enabledLabel')"
+              :title="lanForced ? t('settings.lan.forcedHint') : t('settings.lan.enabledHint')"
+              @update:model-value="toggleLan"
+            />
+            <span class="mcp-status" :class="lanEnabled ? 'is-ok' : ''">
+              <span class="mcp-status__dot" />
+              {{ lanEnabled ? t('settings.lan.statusOn') : t('settings.lan.statusOff') }}
+            </span>
+          </div>
+          <div class="section-desc">
+            {{ lanForced ? t('settings.lan.forcedHint') : t('settings.lan.enabledHint') }}
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row__line">
+            <HlInput
+              v-model="lanPasswordInput"
+              type="password"
+              :placeholder="
+                lanHasPassword
+                  ? t('settings.lan.passwordPlaceholderSet')
+                  : t('settings.lan.passwordPlaceholder')
+              "
+              style="max-width: 220px"
+              :disabled="lanSaving"
+              @keydown.enter="saveLanPassword"
+            />
+            <HlButton
+              art="outline"
+              tone="blue"
+              size="sm"
+              :disabled="lanSaving || !lanPasswordInput.trim()"
+              :loading="lanSaving"
+              @click="saveLanPassword"
+            >
+              {{ t('settings.lan.passwordSave') }}
+            </HlButton>
+          </div>
+          <div class="section-desc">{{ t('settings.lan.passwordHint') }}</div>
+        </div>
+
+        <div class="settings-row">
+          <div class="section-desc">{{ t('settings.lan.addressHint') }}</div>
+          <ul v-if="lanHosts.length" class="settings-lan-hosts">
+            <li v-for="host in lanHosts" :key="host"><code>{{ host }}</code></li>
+          </ul>
+        </div>
       </div>
 
       <!-- 产品导览：首次启动自动展示过，这里手动重开（幂等） -->
@@ -2977,6 +3103,19 @@ onUnmounted(() => {
   color: var(--text-secondary);
   flex-shrink: 0;
   min-width: 88px;
+}
+.settings-lan-hosts {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.settings-lan-hosts code {
+  font-size: 12.5px;
+  color: var(--text-secondary);
 }
 .pilot-model-list {
   display: flex;

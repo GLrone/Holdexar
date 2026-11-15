@@ -66,12 +66,34 @@ const {
   history,
   historyTotal,
   historyLoading,
+  historyLoadingMore,
+  historyFilter,
+  historySearch,
+  okHistoryByCode,
 } = storeToRefs(cdk)
 const ACT_LIMIT = CDK_ACT_LIMIT
 
-/** 结果行展开原文的索引（-1 = 全收起） */
+/** 结果行展开原文的索引（-1 = 全收起）。行数变化即收起：行按位置一一对应，
+ *  删行/加行后索引会错位，指向别的码的原文会误导。 */
 const rawOpenIdx = ref(-1)
 const copied = ref(false)
+/** 展开历史成功记录的失败行（绿角标点击切换） */
+const okOpenIdx = ref(-1)
+watch(
+  () => resultRows.value.length,
+  () => {
+    rawOpenIdx.value = -1
+    okOpenIdx.value = -1
+  },
+)
+
+/* 历史筛选/搜索在 store（后端检索覆盖检索窗内全部库内记录）；搜索词防抖 */
+watch(historyFilter, () => void cdk.loadHistory())
+let historySearchTimer: number | undefined
+watch(historySearch, () => {
+  window.clearTimeout(historySearchTimer)
+  historySearchTimer = window.setTimeout(() => void cdk.loadHistory(), 300)
+})
 
 watch(keyArea, () => cdk.renderKeyQueue())
 
@@ -103,6 +125,33 @@ const HISTORY_STATUS_KEY: Record<string, MessageKey> = {
 
 const startRedeem = () => cdk.startRedeem()
 const resetRedeem = () => cdk.resetRedeem()
+
+/** 历史行的账号显示：优先昵称，其次好友码；账号已解绑时回落 SteamID 保证可对账 */
+function accountLabel(steamId: string): string {
+  const acc = accountStore.accounts.find((a) => a.steam_id === steamId)
+  return acc?.persona_name || acc?.friend_code || steamId
+}
+
+/* ── 激活历史筛选/搜索在 store，后端检索覆盖检索窗内全部库内记录 ── */
+
+/** 点击复制激活码（历史表里的码一键复制，便于去 Steam/售后核销）。
+   成功后按钮本体闪成功色：岛胶囊被常驻通知占位时不依赖它也有即时反馈 */
+const copiedKeyId = ref<number | null>(null)
+let copiedTimer: number | undefined
+async function copyHistoryKey(row: { id: number; key: string }) {
+  try {
+    await navigator.clipboard.writeText(row.key)
+    copiedKeyId.value = row.id
+    window.clearTimeout(copiedTimer)
+    copiedTimer = window.setTimeout(() => (copiedKeyId.value = null), 1200)
+    message.success(t('toolbox.cdk.history.copied'))
+  } catch {
+    message.error(t('toolbox.copy.failedHint'))
+  }
+}
+
+/** 本次激活有成功的码时显示「移除已成功」：一键从输入框清掉成功的，剩失败的切号重试 */
+const hasSucceededRows = computed(() => resultRows.value.some((r) => r.status === 'ok'))
 
 /** 复制所有 SubID + 版本名（一行一个） */
 async function copyResults() {
@@ -442,6 +491,14 @@ onMounted(() => void loadBills())
               {{ t('toolbox.cdk.start') }}
             </HlButton>
             <HlButton art="outline" tone="dark" size="sm" :disabled="running" @click="resetRedeem">{{ t('toolbox.cdk.reset') }}</HlButton>
+            <HlButton
+              v-if="hasSucceededRows"
+              variant="text"
+              size="sm"
+              :disabled="running"
+              :title="t('toolbox.cdk.removeOk.title')"
+              @click="cdk.removeSucceededKeys()"
+            >{{ t('toolbox.cdk.removeOk') }}</HlButton>
             <span class="cdk-batch-indicator" style="margin-left: auto">{{ t('toolbox.cdk.batch.label', { current: batchNo, total: batchTotal }) }}</span>
           </div>
           <div class="key-progress"><i :style="{ width: progressPct + '%' }"></i></div>
@@ -495,7 +552,20 @@ onMounted(() => void loadBills())
                     :class="r.status === 'wait' ? 'is-wait' : r.status === 'doing' ? 'is-doing' : 'is-done ' + 'is-' + r.status"
                   >
                     <td class="cdk-col-idx"><span class="cdk-idx">{{ i + 1 }}</span></td>
-                    <td class="cdk-col-code">{{ r.code }}</td>
+                    <td class="cdk-col-code">
+                      <span class="cdk-code-line">
+                        <span>{{ r.code }}</span>
+                        <!-- 绿色感叹号角标：此码本次失败但库内有成功历史（如已在别的账号入库），点开看记录 -->
+                        <button
+                          v-if="r.status === 'fail' && okHistoryByCode[r.code]?.length"
+                          type="button"
+                          class="cdk-ok-badge"
+                          :class="{ 'is-open': okOpenIdx === i }"
+                          :title="t('toolbox.cdk.okBadge.title')"
+                          @click="okOpenIdx = okOpenIdx === i ? -1 : i"
+                        ><HlIcon name="warning" :size="12" /></button>
+                      </span>
+                    </td>
                     <td class="cdk-col-result">
                       <span class="cdk-result-cell">
                         <!-- 三态徽章：图标 + 语义色，区别于原脚本的纯文本红绿字 -->
@@ -529,6 +599,15 @@ onMounted(() => void loadBills())
                       <span v-else-if="r.status === 'fail' && r.detail" :class="'cdk-detail cdk-detail--fail'">{{ r.detail }}</span>
                       <span v-else class="cdk-sub-empty">—</span>
                       <pre v-if="rawOpenIdx === i && r.raw" class="cdk-raw">{{ r.raw }}</pre>
+                      <!-- 历史成功记录：激活账号 / 激活时间 / 激活内容 -->
+                      <div v-if="okOpenIdx === i && okHistoryByCode[r.code]?.length" class="cdk-ok-records">
+                        <div class="cdk-ok-records__head">{{ t('toolbox.cdk.okBadge.records') }}</div>
+                        <div v-for="rec in okHistoryByCode[r.code]" :key="rec.id" class="cdk-ok-records__row">
+                          <span class="cdk-ok-records__acct">{{ accountLabel(rec.steamId) }}</span>
+                          <span class="cdk-ok-records__time">{{ rec.createdAt }}</span>
+                          <span class="cdk-ok-records__item">{{ rec.subName || '—' }}</span>
+                        </div>
+                      </div>
                     </td>
                     <td class="cdk-col-sub">
                       <a v-if="r.subId && r.subId !== '0'" class="cdk-sub-id" :href="`https://steamdb.info/sub/${r.subId}/`" target="_blank" rel="noopener noreferrer">{{ r.subId }}</a>
@@ -546,40 +625,79 @@ onMounted(() => void loadBills())
         </div>
       </div>
 
-      <!-- 激活历史（后端账本投影，跨会话留存；批量激活完成后 store 自动刷新） -->
+      <!-- 激活历史（后端账本检索投影，跨会话留存；筛选/搜索覆盖检索窗内全部库内记录） -->
       <div class="cdk-history">
         <div class="cdk-result-head" style="margin-top: 16px">
           <div class="cdk-section-title" style="margin-bottom: 0">{{ t('toolbox.cdk.history.title') }}</div>
           <span v-if="historyTotal > 0" class="cdk-batch-indicator">{{ t('toolbox.cdk.history.count', { n: historyTotal }) }}</span>
         </div>
-        <div v-if="historyLoading" class="fx-empty-mini" style="margin-top: 8px">{{ t('toolbox.cdk.history.loading') }}</div>
-        <HlEmpty v-else-if="history.length === 0" size="sm" icon="" :text="t('toolbox.cdk.history.empty')" />
-        <div v-else class="cdk-history-scroll">
-          <table class="bill-tbl">
-            <thead>
-              <tr>
-                <th style="width: 150px">{{ t('toolbox.cdk.history.col.time') }}</th>
-                <th style="width: 92px">{{ t('toolbox.cdk.history.col.result') }}</th>
-                <th>{{ t('toolbox.cdk.history.col.item') }}</th>
-                <th>{{ t('toolbox.cdk.history.col.detail') }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="row in history" :key="row.id">
-                <td class="mono" style="color: var(--text-dim); white-space: nowrap">{{ row.createdAt }}</td>
-                <td>
-                  <span class="cdk-badge" :class="'cdk-badge--' + row.status">{{ t(HISTORY_STATUS_KEY[row.status] ?? 'toolbox.cdk.status.fail') }}</span>
-                </td>
-                <td class="cdk-history__item">
-                  <span v-if="row.subName">{{ row.subName }}</span>
-                  <span v-else-if="row.kind === 'free'" class="cdk-sub-empty">{{ t('toolbox.cdk.history.freeItem', { subid: row.subId }) }}</span>
-                  <span v-else class="cdk-history__key">{{ row.key }}</span>
-                </td>
-                <td class="cdk-history__detail" :class="{ 'cdk-detail--fail': row.status === 'fail' }">{{ row.detail || '—' }}</td>
-              </tr>
-            </tbody>
-          </table>
+        <!-- 结果筛选 + 搜索：后端检索，覆盖检索窗内全部库内记录 -->
+        <div class="cdk-history-tools">
+          <div class="bill-chips" style="margin-bottom: 0">
+            <HlChip :on="historyFilter === ''" @click="historyFilter = ''">{{ t('common.all') }}</HlChip>
+            <HlChip :on="historyFilter === 'ok'" @click="historyFilter = 'ok'">{{ t('toolbox.cdk.status.ok') }}</HlChip>
+            <HlChip :on="historyFilter === 'own'" @click="historyFilter = 'own'">{{ t('toolbox.cdk.summary.own') }}</HlChip>
+            <HlChip :on="historyFilter === 'fail'" @click="historyFilter = 'fail'">{{ t('toolbox.cdk.summary.fail') }}</HlChip>
+          </div>
+          <input
+            v-model="historySearch"
+            :placeholder="t('toolbox.cdk.history.search')"
+            class="cdk-history-search"
+          />
         </div>
+        <div v-if="historyLoading" class="fx-empty-mini" style="margin-top: 8px">{{ t('toolbox.cdk.history.loading') }}</div>
+        <HlEmpty v-else-if="history.length === 0 && (historyFilter || historySearch.trim())" size="sm" icon="🔍" :text="t('toolbox.cdk.history.emptyFiltered')" />
+        <HlEmpty v-else-if="history.length === 0" size="sm" icon="" :text="t('toolbox.cdk.history.empty')" />
+        <template v-else>
+          <div class="cdk-history-scroll">
+            <table class="bill-tbl">
+              <thead>
+                <tr>
+                  <th style="width: 150px">{{ t('toolbox.cdk.history.col.time') }}</th>
+                  <th style="width: 92px">{{ t('toolbox.cdk.history.col.result') }}</th>
+                  <th style="width: 200px">{{ t('toolbox.cdk.history.col.key') }}</th>
+                  <th>{{ t('toolbox.cdk.history.col.item') }}</th>
+                  <th style="width: 110px">{{ t('toolbox.cdk.history.col.account') }}</th>
+                  <th>{{ t('toolbox.cdk.history.col.detail') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in history" :key="row.id">
+                  <td class="mono" style="color: var(--text-dim); white-space: nowrap">{{ row.createdAt }}</td>
+                  <td>
+                    <span class="cdk-badge" :class="'cdk-badge--' + row.status">{{ t(HISTORY_STATUS_KEY[row.status] ?? 'toolbox.cdk.status.fail') }}</span>
+                  </td>
+                  <!-- 激活码独立成列且点击即复制：失败记录（锁区/无效码等没有版本名）靠它认领是哪个码 -->
+                  <td class="cdk-history__keycell">
+                    <button
+                      v-if="row.key"
+                      type="button"
+                      class="cdk-history__key"
+                      :class="{ 'is-copied': copiedKeyId === row.id }"
+                      :title="t('toolbox.cdk.history.copy.title')"
+                      @click="copyHistoryKey(row)"
+                    >{{ row.key }}</button>
+                    <span v-else class="cdk-sub-empty">—</span>
+                  </td>
+                  <td class="cdk-history__item">
+                    <span v-if="row.subName">{{ row.subName }}</span>
+                    <span v-else-if="row.kind === 'free'" class="cdk-sub-empty">{{ t('toolbox.cdk.history.freeItem', { subid: row.subId }) }}</span>
+                    <span v-else class="cdk-sub-empty">—</span>
+                  </td>
+                  <!-- 哪个账号激活的：昵称优先，账号已解绑回落 SteamID（悬停看全号） -->
+                  <td class="cdk-history__acct" :title="row.steamId">
+                    <span v-if="row.steamId">{{ accountLabel(row.steamId) }}</span>
+                    <span v-else class="cdk-sub-empty">—</span>
+                  </td>
+                  <td class="cdk-history__detail" :class="{ 'cdk-detail--fail': row.status === 'fail' }">{{ row.detail || '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="historyTotal > history.length" style="text-align: center; padding: 7px 0 0">
+            <HlButton variant="text" size="sm" :loading="historyLoadingMore" @click="cdk.loadMoreHistory()">{{ t('toolbox.cdk.history.loadMore') }}</HlButton>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -747,9 +865,45 @@ onMounted(() => void loadBills())
 .cdk-copy-btn.copied { border-color: var(--success); color: var(--success); background: var(--success-a15); }
 .cdk-result-scroll { max-height: 320px; overflow-y: auto; border: 1px solid var(--line-1); border-radius: 6px; }
 
-/* 激活历史（账本投影）：复用结果表徽章色，行高收紧 */
+/* 激活历史（账本投影）：复用结果表徽章色，行高收紧；表头冻结不随滚动 */
 .cdk-history-scroll { max-height: 260px; overflow-y: auto; border: 1px solid var(--line-1); border-radius: 6px; margin-top: 8px; }
+.cdk-history-scroll .bill-tbl th { position: sticky; top: 0; background: var(--bg-card); }
+.cdk-history-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+.cdk-history-search {
+  width: 240px;
+  height: 30px;
+  background: var(--input-bg, var(--surface-inset));
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  color: var(--text-primary);
+  font-family: inherit;
+}
+.cdk-history-search:focus { outline: none; border-color: var(--accent-a40); }
+.cdk-history__keycell { max-width: 200px; }
+.cdk-history__keycell span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cdk-history__key {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.cdk-history__key:hover { color: var(--accent); text-decoration: underline; }
+.cdk-history__key.is-copied { color: var(--success); }
 .cdk-history__item { max-width: 220px; }
+.cdk-history__acct { max-width: 110px; }
+.cdk-history__acct span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cdk-history__item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cdk-history__key { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.3px; color: var(--text-secondary); }
 .cdk-history__detail { font-size: 11px; color: var(--text-secondary); }
@@ -864,6 +1018,37 @@ onMounted(() => void loadBills())
 .cdk-result-table .cdk-col-sub { width: 92px; }
 .cdk-idx { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
 .cdk-col-code { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.3px; color: var(--text-secondary); white-space: nowrap; }
+.cdk-code-line { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.cdk-ok-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--success);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.cdk-ok-badge:hover, .cdk-ok-badge.is-open { background: var(--success-a15); }
+/* 历史成功记录块（角标展开）：成功色调的小信息块 */
+.cdk-ok-records {
+  margin: 7px 0 2px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: var(--success-a15);
+  border: 1px solid color-mix(in srgb, var(--success) 32%, transparent);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.cdk-ok-records__head { color: var(--success); font-weight: 600; margin-bottom: 3px; }
+.cdk-ok-records__row { display: flex; gap: 9px; align-items: baseline; padding: 2px 0; flex-wrap: wrap; }
+.cdk-ok-records__acct { color: var(--success); font-weight: 600; }
+.cdk-ok-records__time { color: var(--text-dim); font-family: var(--font-mono); font-size: 10.5px; }
+.cdk-ok-records__item { color: var(--text-secondary); }
 .cdk-result-table td { padding: 7px 10px; border-bottom: 1px solid var(--row-border); vertical-align: middle; }
 .cdk-result-table td.cdk-col-sub, .cdk-result-table td.cdk-col-result { white-space: nowrap; }
 .cdk-result-cell { display: inline-flex; align-items: center; gap: 5px; }

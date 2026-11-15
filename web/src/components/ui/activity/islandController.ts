@@ -16,12 +16,7 @@ export interface IslandLayout {
 }
 
 type ExpandedOrigin = 'main' | 'secondary' | 'idle' | null
-export type IslandLayoutAction = 'main' | 'secondary' | 'collapse' | 'return'
-
-interface LayoutSnapshot extends IslandLayout {
-  order: string[]
-  origin: ExpandedOrigin
-}
+export type IslandLayoutAction = 'main' | 'secondary' | 'collapse'
 
 function unique(ids: Array<string | null>): string[] {
   return [...new Set(ids.filter((id): id is string => Boolean(id)))]
@@ -36,7 +31,6 @@ export class IslandController {
   private readonly _userSelectedId = ref<string | null>(null)
   private _order: string[] = []
   private _expandedOrigin: ExpandedOrigin = null
-  private _previousLayout: LayoutSnapshot | null = null
   private _lastUrgentId: string | null = null
 
   readonly isExpanded = computed(() => this._expandedId.value !== null)
@@ -135,7 +129,6 @@ export class IslandController {
     const selected = this._secondaryId.value
     if (!selected || !this._manager.get(selected)) return
 
-    this._rememberLayout()
     const currentExpanded = this._expandedId.value
     if (currentExpanded && currentExpanded !== IDLE_EXPANDED_ID) {
       this._secondaryId.value = currentExpanded
@@ -153,7 +146,6 @@ export class IslandController {
   openMain(): void {
     const main = this._mainId.value
     if (this.isExpanded.value && this._expandedId.value !== IDLE_EXPANDED_ID) {
-      this._rememberLayout()
       const oldMain = this._mainId.value
       const oldExpanded = this._expandedId.value
       this._mainId.value = oldExpanded
@@ -166,11 +158,9 @@ export class IslandController {
     }
 
     if (this._expandedId.value === IDLE_EXPANDED_ID) {
-      this._rememberLayout()
       this._expandedId.value = null
       this._expandedOrigin = null
     } else {
-      this._rememberLayout()
       const selectedMain = main ?? this._nextCandidate([])
       if (!selectedMain) {
         this._expandedId.value = IDLE_EXPANDED_ID
@@ -217,27 +207,6 @@ export class IslandController {
     if (!expanded && this.isExpanded.value) this.requestLayoutAction('collapse')
   }
 
-  /** 恢复最近一次槽位转换前的布局。 */
-  returnPreviousLayout(): void {
-    const previous = this._previousLayout
-    if (!previous) {
-      this.collapseExpanded()
-      return
-    }
-
-    const active = new Set(this._manager.activities.map((activity) => activity.id))
-    this._mainId.value = this._valid(previous.mainId, active)
-    this._secondaryId.value = this._valid(previous.secondaryId, active)
-    this._expandedId.value = previous.expandedId === IDLE_EXPANDED_ID
-      ? (active.size ? null : IDLE_EXPANDED_ID)
-      : this._valid(previous.expandedId, active)
-    this._expandedOrigin = previous.origin
-    this._order = previous.order.filter((id) => active.has(id))
-    this._previousLayout = null
-    this._repairSlots()
-    this._commitVisibleOrder()
-  }
-
   /** 展开任务回到进入展开位前对应的紧凑槽位。 */
   collapseExpanded(): void {
     const expanded = this._expandedId.value
@@ -245,7 +214,6 @@ export class IslandController {
     if (expanded === IDLE_EXPANDED_ID) {
       this._expandedId.value = null
       this._expandedOrigin = null
-      this._previousLayout = null
       return
     }
 
@@ -266,7 +234,6 @@ export class IslandController {
 
     this._expandedId.value = null
     this._expandedOrigin = null
-    this._previousLayout = null
     this._repairSlots()
     this._commitVisibleOrder()
   }
@@ -286,7 +253,6 @@ export class IslandController {
         ? oldMain
         : this._nextCandidate([id, this._expandedId.value])
     }
-    this._previousLayout = null
     this._repairSlots()
     this._commitVisibleOrder()
   }
@@ -335,7 +301,6 @@ export class IslandController {
   setOverview(open: boolean): void {
     this.isOverviewOpen.value = open
     if (open && this.isExpanded.value) this.collapseExpanded()
-    if (open) this._previousLayout = null
   }
 
   setHovered(hovered: boolean): void {
@@ -347,18 +312,9 @@ export class IslandController {
     return this._manager.get(id) ?? null
   }
 
-  private _valid(id: string | null, active: Set<string>): string | null {
-    return id && active.has(id) ? id : null
-  }
-
   private _nextCandidate(excluded: Array<string | null>): string | null {
     const unavailable = new Set(unique(excluded))
     return this._order.find((id) => this._manager.get(id) && !unavailable.has(id)) ?? null
-  }
-
-  private _rememberLayout(): void {
-    const current = this.layout
-    this._previousLayout = { ...current, waitingIds: [...current.waitingIds], order: [...this._order], origin: this._expandedOrigin }
   }
 
   private _commitVisibleOrder(): void {
@@ -377,7 +333,6 @@ export class IslandController {
       this._secondaryId.value = this._mainId.value
     }
     this._mainId.value = id
-    this._previousLayout = null
     this._repairSlots()
     this._commitVisibleOrder()
   }
@@ -407,7 +362,6 @@ export class IslandController {
     if (this._expandedId.value && this._expandedId.value !== IDLE_EXPANDED_ID && !active.has(this._expandedId.value)) {
       this._expandedId.value = null
       this._expandedOrigin = null
-      this._previousLayout = null
     }
     if (this._expandedId.value === IDLE_EXPANDED_ID && active.size) {
       this._expandedId.value = null

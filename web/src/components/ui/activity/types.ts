@@ -51,6 +51,8 @@ export interface Activity {
   to?: string
   /** 跳转按钮文案 */
   toLabel?: string
+  /** 打开动作回调：存在时点击动作优先触发它，不再走 to 路由跳转（to 仍作按钮可见性依据与兜底） */
+  onOpen?: (() => void) | null
   /** 扩展元数据 */
   metadata?: Record<string, unknown>
 }
@@ -73,5 +75,6 @@ export interface ActivityRegistration {
   retry?: (() => void) | null
   to?: string
   toLabel?: string
+  onOpen?: (() => void) | null
   metadata?: Record<string, unknown>
 }

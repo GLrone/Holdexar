@@ -438,22 +438,22 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 4px;
-  background: var(--success-a15);
-  color: var(--success-on-dark);
+  background: var(--success);
+  color: var(--on-accent);
   font-size: 10px;
   font-weight: 600;
 }
 
 /* 预告章换中性蓝（未开始的语义），倒计时跟随其后 */
 .epic-card__status--upcoming .epic-card__state {
-  background: var(--accent-a15);
-  color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 /* 移动端章：来源语义（不是时间状态），沿用品牌蓝 */
 .epic-card__state--mobile {
-  background: var(--accent-a15);
-  color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .epic-card__countdown {

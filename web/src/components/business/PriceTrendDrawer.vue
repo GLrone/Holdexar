@@ -447,6 +447,7 @@ watch(visible, (open) => {
         <div class="pc-chart-wrap">
           <PriceTrendChart
             :payload="history"
+            :unknown-product="versionKey === -1"
             height="240px"
             :window-days="days"
             @window-change="days = $event"

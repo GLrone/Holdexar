@@ -55,9 +55,11 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
   const progressKey = ref<MessageKey>('toolbox.cdk.progress.ready')
   const progressCount = ref('0 / 0')
   const progressPct = ref(0)
-  const ksOk = ref(0)
-  const ksFail = ref(0)
-  const ksOwn = ref(0)
+  /* 汇总计数从结果行派生（唯一事实源是结果表）：重跑不重复累加、
+     删行/改输入后计数自动跟随，不存在独立累积的第二份账 */
+  const ksOk = computed(() => resultRows.value.filter((r) => r.status === 'ok').length)
+  const ksFail = computed(() => resultRows.value.filter((r) => r.status === 'fail').length)
+  const ksOwn = computed(() => resultRows.value.filter((r) => r.status === 'own').length)
   const running = ref(false)
 
   const quotaReady = ref(true)
@@ -69,17 +71,24 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
   const usedBase = ref(0)
   const usedSession = ref<number[]>([])
 
-  /* ── 激活历史（后端账本，跨会话留存；批量激活完成后自动刷新）── */
+  /* ── 激活历史（后端账本检索投影，跨会话留存；筛选/搜索走后端接口，
+     覆盖检索窗内全部库内记录，不限已加载页）── */
   const history = ref<RedeemActivationRow[]>([])
   const historyTotal = ref(0)
   const historyLoading = ref(false)
-  const HISTORY_PAGE_SIZE = 20
+  const historyLoadingMore = ref(false)
+  const HISTORY_PAGE_SIZE = 200
+  const historyFilter = ref<'' | 'ok' | 'own' | 'fail'>('')
+  const historySearch = ref('')
 
-  /** 拉取激活历史（时间倒序，取最近一页） */
   async function loadHistory(): Promise<void> {
     historyLoading.value = true
     try {
-      const res = await redeemApi.activations({ limit: HISTORY_PAGE_SIZE })
+      const res = await redeemApi.activations({
+        limit: HISTORY_PAGE_SIZE,
+        status: historyFilter.value || undefined,
+        q: historySearch.value.trim() || undefined,
+      })
       history.value = res.rows
       historyTotal.value = res.total
     } catch {
@@ -87,6 +96,42 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     } finally {
       historyLoading.value = false
     }
+  }
+
+  /** 加载更多（同一筛选/搜索词的下一页，追加展示） */
+  async function loadMoreHistory(): Promise<void> {
+    if (historyLoadingMore.value || history.value.length >= historyTotal.value) return
+    historyLoadingMore.value = true
+    try {
+      const res = await redeemApi.activations({
+        limit: HISTORY_PAGE_SIZE,
+        offset: history.value.length,
+        status: historyFilter.value || undefined,
+        q: historySearch.value.trim() || undefined,
+      })
+      history.value = [...history.value, ...res.rows]
+      historyTotal.value = res.total
+    } catch {
+      /* 追加失败保留旧数据 */
+    } finally {
+      historyLoadingMore.value = false
+    }
+  }
+
+  /** 失败码 → 库内成功记录（结果表绿角标数据源；激活完成后对失败码静默回查） */
+  const okHistoryByCode = ref<Record<string, RedeemActivationRow[]>>({})
+
+  async function lookupOkHistory(codes: string[]): Promise<void> {
+    await Promise.all(
+      codes.map(async (code) => {
+        try {
+          const res = await redeemApi.activations({ key: code, status: 'ok', limit: 5 })
+          if (res.rows.length) okHistoryByCode.value = { ...okHistoryByCode.value, [code]: res.rows }
+        } catch {
+          /* 回查失败角标不出现，不打断激活面板 */
+        }
+      }),
+    )
   }
 
   /** 30 分钟窗口内本账号已用激活次数（后端基数 + 会话增量） */
@@ -110,20 +155,31 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     return keys
   }
 
-  /** 输入即渲染左栏队列 + 右栏等待行（运行中不重建，防清掉在跑的批次） */
+  /** 输入即渲染左栏队列 + 右栏等待行（运行中不重建，防清掉在跑的批次）。
+   *  仍在输入区里的码保留已有状态与回执——删掉已成功的码去重试失败的，
+   *  不该把已拿到的激活结果一并清成待激活；新出现的码补等待行。 */
   function renderKeyQueue(): void {
     if (running.value) return
     const keys = parseKeys()
-    keyQueue.value = keys.map((k) => ({ code: k, status: 'wait' as KeyStatus }))
-    resultRows.value = keys.map((k) => ({
+    const previous = new Map<string, ResultRow[]>()
+    for (const r of resultRows.value) {
+      const list = previous.get(r.code)
+      if (list) list.push(r)
+      else previous.set(r.code, [r])
+    }
+    resultRows.value = keys.map((k) => previous.get(k)?.shift() ?? {
       code: k,
       status: 'wait' as KeyStatus,
       detail: '',
       subId: '',
       subName: '',
       raw: '',
-    }))
-    progressCount.value = `0 / ${keys.length}`
+    })
+    // 左栏队列行只是结果行的投影，状态直接跟随，不再各存一份
+    keyQueue.value = resultRows.value.map((r) => ({ code: r.code, status: r.status }))
+    const done = ksOk.value + ksFail.value + ksOwn.value
+    progressCount.value = `${done} / ${keys.length}`
+    progressPct.value = keys.length ? Math.round((done / keys.length) * 100) : 0
     batchNo.value = 1
     batchTotal.value = Math.max(1, Math.ceil(keys.length / CDK_BATCH_SIZE))
   }
@@ -138,6 +194,11 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
         quotaSteamId.value = q.steamId
         usedSession.value = []
       }
+      // 后端计数已包含本会话的尝试（激活时后端同步记账），再留会话增量会把
+      // 同一批尝试算两遍——重试一两轮就被虚高计数挡住。传输失败的尝试后端
+      // 不计（Steam 没收到不烧配额），清增量后这类尝试也不再进节流提示，
+      // Steam 端才是真裁判。
+      usedSession.value = []
       usedBase.value = q.used
     } catch {
       quotaMsgKey.value = ''
@@ -217,9 +278,7 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
             raw: r.raw || '',
           }
         }
-        if (st === 'ok') ksOk.value++
-        else if (st === 'own') ksOwn.value++
-        else ksFail.value++
+        // 汇总计数由结果行派生（ksOk/ksFail/ksOwn computed），这里只推进进度
         done++
         progressPct.value = Math.round((done / toActivate) * 100)
         progressCount.value = `${done} / ${toActivate}`
@@ -253,19 +312,36 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     }
     void loadQuota()
     void loadHistory()
+    // 失败码回查库内成功历史：绿角标提示「此码此前激活成功过」（切号撞库场景）
+    const failedCodes = resultRows.value.filter((r) => r.status === 'fail').map((r) => r.code)
+    if (failedCodes.length) void lookupOkHistory(failedCodes)
+  }
+
+  /** 从输入区移除本次激活成功的码（切号后只兑剩下的）。
+   *  行内其他文字原样保留，整行只剩这个码时整行删除；keyArea 变化
+   *  经既有 watcher 触发 renderKeyQueue——被移除的成功行随之出列，
+   *  失败结果按码保留。 */
+  function removeSucceededKeys(): void {
+    if (running.value) return
+    const okCodes = new Set(resultRows.value.filter((r) => r.status === 'ok').map((r) => r.code))
+    if (okCodes.size === 0) return
+    const reg = /([0-9A-Z]{5}-){2,4}[0-9A-Z]{5}/g
+    keyArea.value = keyArea.value
+      .split(/\r?\n/)
+      .map((line) => line.replace(reg, (m) => (okCodes.has(m) ? '' : m)))
+      .filter((line) => line.trim() !== '')
+      .join('\n')
   }
 
   /** 清空重置（运行中拒绝：会清掉在跑批次的状态行） */
   function resetRedeem(): void {
     if (running.value) return
     usedSession.value = []
-    keyQueue.value = []
     resultRows.value = []
+    keyQueue.value = []
+    okHistoryByCode.value = {}
     progressPct.value = 0
     progressKey.value = 'toolbox.cdk.progress.ready'
-    ksOk.value = 0
-    ksFail.value = 0
-    ksOwn.value = 0
     progressCount.value = '0 / 0'
     batchNo.value = 1
     batchTotal.value = 1
@@ -294,12 +370,18 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     history,
     historyTotal,
     historyLoading,
+    historyLoadingMore,
+    historyFilter,
+    historySearch,
+    okHistoryByCode,
     parseKeys,
     renderKeyQueue,
     loadQuota,
     loadHistory,
+    loadMoreHistory,
     resetSession,
     startRedeem,
     resetRedeem,
+    removeSucceededKeys,
   }
 })

@@ -43,8 +43,10 @@ test('island motion source：槽位容器与任务标识分别连续迁移', () 
   assert.doesNotMatch(motionSource, /setTimeout|setInterval/)
   assert.doesNotMatch(secondarySource, /is-phase-sliding|is-phase-settling|hl-secondary-settle|translateY\(4px\)/)
   assert.doesNotMatch(secondarySource, /\.hl-secondary-island:hover\s*\{[^}]*transform:\s*scale/s)
-  assert.match(primarySource, /returnToPrevious/)
   assert.match(primarySource, /emit\(['"]collapse['"]\)/)
+  assert.doesNotMatch(primarySource, /returnToPrevious/)
+  /* 忽略动作收口在展开卡控制区（✕），折叠动作行不再重复提供 */
+  assert.match(primarySource, /mode === 'expanded' && dismissible/)
 })
 
 test('island motion overlays：候补动画副本清理后不会留成重复槽位', () => {
@@ -83,7 +85,7 @@ test('island controls：实验室触发副岛直开且主活动列表不用边�
   assert.ok(playgroundSource.includes('function toggleIslandExpanded()'))
   assert.doesNotMatch(itemSource, /\.hl-activity-item\.is-primary\s*\{[^}]*border\s*:/s)
   assert.doesNotMatch(islandSource, /@after-close="onActivityPanelAfterLeave"/)
-  assert.match(islandSource, /@return="returnToPreviousLayout"/)
+  assert.doesNotMatch(islandSource, /returnToPreviousLayout/)
   assert.match(islandSource, /@collapse="collapseExpanded"/)
 })
 

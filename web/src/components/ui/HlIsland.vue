@@ -15,7 +15,7 @@ import PrimaryIsland from './activity/PrimaryIsland.vue'
 import SecondaryIsland from './activity/SecondaryIsland.vue'
 import { IslandLayoutMotion } from './activity/islandLayoutMotion'
 import type { Activity } from './activity/types'
-import { armTimer, dropNotice, endTask, island, setHovered } from './island'
+import { dropNotice, endTask, island, setHovered } from './island'
 
 const router = useRouter()
 const crawl = useCrawlStatusStore()
@@ -171,6 +171,11 @@ const expandedIsTask = computed(() => {
   return !legacyNotice.value && crawlRunning.value
 })
 const expandedCanRetry = computed(() => Boolean(expandedAct.value?.retry || legacyNotice.value?.retry))
+/** 忽略只在展开卡控制区提供：运行中且自带取消的任务以取消为准，不重复给忽略 */
+const expandedDismissible = computed(() => {
+  const act = expandedAct.value
+  return Boolean(act) && !(act!.cancel && act!.status === 'running')
+})
 const expandedGoto = computed(() => {
   if (expandedAct.value) return expandedAct.value.to || (expandedAct.value.status === 'failed' || expandedAct.value.tone === 'error' ? '/logs' : '')
   if (legacyNotice.value) return legacyNotice.value.to || (legacyNotice.value.tone === 'error' ? '/logs' : '')
@@ -222,7 +227,6 @@ let applyingControllerMutation = false
 
 function syncExpandedBridge() {
   island.expanded = islandController.isExpanded.value
-  armTimer()
 }
 
 async function transitionLayout(change: () => void) {
@@ -255,10 +259,6 @@ async function onIslandKeydown() {
 function onSecondaryAction() {
   if (!islandController.hasSecondary) return
   void transitionLayout(() => islandController.openSecondary())
-}
-
-function returnToPreviousLayout() {
-  void transitionLayout(() => islandController.returnPreviousLayout())
 }
 
 async function collapseExpanded() {
@@ -305,9 +305,16 @@ function retry() {
 }
 
 function goDetail() {
+  const act = expandedAct.value ?? primaryAct.value
+  if (act?.onOpen) {
+    islandController.collapseExpanded()
+    syncExpandedBridge()
+    act.onOpen()
+    return
+  }
   const target = expandedGoto.value || goto.value
   if (!target) return
-  const isDev = (expandedAct.value ?? primaryAct.value)?.id.startsWith('dev:') ?? false
+  const isDev = act?.id.startsWith('dev:') ?? false
   islandController.collapseExpanded()
   syncExpandedBridge()
   if (isDev) return
@@ -369,14 +376,11 @@ watch(islandController.layoutRequest, () => {
     main: () => islandController.openMain(),
     secondary: () => islandController.openSecondary(),
     collapse: () => islandController.collapseExpanded(),
-    return: () => islandController.returnPreviousLayout(),
   }
   void transitionLayout(actions[action])
 })
 watch(islandController.isExpanded, (expanded) => {
-  if (island.expanded === expanded) return
   island.expanded = expanded
-  armTimer()
 }, { immediate: true })
 watch(
   () => [primaryAct.value?.id, legacyNotice.value?.id, legacyTask.value?.key, priceKind.value, priceLabel.value, priceStale.value],
@@ -406,6 +410,10 @@ function onPinActivity(id: string) {
 
 function onPanelAction(activity: Activity) {
   void transitionLayout(() => islandController.setOverview(false))
+  if (activity.onOpen) {
+    activity.onOpen()
+    return
+  }
   if (activity.to && !activity.id.startsWith('dev:')) void router.push(activity.to)
 }
 
@@ -529,13 +537,13 @@ onBeforeUnmount(() => {
           :can-retry="expandedCanRetry"
           :goto="expandedGoto"
           :goto-label="expandedGotoLabel"
+          :dismissible="expandedDismissible"
           @cancel="cancelTask(expandedAct)"
           @retry="retry"
           @dismiss="dismiss"
           @go-detail="goDetail"
           @go-task="goTask"
           @open-task="openTask"
-          @return="returnToPreviousLayout"
           @collapse="collapseExpanded"
         />
       </div>

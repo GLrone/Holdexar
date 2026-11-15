@@ -18,7 +18,6 @@ import { walletSyncOk, walletSyncedAt } from '@/lib/walletSync'
 import { APP_NAME } from '@/appInfo'
 import ProductTour from '@/components/ProductTour.vue'
 import UpdateDialog from '@/components/business/UpdateDialog.vue'
-import UpdateBubble from '@/components/business/UpdateBubble.vue'
 import {
   HlIcon,
   HlImg,
@@ -133,13 +132,13 @@ watch(
   { immediate: true },
 )
 
-/* ── 启动检查更新（气泡提示 / 静默自动更新）──
+/* ── 启动检查更新（灵动岛提示 / 静默自动更新）──
    settings 拉到之后（拿两个更新开关 + 跳过版本）查一次更新，按用户设置分路：
    · 静默自动更新开 → 有新版不吆喝，直接后台下载校验；桌面壳下次启动消费
      暂存目录自动换装（浏览器态等用户手动重启）。「静默」就是全程无感，
-     下载完成后气泡转「重启更新」态——真正需要用户动手的时刻（重启）不能瞒。
-   · 提示开 → 左上角气泡持续显示「发现新版本」，悬停看更新内容、点击进更新
-     窗口（跳过此版本可关掉气泡，下一个新版本会重新出现）。
+     下载完成后岛上转「重启更新」态——真正需要用户动手的时刻（重启）不能瞒。
+   · 提示开 → 灵动岛持续显示「发现新版本」，点击打开更新窗口（跳过此版本后
+     不再上岛，下一个新版本会重新出现）。
    · 两者都关 → 启动不查（省一次网络请求），用户仍可在更新窗口手动检查。 */
 function startSilentUpdate(version: string) {
   if (updaterStore.pendingTag || updaterStore.downloading) return
@@ -489,11 +488,8 @@ async function manualRefreshWallet() {
     <ProductTour v-model="tour.open" />
 
     <!-- 全局更新弹窗（检查/下载/校验/重启全在这里闭环；模糊幕布遮住底层页面）。
-         更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。 -->
-    <!-- 左上角更新气泡：发现新版 / 下载中 / 待重启 / 上次失败时悬浮出现，
-         悬停看更新内容，点击打开更新报告窗口；跳过此版本即收起（Teleport 固定定位，
-         挂载点不决定位置） -->
-    <UpdateBubble />
+         更新模块已从设置页搬出——更新是应用级事务，不该塞在某个页签里。
+         常驻提示由灵动岛的更新活动承担。 -->
     <UpdateDialog />
 
     <!-- 领航台：领航员问答抽屉（全局唯一实例；顶栏 / 找游戏 / 游戏详情三处入口共开） -->

@@ -20,7 +20,7 @@ import {
   stateFormatter,
   type EventFormatters,
 } from '@/lib/priceEvents'
-import { selectableVariants, versionSelectOptions } from '@/lib/versions'
+import { versionSelectOptions } from '@/lib/versions'
 import { useCrawlStatusStore } from '@/stores/crawlStatus'
 import { useLocaleStore } from '@/stores/locale'
 import { usePilotStore } from '@/stores/pilot'
@@ -71,7 +71,7 @@ const loading = ref(true)
 const errorMsg = ref('')
 
 const historyRegion = ref('cn') // 小写（history API 语义）
-/** 0 = 标准版（请求不带 subId）；其余 = sub 包号（对齐走势抽屉 versionKey 语义） */
+/** -1 = 未识别版本；0 = 标准版；正数 = sub 包号。 */
 const historySubId = ref(0)
 const history = ref<HistoryPayload | null>(null)
 const historyLoading = ref(false)
@@ -335,7 +335,7 @@ const lowTimeline = computed(() => {
     ts: e.ts,
     label:
       i === 0
-        ? t('gameDetail.event.first')
+        ? t(historySubId.value === -1 ? 'gameDetail.trend.firstObserved' : 'gameDetail.event.first')
         : i === evts.length - 1
           ? t('gameDetail.event.lowest')
           : t('gameDetail.event.drop'),
@@ -414,9 +414,8 @@ async function load() {
 // ── 版本切换（版本列表来自 history 响应 versions，随地区刷新）──
 // 展示口径与卡片 GPW、走势抽屉同源（lib/versions.ts）：标准版只占一行，
 // 它横跨的多个 sub 代际不各占一行。
-const hasMultipleVersions = computed(() => selectableVariants(history.value?.versions ?? []).length > 0)
-
 const versionOptions = computed(() => versionSelectOptions(history.value?.versions ?? [], t))
+const hasMultipleVersions = computed(() => versionOptions.value.length > 1)
 
 async function loadHistory() {
   const seq = ++requestSeq
@@ -427,14 +426,15 @@ async function loadHistory() {
       appid.value,
       historyRegion.value,
       0,
-      historySubId.value || undefined,
+      historySubId.value > 0 ? historySubId.value : undefined,
+      historySubId.value === -1 ? 'unknown' : undefined,
     )
     if (seq !== requestSeq) return
     history.value = res
     // 版本列表随地区/响应刷新，当前选择可能已不在列表 → 回落标准版
     if (
       historySubId.value !== 0 &&
-      !history.value?.versions?.some((v) => (v.subId ?? 0) === historySubId.value)
+      !versionOptions.value.some((v) => v.value === historySubId.value)
     ) {
       historySubId.value = 0
     }
@@ -856,7 +856,7 @@ onMounted(load)
               <!-- 现价块（模版 pc-price-now：现价/原价/折扣角标） -->
               <div class="gd-trend-pricebar">
                 <div class="gd-tp-row">
-                  <span class="gd-tp-label">{{ t('gameDetail.trend.steamNow') }}</span>
+                  <span class="gd-tp-label">{{ t(historySubId === -1 ? 'gameDetail.trend.latestObserved' : 'gameDetail.trend.steamNow') }}</span>
                   <div class="gd-tp-block">
                     <div class="gd-tp-current" :class="{ 'is-discount': regionNowDiscount > 0 }">
                       {{ regionNowCnyFen !== null ? formatCnyFen(regionNowCnyFen) : '—' }}
@@ -876,6 +876,7 @@ onMounted(load)
               </div>
               <PriceTrendChart
                 :payload="history"
+                :unknown-product="historySubId === -1"
                 :appid="appid"
                 with-key-line
                 height="300px"
@@ -896,13 +897,13 @@ onMounted(load)
                   <div class="gd-stat__num gd-stat--now">
                     {{ regionNowCnyFen !== null ? formatCnyFen(regionNowCnyFen) : '—' }}
                   </div>
-                  <div class="gd-stat__lbl">{{ t('gameDetail.trend.steamNow') }}</div>
+                  <div class="gd-stat__lbl">{{ t(historySubId === -1 ? 'gameDetail.trend.latestObserved' : 'gameDetail.trend.steamNow') }}</div>
                 </div>
                 <div class="gd-stat">
                   <div class="gd-stat__num gd-stat--orig">
                     {{ debutOriginalYuan !== null ? `¥${debutOriginalYuan.toFixed(0)}` : '—' }}
                   </div>
-                  <div class="gd-stat__lbl">{{ t('gameDetail.trend.debutPrice') }}</div>
+                  <div class="gd-stat__lbl">{{ t(historySubId === -1 ? 'gameDetail.trend.firstObserved' : 'gameDetail.trend.debutPrice') }}</div>
                 </div>
                 <div class="gd-stat">
                   <div class="gd-stat__num gd-stat--evt">

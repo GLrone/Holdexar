@@ -7,9 +7,19 @@ const hbChoice = {
   'hbChoice.title': 'HB 月包',
   'hbChoice.refresh': '立即刷新',
   'hbChoice.refreshing': '刷新中…',
+  'hbChoice.refreshFailed': '刷新未完成',
   'hbChoice.goMonth': '前往月包',
   'hbChoice.skip': '跳过本月',
   'hbChoice.empty': '当月包尚未入库，等待每日抓取',
+  'hbChoice.platform.steam': 'Steam',
+  'hbChoice.platform.blizzard': 'Battle.net 战网',
+  'hbChoice.platform.epic': 'Epic',
+  'hbChoice.platform.ubisoft': '育碧',
+  'hbChoice.platform.gog': 'GOG',
+  'hbChoice.platform.origin': 'Origin',
+  'hbChoice.platform.ea': 'EA App',
+  'hbChoice.platform.itch': 'itch.io',
+  'hbChoice.platform.drm-free': '直接下载版',
 } as const
 
 export default hbChoice

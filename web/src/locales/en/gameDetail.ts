@@ -85,6 +85,8 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   /* Region picker: name and currency are data, but the full-width parens are zh typography */
   'gameDetail.region.option': '{name} ({currency})',
   'gameDetail.trend.steamNow': 'Steam price',
+  'gameDetail.trend.latestObserved': 'Latest observed price',
+  'gameDetail.trend.firstObserved': 'First observation',
   'gameDetail.trend.discount': '▼ -{pct}% · On sale',
   'gameDetail.trend.noDiscount': 'Full price',
   'gameDetail.trend.emptyRegion':

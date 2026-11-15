@@ -13,7 +13,6 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.viewLogs': 'View logs',
   'island.dismiss': 'Dismiss',
   'island.hideStatus': 'Close status indicator',
-  'island.returnToPrevious': 'Return to previous layout',
   'island.collapse': 'Collapse expanded card',
   'island.more': '{n} more',
   'island.swap': 'Open details',
@@ -28,6 +27,7 @@ const island: Partial<Record<MessageKey, string>> = {
   'island.updater.available': 'New version available: {tag}',
   'island.updater.downloading': 'Downloading update {pct}%',
   'island.updater.ready': 'Update ready, restart to apply',
+  'island.updater.swapFailed': 'Last update did not finish, click to retry',
   'island.updater.failed': 'Update download failed',
   'island.badge.new': 'NEW',
 

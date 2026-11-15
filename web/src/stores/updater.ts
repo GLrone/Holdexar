@@ -14,15 +14,18 @@ import { useSettingsStore } from '@/stores/settings'
  * 后端 409（已有下载在进行）顶回来」。store 是 pinia 单例、跨页存活：进设置页时
  * 只要后端还在 `running` 就接着轮询，进度自然续上，也不会重复发起下载。
  *
- * 与「我」页更新卡片的职责分工：卡片负责展示细节与执行下载/重启，
- * 本 store 只负责**应用启动时查一次**，供侧栏红点与主动提示使用。
- * 检查结果缓存在这里，卡片主动检查时也会回写同一份（见 views/settings）。
+ * 与全局更新弹窗的职责分工：弹窗是更新模块的唯一交互面（检查/下载/重启/跳过
+ * 都在它里面），本 store 负责状态收口与灵动岛投影，并在应用启动时查一次。
+ * 检查结果缓存在这里，弹窗主动检查时也会回写同一份。
  *
  * 设计要点：
  * - `hasUpdate` 跟随实际可用状态，用户没更新就一直亮红点
  * - 「跳过此版本」持久化在 settings store（app_settings KV），本 store 只投影
- * - `pendingTag` 非空 = 新版本已下载校验完成、等待重启换装：全局弹窗与
- *   气泡都以此为准（后端 /system/update-pending 是唯一事实来源）
+ * - `pendingTag` 非空 = 新版本已下载校验完成、等待重启换装：全局弹窗与灵动岛
+ *   都以此为准（后端 /system/update-pending 是唯一事实来源）
+ * - 灵动岛是唯一的常驻更新提示面：待重启 > 下载中 > 换装失败 > 下载失败 >
+ *   发现新版，同一时刻只呈现最高优先级的一态；发现新版遵循「零打扰」开关
+ *   与跳过版本，进行中/失败态无视开关强制可见；点击一律打开全局更新弹窗
  */
 export const useUpdaterStore = defineStore('updater', () => {
   const settingsStore = useSettingsStore()
@@ -303,6 +306,21 @@ export const useUpdaterStore = defineStore('updater', () => {
 
   function syncUpdaterActivity(): void {
     const { t } = useI18n()
+    const open = (): void => { void openDialog() }
+    if (pendingTag.value) {
+      activityManager.register({
+        id: UPDATER_ACTIVITY_ID,
+        source: 'updater',
+        kind: 'system',
+        status: 'attention',
+        title: t('island.updater.ready'),
+        priority: 50,
+        to: '/settings',
+        onOpen: open,
+        metadata: { type: 'ready', tag: pendingTag.value },
+      })
+      return
+    }
     if (downloading.value && progress.value) {
       const p = progress.value
       const pct =
@@ -321,20 +339,23 @@ export const useUpdaterStore = defineStore('updater', () => {
         progress: pct,
         priority: 45,
         to: '/settings',
+        onOpen: open,
         metadata: { type: 'download' },
       })
       return
     }
-    if (pendingTag.value) {
+    if (swapFailed.value) {
       activityManager.register({
         id: UPDATER_ACTIVITY_ID,
         source: 'updater',
-        kind: 'system',
-        status: 'attention',
-        title: t('island.updater.ready'),
-        priority: 50,
+        kind: 'notice',
+        status: 'failed',
+        tone: 'error',
+        title: t('island.updater.swapFailed'),
+        priority: 55,
         to: '/settings',
-        metadata: { type: 'ready', tag: pendingTag.value },
+        onOpen: open,
+        metadata: { type: 'swap-failed' },
       })
       return
     }
@@ -349,20 +370,26 @@ export const useUpdaterStore = defineStore('updater', () => {
         detail: failure.value.message || failure.value.code,
         priority: 60,
         to: '/settings',
+        onOpen: open,
         metadata: { type: 'failed' },
       })
       return
     }
-    if (hasUpdate.value && info.value?.tag && skipped.value !== info.value.tag) {
+    /* 发现新版 = 纯提示态：遵循「零打扰」开关与跳过版本（严格等值，拦同版本不拦后续）；
+       版本号剥掉 v 前缀再与跳过值比对（跳过值存的是无前缀版本） */
+    const latestTag = info.value?.tag || ''
+    const skippedCurrent = Boolean(skipped.value) && skipped.value === latestTag.replace(/^v/, '')
+    if (hasUpdate.value && latestTag && !skippedCurrent && settingsStore.updateNotify !== false) {
       activityManager.register({
         id: UPDATER_ACTIVITY_ID,
         source: 'updater',
         kind: 'notice',
         status: 'attention',
-        title: t('island.updater.available', { tag: info.value.tag }),
+        title: t('island.updater.available', { tag: latestTag }),
         priority: 25,
         to: '/settings',
-        metadata: { type: 'available', tag: info.value.tag },
+        onOpen: open,
+        metadata: { type: 'available', tag: latestTag },
       })
       return
     }
@@ -370,7 +397,9 @@ export const useUpdaterStore = defineStore('updater', () => {
   }
 
   watch(
-    [hasUpdate, downloading, pendingTag, failure, skipped, () => progress.value?.downloaded, () => info.value?.tag],
+    [hasUpdate, downloading, pendingTag, swapFailed, failure, skipped,
+      () => settingsStore.updateNotify,
+      () => progress.value?.downloaded, () => info.value?.tag],
     () => {
       syncUpdaterActivity()
     },
