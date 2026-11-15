@@ -23,13 +23,13 @@ from sqlalchemy import delete, func, select
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
+from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.account import service as account_service
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
 from app.domains.family.service import (
     _fetch_family_group,
     _fetch_shared_library,
     _steam_get,
-    _strategy_proxy,
     extract_webapi_token,
 )
 from app.domains.games.models import Game
@@ -132,7 +132,7 @@ async def _post_form(url: str, data: dict) -> httpx.Response:
     """POST 表单（代理优先 + SSL 证书降级，与 family._steam_get 同规则）。"""
     from app.core.tls import ssl_context as _ssl_context
 
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     try:
         async with httpx.AsyncClient(timeout=30, proxy=proxy, verify=_ssl_context(True)) as client:
             resp = await client.post(url, data=data)
@@ -480,7 +480,7 @@ _community_gate = asyncio.Lock()
 async def _community_get(url: str, params: dict) -> str:
     """公开页抓取：全局节流（最小间隔 + 抖动）+ 429/5xx 退避重试。"""
     global _last_community_at
-    proxy = await _strategy_proxy()
+    proxy = await strategy_proxy_or_direct()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125",
         "Referer": "https://steamcommunity.com/",

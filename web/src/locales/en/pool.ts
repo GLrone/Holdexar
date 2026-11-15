@@ -13,7 +13,7 @@ const pool: Partial<Record<MessageKey, string>> = {
 
   /* Steam accounts section */
   'pool.account.desc':
-    'Binding syncs the account\u2019s wishlist and owned games into the watch pool (the profile must be public) — the data source for crawls.',
+    'Binding syncs the account\u2019s wishlist and owned games into Following (the profile must be public) — the data source for crawls.',
   'pool.account.steamidPlaceholder': 'Steam friend code / SteamID64 / profile URL',
   'pool.account.labelPlaceholder': 'Label (optional)',
   'pool.account.bind': 'Bind',
@@ -23,7 +23,7 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.account.sync': 'Sync',
   'pool.account.syncAdded': 'Sync complete: {n} new games',
   'pool.account.syncAddedCrawling': 'Sync complete: {n} new games, crawl started automatically',
-  'pool.account.syncNoNew': 'Sync complete: {n} items in the pool, nothing new',
+  'pool.account.syncNoNew': 'Sync complete: {n} items in Following, nothing new',
   'pool.account.neverSynced': 'Never synced',
   'pool.account.friendCode': 'Friend code {code}',
   'pool.account.kindWishlist': 'Wishlist',
@@ -46,7 +46,7 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.matchCount': 'Matching {matched} of {total} items',
   'pool.items.totalHint': '{total} items — click for price details.',
   'pool.items.searchPlaceholder': 'Search by game name or AppID',
-  'pool.items.crawlAll': 'Crawl the whole pool',
+  'pool.items.crawlAll': 'Crawl all of Following',
 
   /* Pool management (add / remove / bulk operations) */
   'pool.items.kind.all': 'All',
@@ -59,15 +59,15 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.add': 'Add items',
   'pool.items.addTitle': 'Add tracked items',
   'pool.items.addHint':
-    'Every item added to the pool is crawled for prices; games on your Steam wishlist or starred as followed are crawled first. Paste or use "Choose file" (JSON array / links / raw AppIDs all work) — AppIDs imported from a file also join the preset game pool.',
+    'Every item added to Following is crawled for prices; games on your Steam wishlist or starred as followed are crawled first. Paste or use "Choose file" (JSON array / links / raw AppIDs all work) — AppIDs imported from a file also join the preset game pool.',
   'pool.items.addPlaceholder':
     'Paste Steam store / SteamDB links or raw AppIDs (spaces, commas and new lines all work)',
   'pool.items.importFile': 'Choose file',
   'pool.items.importFileLoaded': 'Loaded {name}',
-  'pool.items.addSubmit': 'Add to pool',
+  'pool.items.addSubmit': 'Add to Following',
   'pool.items.addNoValid': 'No valid AppID found',
   'pool.items.addResult':
-    'Added to the pool: {added} new · {restored} restored · {exists} already in pool · {invalid} unrecognized',
+    'Added to Following: {added} new · {restored} restored · {exists} already in Following · {invalid} unrecognized',
   'pool.items.manage': 'Manage',
   'pool.items.manageDone': 'Done',
   'pool.items.manageHint': 'Select items and remove them in bulk; removed items are no longer crawled.',
@@ -76,8 +76,8 @@ const pool: Partial<Record<MessageKey, string>> = {
   'pool.items.unselectPage': 'Unselect page',
   'pool.items.clearSelection': 'Clear selection',
   'pool.items.removeSelected': 'Remove selected',
-  'pool.items.removeConfirm': 'Remove the {n} selected games from the pool?',
-  'pool.items.removeResult': '{n} games removed from the pool',
+  'pool.items.removeConfirm': 'Remove the {n} selected games from Following?',
+  'pool.items.removeResult': '{n} games removed from Following',
 
   /* Item grid and empty states */
   'pool.items.pendingName': 'Not fetched yet (new entry)',

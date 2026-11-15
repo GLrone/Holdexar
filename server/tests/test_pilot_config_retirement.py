@@ -183,3 +183,11 @@ async def test_flat_save_key_failure_does_not_commit_provider_or_globals(tmp_dat
         await config.save_config({"base_url": "https://one.example.test", "api_key": "secret", "enabled": True})
     assert await config.load_providers() == []
     assert await settings.get_value("pilot.llm.enabled") is None
+
+@pytest.mark.asyncio
+async def test_add_usage_concurrent_increments_not_lost(tmp_data_dir):
+    """并发回合的用量累加必须互斥：闸外读改写同键会整批丢增量（多会话并发点）。"""
+    await init_db()
+    await asyncio.gather(*(config.add_usage(2, 3) for _ in range(60)))
+    usage = await config.usage_month()
+    assert usage == {"inp": 120, "out": 180, "calls": 60, "total": 300}

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import aiohttp
 
 from app.core.logging import log_event
+from app.domains.proxies.service import strategy_proxy_or_direct
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +126,6 @@ _board_state: dict[str, dict] = {
 _board_locks: dict[str, asyncio.Lock] = {key: asyncio.Lock() for key in BOARDS}
 
 
-async def _strategy_proxy() -> str | None:
-    """按代理策略引擎解析出网代理；引擎不可用时 None（直连）。"""
-    from app.domains.proxies.service import strategy_proxy_or_direct
-
-    return await strategy_proxy_or_direct()
-
-
 def _board_of(key: str) -> Board:
     board = BOARDS.get(key)
     if board is None:
@@ -149,7 +143,7 @@ async def fetch_board(key: str) -> list[int]:
     collected: list[int] = []
     seen: set[int] = set()
     consecutive_empty = 0
-    proxy_url = await _strategy_proxy()
+    proxy_url = await strategy_proxy_or_direct()
 
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:

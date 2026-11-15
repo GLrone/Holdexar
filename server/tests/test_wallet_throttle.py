@@ -52,7 +52,7 @@ async def _isolation(monkeypatch):
     async def _no_sleep(_seconds):
         return None
 
-    monkeypatch.setattr(account_service, "_strategy_proxy", _none)
+    monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _none)
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
     account_service._last_seen = None

@@ -87,7 +87,7 @@ def sign_manifest(monkeypatch):
     ],
 )
 def test_version_gt(latest: str, current: str, expect: bool) -> None:
-    assert updater._version_gt(latest, current) is expect
+    assert updater.version_gt(latest, current) is expect
 
 
 @pytest.mark.asyncio

@@ -58,6 +58,15 @@ const common = {
      调用点见 components/RegionFlag.vue 与 business/HlGameCard.vue 的列表布局。 */
   'common.regionSuffix': '区',
 
+  /* 错误出口词条（lib/errorText.ts 的类别映射）：catch 到的异常按类别给
+     用户语言（结果+影响+下一步），未知错误用 prefix 前缀保留原文。 */
+  'common.error.network': '网络连接不可用，请检查网络后重试',
+  'common.error.auth': '登录已过期，请重新登录后再试',
+  'common.error.forbidden': '当前账号没有权限执行此操作',
+  'common.error.server': '服务暂时不可用，请稍后重试',
+  'common.error.request': '请求失败，请稍后重试',
+  'common.error.prefix': '操作未完成：',
+
   /* 页内分节轨（HlSectionRail）：分节无 data-section 名时的兜底标签 */
   'rail.unnamed': '分节',
   'rail.navLabel': '页面分节导航',

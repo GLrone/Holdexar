@@ -126,7 +126,7 @@ def _mock_fetch(monkeypatch, responses):
         return None
 
     monkeypatch.setattr(boards_mod.aiohttp, "ClientSession", _SessionFactory)
-    monkeypatch.setattr(boards_mod, "_strategy_proxy", _fake_proxy)
+    monkeypatch.setattr(boards_mod, "strategy_proxy_or_direct", _fake_proxy)
     return session
 
 

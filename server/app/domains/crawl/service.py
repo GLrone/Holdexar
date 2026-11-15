@@ -940,8 +940,9 @@ async def start_job(
     kind="repair" 为失败记录修复线程：与 missing 同通道
     （按区批量定向补抓、低 worker），仅冷却默认 4min（REPAIR_RETRY_
     COOLDOWN_MINUTES）——供 5min 空闲档修复轮高频复访失败区；
-    仍失败的照常走 missing 计账（fail_count 递增，穷尽 5 次转 blocked），
-    成功清账，与主爬虫逻辑完全一致。
+    仍失败走 missing 计账：传输类失败只记账不递增（不消耗预算），真实
+    响应缺价的门禁降级才递增 fail_count（穷尽 5 次转 blocked）；成功清账，
+    与主爬虫逻辑完全一致。
     missing_cooldown 显式传值时覆盖 missing/repair 两类冷却。
     """
     global _active

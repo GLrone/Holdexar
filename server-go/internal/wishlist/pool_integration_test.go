@@ -70,7 +70,7 @@ func TestUserPoolAPIAutomaticallyFetchesAndPreservesDataOnRemove(t *testing.T) {
 	regions.Register(mux, db, regions.Options{Gate: gate, Settings: settings.Options{Bus: bus}})
 	settings.Register(mux, db, gate, settings.Options{Bus: bus})
 	security := access.New()
-	systemx.RegisterSession(mux, security, true)
+	systemx.RegisterSession(mux, security, true, systemx.UnlockDeps{})
 	server := httptest.NewServer(security.Middleware(mux))
 	defer server.Close()
 	jar, _ := cookiejar.New(nil)

@@ -13,7 +13,8 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.section.bundles': 'Linked bundles',
 
   /* Gradient header */
-  'gameDetail.header.back': 'Back to Store',
+  'gameDetail.header.back': 'Back',
+  'gameDetail.header.setAlert': 'Set price alert',
   'gameDetail.header.developers': 'Developer: {names}',
   'gameDetail.header.publishers': 'Publisher: {names}',
   'gameDetail.region.cn': 'CN',
@@ -32,7 +33,7 @@ const gameDetail: Partial<Record<MessageKey, string>> = {
   'gameDetail.removed.retry': 'Recheck',
   'gameDetail.removed.probing': 'Checking…',
   'gameDetail.removed.requeued': 'Recrawl queued — refresh in a moment',
-  'gameDetail.removed.cleared': 'Flag cleared — the next monitoring round will pick it up',
+  'gameDetail.removed.cleared': 'Flag cleared — the next update round will pick it up',
 
   /* No-store-data banner (shares the Recheck action with the delisted one) */
   'gameDetail.storeMissing.tag': 'No store data yet',

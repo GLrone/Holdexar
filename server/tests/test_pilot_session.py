@@ -761,6 +761,27 @@ class TestFork:
         assert out["ok"] is False and out["reason"] == "busy"
 
     @pytest.mark.asyncio
+    async def test_service_write_gate_refuses_stream_connected_session(self, monkeypatch, tmp_path):
+        """会话写闸：流在挂（无在飞轮）同样拒编辑类操作——闸谓词单一归属，
+        在飞轮与流在挂两路证据都汇入同一判据（rewind 为例，fork/run_tool 同闸）。"""
+        monkeypatch.setattr(service, "resolve_data_dir", lambda: tmp_path)
+        service._store = None
+        service.mark_session_running("s-live")
+        try:
+            out = await service.rewind_session("s-live", 1)
+            assert out["ok"] is False and out["reason"] == "busy"
+            assert service.session_busy("s-live") is True
+            service.clear_session_running("s-live")
+            assert service.session_busy("s-live") is False
+            # 流已摘：无此会话 → 闸放行，走到 no_session（证明拒绝来自闸而非别处）
+            out2 = await service.rewind_session("s-live", 1)
+            assert out2["ok"] is False and out2["reason"] == "no_session"
+        finally:
+            service._store = None
+            service.clear_session_running("s-live")
+            service._INFLIGHT_TURNS.clear()
+
+    @pytest.mark.asyncio
     async def test_service_pin_missing_session(self, monkeypatch, tmp_path):
         monkeypatch.setattr(service, "resolve_data_dir", lambda: tmp_path)
         service._store = None
@@ -769,3 +790,20 @@ class TestFork:
         finally:
             service._store = None
         assert out["ok"] is False and out["reason"] == "no_session"
+
+@pytest.mark.asyncio
+async def test_load_refolds_when_ledger_file_changed_externally(store, tmp_path):
+    """缓存命中必须校验账本 stat 键：外部直改文件（测试工具/手工检修）后读账不得给旧折叠态。"""
+    sid = "s-ext1"
+    await store.load_or_new(sid)
+    await store.append_turn(sid, _turn("问", "答"))
+    path = tmp_path / "sessions" / f"{sid}.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records.append({"t": "title", "text": "外部改名", "ts": "2026-10-31T00:00:00"})
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+
+    reloaded = await store.load(sid)
+    assert reloaded is not None and reloaded.title == "外部改名"
+    # 外部删除同样按失配处理：缓存不再复活已删账本
+    path.unlink()
+    assert await store.load(sid) is None

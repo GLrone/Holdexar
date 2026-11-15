@@ -58,6 +58,8 @@ from app.core.app_info import (  # noqa: E402
     ENV_PREFIX,
     HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
+    HEALTH_TIMEOUT,
+    MIGRATION_MAX_DURATION,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
     SWAP_FAILED_FLAG,
@@ -98,7 +100,8 @@ _SPLASH_HTML = (
     f"{APP_NAME} 启动中，请稍候…</div></body></html>"
 )
 
-SERVER_HOST = "127.0.0.1"
+# 绑定地址可配（NAS/局域网场景）：默认回环，行为与历史版本一致
+SERVER_HOST = os.environ.get(f"{ENV_PREFIX}HOST", "127.0.0.1")
 # 端口协商结果：默认取环境变量（HOLDEXAR_PORT/HOLDEXAR_LOCK_PORT），
 # main() 启动时被占则按 DEV/FROZEN 态分流协商（见 _negotiate_ports）
 SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))
@@ -106,8 +109,6 @@ SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))
 LOCK_PORT = int(os.environ.get(f"{ENV_PREFIX}LOCK_PORT", "28965"))
 # frozen 态服务端口被占时的自动扫描窗口（从默认端口起试 N 个）
 _PORT_SCAN_SPAN = 20
-# 健康检查等待上限：须覆盖首装时大数据量导入的耗时，兼顾低端机/机械盘。
-HEALTH_TIMEOUT = 90.0
 WINDOW_TITLE = APP_NAME
 if not getattr(sys, "frozen", False) and os.environ.get(f"{ENV_PREFIX}DEV_WATCH"):
     WINDOW_TITLE = f"{APP_NAME} Go (dev)"
@@ -939,20 +940,6 @@ def _handoff_pending_update() -> bool:
     return True
 
 
-def _mark_swap_failed(target: Path) -> None:
-    """登记换装失败的安装状态。
-
-    本进程正跑在暂存载荷里，删不掉自己的目录；作废暂存由下一次启动的现装进程
-    （`_cleanup_staging_leftover`）执行，这里只落标记。
-    """
-    try:
-        _swap_failed_flag().write_text(
-            f"更新未完成 target={target}\n", encoding="utf-8"
-        )
-    except Exception as e:  # noqa: BLE001 —— 标记写不进去不阻断回滚后的正常启动
-        _log_update(f"写换装失败标记失败：{e}")
-
-
 def _should_clean_old_dir(old_dir: Path) -> bool:
     """`__old__` 清理判据：存在，且没有换装失败标记。"""
     return old_dir.exists() and not _swap_failed_flag().is_file()
@@ -978,12 +965,12 @@ def _cleanup_staging_leftover() -> None:
     否则它会一直占着几百兆，且 manifest 留着会让前端一直报「已下载待重启」。
     """
 
-    staging = _data_dir() / STAGING_DIR_NAME
-    if not staging.is_dir():
-        return
-    if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
-        return
-    shutil.rmtree(staging, ignore_errors=True)
+    for staging in (_app_root() / STAGING_DIR_NAME, _data_dir() / STAGING_DIR_NAME):
+        if not staging.is_dir():
+            continue
+        if (staging / _MANIFEST_NAME).is_file() and not _swap_failed_flag().is_file():
+            continue
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _browser_fallback(url: str, reason: str) -> None:
@@ -2104,20 +2091,33 @@ def main() -> None:
     ready = threading.Event()
     error_box: list[str] = []
     atexit.register(_stop_server_process)  # 正常退出路径的子进程回收兜底；os._exit 路径各自显式调用
-    threading.Thread(target=_start_server, args=(ready, error_box), daemon=True).start()
+    server_thread = threading.Thread(target=_start_server, args=(ready, error_box), daemon=True)
+    server_thread.start()
     if lock is not None:
         threading.Thread(target=_listen_activation, args=(lock,), daemon=True).start()
 
     url = os.environ.get(f"{ENV_PREFIX}DEV_URL") or f"http://{SERVER_HOST}:{SERVER_PORT}"
     if args.server:
-        if not _wait_health(HEALTH_TIMEOUT):
-            detail = "".join(error_box)
-            print("服务启动失败：")
-            if detail:
-                print(detail)
-            else:
-                print(f"{HEALTH_TIMEOUT:.0f}s 内健康检查未通过")
-            sys.exit(1)
+        if not os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID"):
+            if not _wait_health(HEALTH_TIMEOUT):
+                detail = "".join(error_box)
+                print("服务启动失败：")
+                if detail:
+                    print(detail)
+                else:
+                    print(f"{HEALTH_TIMEOUT:.0f}s 内健康检查未通过")
+                sys.exit(1)
+        else:
+            # 受保护验收实例：等待预算归宿主；仅服务线程死亡（迁移异常等）或总预算
+            # 耗尽时自退，宿主据此快速归因，不与宿主的迁移存活信号抢判定
+            budget = time.monotonic() + MIGRATION_MAX_DURATION
+            while not _wait_health(2.0):
+                if not server_thread.is_alive() or time.monotonic() > budget:
+                    detail = "".join(error_box)
+                    print("服务启动失败：")
+                    if detail:
+                        print(detail)
+                    sys.exit(1)
         print(f"服务已就绪：{url}（Ctrl+C 退出）")
     if _background_mode:
         try:

@@ -26,6 +26,9 @@ const library: Partial<Record<MessageKey, string>> = {
   'library.empty.filter.title': 'No games match these conditions',
   'library.empty.filter.hint': 'Try a different search term, or clear the filters.',
   'library.empty.filter.clear': 'Clear search & filters',
+  'library.empty.filter.add': 'No match? Paste a link to add',
+  'library.empty.filter.addHint':
+    'Your search term is prefilled, but this box takes store links — replace it with the Steam store page URL of the game, then add.',
 
   'library.loadingMore': 'Loading more...',
   'library.end': 'You have reached the end',

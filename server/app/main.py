@@ -102,6 +102,33 @@ async def _initialize_runtime() -> None:
         log_event(logger, "自定义刷新时间应用失败，继续使用默认时间", level=logging.ERROR, exc_info=True)
 
 
+async def _init_lan_access() -> None:
+    """局域网访问模式初始化：读设置开关并同步 Host 闸白名单。
+
+    环境变量 HOLDEXAR_ACCESS=lan 强制开启（NAS 无窗口场景先于设置页存在）；
+    失败按关闭处理（fail-closed），不影响正常启动。
+    """
+    from app.core import lan_access
+    from app.domains.system.session_router import ensure_lan_password
+
+    try:
+        from app.domains.settings import service as settings_service
+
+        kv_enabled = bool(
+            await settings_service.get_value(settings_service.LAN_ENABLED_KEY, False)
+        )
+        lan_mode = lan_access.set_enabled(kv_enabled)
+        lan_access.refresh_extra_hosts()
+        if lan_mode:
+            await ensure_lan_password()
+            log_event(logger, "局域网访问模式已开启，本机地址已加入访问白名单")
+    except Exception as error:
+        lan_access.set_enabled(False)
+        lan_access.refresh_extra_hosts()
+        log_event(logger, "局域网访问模式初始化失败，按关闭处理", level=logging.ERROR,
+                  exc_info=(type(error), error, error.__traceback__))
+
+
 @asynccontextmanager
 async def _application_lifespan(application: FastAPI):
     """结构与换装安全检查完成后开放HTTP，兼容恢复后启用正常调度。"""
@@ -114,6 +141,7 @@ async def _application_lifespan(application: FastAPI):
     with update_data.startup_authorization(settings.data_dir) as update_token:
         await init_db(maintenance_token=update_token)
     await agent_mcp.startup(settings.data_dir)
+    await _init_lan_access()
     application.state.update_verification = {
         "protected": bool(update_token), "pageReady": False,
     }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useI18n } from '@/locales'
 
 defineProps<{ text?: string; confirmLabel?: string; cancelLabel?: string }>()
@@ -9,10 +9,20 @@ const emit = defineEmits<{ confirm: []; cancel: [] }>()
 const { t } = useI18n()
 
 const show = ref(false)
+const root = ref<HTMLElement | null>(null)
+
+/** 点外关闭（对齐 HlSelect）：气泡与触发钮都在 host 子树内，点外面才收起 */
+function onDocClick(e: MouseEvent) {
+  if (root.value?.contains(e.target as Node)) return
+  show.value = false
+}
+
+onMounted(() => document.addEventListener('click', onDocClick))
+onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 </script>
 
 <template>
-  <span class="hl-tip-host" @click="show = !show">
+  <span ref="root" class="hl-tip-host" @click="show = !show">
     <slot />
     <span class="hl-popconfirm" :class="{ 'is-show': show }" @click.stop>
       {{ text ?? t('common.confirmTip') }}

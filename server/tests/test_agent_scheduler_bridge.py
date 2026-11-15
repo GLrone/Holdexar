@@ -151,13 +151,18 @@ class TestSkipNotes:
     @pytest.mark.asyncio
     async def test_bills_sync_no_cookie_and_busy_notes_skip(self, db, monkeypatch):
         from app.core import scheduler as sched
+        from app.domains.account import service as account_service
         from app.domains.bills import service as bills_service
+
+        # 逐账号任务：先绑一个账号，no_cookie / busy 才经由 _sync_account_bills 到达
+        await account_service.save_cookies(
+            "sessionid=s; steamLoginSecure=76561198000000001%7C%7Cjwt-token")
 
         for status, wording in (
             ("no_cookie", "未绑定 Steam Cookie"),
             ("busy", "账单同步进行中"),
         ):
-            async def fake(force=False, _status=status):
+            async def fake(*, force=False, steam_id=None, _status=status):
                 return {"ok": False, "status": _status}
 
             monkeypatch.setattr(bills_service, "sync_bills", fake)

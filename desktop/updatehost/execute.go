@@ -130,10 +130,15 @@ func executeUpdateLocked(root string, opts *options) bool {
 			logUpdate(root, "恢复上次中断事务失败："+err.Error())
 			return false
 		}
+		// 裁决只认恢复后的最新事务：恢复已收尾（含清场）即放行
 		currentTx := readTransaction(root)
-		if !txBool(currentTx, "dataAccepted") && !txBool(currentTx, "dataRollbackReleased") &&
-			txString(currentTx, "stage") != stageRolledBack {
-			_ = updateTransaction(root, txString(currentTx, "stage"), map[string]any{"relaunchPrevious": true})
+		if currentTx != nil && txString(currentTx, "dataDir") != "" &&
+			!txBool(currentTx, "dataAccepted") && !txBool(currentTx, "dataRollbackReleased") {
+			stage := txString(currentTx, "stage")
+			if stage == "" {
+				stage = stageRolledBack
+			}
+			_ = updateTransaction(root, stage, map[string]any{"relaunchPrevious": true})
 			return false
 		}
 	}
@@ -257,6 +262,8 @@ func commit(root, staging, targetVersion string, diagnosis *diagnosis, launchOnF
 	pruned := confirmablePrune(root, 2)
 	logUpdate(root, fmt.Sprintf("换装成功！清理历史版本：%v", pruned))
 	finishDiagnosis(root, targetVersion, diagnosis)
+	// 提交即终态：指针与相容记录已落 current.json，事务档案使命结束
+	clearTransaction(root)
 	return true
 }
 
@@ -330,10 +337,10 @@ func failPath(root string, diagnosis *diagnosis, errorText string, launchedVersi
 	if txBool(tx, "dataPrepared") {
 		if err := rollbackData(root, true); err != nil {
 			errorText = fmt.Sprintf("%s；数据恢复未完成，已保留现场：%v", errorText, err)
-			_ = updateTransaction(root, "recovery_required", map[string]any{"error": errorText})
+			_ = updateTransaction(root, stageRecoveryRequired, map[string]any{"error": errorText})
 			diagnosis.Success = false
 			diagnosis.DataPreserved = true
-			diagnosis.Stage = "recovery_required"
+			diagnosis.Stage = stageRecoveryRequired
 			message := errorText
 			diagnosis.Error = &message
 			writeDiagnosis(root, *diagnosis)
@@ -341,7 +348,7 @@ func failPath(root string, diagnosis *diagnosis, errorText string, launchedVersi
 		}
 	} else if txString(tx, "dataDir") != "" {
 		if err := abortPreparation(root, txString(tx, "dataDir")); err != nil {
-			_ = updateTransaction(root, "recovery_required", map[string]any{
+			_ = updateTransaction(root, stageRecoveryRequired, map[string]any{
 				"error": fmt.Sprintf("恢复点准备未结束：%v", err)})
 			return false
 		}
@@ -365,11 +372,11 @@ func failPath(root string, diagnosis *diagnosis, errorText string, launchedVersi
 	if txBool(tx, "dataPrepared") {
 		if err := finishRollback(root); err != nil {
 			errorText = fmt.Sprintf("%s；程序与数据恢复尚未完成：%v", errorText, err)
-			_ = updateTransaction(root, "recovery_required", map[string]any{
+			_ = updateTransaction(root, stageRecoveryRequired, map[string]any{
 				"error": errorText, "relaunchPrevious": false})
 			diagnosis.Success = false
 			diagnosis.DataPreserved = true
-			diagnosis.Stage = "recovery_required"
+			diagnosis.Stage = stageRecoveryRequired
 			message := errorText
 			diagnosis.Error = &message
 			writeDiagnosis(root, *diagnosis)
@@ -404,13 +411,14 @@ func recoverInterruptedUpdate(root string) error {
 	}
 	switch {
 	case txBool(tx, "dataRollbackReleased"):
+		// 已释放=数据已还原且保护解除，事务完结；指针归启动链相容性校验管
+		if phase := txString(tx, "dataRecoveryPhase"); phase != "" && phase != "restored" {
+			return errors.New("更新恢复相位无法证明完成，已停止启动并保留数据")
+		}
 		if err := finishRollback(root); err != nil {
 			return err
 		}
-		state, _ := readCurrentState(root)
-		if stateString(state, "version") != txString(tx, "sourceVersion") {
-			return errors.New("已恢复的数据与当前程序指向不一致，已停止启动并保留数据")
-		}
+		clearTransaction(root)
 		return nil
 	case txBool(tx, "dataAccepted"):
 		if err := acceptData(root); err != nil {
@@ -425,6 +433,7 @@ func recoverInterruptedUpdate(root string) error {
 		}
 		_ = updateTransaction(root, stageCommitted, map[string]any{"currentVersion": compatible})
 		finishDiagnosis(root, compatible, nil)
+		clearTransaction(root)
 		return nil
 	case txBool(tx, "dataPrepared"):
 		if txBool(tx, "launchPending") {
@@ -449,9 +458,24 @@ func recoverInterruptedUpdate(root string) error {
 			fileExists(markerPath(txString(current, "dataDir"))) {
 			return errors.New("更新恢复尚未完成，原始快照与故障数据均已保留，请查看更新诊断")
 		}
+		clearTransaction(root)
 		return nil
 	case txString(tx, "dataDir") != "":
-		return abortPreparation(root, txString(tx, "dataDir"))
+		dataDir := txString(tx, "dataDir")
+		marker, err := readMarker(dataDir)
+		if err != nil {
+			return err
+		}
+		if marker == nil {
+			// 无准备标记=数据从未进入保护，事务只是残壳；指针归属由启动链相容校验管
+			clearTransaction(root)
+			return nil
+		}
+		if err := abortPreparation(root, dataDir); err != nil {
+			return err
+		}
+		clearTransaction(root)
+		return nil
 	}
 	return nil
 }

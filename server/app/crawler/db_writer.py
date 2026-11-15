@@ -1201,98 +1201,12 @@ class DbWriter:
         except Exception as e:
             log_event(logger, "标记非游戏类型失败", level=logging.ERROR, detail={"原因": e})
 
-    async def mark_region_status(self, appid: int, region_code: str, status: str) -> None:
-        """标记区域状态（locked/blocked/missing）→ game_current_prices (UPSERT)。
-
-        尝试观察语义：missing = 本次尝试失败（传输/写库类），行上保留上一次
-        成功的价格与 last_success_at——「这次没拿到」不推翻「曾经拿到」；
-        locked = 成功观察（Steam 明确答复该区不售）。price_status 仍按旧口径
-        投影（missing/blocked 计欠账、locked 终态），供过渡期读取方兼容。
-        账本语义（补抓链路）：
-        - missing：fail_count 递增（_missing_ledger_bump）；穷尽 MISSING_MAX_RETRIES
-          转 blocked（终态）——该区大概率根本无货/无版本，继续重试只是浪费配额
-        - locked/blocked：fail_count 清零（非欠账）
-        """
-        try:
-            now_dt = _naive(get_beijing_time_obj())
-            async with write_session(WritePriority.BACKGROUND) as session:
-                if status == "missing":
-                    # 首次插入 fail_count=1；已有行则 DO UPDATE 里旧值+1。
-                    # 价格三件套不在 SET 里：失败保留 last good price
-                    stmt = sqlite_insert(GameCurrentPrice).values(
-                        appid=int(appid),
-                        region_code=region_code.upper() if region_code else "",
-                        currency="",
-                        price=None,
-                        original_price=None,
-                        discount_percent=0,
-                        sub_id=None,
-                        price_status="missing",
-                        fail_count=1,
-                        cny_fen=None,
-                        attempt_outcome="failed",
-                        last_success_at=None,
-                        updated_at=now_dt,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=[GameCurrentPrice.appid, GameCurrentPrice.region_code],
-                        set_={
-                            **_missing_ledger_bump(),
-                            "attempt_outcome": "failed",
-                            "steam_answer": None,
-                            "updated_at": now_dt,
-                        },
-                    )
-                else:
-                    outcome = "success" if status == "locked" else "failed"
-                    stmt = sqlite_insert(GameCurrentPrice).values(
-                        appid=int(appid),
-                        region_code=region_code.upper() if region_code else "",
-                        currency="",
-                        price=None,
-                        original_price=None,
-                        discount_percent=0,
-                        sub_id=None,
-                        price_status=status,
-                        fail_count=0,
-                        cny_fen=None,
-                        attempt_outcome=outcome,
-                        steam_answer="locked" if status == "locked" else None,
-                        last_success_at=now_dt if status == "locked" else None,
-                        updated_at=now_dt,
-                    )
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=[
-                            GameCurrentPrice.appid,
-                            GameCurrentPrice.region_code,
-                        ],
-                        set_={
-                            "price_status": stmt.excluded.price_status,
-                            "fail_count": 0,
-                            "price": None,
-                            "original_price": None,
-                            "discount_percent": 0,
-                            "cny_fen": None,
-                            "attempt_outcome": outcome,
-                            "steam_answer": stmt.excluded.steam_answer,
-                            "last_success_at": stmt.excluded.last_success_at,
-                            "updated_at": stmt.excluded.updated_at,
-                        },
-                    )
-                await session.execute(stmt)
-                from app.domains.games.derived import update_price_derived
-
-                await update_price_derived([int(appid)], session=session)
-                await session.commit()
-        except Exception as e:
-            log_event(logger, "记录区域异常状态失败", level=logging.ERROR, detail={"原因": e})
-            raise RegionStatusWriteError([(appid, region_code)]) from e
-
     async def mark_region_status_missing_batch(self, pairs: list[tuple[int, str]]) -> int:
-        """批量记 missing 欠账（一次闸一事务）：行形状与 mark_region_status
-        的 missing 分支同口径（failed 章 + fail_count 递增 + 保留 last good
-        price）。逐款循环的调用点（补记缺失/免费赠送异常/批量写失败）改收
-        pairs 整批，(appid, 区) 去重防同批双 bump。返回写入行数。
+        """批量记 missing 欠账（一次闸一事务，传输类失败通道）：failed 章 +
+        保留 last good price；首记 fail_count=1、重复失败不递增——预算只由
+        真实响应缺价的门禁降级消耗。逐款循环的调用点（补记缺失/免费赠送
+        异常/批量写失败）改收 pairs 整批，(appid, 区) 去重防同批双 bump。
+        返回写入行数。
         """
         if not pairs:
             return 0

@@ -53,6 +53,16 @@ const common: Partial<Record<MessageKey, string>> = {
      ("Kazakh…" reads far better than "Ka区"). */
   'common.regionSuffix': '',
 
+  /* Error outlet entries (lib/errorText.ts category mapping): known failure
+     classes get user-language copy (outcome + impact + next step), unknown
+     errors keep the raw message behind a shared prefix. */
+  'common.error.network': 'Network unavailable. Check your connection and try again.',
+  'common.error.auth': 'Session expired. Please sign in again.',
+  'common.error.forbidden': "This account doesn't have permission for this action.",
+  'common.error.server': 'Service temporarily unavailable. Please try again later.',
+  'common.error.request': 'Request failed. Please try again later.',
+  'common.error.prefix': "Couldn't complete: ",
+
   'rail.unnamed': 'Section',
   'rail.navLabel': 'Page section navigation',
   'rail.jumpTo': 'Jump to “{label}”',

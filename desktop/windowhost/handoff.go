@@ -21,6 +21,15 @@ import (
 	"unsafe"
 )
 
+// 更新状态文件路径所有权（单一命名来源）：暂存目录以安装根为正位，数据目录
+// 为历史布局残留位置；失败标记与交接账本随数据目录。
+const (
+	stagingDirName      = "update-staging"
+	stagingManifestName = "manifest.json"
+	swapFailedFlag      = ".swap-failed"
+	handoffLedgerName   = "update-handoff.json"
+)
+
 type handoffInfo struct {
 	tag       string
 	attemptID string
@@ -102,25 +111,33 @@ func handoffPending(cfg *options, trace func(string)) bool {
 		trace("交接跳过：本进程为验收探针子进程")
 		return false
 	}
-	if fileExists(filepath.Join(cfg.dataDir, ".swap-failed")) {
+	// 暂存残留清场（对齐桌面壳 _cleanup_staging_leftover）：清单缺失或换装失败
+	// 标记在位的暂存目录不再具备交接资格，两处位置各自清理——此刻宿主必已退出，
+	// 无占用；成功换装只删清单、残留载荷由本清理兜底
+	swapFailed := fileExists(filepath.Join(cfg.dataDir, swapFailedFlag))
+	for _, dir := range []string{filepath.Join(cfg.installRoot, stagingDirName), filepath.Join(cfg.dataDir, stagingDirName)} {
+		if info, serr := os.Stat(dir); serr != nil || !info.IsDir() {
+			continue
+		}
+		if fileExists(filepath.Join(dir, stagingManifestName)) && !swapFailed {
+			continue
+		}
+		if os.RemoveAll(dir) == nil {
+			trace("已清理暂存残留 " + dir)
+		}
+	}
+	if swapFailed {
 		trace("交接跳过：上次换装失败标记在位")
 		return false
 	}
-	staging := filepath.Join(cfg.installRoot, "update-staging")
-	manifestPath := filepath.Join(staging, "manifest.json")
+	staging := filepath.Join(cfg.installRoot, stagingDirName)
+	manifestPath := filepath.Join(staging, stagingManifestName)
 	if !fileExists(manifestPath) {
-		staging = filepath.Join(cfg.dataDir, "update-staging")
-		manifestPath = filepath.Join(staging, "manifest.json")
+		staging = filepath.Join(cfg.dataDir, stagingDirName)
+		manifestPath = filepath.Join(staging, stagingManifestName)
 	}
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
-		// 成功换装只删清单（更新宿主仍在暂存包内运行到退出），残留载荷由
-		// 下一次启动清理——此刻宿主必已退出，无占用
-		if info, serr := os.Stat(staging); serr == nil && info.IsDir() {
-			if os.RemoveAll(staging) == nil {
-				trace("已清理上次换装的暂存残留")
-			}
-		}
 		trace("交接跳过：暂存清单不存在 " + manifestPath)
 		return false
 	}
@@ -168,7 +185,7 @@ func handoffPending(cfg *options, trace func(string)) bool {
 }
 
 func readHandoffLedger(dataDir string) (string, int) {
-	raw, err := os.ReadFile(filepath.Join(dataDir, "update-handoff.json"))
+	raw, err := os.ReadFile(filepath.Join(dataDir, handoffLedgerName))
 	if err != nil {
 		return "", 0
 	}
@@ -191,17 +208,17 @@ func recordHandoffLedger(dataDir, tag string) {
 	payload, _ := json.Marshal(map[string]any{
 		"tag": tag, "count": next, "pid": os.Getpid(), "ts": float64(timeNowUnix()),
 	})
-	_ = os.WriteFile(filepath.Join(dataDir, "update-handoff.json"), payload, 0o644)
+	_ = os.WriteFile(filepath.Join(dataDir, handoffLedgerName), payload, 0o644)
 }
 
 // spawnUpdateHost 分离拉起暂存包内的更新宿主并登记交接；成功后本进程退出。
 func spawnUpdateHost(cfg *options, log *hostLog) bool {
-	staging := filepath.Join(cfg.installRoot, "update-staging")
-	manifestPath := filepath.Join(staging, "manifest.json")
+	staging := filepath.Join(cfg.installRoot, stagingDirName)
+	manifestPath := filepath.Join(staging, stagingManifestName)
 	if !fileExists(manifestPath) {
-		staging = filepath.Join(cfg.dataDir, "update-staging")
+		staging = filepath.Join(cfg.dataDir, stagingDirName)
 	}
-	raw, err := os.ReadFile(filepath.Join(staging, "manifest.json"))
+	raw, err := os.ReadFile(filepath.Join(staging, stagingManifestName))
 	if err != nil {
 		return false
 	}

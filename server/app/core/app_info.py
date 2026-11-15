@@ -59,6 +59,13 @@ HANDOFF_LEDGER_NAME = "update-handoff.json"
 # 的 90s）同量级——压得过低会把「还在启动」误判为「不健康」，好更新被回滚。
 HEALTH_TIMEOUT = 90.0
 
+# 数据库迁移的独立预算（秒）。换装验收窗（HEALTH_TIMEOUT）只管「迁移完成后服务
+# 可用」；迁移进行中的存活判定走只读信号（库结构版本推进/迁移前快照增长），信号
+# 每推进一次即刷新空闲窗；空闲窗兜「真卡死」，总上限兜「无限慢」，都不放宽验收判据。
+MIGRATION_SIGNAL_INTERVAL = 2.0
+MIGRATION_IDLE_WINDOW = 300.0
+MIGRATION_MAX_DURATION = 1800.0
+
 
 def version_from_tag(tag: str) -> str:
     """release tag → 版本号（v0.3.0-beta → 0.3.0-beta）。"""

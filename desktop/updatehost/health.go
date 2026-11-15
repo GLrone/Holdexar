@@ -209,6 +209,92 @@ func (t *probeTree) stop(proc *os.Process) {
 
 var _ = errors.New
 
+// 健康验收窗与迁移分阶段预算：验收窗只管「迁移完成后服务可用」；迁移进行中的
+// 存活判定走只读信号（结构版本推进/迁移前快照增长），信号每推进一次即刷新空闲
+// 窗；空闲窗兜「真卡死」，总上限兜「无限慢」，都不放宽验收判据。var 供测试收缩。
+var (
+	healthTimeout           = 90 * time.Second
+	migrationSignalInterval = 2 * time.Second
+	migrationIdleWindow     = 300 * time.Second
+	migrationMaxDuration    = 1800 * time.Second
+)
+
+// migrationSignal 只读迁移存活信号：库结构版本与迁移前快照字节数。
+type migrationSignal struct {
+	schemaKnown bool
+	schema      int64
+	snapshot    int64
+}
+
+// differsFrom 与上次信号比对：任一成分变化即迁移推进。
+func (s migrationSignal) differsFrom(other migrationSignal) bool {
+	if s.snapshot != other.snapshot {
+		return true
+	}
+	if s.schemaKnown != other.schemaKnown {
+		return true
+	}
+	return s.schemaKnown && s.schema != other.schema
+}
+
+func (s migrationSignal) schemaDisplay() string {
+	if !s.schemaKnown {
+		return "unknown"
+	}
+	return strconv.FormatInt(s.schema, 10)
+}
+
+// readMigrationSignal 只读探测迁移存活信号；读不到的成分按无信号处理，
+// 迁移写事务中的瞬时锁冲突不算故障。
+func readMigrationSignal(dataDir string) migrationSignal {
+	signal := migrationSignal{snapshot: -1}
+	if matches, _ := filepath.Glob(filepath.Join(dataDir, "*.pre-migration.bak")); len(matches) > 0 {
+		if info, err := os.Stat(matches[0]); err == nil {
+			signal.snapshot = info.Size()
+		}
+	}
+	if version, err := schemaVersionOf(dbPathOf(dataDir)); err == nil {
+		signal.schema, signal.schemaKnown = int64(version), true
+	}
+	return signal
+}
+
+// migrationWatch 迁移分阶段计时状态：只读信号推进刷新空闲窗，总上限兜底。
+type migrationWatch struct {
+	deadline        time.Time
+	migrationCap    time.Time
+	signal          migrationSignal
+	nextSignalCheck time.Time
+}
+
+func newMigrationWatch(started time.Time, timeout time.Duration) *migrationWatch {
+	return &migrationWatch{
+		deadline:        started.Add(timeout),
+		migrationCap:    started.Add(migrationMaxDuration),
+		signal:          migrationSignal{snapshot: -1},
+		nextSignalCheck: started,
+	}
+}
+
+// observe 每轮验收轮询调用一次：越过迁移总上限返回 true；信号推进时把空闲窗
+// 延至 now+迁移空闲窗（只延长不缩短）。
+func (w *migrationWatch) observe(root, dataDir string, now time.Time) bool {
+	if now.After(w.migrationCap) {
+		return true
+	}
+	if !now.Before(w.nextSignalCheck) {
+		w.nextSignalCheck = now.Add(migrationSignalInterval)
+		if latest := readMigrationSignal(dataDir); latest.differsFrom(w.signal) {
+			w.signal = latest
+			if extended := now.Add(migrationIdleWindow); extended.After(w.deadline) {
+				w.deadline = extended
+			}
+			logUpdate(root, fmt.Sprintf("迁移推进：schema=%s 快照字节=%d", w.signal.schemaDisplay(), w.signal.snapshot))
+		}
+	}
+	return false
+}
+
 type probeOptions struct {
 	requireWindow bool
 	keepRunning   bool
@@ -303,9 +389,10 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 		}
 	}()
 
-	deadline := time.Now().Add(healthTimeout)
+	started := time.Now()
+	watch := newMigrationWatch(started, healthTimeout)
 	lastReason := "健康验收未绑定本事务：无可用健康响应"
-	for time.Now().Before(deadline) {
+	for time.Now().Before(watch.deadline) {
 		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
 			return false, fmt.Sprintf("新版本进程已退出，退出码 %d", cmd.ProcessState.ExitCode())
 		}
@@ -316,6 +403,9 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 			if current := processImage(cmd.Process.Pid); current != "" && !samePath(current, expectedImage) {
 				return false, "健康验收未绑定本事务：进程镜像被替换为 " + current
 			}
+		}
+		if watch.observe(root, dataDir, time.Now()) {
+			return false, fmt.Sprintf("数据库迁移超出总预算（%.0fs），执行回滚", migrationMaxDuration.Seconds())
 		}
 		candidates := listeningPortsOf(cmd.Process.Pid)
 		candidates = append(candidates, allListeningPorts()...)
@@ -363,7 +453,11 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 		}
 		time.Sleep(probePollInterval)
 	}
-	return false, fmt.Sprintf("健康验收超时（%.1fs）：%s", healthTimeout.Seconds(), lastReason)
+	budget := fmt.Sprintf("%.0fs", healthTimeout.Seconds())
+	if watch.deadline.After(started.Add(healthTimeout)) {
+		budget = fmt.Sprintf("验收窗 %.0fs + 迁移空闲窗 %.0fs", healthTimeout.Seconds(), migrationIdleWindow.Seconds())
+	}
+	return false, fmt.Sprintf("健康验收超时（%s）：%s", budget, lastReason)
 }
 
 // serverdExeOf 窗口宿主 exe → 同版本目录内的本地服务 exe（健康载荷的

@@ -28,7 +28,7 @@ const famWish: Partial<Record<MessageKey, string>> = {
   /* Empty / loading states */
   'famWish.empty.loading': 'Aggregating family wishlist…',
   'famWish.empty.noData':
-    'No wishlist data yet — it appears once family members sync their wishlists (you can sync manually on the Watch pool page)',
+    'No wishlist data yet — it appears once family members sync their wishlists (you can sync manually on the Following page)',
   'famWish.empty.noMemberData': 'No member data',
   'famWish.empty.noTagData': 'No tag data',
   'famWish.empty.noMatch': 'No matching titles',

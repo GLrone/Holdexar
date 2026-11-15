@@ -204,3 +204,5 @@ func TestMiddlewareGate(t *testing.T) {
 		t.Fatalf("令牌长度=%d，应为 43（32 字节 urlsafe 无填充）", len(g.Token()))
 	}
 }
+
+// resetLAN 测试隔离：清空局域网模式全部内存态。

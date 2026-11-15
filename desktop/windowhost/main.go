@@ -26,9 +26,12 @@ const (
 	lockFallbackBase = 28966
 	portScanSpan     = 20
 	healthTimeout    = 90 * time.Second
-	ticketName       = "server-bootstrap.ticket"
-	windowClassName  = "HoldexarHostWindow"
-	dbName           = "holdexar.db"
+	// 迁移总预算：受保护验收实例的等待上限（健康验收窗归宿主管，本地不按
+	// 验收窗自尽，仅服务死亡或本预算耗尽自退）
+	migrationMaxDuration = 1800 * time.Second
+	ticketName           = "server-bootstrap.ticket"
+	windowClassName      = "HoldexarHostWindow"
+	dbName               = "holdexar.db"
 )
 
 var lockFallbacks = []int{28966, 28967, 28968, 29965, 29966}
@@ -375,20 +378,31 @@ func run(args []string) int {
 	if cfg.serverMode {
 		// 服务端启动含数据准备，健康就绪需轮询等待；进程先退则快速失败
 		deadline := time.Now().Add(healthTimeout)
+		// 受保护验收实例：等宿主预算归宿的验收循环，仅服务死亡或迁移总预算
+		// 耗尽自退，不与宿主的迁移存活信号抢判定
+		protected := os.Getenv(envPrefix+"UPDATE_ATTEMPT_ID") != ""
+		budget := time.Now().Add(migrationMaxDuration)
 		ready := false
 		for {
 			if payload := healthIsOurs(cfg.serverPort, cfg, 1500*time.Millisecond); payload != nil {
 				ready = true
 				break
 			}
-			if !srv.alive() || time.Now().After(deadline) {
+			if !srv.alive() {
+				break
+			}
+			if protected {
+				if time.Now().After(budget) {
+					break
+				}
+			} else if time.Now().After(deadline) {
 				break
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
 		if !ready {
 			log.write("本地服务健康检查超时")
-			fmt.Fprintln(os.Stderr, "服务启动失败：90s 内健康检查未通过")
+			fmt.Fprintln(os.Stderr, "服务启动失败：健康检查未通过")
 			return 1
 		}
 		log.write(fmt.Sprintf("服务已就绪：http://127.0.0.1:%d", cfg.serverPort))

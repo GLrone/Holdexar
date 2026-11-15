@@ -993,3 +993,87 @@ async def test_clear_cookies_purges_all_family_groups_and_snapshots(db):
         groups = (await session.execute(select(FamilyGroup))).scalars().all()
         snaps = (await session.execute(select(FamilyLibrarySnapshot))).scalars().all()
     assert groups == [] and snaps == []
+
+
+@pytest.mark.asyncio
+async def test_two_accounts_different_family_groups_stay_isolated(db):
+    """两账号分属两个家庭组：status 各组自成一组、顶层并集去重不串组；
+    family_wishlist 按属主组投影，两组成员互不可见。"""
+    from app.domains.family.models import FamilyGroup
+    from app.domains.wishlist.models import WishlistItem
+
+    second = "76561198000000003"
+    m1, m2 = "76561198000000011", "76561198000000012"
+    await _seed_account(db, sid=PRIMARY)
+    await _seed_account(db, sid=second)
+    await _seed_games(db)
+    async with db() as session:
+        session.add(FamilyGroup(
+            steamid=PRIMARY, family_groupid="111", family_name="甲组", member_count=2, fetch_ok=True,
+            members_json=[
+                {"steamid": PRIMARY, "role": "1", "personaName": "主号", "avatarUrl": "",
+                 "loccountrycode": "CN"},
+                {"steamid": m1, "role": "2", "personaName": "m1", "avatarUrl": "",
+                 "loccountrycode": "US"},
+            ],
+        ))
+        session.add(FamilyGroup(
+            steamid=second, family_groupid="222", family_name="乙组", member_count=2, fetch_ok=True,
+            members_json=[
+                {"steamid": second, "role": "1", "personaName": "二号", "avatarUrl": "",
+                 "loccountrycode": "CN"},
+                {"steamid": m2, "role": "2", "personaName": "m2", "avatarUrl": "",
+                 "loccountrycode": "RU"},
+            ],
+        ))
+        now = datetime(2026, 9, 3, 12, 0, 0)
+        session.add(WishlistItem(steamid=m1, appid=620, added_at=now, active=True, owned=False))
+        session.add(WishlistItem(steamid=m2, appid=570, added_at=now, active=True, owned=False))
+        await session.commit()
+
+    st = await family_service.get_status()
+    assert [g["familyGroupid"] for g in st["groups"]] == ["111", "222"]
+    assert {m["steamid"] for m in st["groups"][0]["members"]} == {PRIMARY, m1}
+    assert {m["steamid"] for m in st["groups"][1]["members"]} == {second, m2}
+    assert {m["steamid"] for m in st["members"]} == {PRIMARY, m1, second, m2}
+
+    wish_a = await family_service.family_wishlist(PRIMARY)
+    assert wish_a["fallback"] is False and wish_a["familyName"] == "甲组"
+    assert [it["appid"] for it in wish_a["items"]] == [620]
+    assert wish_a["items"][0]["members"] == [m1]
+    wish_b = await family_service.family_wishlist(second)
+    assert wish_b["fallback"] is False and wish_b["familyName"] == "乙组"
+    assert [it["appid"] for it in wish_b["items"]] == [570]
+    assert wish_b["items"][0]["members"] == [m2]
+
+
+@pytest.mark.asyncio
+async def test_two_accounts_same_real_family_share_group_projection(db):
+    """两账号同一真实家庭（同 groupid）：两组行同名同组投影，顶层成员去重不重复。"""
+    from app.domains.family.models import FamilyGroup
+
+    second = "76561198000000003"
+    member = "76561198000000011"
+    await _seed_account(db, sid=PRIMARY)
+    await _seed_account(db, sid=second)
+    members_json = [
+        {"steamid": PRIMARY, "role": "1", "personaName": "主号", "avatarUrl": "",
+         "loccountrycode": "CN"},
+        {"steamid": second, "role": "2", "personaName": "二号", "avatarUrl": "",
+         "loccountrycode": "CN"},
+        {"steamid": member, "role": "2", "personaName": "m1", "avatarUrl": "",
+         "loccountrycode": "US"},
+    ]
+    async with db() as session:
+        session.add(FamilyGroup(steamid=PRIMARY, family_groupid="333", family_name="同一家",
+                                member_count=3, fetch_ok=True, members_json=members_json))
+        session.add(FamilyGroup(steamid=second, family_groupid="333", family_name="同一家",
+                                member_count=3, fetch_ok=True, members_json=members_json))
+        await session.commit()
+
+    st = await family_service.get_status()
+    assert [g["familyGroupid"] for g in st["groups"]] == ["333", "333"]
+    for g in st["groups"]:
+        assert {m["steamid"] for m in g["members"]} == {PRIMARY, second, member}
+    # 顶层并集按 steamid 去重：同组成员不因两组行重复出现
+    assert len(st["members"]) == 3
