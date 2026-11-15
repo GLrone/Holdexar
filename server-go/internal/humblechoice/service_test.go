@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -48,11 +47,30 @@ func TestMonthlyRetryPreservesTagsThenBackfillsAndNotifiesOnce(t *testing.T) {
 	}
 	var complete atomic.Bool
 	var searches atomic.Int32
-	membership := html.EscapeString(`{"activeContentMachineName":"november_2026_choice",
-		"productHumanName":"November 2026 Humble Choice","activeContentEndDate|datetime":"2026-12-01T18:00:00",
-		"first":{"recommendation_copy_dict":{"text":"{}"},"title":"First Game","delivery_methods":["steam"]},
-		"second":{"recommendation_copy_dict":{},"title":"Second Game Playtest","delivery_methods":["steam"]},
-		"coupon":{"recommendation_copy_dict":{},"title":"Coupon","delivery_methods":["direct"]}}`)
+	// 2026-11 改版形态：RSC flight 流内嵌（页面按区块重复同一份清单，解析需去重）。
+	// 覆盖三态：Steam 交付（appid 匹配）/ 非 Steam 平台（blizzard，带标识保留）/
+	// 仅 external_key（订阅权益类，排除）。
+	products := []map[string]any{
+		{"id": "firstgame_choice", "title": "First Game", "deliveryMethods": []string{"steam"},
+			"endDate": "2027-06-01T00:00:00+00:00", "displayPrice": map[string]any{"currentPrice": map[string]any{"centAmount": 1999}}},
+		{"id": "secondgame_choice", "title": "Second Game Playtest", "deliveryMethods": []string{"steam"},
+			"endDate": "2027-06-01T00:00:00+00:00", "displayPrice": map[string]any{"currentPrice": map[string]any{"centAmount": 999}}},
+		{"id": "thirdgame_choice", "title": "Third Game", "deliveryMethods": []string{"blizzard"},
+			"endDate": "2027-06-01T00:00:00+00:00", "thumbnail": "https://img.test/third.jpg",
+			"displayPrice": map[string]any{"currentPrice": map[string]any{"centAmount": 5999}}},
+		{"id": "coupon_choice", "title": "IGN Plus Subscription", "deliveryMethods": []string{"external_key"},
+			"endDate": "2027-01-01T00:00:00+00:00", "displayPrice": map[string]any{"currentPrice": map[string]any{"centAmount": 100}}},
+	}
+	raw, err := json.Marshal(products)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flight := `14:["$","meta","1",{"name":"description","content":"Get November 2026 Humble Choice and more when you subscribe for just $11.99 per month!"}],68:["$","$L6f","68",{"blockName":"Choice Carousel","subscriptionProducts":` + string(raw) + `}]`
+	pushed, err := json.Marshal(flight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership := "<script>self.__next_f.push([1," + string(pushed) + "])</script>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/membership" {
 			_, _ = io.WriteString(w, membership+membership)
@@ -123,9 +141,16 @@ func TestMonthlyRetryPreservesTagsThenBackfillsAndNotifiesOnce(t *testing.T) {
 	hbCount(t, db, `SELECT count(*) FROM fact_notices WHERE source='hb_choice'`, 1)
 	hbCount(t, db, `SELECT count(*) FROM crawl_jobs WHERE kind='hb_backfill'`, 2)
 	offers := call("GET", "offers")
-	if offers["monthUrl"] != membershipURL+"/November-2026" || len(offers["games"].([]any)) != 2 ||
+	if offers["monthUrl"] != membershipURL || len(offers["games"].([]any)) != 3 ||
 		offers["games"].([]any)[0].(map[string]any)["priceFen"] != float64(999) {
 		t.Fatalf("price read: %+v", offers)
+	}
+	// 非 Steam 平台游戏：appid=0 + 平台标识 + 官方缩略图/零售价
+	platformGame := offers["games"].([]any)[2].(map[string]any)
+	if platformGame["appid"] != float64(0) || platformGame["name"] != "Third Game" ||
+		platformGame["platform"] != "blizzard" || platformGame["originalPriceFen"] != float64(5999) ||
+		platformGame["headerImage"] != "https://img.test/third.jpg" {
+		t.Fatalf("platform game shape: %+v", platformGame)
 	}
 	var delivered int
 	delivery := notifications.NewDelivery(db, gate, notifications.DeliveryOptions{Now: func() time.Time { return now.Add(time.Minute).In(sched.DefaultLoc) },

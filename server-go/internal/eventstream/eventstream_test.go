@@ -242,3 +242,22 @@ func TestRingSnapshotWraps(t *testing.T) {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// B10：Ring 写入前过统一脱敏链——缓冲回放与订阅者看到的都是已抹值文本。
+func TestRingWriteRedactsBeforeBuffer(t *testing.T) {
+	ring := NewRing(10)
+	ch := ring.Subscribe()
+	ring.Write("STEAM_API_KEY=DEADBEEF123 已读取")
+	snap := ring.Snapshot(10)
+	if len(snap) != 1 || snap[0] != "STEAM_API_KEY=*** 已读取" {
+		t.Fatalf("回放行未脱敏: %q", snap)
+	}
+	select {
+	case line := <-ch:
+		if line != "STEAM_API_KEY=*** 已读取" {
+			t.Fatalf("订阅行未脱敏: %q", line)
+		}
+	default:
+		t.Fatal("订阅者未收到行")
+	}
+}

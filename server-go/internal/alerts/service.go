@@ -18,6 +18,7 @@ type Options struct {
 	Now      func() time.Time
 	Log      func(string, ...any)
 	Dispatch func(context.Context) error
+	Proxy    func(context.Context) (string, error)
 }
 type Service struct {
 	db   *sql.DB

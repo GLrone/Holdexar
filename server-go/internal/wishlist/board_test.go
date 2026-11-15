@@ -14,7 +14,7 @@ func TestBoardPoolPreservesExclusionsAndInactiveSources(t *testing.T) {
 	if _, e := p.EnsureBoard(ctx, []int64{2, 3}, "board"); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := p.Remove(ctx, []int64{2}); e != nil {
+	if _, e := p.Remove(ctx, []int64{2}, "pool_removed"); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := db.Exec(`UPDATE monitor_sources SET active=0 WHERE target_id=3`); e != nil {

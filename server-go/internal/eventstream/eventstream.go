@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/logredact"
 )
 
 // defaultKeepAlive 无事件时的注释帧间隔；前端 EventSource 与中间层都以
@@ -151,9 +152,11 @@ func NewRing(capacity int) *Ring {
 	}
 }
 
-// Write 追加一行并广播订阅者。锁内广播（非阻塞投递）：保证广播次序与
-// 缓冲次序一致。
+// Write 追加一行并广播订阅者。写入前过统一脱敏链（后置兜底网：散点事前
+// 掩码之外，缓冲回放、SSE 增量与 /system/logs 读口看到的是同一份已抹值
+// 文本）。锁内广播（非阻塞投递）：保证广播次序与缓冲次序一致。
 func (r *Ring) Write(line string) {
+	line = logredact.Redact(line)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.buf) < cap(r.buf) {

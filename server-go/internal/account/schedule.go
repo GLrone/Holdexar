@@ -20,7 +20,11 @@ func storedTime(raw string) (time.Time, bool) {
 }
 func (s *Service) rotationSkip(row accountRow, freshMinutes float64) map[string]any {
 	if row.Frozen {
-		return map[string]any{"ok": false, "status": "frozen", "error": row.Error}
+		// 冻结只兜「会话已死」的停摆：会话仍有效（已续期/未过期）时不跳过，
+		// 落入下方退避节奏重试，成功一轮即自然复位；会话死了才保持终态。
+		if s.freshness(row).Expired {
+			return map[string]any{"ok": false, "status": "frozen", "error": row.Error}
+		}
 	}
 	if row.Wallet["check_ok"] == true {
 		if at, ok := storedTime(textField(row.Wallet["checked_at"])); ok && s.now().Sub(at).Minutes() < freshMinutes {

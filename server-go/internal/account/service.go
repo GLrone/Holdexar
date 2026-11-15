@@ -34,6 +34,9 @@ type ServiceOptions struct {
 	AfterBind    func(string)
 	APIKey       func(context.Context) (string, error)
 	Summaries    func(context.Context, []string, string) (map[string]wishlist.PlayerSummary, error)
+	// RedeemUsed 该账号 30 分钟窗口内已用激活次数（redeem 域进程内计数器，
+	// 经装配注入防 import 环；nil 恒 0）。
+	RedeemUsed func(steamID string) int
 }
 
 type InputError struct{ Message string }
@@ -43,19 +46,20 @@ func (e *InputError) Error() string { return e.Message }
 var ErrAccountNotFound = errors.New("账号不存在")
 
 type Service struct {
-	db       *sql.DB
-	gate     *store.WriteGate
-	opts     ServiceOptions
-	life     context.Context
-	cancel   context.CancelFunc
-	mu       sync.Mutex
-	closing  bool
-	jobs     sync.WaitGroup
-	locks    map[string]chan struct{}
-	renewAt  map[string]time.Time
-	lastSeen time.Time
-	loginMu  sync.Mutex
-	login    *loginAttempt
+	db            *sql.DB
+	gate          *store.WriteGate
+	opts          ServiceOptions
+	life          context.Context
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	closing       bool
+	jobs          sync.WaitGroup
+	locks         map[string]chan struct{}
+	renewAt       map[string]time.Time
+	lastSeen      time.Time
+	loginMu       sync.Mutex
+	login         *loginAttempt
+	recoveryGuard func(steamID string) error
 }
 
 func NewService(parent context.Context, db *sql.DB, gate *store.WriteGate, opts ServiceOptions) *Service {
@@ -227,6 +231,21 @@ func publicTime(raw sql.NullString) any {
 	}
 	return strings.Replace(raw.String, " ", "T", 1)
 }
+
+// redeemUsed 账号面激活计数读口：注入缺失或计数器异常按 0 处理，
+// 账号视图不因它失败。
+func (s *Service) redeemUsed(steamID string) (used int) {
+	if s.opts.RedeemUsed == nil {
+		return 0
+	}
+	defer func() {
+		if recover() != nil {
+			used = 0
+		}
+	}()
+	return s.opts.RedeemUsed(steamID)
+}
+
 func (s *Service) views(ctx context.Context, rows []accountRow) ([]map[string]any, error) {
 	ids := []string{}
 	for _, row := range rows {
@@ -262,7 +281,7 @@ func (s *Service) views(ctx context.Context, rows []accountRow) ([]map[string]an
 	for i, row := range rows {
 		f := s.freshness(row)
 		count := counts[row.ID]
-		out = append(out, map[string]any{"steam_id": row.ID, "friend_code": FriendCode(row.ID), "persona_name": row.Persona, "avatar_url": row.Avatar, "is_active": row.Active, "is_primary": i == 0, "bound_at": publicTime(row.Bound), "wallet": row.Wallet, "wallet_error": row.Error, "wallet_frozen": row.Frozen, "session_expires_at": f.ExpiresAt, "session_expired": f.Expired, "session_has_refresh": f.HasRefresh, "wishlist_count": count.wishlist, "game_count": count.owned, "bills_synced_at": bills[row.ID], "redeem_used": 0, "is_online": row.Online, "in_game": row.InGame})
+		out = append(out, map[string]any{"steam_id": row.ID, "friend_code": FriendCode(row.ID), "persona_name": row.Persona, "avatar_url": row.Avatar, "is_active": row.Active, "is_primary": i == 0, "bound_at": publicTime(row.Bound), "wallet": row.Wallet, "wallet_error": row.Error, "wallet_frozen": row.Frozen, "session_expires_at": f.ExpiresAt, "session_expired": f.Expired, "session_has_refresh": f.HasRefresh, "wishlist_count": count.wishlist, "game_count": count.owned, "bills_synced_at": bills[row.ID], "redeem_used": s.redeemUsed(row.ID), "is_online": row.Online, "in_game": row.InGame})
 	}
 	return out, nil
 }

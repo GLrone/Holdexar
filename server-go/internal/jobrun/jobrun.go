@@ -55,6 +55,16 @@ func appendEvents(ctx context.Context, conn *sql.Conn, id, stamp string, events 
 }
 
 func (r *Recorder) Run(ctx context.Context, job string, body func() (map[string]any, error)) (map[string]any, error) {
+	return r.runWith(ctx, job, "scheduled", "scheduled", body)
+}
+
+// RunManual 手动触发记账（对齐 scheduler_bridge.run_accounted trigger="manual"）：
+// entry 为入口标识（如 manual_refresh_button）。
+func (r *Recorder) RunManual(ctx context.Context, job, entry string, body func() (map[string]any, error)) (map[string]any, error) {
+	return r.runWith(ctx, job, "manual", entry, body)
+}
+
+func (r *Recorder) runWith(ctx context.Context, job, trigger, entry string, body func() (map[string]any, error)) (map[string]any, error) {
 	key := make([]byte, 16)
 	if _, e := rand.Read(key); e != nil {
 		return nil, e
@@ -65,7 +75,7 @@ func (r *Recorder) Run(ctx context.Context, job string, body func() (map[string]
 		if _, e := conn.ExecContext(ctx, `INSERT INTO agent_sessions(id,created_at,updated_at) VALUES('runtime',?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at`, stamp, stamp); e != nil {
 			return e
 		}
-		if _, e := conn.ExecContext(ctx, `INSERT INTO agent_runs(id,session_id,runner,"trigger",meta,status,created_at,started_at) VALUES(?,'runtime','job','scheduled',?,'running',?,?)`, id, encode(map[string]any{"job": job, "entry": "scheduled", "ref": map[string]any{}}), stamp, stamp); e != nil {
+		if _, e := conn.ExecContext(ctx, `INSERT INTO agent_runs(id,session_id,runner,"trigger",meta,status,created_at,started_at) VALUES(?,'runtime','job',?,?,'running',?,?)`, id, trigger, encode(map[string]any{"job": job, "entry": entry, "ref": map[string]any{}}), stamp, stamp); e != nil {
 			return e
 		}
 		return appendEvents(ctx, conn, id, stamp, []event{{"run.state", map[string]any{"from": "queued", "to": "running"}}})

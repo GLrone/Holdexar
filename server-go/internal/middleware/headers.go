@@ -7,9 +7,17 @@ import (
 	"strings"
 )
 
-// cspValue 内容安全策略（逐字对齐 Python，含空格排布）。
+// cspValue 内容安全策略（对齐 Python，含空格排布）。img-src 在 Steam 三个
+// CDN 外追加白拿卡的实际图片域族：Epic 主 CDN/视频 CDN、 unrealengine 素材、
+// GamerPower 移动白拿缩略图、Epic 大陆边缘节点重定向落点、Humble 产品媒体
+// CDN（HB 月包非 Steam 平台游戏的封面，imgix）。
+// 与 Python 的差异（登记）：头像域 avatars.fastly.steamstatic.com 缺席会使
+// 归一化到该域的头像全被 CSP 拦死（Python 同款缺陷，修复候选）——Go 侧补上。
 const cspValue = "default-src 'self'; img-src 'self' data: https://cdn.cloudflare.steamstatic.com " +
-	"https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com; " +
+	"https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com " +
+	"https://avatars.fastly.steamstatic.com " +
+	"https://*.epicgames.com https://*.epicgamescdn.com https://*.unrealengine.com " +
+	"https://*.gamerpower.com https://*.file.myqcloud.com https://hb-prd.imgix.net; " +
 	"style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; " +
 	"frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
 

@@ -31,6 +31,27 @@ type loginAttempt struct {
 	interval  time.Duration
 }
 
+// SetRecoveryGuard 挂一次性登录守卫：找回流程在 BindCookies 之前校验
+// 「登录成功的 Steam 账号是否在绑定集合」，未绑定账号不落库不建立登录态。
+// 守卫在一次尝试终结（成功校验/失败/取消）后自动清除。
+func (s *Service) SetRecoveryGuard(guard func(steamID string) error) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	s.recoveryGuard = guard
+}
+
+// RecoverySteamID 找回流程完成态：最近一次登录已成功且尚未被新尝试覆盖时
+// 返回其 SteamID。
+func (s *Service) RecoverySteamID() (string, bool) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	a := s.login
+	if a == nil || a.running || a.state.State != "done" || a.steamID == "" {
+		return "", false
+	}
+	return a.steamID, true
+}
+
 func (s *Service) newLoginState(state, message string) LoginState {
 	stamp := s.now().Format("2006-01-02T15:04:05")
 	return LoginState{State: state, Message: message, StartedAt: stamp, UpdatedAt: stamp}
@@ -67,6 +88,9 @@ func loginErrorText(err error) string {
 	return "登录收尾失败，请重试"
 }
 func (s *Service) failLogin(a *loginAttempt, err error) {
+	s.loginMu.Lock()
+	s.recoveryGuard = nil // 一次性守卫：尝试终止即恢复常规绑定语义
+	s.loginMu.Unlock()
 	if errors.Is(a.ctx.Err(), context.Canceled) {
 		s.updateLogin(a, "idle", "", "")
 		return
@@ -181,6 +205,18 @@ func (s *Service) pollLoginAttempt(a *loginAttempt) {
 		if !s.updateLogin(a, "finalizing", "正在建立登录态…", "") {
 			return
 		}
+		// 找回守卫（一次性）：绑定落库前先校验登录身份是否属于绑定集合，
+		// 未绑定账号不落库（防止找回流程把任意 Steam 账号自动绑定进来）。
+		s.loginMu.Lock()
+		guard := s.recoveryGuard
+		s.recoveryGuard = nil
+		s.loginMu.Unlock()
+		if guard != nil {
+			if err := guard(a.steamID); err != nil {
+				s.failLogin(a, err)
+				return
+			}
+		}
 		var cookies string
 		for attempt := 0; attempt < 4; attempt++ {
 			cookies, err = s.opts.Steam.WebCookies(a.ctx, token, a.steamID, nil)
@@ -252,6 +288,7 @@ func (s *Service) SubmitLoginCode(parent context.Context, code string) (map[stri
 func (s *Service) CancelLogin() map[string]any {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
+	s.recoveryGuard = nil
 	if a := s.login; a != nil && a.running {
 		a.cancel()
 		a.running = false

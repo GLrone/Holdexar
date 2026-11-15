@@ -24,6 +24,8 @@ type HistorySource interface {
 	Fetch(ctx context.Context, appid int64, region string) ([]dbwriter.CommunityObservation, error)
 }
 
+var ErrHistorySourceUnavailable = errors.New("社区历史数据源未安装，可在设置 → 插件中添加")
+
 // HistoryBackfill 回填派发与同步状态管理。上下文用进程级后台 ctx——
 // 请求断开不中断在途回填。
 type HistoryBackfill struct {
@@ -81,7 +83,24 @@ func (b *HistoryBackfill) Start(appid int64, region string) (bool, string, error
 	source := b.source
 	if source == nil {
 		b.mu.Unlock()
-		return false, "", errors.New("社区历史数据源未安装，可在设置 → 插件中添加")
+		return false, "", ErrHistorySourceUnavailable
+	}
+	if availability, ok := source.(interface {
+		Available(context.Context) (bool, error)
+	}); ok {
+		b.mu.Unlock()
+		available, err := availability.Available(b.background)
+		if err != nil {
+			return false, "", err
+		}
+		if !available {
+			return false, "", ErrHistorySourceUnavailable
+		}
+		b.mu.Lock()
+		if _, busy := b.inflight[key]; busy {
+			b.mu.Unlock()
+			return false, "running", nil
+		}
 	}
 	b.inflight[key] = struct{}{}
 	b.mu.Unlock()

@@ -28,13 +28,23 @@ func (c *SteamClient) sleep(ctx context.Context, d time.Duration) error {
 		return nil
 	}
 }
+
+// rejectHost 被拒下发地址的可读宿主（诊断用；解析失败退原文）。
+func (c *SteamClient) rejectHost(raw string) string {
+	u, e := url.Parse(raw)
+	if e != nil || u.Hostname() == "" {
+		return raw
+	}
+	return u.Hostname()
+}
+
 func (c *SteamClient) trustedTransfer(raw string) bool {
 	u, e := url.Parse(raw)
 	if e != nil || u.User != nil || u.Host == "" {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	if u.Scheme == "https" && (host == "steamcommunity.com" || host == "steampowered.com" || strings.HasSuffix(host, ".steampowered.com")) {
+	if u.Scheme == "https" && (host == "steamcommunity.com" || host == "steam.tv" || host == "steampowered.com" || strings.HasSuffix(host, ".steampowered.com")) {
 		return true
 	}
 	base, e := url.Parse(c.opts.FinalizeURL)
@@ -148,12 +158,15 @@ func (c *SteamClient) WebCookies(ctx context.Context, refresh, sid string, inher
 	values := responseCookies(resp)
 	accessByHost := map[string]string{}
 	hostOrder := []string{}
+	var transferErr error
 	for _, transfer := range body.Transfers {
 		if transfer.URL == "" {
 			continue
 		}
 		if !c.trustedTransfer(transfer.URL) {
-			return "", walletError("session", "Steam Cookie 下发地址不可信")
+			// 与 Python 的差异（登记）：非可信域跳过不中断——本应用只消费
+			// store 域令牌，个别域被网络规则拦死不该拖死整个续期。
+			continue
 		}
 		fields := map[string]string{"steamID": sid}
 		for k, v := range transfer.Params {
@@ -182,7 +195,8 @@ func (c *SteamClient) WebCookies(ctx context.Context, refresh, sid string, inher
 			}
 		}
 		if got["steamLoginSecure"] == "" {
-			return "", walletError("session", "Steam Cookie 下发失败，本轮保留原凭据")
+			transferErr = walletError("session", "Steam Cookie 下发失败（"+c.rejectHost(transfer.URL)+"）")
+			continue
 		}
 		owner, _ := cookieToken(got["steamLoginSecure"])
 		if owner != sid {
@@ -205,6 +219,9 @@ func (c *SteamClient) WebCookies(ctx context.Context, refresh, sid string, inher
 		}
 	}
 	if values["steamLoginSecure"] == "" {
+		if transferErr != nil {
+			return "", transferErr
+		}
 		return "", walletError("session", "Steam 续期未返回访问凭据")
 	}
 	if values["steamRefresh_steam"] == "" {

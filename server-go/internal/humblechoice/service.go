@@ -25,10 +25,13 @@ type Options struct {
 	Client        *http.Client
 	MembershipURL string
 	SearchURL     string
-	Now           func() time.Time
-	Crawl         func(context.Context, []int64) (int64, error)
-	AutoPrice     func(context.Context) (bool, error)
-	Log           func(string, ...any)
+	// Proxy 出网代理解析（代理池语义：池可用返回池地址，不可用回落直连）；
+	// nil = 只认系统代理（与 Python 池通道语义对齐的缺口补齐点）
+	Proxy     func(context.Context) (string, bool)
+	Now       func() time.Time
+	Crawl     func(context.Context, []int64) (int64, error)
+	AutoPrice func(context.Context) (bool, error)
+	Log       func(string, ...any)
 }
 
 type Service struct {
@@ -42,7 +45,7 @@ type Service struct {
 
 func New(db *sql.DB, gate *store.WriteGate, opts Options) *Service {
 	if opts.Client == nil {
-		opts.Client = publicClient()
+		opts.Client = publicClient(opts.Proxy)
 	}
 	if opts.MembershipURL == "" {
 		opts.MembershipURL = membershipURL
@@ -60,9 +63,10 @@ func New(db *sql.DB, gate *store.WriteGate, opts Options) *Service {
 }
 
 type state struct {
-	Machine string `json:"machineName"`
-	Product string `json:"productName"`
-	Marked  int    `json:"marked"`
+	Machine       string         `json:"machineName"`
+	Product       string         `json:"productName"`
+	Marked        int            `json:"marked"`
+	PlatformGames []platformGame `json:"platformGames,omitempty"` // 非 Steam 平台游戏（带平台标识）
 }
 
 type mark struct {
@@ -204,16 +208,22 @@ func (s *Service) persist(ctx context.Context, m month, label string, marked []m
 		if !complete {
 			return nil
 		}
-		if err := settings.WriteValue(ctx, conn, stateKey, state{m.Machine, m.Product, len(marked)}); err != nil {
+		if err := settings.WriteValue(ctx, conn, stateKey, state{Machine: m.Machine, Product: m.Product, Marked: len(marked), PlatformGames: m.Others}); err != nil {
 			return err
 		}
 		return recordNotice(ctx, conn, m, label, marked, now, stamp)
 	})
 }
 
+// platformZh 非 Steam 平台的中文展示名（通知文案用）；未知平台回原值。
+var platformZh = map[string]string{
+	"blizzard": "Battle.net 战网", "epic": "Epic", "ubisoft": "育碧", "gog": "GOG",
+	"origin": "Origin", "ea": "EA App", "itch": "itch.io", "drm-free": "直接下载版",
+}
+
 func recordNotice(ctx context.Context, conn *sql.Conn, m month, label string, marked []mark, now time.Time, stamp string) error {
 	items := make([]map[string]any, 0, len(marked))
-	names := make([]string, 0, len(marked))
+	names := make([]string, 0, len(marked)+len(m.Others))
 	raw, err := json.Marshal(marked)
 	if err != nil {
 		return err
@@ -237,9 +247,17 @@ func recordNotice(ctx context.Context, conn *sql.Conn, m month, label string, ma
 	if err != nil {
 		return err
 	}
+	// 非 Steam 平台游戏一并入通知（名称带平台标注），领取口径=当月全部游戏
+	for _, pg := range m.Others {
+		zh, ok := platformZh[pg.Platform]
+		if !ok {
+			zh = pg.Platform
+		}
+		names = append(names, pg.Title+"（"+zh+"）")
+	}
 	payload := map[string]any{
-		"appid": 0, "label": label, "productName": m.Product, "count": len(marked),
-		"title":  fmt.Sprintf("Humble Choice %s：%d 款可兑换", label, len(marked)),
+		"appid": 0, "label": label, "productName": m.Product, "count": len(names),
+		"title":  fmt.Sprintf("Humble Choice %s：%d 款可领取", label, len(names)),
 		"labels": []string{"Humble Choice"}, "games": names, "url": monthURL(m.Machine), "end": m.End, "items": items,
 	}
 	raw, err = json.Marshal(payload)

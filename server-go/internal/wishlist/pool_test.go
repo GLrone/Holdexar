@@ -89,7 +89,7 @@ func TestUnfollowPreservesAccountAndRemovalCannotBeRevivedByAccount(t *testing.T
 	if snapshot["state"] != "active" || len(snapshot["sources"].([]string)) != 2 {
 		t.Fatalf("unfollow lost account sources=%v", snapshot)
 	}
-	if _, e := p.Remove(ctx, []int64{220}); e != nil {
+	if _, e := p.Remove(ctx, []int64{220}, "pool_removed"); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := p.Monitor.Apply(ctx, "game", []int64{220}, monitoring.Change{Sources: map[int64][]string{220: {"owned", "family_wishlist"}}, Managed: []string{"owned", "family_wishlist"}}); e != nil {
@@ -124,7 +124,7 @@ func TestRemoveFailureRollsBackAccountAndMonitoringTogether(t *testing.T) {
 	if _, e := db.Exec(`INSERT INTO wishlist_items VALUES('a',220,NULL,1,1,0,1,0,0,0); CREATE TRIGGER reject_exclusion BEFORE INSERT ON monitor_exclusions BEGIN SELECT RAISE(ABORT,'controlled failure'); END`); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := p.Remove(ctx, []int64{220}); e == nil {
+	if _, e := p.Remove(ctx, []int64{220}, "pool_removed"); e == nil {
 		t.Fatal("remove failure swallowed")
 	}
 	var active int
@@ -193,11 +193,34 @@ func TestPoolItemsMergeAccountFlagsAndKeepAccountFilters(t *testing.T) {
 	if err != nil || len(empty) != 1 || empty[0]["wishlisted"] != true {
 		t.Fatalf("explicit empty account=%v err=%v", empty, err)
 	}
-	if _, err := p.Remove(ctx, []int64{220}); err != nil {
+	if _, err := p.Remove(ctx, []int64{220}, "pool_removed"); err != nil {
 		t.Fatal(err)
 	}
 	remaining, err := p.Items(ctx, nil)
 	if err != nil || len(remaining) != 1 || remaining[0]["appid"] != int64(620) {
 		t.Fatalf("excluded still visible=%v err=%v", remaining, err)
+	}
+}
+
+// reason 参数化回归：目录移除链传 catalog_removed 与恢复侧配对；默认路由
+// 仍写 pool_removed，行为不变。
+func TestPoolRemoveReasonParameterized(t *testing.T) {
+	p, db := poolFixture(t)
+	ctx := context.Background()
+	if _, e := p.Add(ctx, []int64{220}, ""); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := p.Remove(ctx, []int64{220}, "catalog_removed"); e != nil {
+		t.Fatal(e)
+	}
+	var reason string
+	if e := db.QueryRow(`SELECT reason FROM monitor_exclusions WHERE target_type='game' AND target_id=220 AND active=1`).Scan(&reason); e != nil || reason != "catalog_removed" {
+		t.Fatalf("catalog_removed reason=%q err=%v", reason, e)
+	}
+	if _, e := p.Remove(ctx, []int64{220}, "pool_removed"); e != nil {
+		t.Fatal(e)
+	}
+	if e := db.QueryRow(`SELECT reason FROM monitor_exclusions WHERE target_type='game' AND target_id=220 AND active=1`).Scan(&reason); e != nil || reason != "pool_removed" {
+		t.Fatalf("pool_removed reason=%q err=%v", reason, e)
 	}
 }

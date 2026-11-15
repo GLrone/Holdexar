@@ -53,10 +53,21 @@ func assertDetailNull(t *testing.T, body map[string]any) {
 	}
 }
 
+// doFrom 指定对端地址发请求（health 的对端信任分级测试用）。
+func doFrom(t *testing.T, srv *Server, method, target, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(method, target, nil)
+	req.RemoteAddr = remoteAddr
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestHealthDefaultShape 回环对端（桌面壳）：完整快照含 pid/dataDir/路径。
 func TestHealthDefaultShape(t *testing.T) {
 	unsetForTest(t, "HOLDEXAR_UPDATE_ATTEMPT_ID")
 	srv := newTestServer(t)
-	rec := do(t, srv, "GET", "/api/v1/health")
+	rec := doFrom(t, srv, "GET", "/api/v1/health", "127.0.0.1:51234")
 	if rec.Code != 200 {
 		t.Fatalf("健康端点状态码=%d，应为 200", rec.Code)
 	}
@@ -88,10 +99,30 @@ func TestHealthDefaultShape(t *testing.T) {
 	}
 }
 
+// TestHealthRemotePeerMinimal 远端对端（局域网/外部）：只获判活最小面，
+// 不泄露 pid/数据目录/可执行路径（P0 审计修复）。
+func TestHealthRemotePeerMinimal(t *testing.T) {
+	unsetForTest(t, "HOLDEXAR_UPDATE_ATTEMPT_ID")
+	srv := newTestServer(t)
+	rec := doFrom(t, srv, "GET", "/api/v1/health", "192.168.1.5:51234")
+	body := decodeJSON(t, rec.Body.Bytes())
+	if len(body) != 4 {
+		t.Fatalf("远端字段数=%d，应为 4：%v", len(body), body)
+	}
+	for _, key := range []string{"pid", "dataDir", "executable"} {
+		if _, present := body[key]; present {
+			t.Fatalf("远端响应不得含 %s（P0-1 回归）", key)
+		}
+	}
+	if body["status"] != "ok" || body["app"] != "Holdexar" {
+		t.Fatalf("最小面不符：%v", body)
+	}
+}
+
 func TestHealthUpdateAttemptFields(t *testing.T) {
 	t.Setenv("HOLDEXAR_UPDATE_ATTEMPT_ID", "attempt-1")
 	srv := newTestServer(t)
-	rec := do(t, srv, "GET", "/api/v1/health")
+	rec := doFrom(t, srv, "GET", "/api/v1/health", "127.0.0.1:51234")
 	if rec.Code != 200 {
 		t.Fatalf("健康端点状态码=%d，应为 200", rec.Code)
 	}

@@ -41,6 +41,7 @@ type Snapshot struct {
 
 type SyncOptions struct {
 	Steam    *Steam
+	Proxy    func(context.Context) (string, error)
 	APIKey   func(context.Context) (string, error)
 	Token    func(context.Context, string) (string, error)
 	HasToken func(context.Context, string) (bool, error)
@@ -70,7 +71,7 @@ type SyncService struct {
 
 func NewSync(parent context.Context, db *sql.DB, gate *store.WriteGate, opts SyncOptions) *SyncService {
 	if opts.Steam == nil {
-		opts.Steam = NewSteam(SteamOptions{})
+		opts.Steam = NewSteam(SteamOptions{Proxy: opts.Proxy})
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now

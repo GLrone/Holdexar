@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,21 @@ const (
 
 // AppVersion 构建期经 -ldflags -X 注入（-X 对 const 无效）；缺省为开发态版本。
 var AppVersion = "0.3.6-beta"
+
+// ServerAddr 默认监听地址：回环不变；HOLDEXAR_HOST 显式指定时回退
+// （NAS/局域网绑定场景，桌面壳 windowhost 同读同源）。值已带端口则原样
+// 使用，否则补默认端口。
+func ServerAddr() string {
+	const defaultPort = "28765"
+	host := strings.TrimSpace(os.Getenv(EnvPrefix + "HOST"))
+	if host == "" {
+		return "127.0.0.1:" + defaultPort
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	return host + ":" + defaultPort
+}
 
 // AppName 品牌名；环境变量 HOLDEXAR_APP_NAME 显式设置时优先（空串同为显式值）。
 func AppName() string {

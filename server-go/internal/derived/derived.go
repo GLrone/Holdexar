@@ -102,7 +102,18 @@ func UpdatePriceDerived(ctx context.Context, conn *sql.Conn, appids []int64, opt
 				return 0, err
 			}
 		}
-		// 评测/发行日变化的捆绑包排序缓存联动未迁移（bundles 域未到）
+		// 评测/发行日变化的捆绑包排序缓存联动（对齐 derived.py:129-137：
+		// (positive_rate, review_count, release_date) 任一变化或新行触发）
+		bundleChanged := make([]int64, 0, len(current))
+		for aid, cur := range current {
+			old, ok := before[aid]
+			if !ok || ReviewReleaseChanged(cur, old) {
+				bundleChanged = append(bundleChanged, aid)
+			}
+		}
+		if err := UpdateMemberBundles(ctx, conn, bundleChanged); err != nil {
+			return 0, err
+		}
 	}
 	return count, nil
 }

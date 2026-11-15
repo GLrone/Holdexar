@@ -76,7 +76,7 @@ func (p *Pool) Register(mux *http.ServeMux) {
 			var result map[string]any
 			var e error
 			if path == "/pool/items/remove" {
-				result, e = p.Remove(r.Context(), body.AppIDs)
+				result, e = p.Remove(r.Context(), body.AppIDs, "pool_removed")
 			} else {
 				source := ""
 				if body.Source != nil {

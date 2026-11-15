@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,10 +20,12 @@ import (
 const membershipURL = "https://www.humblebundle.com/membership"
 const steamSearchURL = "https://store.steampowered.com/api/storesearch"
 
-var choiceItem = regexp.MustCompile(`"([a-z0-9_]+)"\s*:\s*\{\s*"recommendation_copy_dict"`)
+// 2026-11 页面改版：membership 换 Next.js RSC（旧内嵌 JSON 的锚点全部消失），
+// 内容以 flight 流内嵌在首屏；服务器按请求指纹分流，头不全时返回无数据的壳页。
+var flightPush = regexp.MustCompile(`self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)`)
+var monthDesc = regexp.MustCompile(`Get ([A-Za-z]+) (\d{4}) Humble Choice`)
 var monthKey = regexp.MustCompile(`^([a-z]+)_(\d{4})_choice$`)
 var productMonth = regexp.MustCompile(`([A-Za-z]+)\s+(\d{4})`)
-var fieldPattern = regexp.MustCompile(`"(activeContentMachineName|productHumanName|activeContentEndDate\|datetime)"\s*:\s*"([^"]+)"`)
 var edition = regexp.MustCompile(`\s*-\s*pc edition|\s*\(pc\)|\s*\(windows\)|\s*windows edition|\s*xbox one|\s*xbox series x\|s|\s*standard edition|\s*game of the year edition|\s*anniversary edition|\s*complete edition|\s*deluxe edition|\s*definitive edition|\s*remastered|\s*director's cut|\s*ultimate edition`)
 var searchWords = regexp.MustCompile(`[^\pL\pN_\s]+`)
 var dlcBundleSuffix = regexp.MustCompile(`(?i)\s*\+\s*\d+\s+dlc packs?\s*$`)
@@ -33,44 +34,157 @@ type month struct {
 	Machine string
 	Product string
 	End     string
-	Titles  []string
+	Titles  []string       // Steam 交付：走 appid 匹配入 games 账本
+	Others  []platformGame // 非 Steam 平台游戏：带平台标识，不进 games（无 appid）
 }
 
-type choiceItemData struct {
-	Title    string   `json:"title"`
-	Delivery []string `json:"delivery_methods"`
+// platformGame 非 Steam 平台的当月包游戏：平台取 Humble 交付方式原值
+// （blizzard/epic/ubisoft/gog/origin/ea/itch/drm-free…，展示层本地化）。
+type platformGame struct {
+	Title     string `json:"title"`
+	Platform  string `json:"platform"`
+	Thumbnail string `json:"thumbnail,omitempty"`
+	RetailFen *int64 `json:"retailFen,omitempty"`
+	EndDate   string `json:"endDate,omitempty"`
 }
 
-func parseMembership(raw []byte) (month, error) {
-	page := html.UnescapeString(string(raw))
-	fields := map[string]string{}
-	for _, match := range fieldPattern.FindAllStringSubmatch(page, -1) {
-		if fields[match[1]] == "" {
-			fields[match[1]] = match[2]
+type choiceProduct struct {
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	Delivery       []string `json:"deliveryMethods"`
+	EndDate        string   `json:"endDate"`
+	Thumbnail      string   `json:"thumbnail"`
+	DisplayPrice   struct {
+		CurrentPrice struct {
+			CentAmount float64 `json:"centAmount"`
+		} `json:"currentPrice"`
+	} `json:"displayPrice"`
+}
+
+// flightPayload 抽取并解码页面内嵌的 RSC flight 流（每段 push 是一个 JS 字符串
+// 字面量，按 JSON 转义解码；个别段解码失败跳过，数据在其余段仍可拼齐）。
+func flightPayload(page string) string {
+	var full strings.Builder
+	for _, match := range flightPush.FindAllStringSubmatch(page, -1) {
+		var decoded string
+		if json.Unmarshal([]byte("\""+match[1]+"\""), &decoded) != nil {
+			continue
 		}
+		full.WriteString(decoded)
 	}
-	m := month{Machine: fields["activeContentMachineName"], Product: fields["productHumanName"], End: fields["activeContentEndDate|datetime"]}
-	seen := map[string]bool{}
-	for _, span := range choiceItem.FindAllStringSubmatchIndex(page, -1) {
-		slug := page[span[2]:span[3]]
-		if seen[slug] {
+	return full.String()
+}
+
+// extractJSONValue 取 key 后第一个完整的 JSON 值（配平引号/转义/括号）。
+func extractJSONValue(payload, key string) (string, bool) {
+	i := strings.Index(payload, key)
+	if i < 0 {
+		return "", false
+	}
+	start := i + len(key)
+	for start < len(payload) && (payload[start] == ' ' || payload[start] == ':') {
+		start++
+	}
+	if start >= len(payload) || payload[start] != '[' {
+		return "", false
+	}
+	depth, inStr, esc := 0, false, false
+	for j := start; j < len(payload); j++ {
+		ch := payload[j]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case ch == '"':
+				inStr = false
+			}
 			continue
 		}
-		start := span[0] + strings.IndexByte(page[span[0]:span[1]], '{')
-		var item choiceItemData
-		if json.NewDecoder(strings.NewReader(page[start:])).Decode(&item) != nil || strings.TrimSpace(item.Title) == "" {
-			continue
-		}
-		seen[slug] = true
-		for _, delivery := range item.Delivery {
-			if delivery == "steam" {
-				m.Titles = append(m.Titles, strings.TrimSpace(item.Title))
-				break
+		switch ch {
+		case '"':
+			inStr = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return payload[start : j+1], true
 			}
 		}
 	}
-	if m.Machine == "" || len(m.Titles) == 0 {
-		return month{}, errors.New("页面无当月包 Steam 游戏数据")
+	return "", false
+}
+
+// parseMembership 解析当月包：subscriptionProducts 全量游戏 + 页面元描述里的
+// 期号（"Get November 2026 Humble Choice"）。Steam 交付走 appid 匹配；其余
+// 平台交付（blizzard/epic/ubisoft/…，平台名取交付方式原值）按平台游戏保留；
+// 仅 external_key 的条目是订阅/权益类（如 IGN Plus），不是游戏，排除。机器名
+// 归一成旧格式（november_2026_choice），与既有落库状态/月标签派生同构兼容。
+func parseMembership(raw []byte) (month, error) {
+	payload := flightPayload(string(raw))
+	if payload == "" {
+		return month{}, errors.New("页面无内嵌数据（请求被识别为机器人，返回了空壳）")
+	}
+	source, ok := extractJSONValue(payload, `"subscriptionProducts"`)
+	if !ok {
+		return month{}, errors.New("页面无当月包产品清单")
+	}
+	var products []choiceProduct
+	if json.Unmarshal([]byte(source), &products) != nil {
+		return month{}, errors.New("当月包产品清单格式无效")
+	}
+	m := month{}
+	seen := map[string]bool{}
+	for _, p := range products {
+		title := strings.TrimSpace(p.Title)
+		if title == "" {
+			continue
+		}
+		steam := false
+		platform := ""
+		for _, d := range p.Delivery {
+			if d == "steam" {
+				steam = true
+				break
+			}
+			if d != "external_key" && platform == "" {
+				platform = d
+			}
+		}
+		if m.End == "" && p.EndDate != "" {
+			m.End = p.EndDate
+		}
+		if seen[title] {
+			continue
+		}
+		if steam {
+			m.Titles = append(m.Titles, title)
+			seen[title] = true
+			continue
+		}
+		if platform == "" {
+			continue // 仅 external_key：订阅/权益类，非游戏
+		}
+		var retail *int64
+		if cents := int64(p.DisplayPrice.CurrentPrice.CentAmount + 0.5); cents > 0 {
+			retail = &cents
+		}
+		m.Others = append(m.Others, platformGame{
+			Title: title, Platform: platform,
+			Thumbnail: p.Thumbnail, RetailFen: retail, EndDate: p.EndDate,
+		})
+		seen[title] = true
+	}
+	match := monthDesc.FindStringSubmatch(payload)
+	if match == nil {
+		return month{}, errors.New("页面无当月期号（meta 描述缺失）")
+	}
+	m.Machine = strings.ToLower(match[1]) + "_" + match[2] + "_choice"
+	m.Product = match[1] + " " + match[2]
+	if len(m.Titles) == 0 && len(m.Others) == 0 {
+		return month{}, errors.New("页面无当月包游戏数据")
 	}
 	return m, nil
 }
@@ -89,28 +203,40 @@ func parseMonth(raw string) time.Month {
 }
 
 func monthLabel(m month) string {
-	for _, match := range [][]string{productMonth.FindStringSubmatch(m.Product), monthKey.FindStringSubmatch(m.Machine)} {
+	// Machine/Product 两个来源都吃（productHumanName 旧形态与 meta 派生新形态）。
+	for _, candidate := range []string{m.Product, m.Machine} {
+		match := monthKey.FindStringSubmatch(strings.ToLower(candidate))
 		if len(match) > 0 {
 			if mon := parseMonth(match[1]); mon != 0 {
 				return fmt.Sprintf("HB慈善包%s年%d月包", match[2][2:], mon)
 			}
 		}
 	}
+	// Product 形如 "November 2026 Humble Choice"（旧）或 "November 2026"（新）
+	if match := productMonth.FindStringSubmatch(m.Product); len(match) > 0 {
+		if mon := parseMonth(match[1]); mon != 0 {
+			return fmt.Sprintf("HB慈善包%s年%d月包", match[2][2:], mon)
+		}
+	}
 	return "HB慈善包"
 }
 
+// monthURL 月档案页已对未登录整体 404（2026-11 改版），唯一入口是 membership 主页。
 func monthURL(machine string) string {
-	if match := monthKey.FindStringSubmatch(machine); len(match) > 0 {
-		if mon := parseMonth(match[1]); mon != 0 {
-			return membershipURL + "/" + mon.String() + "-" + match[2]
-		}
-	}
 	return membershipURL
 }
 
-func publicClient() *http.Client {
+func publicClient(proxy func(context.Context) (string, bool)) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = func(r *http.Request) (*url.URL, error) {
+		// 出网通道：优先应用代理解析（代理池语义，池不可用自动回落直连），
+		// 未装配时退回系统代理（与 Python 池通道语义对齐）
+		if proxy != nil {
+			if raw, ok := proxy(r.Context()); ok && raw != "" {
+				return url.Parse(raw)
+			}
+			return nil, nil
+		}
 		raw, err := netenv.ResolveSystemProxy(r.Context())
 		if err != nil || raw == "" {
 			return nil, err
@@ -130,8 +256,29 @@ func (s *Service) request(ctx context.Context, address string, limit int64) ([]b
 	if err != nil {
 		return nil, errors.New("公开来源地址无效")
 	}
-	r.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
-	r.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	host := ""
+	if parsed, err := url.Parse(address); err == nil {
+		host = parsed.Hostname()
+	}
+	if host == "www.humblebundle.com" {
+		// Humble 会员页：头指纹是数据有无的开关，缺 Sec-Fetch/sec-ch-ua 系列
+		// 时服务端返回不含内嵌数据的降级壳页（2026-11 改版实测）。
+		r.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		r.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+		r.Header.Set("Upgrade-Insecure-Requests", "1")
+		r.Header.Set("Sec-Fetch-Dest", "document")
+		r.Header.Set("Sec-Fetch-Mode", "navigate")
+		r.Header.Set("Sec-Fetch-Site", "none")
+		r.Header.Set("Sec-Fetch-User", "?1")
+		r.Header.Set("sec-ch-ua", `"Chromium";v="152", "Not?A_Brand";v="24"`)
+		r.Header.Set("sec-ch-ua-mobile", "?0")
+		r.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	} else {
+		// Steam JSON API：文档导航形态的头会被对端直接断连（实测 http=000），
+		// 必须保持 JSON 客户端形态。
+		r.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
+	}
+	r.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
 	resp, err := s.opts.Client.Do(r)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -218,17 +365,33 @@ func (s *Service) resolve(ctx context.Context, title string) int64 {
 	if len(words) > 1 {
 		terms = append(terms, words[0])
 	}
+	// Steam 直连在大陆环境时通时断：每个词两次尝试（短退避），失败继续
+	// 下一个词而不是整题放弃——单次刷新的解析成功率是月包完整性的一半。
 	for _, term := range terms {
 		address := s.opts.SearchURL + "?" + (url.Values{"term": {term}, "cc": {"us"}, "l": {"en"}}).Encode()
-		fetch, cancel := context.WithTimeout(ctx, 15*time.Second)
-		raw, err := s.request(fetch, address, 1<<20)
-		cancel()
+		var raw []byte
+		var err error
+		for attempt := 0; attempt < 2 && err == nil; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-time.After(1500 * time.Millisecond):
+				case <-ctx.Done():
+					return 0
+				}
+			}
+			fetch, cancel := context.WithTimeout(ctx, 15*time.Second)
+			raw, err = s.request(fetch, address, 1<<20)
+			cancel()
+			if err != nil && ctx.Err() != nil {
+				return 0
+			}
+		}
 		if err != nil {
-			return 0
+			continue
 		}
 		var result struct{ Items []searchHit }
 		if json.Unmarshal(raw, &result) != nil {
-			return 0
+			continue
 		}
 		if len(result.Items) > 0 {
 			return pickAppID(title, result.Items, exactOnly)

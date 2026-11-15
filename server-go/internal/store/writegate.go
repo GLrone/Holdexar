@@ -13,8 +13,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/sys/windows"
 )
 
 // 写事务调度优先级：值小者先获得写者。
@@ -43,6 +41,14 @@ func (p WritePriority) label() string {
 		return "后台"
 	}
 	return fmt.Sprintf("优先级%d", int(p))
+}
+
+// pyName 诊断快照用的优先级名（对齐 Python WritePriority.name 枚举字面）。
+func (p WritePriority) pyName() string {
+	if p == PriorityInteractive {
+		return "INTERACTIVE"
+	}
+	return "BACKGROUND"
 }
 
 const (
@@ -94,6 +100,7 @@ type WriteGate struct {
 	warnCh  chan uint64
 	pauseCh chan chan error
 	resumeCh chan struct{}
+	diagCh  chan chan map[string]any
 	seq     atomic.Uint64
 
 	waitTimeout   time.Duration
@@ -120,6 +127,7 @@ func NewWriteGate(db *sql.DB, dbPath string) *WriteGate {
 		warnCh:        make(chan uint64, 1),
 		pauseCh:       make(chan chan error),
 		resumeCh:      make(chan struct{}, 1),
+		diagCh:        make(chan chan map[string]any),
 		waitTimeout:   defaultWaitTimeout,
 		lockTimeout:   defaultLockTimeout,
 		holdWarnAfter: defaultHoldWarn,
@@ -228,6 +236,20 @@ func (g *WriteGate) run() {
 				g.warnFn("%s写事务占用写锁已超过 %v 秒仍未释放",
 					owner.priority.label(), time.Since(holdStart).Round(100*time.Millisecond))
 			}
+		case reply := <-g.diagCh:
+			snap := map[string]any{
+				"busy":                owner != nil,
+				"depth":               0,
+				"owner_priority":      nil,
+				"owner_label":         nil,
+				"waiting_interactive": len(queues[0]),
+				"waiting_background":  len(queues[1]),
+			}
+			if owner != nil {
+				snap["depth"] = 1 // Go 无同任务重入，持闸即深度 1
+				snap["owner_priority"] = owner.priority.pyName()
+			}
+			reply <- snap
 		}
 	}
 }
@@ -300,6 +322,44 @@ func (g *WriteGate) ResumeWrites() {
 	}
 }
 
+// Diagnostics 写调度诊断快照（写者被堵时的取证出口）：键名对齐 Python
+// core/database.py write_scheduler_diagnostics（busy/depth/owner_priority/
+// owner_label/waiting_interactive/waiting_background + pool 占用）。Go 无任务
+// 身份，owner_label 恒 nil、归属只到优先级；ctx 取消时返回 nil。
+func (g *WriteGate) Diagnostics(ctx context.Context) map[string]any {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reply := make(chan map[string]any, 1)
+	select {
+	case g.diagCh <- reply:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case snap := <-reply:
+		var stats sql.DBStats
+		if g.db != nil {
+			stats = g.db.Stats()
+		}
+		overflow := 0
+		if stats.MaxOpenConnections > 0 {
+			overflow = stats.OpenConnections - stats.MaxOpenConnections
+		}
+		snap["pool"] = map[string]any{
+			"type":        "*sql.DB",
+			"status":      fmt.Sprintf("Pool size: %d  Connections in pool: %d  Current Overflow: %d  Current Checked out connections: %d", stats.MaxOpenConnections, stats.Idle, overflow, stats.InUse),
+			"size":        stats.MaxOpenConnections,
+			"checkedOut":  stats.InUse,
+			"checkedIn":   stats.Idle,
+			"overflow":    overflow,
+		}
+		return snap
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // abandon 放弃排队：闸侧按序号幂等处理（移出队列或代收授权），
 // 竞态下已到手的凭证就地释放。
 func (g *WriteGate) abandon(req *writeReq, cause error) error {
@@ -345,7 +405,9 @@ func (g *WriteGate) WithWrite(ctx context.Context, priority WritePriority, fn fu
 }
 
 // lockFile 取跨进程独占文件锁：文件不存在则创建并补一字节，
-// 非阻塞 LockFileEx 失败后按 25ms 轮询，超时或 ctx 取消时报错。
+// 非阻塞独占文件锁失败后按 25ms 轮询，超时或 ctx 取消时报错。
+// 锁原语按平台拆分（Windows LockFileEx / POSIX flock）——锁文件必须与
+// 数据库同盘（本地文件系统；flock 在 NFS 上语义不可靠）。
 func lockFile(path string, timeout time.Duration, ctx context.Context) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -357,14 +419,9 @@ func lockFile(path string, timeout time.Duration, ctx context.Context) (*os.File
 			return nil, fmt.Errorf("跨进程写锁文件初始化失败: %w", werr)
 		}
 	}
-	handle := windows.Handle(f.Fd())
 	deadline := time.Now().Add(timeout)
-	var ol windows.Overlapped
 	for {
-		err := windows.LockFileEx(handle,
-			windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
-			0, 1, 0, &ol)
-		if err == nil {
+		if err := lockFileExclusive(f); err == nil {
 			return f, nil
 		}
 		if time.Now().After(deadline) {
@@ -381,7 +438,6 @@ func lockFile(path string, timeout time.Duration, ctx context.Context) (*os.File
 }
 
 func unlockFile(f *os.File) {
-	var ol windows.Overlapped
-	_ = windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)
+	unlockFileExclusive(f)
 	_ = f.Close()
 }

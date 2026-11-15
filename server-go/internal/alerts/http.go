@@ -260,7 +260,11 @@ func (s *Service) Search(ctx context.Context, q, region string) (map[string]any,
 	if idErr != nil {
 		return map[string]any{"items": empty, "error": "输入不是有效的 AppID，且本地无匹配游戏记录"}, nil
 	}
-	proxy, e := netenv.ResolveSystemProxy(ctx)
+	resolve := s.opts.Proxy
+	if resolve == nil {
+		resolve = netenv.ResolveSystemProxy
+	}
+	proxy, e := resolve(ctx)
 	if e != nil {
 		return nil, e
 	}

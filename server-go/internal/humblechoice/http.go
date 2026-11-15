@@ -17,6 +17,9 @@ type game struct {
 	OriginalPriceFen *int64  `json:"originalPriceFen"`
 	Discount         int     `json:"discount"`
 	LowestCnyFen     *int64  `json:"lowestCnyFen"`
+	// Platform 非 Steam 平台标识（blizzard/epic/ubisoft/gog/origin/ea/itch/
+	// drm-free…原值下发，展示层本地化）；Steam 游戏无此字段。
+	Platform string `json:"platform,omitempty"`
 }
 
 func (s *Service) Offers(ctx context.Context) (map[string]any, error) {
@@ -47,6 +50,15 @@ func (s *Service) Offers(ctx context.Context) (map[string]any, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	// 非 Steam 平台游戏：appid 不存在（games 账本是 Steam appid 主导），
+	// 以状态记录里的平台标识直接下发（appid=0，前端按平台徽章渲染）
+	for _, pg := range previous.PlatformGames {
+		thumb := pg.Thumbnail
+		games = append(games, game{
+			AppID: 0, Name: pg.Title, Platform: pg.Platform,
+			HeaderImage: &thumb, OriginalPriceFen: pg.RetailFen,
+		})
 	}
 	if len(games) == 0 {
 		return map[string]any{"source": "hb-offers", "ok": false, "error": "当月包尚未入库（等待每日抓取或手动触发 /metadata/hb/refresh）"}, nil

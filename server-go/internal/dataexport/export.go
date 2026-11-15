@@ -100,7 +100,9 @@ func SafeExportPath(dataDir, name string) (string, error) {
 }
 
 type Result struct {
-	Path      string         `json:"path"`
+	// Path 服务器绝对路径：仅内部使用（落盘/清理），不进 HTTP 响应
+	// （P0 审计：路径回显曾泄露服务器目录结构）。
+	Path      string         `json:"-"`
 	Name      string         `json:"name"`
 	SizeBytes int64          `json:"sizeBytes"`
 	CreatedAt string         `json:"createdAt"`
@@ -108,11 +110,17 @@ type Result struct {
 	Excludes  []string       `json:"excludes"`
 }
 
+// ValidationError 入参校验失败：HTTP 层映射为 400（不落 500）。
+type ValidationError struct{ err error }
+
+func (e ValidationError) Error() string { return e.err.Error() }
+func (e ValidationError) Unwrap() error { return e.err }
+
 // Create 组装 → 加密 → 落盘。口令过短 400，凭据锁定 409（由 HTTP 层映射）。
 func Create(ctx context.Context, db *sql.DB, dataDir, password string) (Result, error) {
 	var result Result
 	if len(password) < minPasswordLen {
-		return result, fmt.Errorf("导出口令至少 %d 位", minPasswordLen)
+		return result, ValidationError{fmt.Errorf("导出口令至少 %d 位", minPasswordLen)}
 	}
 	payload, err := buildPayload(ctx, db, dataDir)
 	if err != nil {

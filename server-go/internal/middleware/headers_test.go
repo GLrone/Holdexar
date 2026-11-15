@@ -35,7 +35,10 @@ func TestSecurityHeadersOnAllResponses(t *testing.T) {
 			t.Fatalf("%s 安全头缺失: %v", path, h)
 		}
 		want := "default-src 'self'; img-src 'self' data: https://cdn.cloudflare.steamstatic.com " +
-			"https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com; " +
+			"https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com " +
+			"https://avatars.fastly.steamstatic.com " +
+			"https://*.epicgames.com https://*.epicgamescdn.com https://*.unrealengine.com " +
+			"https://*.gamerpower.com https://*.file.myqcloud.com https://hb-prd.imgix.net; " +
 			"style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; " +
 			"frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
 		if h.Get("Content-Security-Policy") != want {

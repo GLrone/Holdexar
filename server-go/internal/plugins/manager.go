@@ -27,18 +27,19 @@ const catalogKey = "plugins.catalog"
 const maxPackage = 256 << 10
 
 type Installed struct {
-	Manifest          Manifest       `json:"manifest"`
-	Enabled           bool           `json:"enabled"`
-	Config            map[string]any `json:"config"`
-	ConfiguredSecrets []string       `json:"configuredSecrets,omitempty"`
-	SHA256            string         `json:"sha256"`
-	URL               string         `json:"url,omitempty"`
-	Unsigned          bool           `json:"unsigned"`
-	TargetDigest      string         `json:"targetDigest"`
-	Compatible        bool           `json:"compatible"`
-	Trust             string         `json:"trust"`
-	Configured        bool           `json:"configured"`
-	Error             string         `json:"error,omitempty"`
+	Manifest          Manifest        `json:"manifest"`
+	Enabled           bool            `json:"enabled"`
+	Config            map[string]any  `json:"config"`
+	ConfiguredSecrets []string        `json:"configuredSecrets,omitempty"`
+	SHA256            string          `json:"sha256"`
+	URL               string          `json:"url,omitempty"`
+	Unsigned          bool            `json:"unsigned"`
+	TargetDigest      string          `json:"targetDigest"`
+	Compatible        bool            `json:"compatible"`
+	Trust             string          `json:"trust"`
+	Configured        bool            `json:"configured"`
+	Error             string          `json:"error,omitempty"`
+	Data              json.RawMessage `json:"data,omitempty"`
 }
 type Selection struct {
 	ID      string `json:"id"`
@@ -98,6 +99,7 @@ func readRegistry(ctx context.Context, q rowQuery) ([]Installed, error) {
 		entries = []Installed{}
 	}
 	active := 0
+	activeDataSource := 0
 	seen := map[string]bool{}
 	for _, entry := range entries {
 		if e = entry.Manifest.Validate(); e != nil {
@@ -108,11 +110,18 @@ func readRegistry(ctx context.Context, q rowQuery) ([]Installed, error) {
 		}
 		seen[entry.Manifest.ID] = true
 		if entry.Enabled {
-			active++
+			if entry.Manifest.Kind == "datasource.community_history" {
+				activeDataSource++
+			} else {
+				active++
+			}
 		}
 	}
 	if active > 1 {
 		return nil, errors.New("multiple active notification plugins")
+	}
+	if activeDataSource > 1 {
+		return nil, errors.New("multiple active data source plugins")
 	}
 	return entries, nil
 }
@@ -126,7 +135,7 @@ func Recipient(ctx context.Context, q rowQuery) (string, error) {
 		return "", e
 	}
 	for _, entry := range entries {
-		if entry.Enabled {
+		if entry.Enabled && entry.Manifest.Kind == "notification.webhook" {
 			if len(entry.TargetDigest) != 64 {
 				return "", errors.New("plugin notification target is invalid")
 			}
@@ -203,6 +212,13 @@ func safeEntry(entry Installed) Installed {
 	entry.Compatible = entry.Manifest.Validate() == nil
 	entry.Trust = "unsigned"
 	entry.Configured = ValidateConfig(entry.Manifest.ConfigSchema, entry.Config, true) == nil
+	if entry.Manifest.Kind == "datasource.community_history" {
+		if _, err := ValidateDataSourceData(entry.Data); err != nil {
+			entry.Configured = false
+			entry.Error = "Plugin data is unavailable; reinstall it."
+		}
+	}
+	entry.Data = nil
 	entry.ConfiguredSecrets = nil
 	for name, value := range entry.Config {
 		if entry.Manifest.ConfigSchema.Properties[name].Format == "password" {
@@ -248,7 +264,7 @@ func (m *Manager) Active(ctx context.Context) (*Installed, error) {
 		return nil, e
 	}
 	for _, entry := range entries {
-		if entry.Enabled {
+		if entry.Enabled && entry.Manifest.Kind == "notification.webhook" {
 			if e := ValidateConfig(entry.Manifest.ConfigSchema, entry.Config, true); e != nil {
 				return nil, e
 			}
@@ -284,42 +300,78 @@ func targetDigest(entry Installed) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func parsePackage(raw []byte) (Manifest, error) {
+func parsePackage(raw []byte) (Manifest, []byte, error) {
 	if len(raw) > maxPackage {
-		return Manifest{}, errors.New("plugin package is too large")
+		return Manifest{}, nil, errors.New("plugin package is too large")
 	}
 	z, e := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
 	if e != nil {
-		return Manifest{}, errors.New("invalid plugin archive")
+		return Manifest{}, nil, errors.New("invalid plugin archive")
 	}
-	if len(z.File) != 1 {
-		return Manifest{}, errors.New("plugin package must contain only manifest.json")
-	}
-	file := z.File[0]
-	if file.Name != "manifest.json" || !file.Mode().IsRegular() || file.UncompressedSize64 > maxManifest || file.Flags&1 != 0 {
-		return Manifest{}, errors.New("unsupported plugin archive member")
-	}
-	reader, e := file.Open()
-	if e != nil {
-		return Manifest{}, errors.New("plugin manifest cannot be read")
-	}
-	defer reader.Close()
-	data, e := io.ReadAll(io.LimitReader(reader, maxManifest+1))
-	if e != nil || len(data) > maxManifest {
-		return Manifest{}, errors.New("plugin manifest is damaged or too large")
+	if len(z.File) != 1 && len(z.File) != 2 {
+		return Manifest{}, nil, errors.New("plugin package must contain manifest.json and at most one data file")
 	}
 	var manifest Manifest
-	if e = strictJSON(data, &manifest); e != nil {
-		return Manifest{}, e
+	var dataPayload []byte
+	seenMembers := map[string]bool{}
+	for _, file := range z.File {
+		if !file.Mode().IsRegular() || file.Flags&1 != 0 || seenMembers[file.Name] {
+			return Manifest{}, nil, errors.New("unsupported plugin archive member")
+		}
+		seenMembers[file.Name] = true
+		switch file.Name {
+		case "manifest.json":
+			if file.UncompressedSize64 > maxManifest {
+				return Manifest{}, nil, errors.New("unsupported plugin archive member")
+			}
+			reader, e := file.Open()
+			if e != nil {
+				return Manifest{}, nil, errors.New("plugin manifest cannot be read")
+			}
+			data, e := io.ReadAll(io.LimitReader(reader, maxManifest+1))
+			reader.Close()
+			if e != nil || len(data) > maxManifest {
+				return Manifest{}, nil, errors.New("plugin manifest is damaged or too large")
+			}
+			if e = strictJSON(data, &manifest); e != nil {
+				return Manifest{}, nil, e
+			}
+		case DataSourceMember:
+			if file.UncompressedSize64 > maxDataSourceData {
+				return Manifest{}, nil, errors.New("unsupported plugin archive member")
+			}
+			reader, e := file.Open()
+			if e != nil {
+				return Manifest{}, nil, errors.New("plugin data file cannot be read")
+			}
+			payload, e := io.ReadAll(io.LimitReader(reader, maxDataSourceData+1))
+			reader.Close()
+			if e != nil || len(payload) > maxDataSourceData {
+				return Manifest{}, nil, errors.New("plugin data file is damaged or too large")
+			}
+			dataPayload = payload
+		default:
+			return Manifest{}, nil, errors.New("unsupported plugin archive member")
+		}
 	}
 	if e = manifest.Validate(); e != nil {
-		return Manifest{}, e
+		return Manifest{}, nil, e
 	}
-	return manifest, nil
+	if manifest.Kind == "datasource.community_history" {
+		if len(z.File) != 2 || dataPayload == nil {
+			return Manifest{}, nil, errors.New("data source plugin must carry its observations file")
+		}
+		if _, e = ValidateDataSourceData(dataPayload); e != nil {
+			return Manifest{}, nil, e
+		}
+	} else if dataPayload != nil {
+		return Manifest{}, nil, errors.New("unsupported plugin archive member")
+	}
+	return manifest, dataPayload, nil
 }
 
 func (m *Manager) install(ctx context.Context, raw []byte, source string, unsigned bool, expected *Listing) (Installed, error) {
-	manifest, e := parsePackage(raw)
+	manifest, dataPayload, e := parsePackage(raw)
 	if e != nil {
 		return Installed{}, e
 	}
@@ -341,10 +393,13 @@ func (m *Manager) install(ctx context.Context, raw []byte, source string, unsign
 	if e != nil {
 		return Installed{}, e
 	}
-	entry := Installed{Manifest: manifest, Config: map[string]any{}, SHA256: hash, URL: source, Unsigned: unsigned}
+	entry := Installed{Manifest: manifest, Config: map[string]any{}, SHA256: hash, URL: source, Unsigned: unsigned, Data: dataPayload}
 	index := -1
 	for i, old := range entries {
 		if old.Manifest.ID == manifest.ID {
+			if old.Manifest.Kind != manifest.Kind {
+				return Installed{}, errors.New("plugin update changes its capability; remove it and review a new installation")
+			}
 			if old.Manifest.Endpoint != manifest.Endpoint {
 				return Installed{}, errors.New("plugin update changes its notification destination; remove it and review a new installation")
 			}
@@ -373,6 +428,14 @@ func (m *Manager) install(ctx context.Context, raw []byte, source string, unsign
 		return Installed{}, e
 	}
 	entry.TargetDigest = targetDigest(entry)
+	// 数据源单活动不变量：启用中的数据源插件同时至多一个。
+	if manifest.Kind == "datasource.community_history" && entry.Enabled {
+		for _, other := range entries {
+			if other.Manifest.ID != manifest.ID && other.Manifest.Kind == "datasource.community_history" && other.Enabled {
+				return Installed{}, errors.New("another data source plugin is already enabled")
+			}
+		}
+	}
 	if index < 0 {
 		entries = append(entries, entry)
 	} else {
@@ -382,6 +445,27 @@ func (m *Manager) install(ctx context.Context, raw []byte, source string, unsign
 		return Installed{}, e
 	}
 	return safeEntry(entry), nil
+}
+
+// ActiveDataSource 启用中的数据源插件与其观测集（无启用项回 nil）。
+func (m *Manager) ActiveDataSource(ctx context.Context) (*Installed, *DataSourceData, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entries, e := readRegistry(ctx, m.db)
+	if e != nil {
+		return nil, nil, e
+	}
+	for _, entry := range entries {
+		if !entry.Enabled || entry.Manifest.Kind != "datasource.community_history" {
+			continue
+		}
+		data, e := ValidateDataSourceData(entry.Data)
+		if e != nil {
+			return nil, nil, e
+		}
+		return &entry, data, nil
+	}
+	return nil, nil, nil
 }
 func (m *Manager) InstallLocal(ctx context.Context, raw []byte) (Installed, error) {
 	return m.install(ctx, raw, "", true, nil)
@@ -450,7 +534,7 @@ func (m *Manager) Update(ctx context.Context, id string, enabled *bool, config m
 		}
 		if entry.Enabled {
 			for j := range entries {
-				if j != i {
+				if j != i && entries[j].Manifest.Kind == entry.Manifest.Kind {
 					entries[j].Enabled = false
 				}
 			}

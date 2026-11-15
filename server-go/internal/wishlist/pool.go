@@ -147,7 +147,7 @@ func (p *Pool) recordImported(ctx context.Context, ids []int64, source string) e
 	})
 }
 
-func (p *Pool) Remove(ctx context.Context, input []int64) (map[string]any, error) {
+func (p *Pool) Remove(ctx context.Context, input []int64, reason string) (map[string]any, error) {
 	ids := cleanPoolIDs(input)
 	results := []map[string]any{}
 	removed, missing := 0, 0
@@ -183,7 +183,7 @@ func (p *Pool) Remove(ctx context.Context, input []int64) (map[string]any, error
 				return e
 			}
 			on := true
-			if _, e = p.Monitor.ApplyTx(ctx, conn, "game", ids, monitoring.Change{Sources: map[int64][]string{}, Managed: []string{"manual", "favorite", "board"}, Excluded: &on, Reason: "pool_removed"}); e != nil {
+			if _, e = p.Monitor.ApplyTx(ctx, conn, "game", ids, monitoring.Change{Sources: map[int64][]string{}, Managed: []string{"manual", "favorite", "board"}, Excluded: &on, Reason: reason}); e != nil {
 				return e
 			}
 			for _, id := range ids {

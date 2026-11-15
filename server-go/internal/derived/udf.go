@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"math"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -78,6 +79,18 @@ func init() {
 			return nil, fmt.Errorf("人民币价格超出整数范围")
 		}
 		return int64(value), nil
+	})
+	// bundle_lower：Unicode 小写（SQLite LOWER() 仅 ASCII，RU 区包名子串搜索依赖它）。
+	sqlite.MustRegisterDeterministicScalarFunction("bundle_lower", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		if s := udfStr(args[0]); s != nil {
+			return strings.ToLower(*s), nil
+		}
+		return "", nil
+	})
+	// bundle_save_score：单参省钱因子（列表地区重锚排序在 SQL 内联调用；
+	// 与 bundle_smart_score 内联的 SaveScore 同式）。
+	sqlite.MustRegisterDeterministicScalarFunction("bundle_save_score", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		return SaveScore(udfInt(args[0])), nil
 	})
 }
 

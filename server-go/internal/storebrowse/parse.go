@@ -391,3 +391,61 @@ func Classify(appid int64, cc, currency string, item Item, game dbwriter.GameDat
 	prices, status := PriceRows(appid, cc, currency, item, nameEn)
 	return dbwriter.BatchEntry{Game: g, Prices: prices}, status, len(prices) > 0
 }
+
+// BundleDiscoveries 游戏条目 purchase_options → 捆绑包发现桩列表。
+// 读**原始**选项（ParseOptions 的 default 组过滤对 bundle 选项无差别放行，
+// 但其产物丢掉了 must_purchase_as_set，这里要原始键）。
+//
+// 收录判据（垃圾来源：DLC 页的单 DLC sub / 每游戏页都有的本体 sub）：
+//   - bundleid 键（真捆绑包）一律收；
+//   - packageid 键（sub 形态）仅当选项名 ≠ 条目名才收——同名即本体 sub
+//     （「游戏名 == 游戏名」）或单 DLC sub，都不是捆绑包；异名的升级包
+//     （Orange Box 469 / Gourmet Edition 1066582）是真实整包购买单元，收。
+//
+// 语义与形态同时落（对齐 Python _discover_bundles_from_item）：
+//   - bundleid 键：选项级 must_purchase_as_set 是权威语义（bool→0/1）；
+//   - packageid 键：sub 恒不可拆——由形态蕴含为 1。
+func BundleDiscoveries(item Item) []dbwriter.BundleDiscovery {
+	if item == nil || value(item["success"]) != 1 || !truth(item["visible"]) {
+		return nil
+	}
+	itemName := strings.ToLower(strings.TrimSpace(text(item["name"])))
+	var out []dbwriter.BundleDiscovery
+	seen := map[int64]bool{}
+	for _, v := range list(item["purchase_options"]) {
+		o := obj(v)
+		bundleID, pkgID := value(o["bundleid"]), value(o["packageid"])
+		isBundle := bundleID != 0
+		bid := bundleID
+		if bid == 0 {
+			bid = pkgID
+		}
+		if bid == 0 || seen[bid] {
+			continue
+		}
+		name := strings.TrimSpace(text(o["purchase_option_name"]))
+		if name == "" {
+			continue
+		}
+		if !isBundle && strings.ToLower(strings.TrimSpace(name)) == itemName {
+			continue
+		}
+		seen[bid] = true
+		mps := int64(1)
+		if isBundle && !truth(o["must_purchase_as_set"]) {
+			mps = 0
+		}
+		kind := int64(1)
+		if isBundle {
+			kind = 0
+		}
+		var appIDs []int64
+		if appid := value(item["appid"]); appid != 0 {
+			appIDs = []int64{appid}
+		}
+		out = append(out, dbwriter.BundleDiscovery{
+			BundleID: bid, Name: name, MPS: mps, ItemKind: kind, AppIDs: appIDs,
+		})
+	}
+	return out
+}

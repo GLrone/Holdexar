@@ -293,3 +293,32 @@ func TestTagsFallbackRetainsOrder(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// B6：purchase_options → 捆绑包发现桩提取（原始选项读取，判据随形态分流）。
+func TestBundleDiscoveriesExtraction(t *testing.T) {
+	item := itemJSON(t, `{"success":1,"visible":true,"appid":440,"name":"Main Game",
+		"purchase_options":[
+			{"bundleid":"77","purchase_option_name":" Bundle 77 ","must_purchase_as_set":true},
+			{"bundleid":"77","purchase_option_name":"dup"},
+			{"packageid":"88","purchase_option_name":"Upgrade Pack"},
+			{"packageid":"99","purchase_option_name":"Main Game"},
+			{"bundleid":"","purchase_option_name":"noname-bid"},
+			{"packageid":"101","purchase_option_name":""}
+		]}`)
+	got := BundleDiscoveries(item)
+	if len(got) != 2 {
+		t.Fatalf("应收录 2 项（bundle + 异名 sub）: %+v", got)
+	}
+	if got[0].BundleID != 77 || got[0].Name != "Bundle 77" || got[0].MPS != 1 || got[0].ItemKind != 0 || !reflect.DeepEqual(got[0].AppIDs, []int64{440}) {
+		t.Fatalf("bundle 形态不符: %+v", got[0])
+	}
+	if got[1].BundleID != 88 || got[1].MPS != 1 || got[1].ItemKind != 1 {
+		t.Fatalf("sub 形态应为整包语义: %+v", got[1])
+	}
+	if BundleDiscoveries(itemJSON(t, `{"success":1,"visible":false}`)) != nil {
+		t.Fatal("不可见条目不应收录")
+	}
+	if BundleDiscoveries(itemJSON(t, `{"success":1,"visible":true,"appid":0,"name":"X","purchase_options":[{"packageid":"5","purchase_option_name":"Y"}]}`))[0].AppIDs != nil {
+		t.Fatal("无 appid 应落空种子")
+	}
+}

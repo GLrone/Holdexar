@@ -54,7 +54,7 @@ func openHistoryFixture(t *testing.T) *sql.DB {
 	for _, row := range history {
 		exec(`INSERT INTO game_price_history
 			(appid, region_code, currency, price, discount_percent, sub_id, is_gold, version_suffix, is_bundle, price_status, cny_fen, snapshot_at, source, product_unknown)
-			VALUES `+row)
+			VALUES ` + row)
 	}
 	exec(`INSERT INTO game_current_prices (appid, region_code, currency, price, discount_percent, price_status, fail_count, sub_id, updated_at)
 		VALUES (872410, 'CN', 'CNY', 12900, 0, 'ok', 0, 222, '2026-04-03 10:00:00')`)
@@ -64,7 +64,7 @@ func openHistoryFixture(t *testing.T) *sql.DB {
 func historyGet(t *testing.T, db *sql.DB, backfill *HistoryBackfill, query string) (*httptest.ResponseRecorder, historyResponse) {
 	t.Helper()
 	mux := http.NewServeMux()
-	Register(mux, db, backfill)
+	Register(mux, db, backfill, Options{})
 	url := "/api/v1/games/872410/history"
 	if query != "" {
 		url += "?" + query
@@ -227,7 +227,7 @@ func (s *stubSource) Fetch(ctx context.Context, appid int64, region string) ([]d
 func historyPost(t *testing.T, db *sql.DB, backfill *HistoryBackfill, url string) *httptest.ResponseRecorder {
 	t.Helper()
 	mux := http.NewServeMux()
-	Register(mux, db, backfill)
+	Register(mux, db, backfill, Options{})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest("POST", url, nil))
 	return rec
