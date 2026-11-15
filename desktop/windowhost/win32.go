@@ -3,15 +3,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"crypto/rand"
-	"encoding/hex"
 	"syscall"
 	"time"
 	"unsafe"
@@ -67,16 +67,18 @@ var (
 	procSetWindowTextW                = modUser32.NewProc("SetWindowTextW")
 	procGetWindowThreadProcessId      = modUser32.NewProc("GetWindowThreadProcessId")
 
-	procShellExecuteW        = modShell32.NewProc("ShellExecuteW")
-	procShellNotifyIconW     = modShell32.NewProc("Shell_NotifyIconW")
+	procShellExecuteW          = modShell32.NewProc("ShellExecuteW")
+	procShellNotifyIconW       = modShell32.NewProc("Shell_NotifyIconW")
 	procExtractAssociatedIconW = modShell32.NewProc("ExtractAssociatedIconW")
 
-	procOpenProcess            = modKernel32.NewProc("OpenProcess")
-	procWaitForSingleObject    = modKernel32.NewProc("WaitForSingleObject")
-	procGetExitCodeProcess     = modKernel32.NewProc("GetExitCodeProcess")
-	procTerminateProcess       = modKernel32.NewProc("TerminateProcess")
-	procCloseHandle            = modKernel32.NewProc("CloseHandle")
-	procCreateFileW            = modKernel32.NewProc("CreateFileW")
+	procOpenProcess               = modKernel32.NewProc("OpenProcess")
+	procWaitForSingleObject       = modKernel32.NewProc("WaitForSingleObject")
+	procGetExitCodeProcess        = modKernel32.NewProc("GetExitCodeProcess")
+	procTerminateProcess          = modKernel32.NewProc("TerminateProcess")
+	procCloseHandle               = modKernel32.NewProc("CloseHandle")
+	procOpenMutexW                = modKernel32.NewProc("OpenMutexW")
+	procReleaseMutex              = modKernel32.NewProc("ReleaseMutex")
+	procCreateFileW               = modKernel32.NewProc("CreateFileW")
 	procGetFinalPathNameByHandleW = modKernel32.NewProc("GetFinalPathNameByHandleW")
 
 	procCreateRoundRectRgn = modGdi32.NewProc("CreateRoundRectRgn")
@@ -93,6 +95,7 @@ var (
 	procEndPaint           = modUser32.NewProc("EndPaint")
 	procDrawIconEx         = modUser32.NewProc("DrawIconEx")
 	procInvalidateRect     = modUser32.NewProc("InvalidateRect")
+	procTrackMouseEvent    = modUser32.NewProc("TrackMouseEvent")
 	procRectangleGdi       = modGdi32.NewProc("Rectangle")
 	procEllipse            = modGdi32.NewProc("Ellipse")
 	procRoundRect          = modGdi32.NewProc("RoundRect")
@@ -141,14 +144,14 @@ const (
 	swRestore  = 9
 
 	// LoadImage
-	imageIcon       = 1
-	lrLoadFromFile  = 0x00000010
-	lrDefaultSize   = 0x00000040
+	imageIcon      = 1
+	lrLoadFromFile = 0x00000010
+	lrDefaultSize  = 0x00000040
 
 	// Shell_NotifyIcon
-	nimAdd    = 0x0
-	nimModify = 0x1
-	nimDelete = 0x2
+	nimAdd     = 0x0
+	nimModify  = 0x1
+	nimDelete  = 0x2
 	nifMessage = 0x1
 	nifIcon    = 0x2
 	nifTip     = 0x4
@@ -162,8 +165,8 @@ const (
 	mbIconInformation = 0x40
 	mbYesNo           = 0x4
 	mbRetryCancel     = 0x5
-	idYes   = 6
-	idRetry = 4
+	idYes             = 6
+	idRetry           = 4
 
 	monitorDefaultToNearest = 0x2
 
@@ -180,16 +183,16 @@ const (
 	swpNoActivate = 0x10
 
 	// GDI
-	psSolid  = 0
-	fwBold   = 700
-	fwNormal = 400
+	psSolid                = 0
+	fwBold                 = 700
+	fwNormal               = 400
 	clipCharacterPrecision = 1 // GDI 象形裁切：仅保留完整字形
 	defaultQuality         = 0
-	dtSingleLine = 0x1
-	dtCenter     = 0x1
-	dtVCenter    = 0x4
-	dtEndEllipsis = 0x8000
-	dtNoprefix    = 0x800
+	dtSingleLine           = 0x20
+	dtCenter               = 0x1
+	dtVCenter              = 0x4
+	dtEndEllipsis          = 0x8000
+	dtNoprefix             = 0x800
 )
 
 type msg struct {
@@ -210,8 +213,14 @@ type rect struct {
 	Left, Top, Right, Bottom int32
 }
 
+// minMaxInfo MINMAXINFO 全量 5×POINT 40 字节：写偏移必须落在系统结构正确槽位
+// （MinTrack 在偏移 24/28），缺 ptMaxPosition 会让后续写 MaxTrack 静默写错段。
 type minMaxInfo struct {
-	Reserved1, Reserved2, MaxX, MaxY, MaxTrackX, MaxTrackY, MinTrackX, MinTrackY int32
+	ReservedX, ReservedY       int32
+	MaxX, MaxY                 int32
+	MaxPositionX, MaxPositionY int32
+	MinTrackX, MinTrackY       int32
+	MaxTrackX, MaxTrackY       int32
 }
 
 type wndClassEx struct {
@@ -230,37 +239,39 @@ type wndClassEx struct {
 }
 
 type notifyIconData struct {
-	Size        uint32
-	HWnd        uintptr
-	UID         uint32
-	UFlags      uint32
-	UCallback   uint32
-	HIcon       uintptr
-	Tip         [128]uint16
-	State       uint32
-	StateMask   uint32
-	Info        [256]uint16
-	Union       uintptr
-	InfoTip     [64]uint16
-	InfoFlags   uint32
+	Size         uint32
+	HWnd         uintptr
+	UID          uint32
+	UFlags       uint32
+	UCallback    uint32
+	HIcon        uintptr
+	Tip          [128]uint16
+	State        uint32
+	StateMask    uint32
+	Info         [256]uint16
+	Union        uintptr
+	InfoTip      [64]uint16
+	InfoFlags    uint32
 	ReservedGUID [16]byte
-	BalloonIcon uintptr
+	BalloonIcon  uintptr
 }
 
 type monitorInfo struct {
-	Size         uint32
-	Monitor      rect
-	Work         rect
-	Flags        uint32
+	Size    uint32
+	Monitor rect
+	Work    rect
+	Flags   uint32
 }
 
+// paintStruct 官方 PAINTSTRUCT x64 布局：BOOL 系字段全部 4 字节
+// （Restore 曾误用 8 字节 uintptr，把 FIncUpdate/Reserved 整体顶后）。
 type paintStruct struct {
-	HDC         uintptr
-	FErase      int32
-	RCPaint     rect
-	Restore     uintptr
-	FIncUpdate  int32
-	Reserved    [32]byte
+	HDC        uintptr
+	FErase     int32
+	RCPaint    rect
+	Restore    int32
+	FIncUpdate int32
+	Reserved   [32]byte
 }
 
 func utf16Ptr(s string) uintptr {
@@ -408,9 +419,24 @@ func pidExitCode(pid int, timeout time.Duration) (int, bool) {
 }
 
 func openProcessHandle(pid int) uintptr {
-	const synchronize = 0x00100000
-	handle, _, _ := call3(procOpenProcess, synchronize, 0, uintptr(pid))
+	// SYNCHRONIZE 等待 + QUERY_LIMITED 读退出码 + TERMINATE 强杀兜底：
+	// 只申请等待权限时，退出码读取与超时强杀会静默失败
+	const rights = 0x00100000 | 0x1000 | 0x0001
+	handle, _, _ := call3(procOpenProcess, rights, 0, uintptr(pid))
 	return handle
+}
+
+// waitInfinite WaitForSingleObject 无限期等待。
+const waitInfinite = 0xFFFFFFFF
+
+// waitHandleInfinite 无限期等待进程句柄触发（启动器孤儿防线监视用）。
+func waitHandleInfinite(handle uintptr) {
+	call(procWaitForSingleObject, handle, waitInfinite)
+}
+
+// windowVisible 窗口可见性判定（可注入面：关窗守卫「隐形窗先亮再问」双案测试）。
+var windowVisible = func(hwnd uintptr) bool {
+	return call(procIsWindowVisible, hwnd) != 0
 }
 
 func terminateProcess(handle uintptr) {

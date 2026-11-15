@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ const (
 	wmAppQuit          = 0x8000 + 5
 	wmAppWebFailed     = 0x8000 + 6
 	wmAppServerRestart = 0x8000 + 7
+	wmAppBridgeReply   = 0x8000 + 8
 
 	trayCmdShow = 1
 	trayCmdQuit = 2
@@ -59,6 +61,7 @@ type app struct {
 	restartPending bool
 	background     atomic.Bool
 	webDead        atomic.Bool
+	browserMode    atomic.Bool // 渲染层不可用：系统浏览器兜底，宿主转无窗口服务模式
 
 	openExternal func(string) // 外链出口；测试注入收集器
 
@@ -69,6 +72,9 @@ type app struct {
 	appURL      string
 	currentPath string // 最近一次同源导航路径+查询+片段（开发热更回跳用）
 	pendingNav  string
+
+	replyMu        sync.Mutex
+	pendingReplies []string // 桥接回复队列：后台线程查完经消息泵回投 UI 线程发送
 }
 
 func newApp(cfg *options, log *hostLog, srv *serverProcess) *app {
@@ -97,8 +103,8 @@ func (a *app) run() int {
 		return 1
 	}
 	a.setupWebview()
-	if a.cfg.background {
-		// 后台常驻：先不露窗，等单实例唤醒或托盘唤起
+	if a.cfg.background || a.browserMode.Load() {
+		// 后台常驻 / 浏览器兜底：先不露窗，等单实例唤醒或托盘唤起
 		call(procShowWindow, a.hwnd, swHide)
 	} else {
 		call(procShowWindow, a.hwnd, swShow)
@@ -192,9 +198,7 @@ func (a *app) setupWebview() {
 	chromium.ProcessFailedCallback = a.onProcessFailed
 	if !chromium.Embed(a.hwnd) {
 		a.log.write("WebView2 嵌入失败")
-		fatalMessage("渲染组件（WebView2 Runtime）缺失或初始化失败。\n请安装微软 WebView2 Runtime 后重新启动：\nhttps://go.microsoft.com/fwlink/p/?LinkId=2124703")
-		a.exitCode = 1
-		call(procPostQuitMessage, 1)
+		a.enterBrowserFallback("渲染组件（WebView2 Runtime）缺失或初始化失败。\n请安装微软 WebView2 Runtime 后重新启动：\nhttps://go.microsoft.com/fwlink/p/?LinkId=2124703")
 		return
 	}
 	a.chromium = chromium
@@ -208,9 +212,7 @@ func (a *app) setupWebview() {
 	chromium.Init(bridgeBootstrapScript)
 	if a.webview == nil {
 		a.log.write("WebView2 控制器创建失败")
-		fatalMessage("渲染组件初始化失败，请重新启动应用。")
-		a.exitCode = 1
-		call(procPostQuitMessage, 1)
+		a.enterBrowserFallback("渲染组件初始化失败，请重新启动应用。")
 		return
 	}
 	a.navHandlers = newNavEventHandlers(a, a.webview)
@@ -222,6 +224,32 @@ func webviewUserDataDir(cfg *options) string {
 		return custom
 	}
 	return filePath(cfg.dataDir, "cache", "webview")
+}
+
+// serviceURL 本地服务地址（浏览器兜底与局域网展示共用）。
+func (a *app) serviceURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", a.cfg.serverPort)
+}
+
+// fallbackAlert 兜底告知框：与致命错误同走可静默环境（验收/CI 不弹框）。
+func fallbackAlert(message string) {
+	fmt.Fprintln(os.Stderr, message)
+	if os.Getenv("HOLDEXAR_NO_DIALOG") == "1" || os.Getenv("CI") == "1" {
+		return
+	}
+	call(procMessageBoxW, 0, utf16Ptr(message), utf16Ptr(appBrandName()), mbIconError)
+}
+
+// enterBrowserFallback 渲染层不可用时的兜底（对齐桌面壳 _browser_fallback）：
+// 系统浏览器打开本地服务，宿主转入无窗口服务模式继续跑——服务生命周期独立
+// 于 webview，托盘「退出」正常收尾（托盘不可用时结束本进程即退出服务）。
+func (a *app) enterBrowserFallback(reason string) {
+	if a.browserMode.Swap(true) {
+		return
+	}
+	a.log.write(fmt.Sprintf("%s：改用系统浏览器打开本地服务，宿主转入无窗口服务模式", strings.ReplaceAll(reason, "\n", " ")))
+	fallbackAlert(reason + "\n\n将改用系统浏览器打开本地服务。托盘「退出」可结束程序；托盘不可用时结束本进程即退出服务。")
+	a.openExternal(a.serviceURL())
 }
 
 func (a *app) onWebMessage(message string, _ *edge.ICoreWebView2, _ *edge.ICoreWebView2WebMessageReceivedEventArgs) {
@@ -243,17 +271,73 @@ func (a *app) onWebMessage(message string, _ *edge.ICoreWebView2, _ *edge.ICoreW
 func (a *app) dispatchBridgeCall(method string, payload map[string]any) {
 	id, _ := payload["id"].(string)
 	response := func(body string) {
-		if a.webview != nil {
-			_ = a.webview.PostWebMessageAsString(body)
-		}
+		a.queueBridgeReply(body)
 	}
 	switch method {
 	case "restart_app":
 		response(bridgeResult(id, map[string]any{"ok": true}))
 		go a.performRestart()
+	case "lan_hosts":
+		// 局域网地址投影含 DNS 解析与出口探测：坏网环境会卡数秒，必须后台查
+		// （COM 回调在 UI 线程上，同步做网络 IO 会冻结整个界面）
+		go func() {
+			response(bridgeResult(id, map[string]any{"hosts": localServiceHosts(a.cfg.serverPort)}))
+		}()
 	default:
 		response(bridgeError(id, -32601, "未知桌面能力："+method))
 	}
+}
+
+// queueBridgeReply 回复排队并唤醒消息泵：PostWebMessageAsString 只能在
+// UI 线程调，后台线程只投递唤醒消息。
+func (a *app) queueBridgeReply(body string) {
+	a.replyMu.Lock()
+	a.pendingReplies = append(a.pendingReplies, body)
+	a.replyMu.Unlock()
+	if a.hwnd != 0 {
+		call(procPostMessageW, a.hwnd, wmAppBridgeReply, 0, 0)
+	}
+}
+
+// flushBridgeReplies 消息泵侧取队发送；渲染层不可用时直接丢弃。
+func (a *app) flushBridgeReplies() {
+	a.replyMu.Lock()
+	replies := a.pendingReplies
+	a.pendingReplies = nil
+	a.replyMu.Unlock()
+	if a.webview == nil || len(replies) == 0 {
+		return
+	}
+	for _, body := range replies {
+		_ = a.webview.PostWebMessageAsString(body)
+	}
+}
+
+// localServiceHosts 本机可直达服务的地址集（滤链路本地段）：回环 + 主机名
+// 解析 + 默认出口源地址，拼上服务端口成完整 URL。
+func localServiceHosts(port int) []string {
+	hosts := map[string]struct{}{"127.0.0.1": {}, "localhost": {}}
+	if host, err := os.Hostname(); err == nil {
+		if addrs, err := net.LookupHost(host); err == nil {
+			for _, addr := range addrs {
+				if addr != "" && !strings.HasPrefix(addr, "169.254.") {
+					hosts[addr] = struct{}{}
+				}
+			}
+		}
+	}
+	if conn, err := net.DialTimeout("udp", "223.5.5.5:53", 500*time.Millisecond); err == nil {
+		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil && !strings.HasPrefix(addr.IP.String(), "169.254.") {
+			hosts[addr.IP.String()] = struct{}{}
+		}
+		_ = conn.Close()
+	}
+	out := make([]string, 0, len(hosts))
+	for host := range hosts {
+		out = append(out, fmt.Sprintf("http://%s:%d", host, port))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // performRestart 更新换装重启：先回收本实例服务，再拉起新进程交棒。
@@ -289,7 +373,7 @@ func execDetached(exe string, env []string) (int, error) {
 }
 
 func (a *app) onProcessFailed(_ *edge.ICoreWebView2, args *edge.ICoreWebView2ProcessFailedEventArgs) {
-	kind := processFailedKind(args)
+	kind := (&ProcessFailedArgs{raw: unsafe.Pointer(args)}).ProcessFailedKind()
 	if kind != 0 /* 浏览器进程退出 */ && kind != 2 /* 主帧渲染无响应 */ {
 		return // 其余失败类型由 WebView2 自动恢复，不提示
 	}
@@ -574,6 +658,23 @@ func waitPortFree(port int, timeout time.Duration) bool {
 	}
 }
 
+// closeGuardNeedsReveal 关窗守卫重亮判定：非后台模式下关闭事件落在不可见
+// 主窗上（托盘态的杂散关闭，如任务栏预览的点 X）——意图无从判断，须先亮窗
+// 再询问；后台模式走隐藏分支不经过询问，无窗口句柄不重亮。
+func (a *app) closeGuardNeedsReveal() bool {
+	return !a.background.Load() && a.hwnd != 0 && !windowVisible(a.hwnd)
+}
+
+// revealBeforeCloseIntent 亮窗再问：先显示主窗并抢前台，再进入意图询问
+// （对齐桌面壳：绝不给隐形窗口弹孤儿确认框，也不无声放行或无声取消）。
+func (a *app) revealBeforeCloseIntent() {
+	call(procShowWindow, a.hwnd, swShow)
+	if a.chromium != nil {
+		_ = a.chromium.Show() // 隐藏期间控制器可见性被收走：显式点亮
+	}
+	focusHwnd(a.hwnd)
+}
+
 func (a *app) handleClose() {
 	if a.quitting {
 		call(procDestroyWindow, a.hwnd)
@@ -585,6 +686,9 @@ func (a *app) handleClose() {
 	}
 	if activeDialog.Load() != nil {
 		return // 意图弹窗进行中：忽略重复关窗请求
+	}
+	if a.closeGuardNeedsReveal() {
+		a.revealBeforeCloseIntent()
 	}
 	intent := askCloseIntent(a)
 	switch intent {
@@ -632,6 +736,11 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lParam unsafe.Poin
 		a.navigateTo(a.takePendingNav())
 		return 0
 	case wmAppShow:
+		if a.browserMode.Load() {
+			// 无窗口服务模式：唤醒即再开系统浏览器（窗口不亮，避免空壳窗）
+			a.openExternal(a.serviceURL())
+			return 0
+		}
 		focusHwnd(a.hwnd)
 		if a.chromium != nil {
 			_ = a.chromium.Show() // 唤醒路径同样要显式点亮控制器
@@ -648,6 +757,9 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lParam unsafe.Poin
 		return 0
 	case wmAppWebFailed:
 		a.handleWebFailed(wParam)
+		return 0
+	case wmAppBridgeReply:
+		a.flushBridgeReplies()
 		return 0
 	case wmClose:
 		a.handleClose()

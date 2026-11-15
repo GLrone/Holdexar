@@ -293,6 +293,17 @@ func run(args []string) int {
 	log.write(fmt.Sprintf("启动 │ 应用=%s，数据目录=%s，服务端口=%d，锁端口=%d",
 		cfg.appName, cfg.dataDir, cfg.serverPort, cfg.lockPort))
 
+	// 孤儿实例防线最早挂上：换装/端口协商/服务启动任何阶段包装进程死亡，
+	// 本进程都不应存活成无主实例（窗口未建时直接退出，服务子进程经 stdin
+	// EOF 自行优雅收尾）
+	watchLauncher(cfg, log, func() {
+		if a := activeApp.Load(); a != nil && a.hwnd != 0 {
+			call(procPostMessageW, a.hwnd, wmAppQuit, 0, 0)
+			return
+		}
+		os.Exit(0)
+	})
+
 	waitPreviousExit(log)
 	negotiatePorts(cfg, log)
 
@@ -330,6 +341,16 @@ func run(args []string) int {
 				}
 			}
 		}()
+	}
+
+	// 换装互斥让位：换装进程进行中本实例退出等待其完成（换装完成会拉起新版
+	// 或回滚现装），不带「程序目录即将被搬空」继续起服务
+	if swapMutexHeld() {
+		log.write("检测到换装进程进行中，本实例退出等待其完成")
+		if cfg.background {
+			return yieldExitCode
+		}
+		return 0
 	}
 
 	// 更新交接：暂存包就绪且未失败过时交给暂存包内的更新宿主，本进程退出
@@ -377,6 +398,77 @@ func run(args []string) int {
 		setBackgroundMode(true)
 	}
 	return runUIOnce(cfg, log, srv)
+}
+
+// 可注入面（假启动器测试）：启动器进程句柄的打开与退出等待。
+var (
+	openLauncherHandle = openProcessHandle
+	waitLauncherExit   = waitHandleInfinite
+)
+
+// isDigits ASCII 数字串判定（对齐 Python str.isdigit：拒绝正负号与空白）。
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// launcherPID 从环境读启动器 PID：非数字、非正数或等于自身返回 0（不设防）。
+func launcherPID() int {
+	raw := strings.TrimSpace(os.Getenv(envPrefix + "LAUNCHER_PID"))
+	if !isDigits(raw) {
+		return 0
+	}
+	pid, err := strconv.Atoi(raw)
+	if err != nil || pid <= 0 || pid == os.Getpid() {
+		return 0
+	}
+	return pid
+}
+
+// launcherExempt 触发时刻的豁免判定：启动旗标（--background/--server）+
+// 运行期后台切换（托盘化常驻）。普通实例随启动器退出，后台实例继续服务。
+func launcherExempt(cfg *options) bool {
+	if cfg.background || cfg.serverMode {
+		return true
+	}
+	if a := activeApp.Load(); a != nil {
+		return a.background.Load()
+	}
+	return false
+}
+
+// watchLauncher 启动器监视（孤儿实例防线，对齐桌面壳 _watch_launcher）：
+// HOLDEXAR_LAUNCHER_PID 数字且 ≠ 自身 → 打开 SYNCHRONIZE 句柄等待；启动器
+// 终止且非后台模式 → 触发退出。句柄打不开（包装进程已不在/权限不足）视为
+// 无孤儿风险，不设防。监视失败不阻断正常启动。
+func watchLauncher(cfg *options, log *hostLog, onGone func()) {
+	if cfg.background || cfg.serverMode {
+		return
+	}
+	pid := launcherPID()
+	if pid == 0 {
+		return
+	}
+	handle := openLauncherHandle(pid)
+	if handle == 0 {
+		return
+	}
+	go func() {
+		waitLauncherExit(handle)
+		call(procCloseHandle, handle)
+		if launcherExempt(cfg) {
+			return
+		}
+		log.write(fmt.Sprintf("启动器进程 %d 已终止，本实例随之退出", pid))
+		onGone()
+	}()
 }
 
 // acquireLock 占用锁端口实现单实例；占用失败返回 nil，真伪由探活判定。

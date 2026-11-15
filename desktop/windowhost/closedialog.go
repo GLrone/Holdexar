@@ -31,9 +31,10 @@ const (
 	dialogClassName = "HoldexarCloseDialog"
 	gwlpUserdata    = ^uintptr(20) // -21
 
-	vkReturn = 0x0D
-	vkEscape = 0x1B
+	vkReturn     = 0x0D
+	vkEscape     = 0x1B
 	wmMouseLeave = 0x02A2
+	tmeLeave     = 0x0002
 	wmNCHitTest  = 0x0084
 )
 
@@ -82,24 +83,25 @@ func lightTheme() dialogTheme {
 }
 
 type closeDialog struct {
-	owner  uintptr
-	hwnd   uintptr
-	theme  dialogTheme
-	logo   uintptr
-	app    *app
+	owner      uintptr
+	hwnd       uintptr
+	theme      dialogTheme
+	logo       uintptr
+	app        *app
 	fontTitle  uintptr
 	fontHead   uintptr
 	fontBody   uintptr
 	fontButton uintptr
 
-	hover     int // 0 无 1 最小化 2 退出 3 关闭键
-	animIn    bool
-	animating bool
-	step      int
-	baseX     int32
-	baseY     int32
-	result    string
-	done      bool
+	hover      int  // 0 无 1 最小化 2 退出 3 关闭键
+	trackArmed bool // WM_MOUSELEAVE 一次性送达，重进客户区须重新挂 TrackMouseEvent
+	animIn     bool
+	animating  bool
+	step       int
+	baseX      int32
+	baseY      int32
+	result     string
+	done       bool
 }
 
 func curtain(on bool) string {
@@ -296,13 +298,15 @@ func dialogProc(hwnd uintptr, message uint32, wParam uintptr, lParam uintptr) ui
 		d.paint()
 		return 0
 	case wmMouseMove:
-		d.updateHover(int32(int16(lParam & 0xFFFF)), int32(int16((lParam>>16)&0xFFFF)))
+		d.armMouseLeave()
+		d.updateHover(int32(int16(lParam&0xFFFF)), int32(int16((lParam>>16)&0xFFFF)))
 		return 0
 	case wmMouseLeave:
+		d.trackArmed = false
 		d.setHover(0)
 		return 0
 	case wmLButtonUp:
-		d.clickAt(int32(int16(lParam & 0xFFFF)), int32(int16((lParam>>16)&0xFFFF)))
+		d.clickAt(int32(int16(lParam&0xFFFF)), int32(int16((lParam>>16)&0xFFFF)))
 		return 0
 	case wmKeyDown:
 		switch wParam {
@@ -341,6 +345,25 @@ func (d *closeDialog) hitTest(x, y int32) int {
 
 func (d *closeDialog) updateHover(x, y int32) {
 	d.setHover(d.hitTest(x, y))
+}
+
+// eventTrack 官方 TRACKMOUSEEVENT 布局。
+type eventTrack struct {
+	Size      uint32
+	Flags     uint32
+	Hwnd      uintptr
+	HoverTime uint32
+}
+
+// armMouseLeave 悬停高亮依赖 WM_MOUSELEAVE 清态，而该消息只在挂了
+// TrackMouseEvent 时送达一次——每次重进客户区都要重新挂。
+func (d *closeDialog) armMouseLeave() {
+	if d.trackArmed {
+		return
+	}
+	d.trackArmed = true
+	ev := eventTrack{Size: uint32(unsafe.Sizeof(eventTrack{})), Flags: tmeLeave, Hwnd: d.hwnd}
+	call(procTrackMouseEvent, uintptr(unsafe.Pointer(&ev)))
 }
 
 func (d *closeDialog) setHover(hover int) {
@@ -442,13 +465,13 @@ func (d *closeDialog) paint() {
 	drawText(hdc, "最小化到托盘后，应用仍在后台继续更新数据。", 28, 110, 492, 132, dtSingleLine|dtVCenter|dtNoprefix)
 	call(procSelectObject, hdc, headFont)
 
-	// 关闭键：悬停圆底 + 双斜线
+	// 关闭键：悬停圆底 + 双斜线（画在右上角关闭键矩形内，与命中区同坐标）
 	closeHover := d.hover == 3
 	if closeHover {
 		brush := call(procCreateSolidBrush, uintptr(d.theme.closeHoverBG))
 		oldBrush := call(procSelectObject, hdc, brush)
 		oldStockPen := call(procSelectObject, hdc, call(procGetStockObject, 8)) // NULL_PEN
-		call(procEllipse, hdc, 0, 0, closeRectSize, closeRectSize)
+		call(procEllipse, hdc, closeRectLeft, closeRectTop, closeRectLeft+closeRectSize, closeRectTop+closeRectSize)
 		call(procSelectObject, hdc, oldStockPen)
 		call(procSelectObject, hdc, oldBrush)
 		call(procDeleteObject, brush)
@@ -459,8 +482,8 @@ func (d *closeDialog) paint() {
 	}
 	pen := call(procCreatePen, psSolid, 2, uintptr(fg))
 	xOldPen := call(procSelectObject, hdc, pen)
-	drawLine(hdc, 13, 13, 23, 23)
-	drawLine(hdc, 23, 13, 13, 23)
+	drawLine(hdc, closeRectLeft+13, closeRectTop+13, closeRectLeft+23, closeRectTop+23)
+	drawLine(hdc, closeRectLeft+23, closeRectTop+13, closeRectLeft+13, closeRectTop+23)
 	call(procSelectObject, hdc, xOldPen)
 	call(procDeleteObject, pen)
 

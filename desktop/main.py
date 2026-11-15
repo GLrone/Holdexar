@@ -625,7 +625,7 @@ class DesktopApi:
             return {"ok": False, "error": "仅打包态支持一键重启，请手动重启应用。"}
 
         # os._exit 不触发 atexit / lifespan 清理：手动停掉代理内核，否则
-        # mihomo.exe 作为孤儿进程继续持有 _internal/ 目录的文件锁，换装
+        # 内核进程作为孤儿继续持有 _internal/ 目录的文件锁，换装
         # 进程在 os.replace 时会因 PermissionError 失败并回滚。
         try:
             from app.domains.proxies import clash_manager

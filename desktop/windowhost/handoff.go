@@ -13,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 type handoffInfo struct {
@@ -244,4 +246,52 @@ func randomHexHost(bytes int) string {
 	buf := make([]byte, bytes)
 	_, _ = rand.Read(buf)
 	return hex.EncodeToString(buf)
+}
+
+// swapMutexName 换装互斥体名，与更新宿主 execute.go 同名同源。
+const swapMutexName = "Holdexar-update-swap"
+
+// yieldExitCode 后台模式下让位/交接的退出码（对齐桌面壳；诊断信号，无自动重启消费方）。
+const yieldExitCode = 75
+
+const (
+	mutexSynchronize = 0x00100000
+	waitTimeout      = 0x00000102 // WAIT_TIMEOUT：互斥体已被他人持有
+	waitAbandoned    = 0x00000080 // WAIT_ABANDONED：前任持有者已死，不算进行中
+)
+
+// probeSwapMutexHeld 探测换装互斥体是否正被换装进程持有（探测不占有）。
+// 互斥体不存在 = 没有换装在跑；探到弃置互斥（前任换装进程暴毙）不算进行中。
+func probeSwapMutexHeld(name string) bool {
+	runtime.LockOSThread() // 互斥体归属线程：探测取得的占有必须在同线程释放
+	defer runtime.UnlockOSThread()
+	namePtr, _ := syscall.UTF16PtrFromString(name)
+	handle, _, _ := call3(procOpenMutexW, mutexSynchronize, 0, uintptr(unsafe.Pointer(namePtr)))
+	if handle == 0 {
+		return false
+	}
+	status, _, _ := call3(procWaitForSingleObject, handle, 0)
+	if status == waitTimeout {
+		call(procCloseHandle, handle)
+		return true
+	}
+	if status != waitAbandoned {
+		call(procReleaseMutex, handle) // 空闲互斥被探测拿到手上，放回去
+	}
+	call(procCloseHandle, handle)
+	return false
+}
+
+// swapMutexHeld 换装互斥让位判定：换装进行中现装启动必须退位——换装进程
+// 完成时会拉起新版或回滚现装，不能带着「程序目录即将被搬空」继续起服务。
+// 更新事务上下文（验收探针/带数据令牌的子进程）豁免：探针恰恰在互斥持有期运行。
+func swapMutexHeld() bool {
+	return swapMutexHeldNamed(swapMutexName)
+}
+
+func swapMutexHeldNamed(name string) bool {
+	if os.Getenv(envPrefix+"UPDATE_ATTEMPT_ID") != "" || os.Getenv(envPrefix+"UPDATE_DATA_TOKEN") != "" {
+		return false
+	}
+	return probeSwapMutexHeld(name)
 }

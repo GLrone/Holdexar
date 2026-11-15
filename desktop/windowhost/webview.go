@@ -44,16 +44,24 @@ const bridgeBootstrapScript = `(function () {
       }, 60000);
     });
   };
-  window.addEventListener('message', function (e) {
+  // 宿主回复经 WebView2 专有通道送达：window.chrome.webview 上的 message
+  // 事件（window 级监听收不到它）；window 级监听保留给其他宿主形态。
+  var recv = function (e) {
     var m = e.data;
     if (typeof m === 'string') { try { m = JSON.parse(m); } catch (_) { return; } }
-    if (m && m.id !== undefined && pending.has(m.id)) {
+    // WebView2 会把页面自己发出的调用回显在同一事件上（带 method）：
+    // 只有「无 method、带 result/error」的帧才是宿主回复，回显直接忽略。
+    if (m && m.id !== undefined && m.method === undefined && pending.has(m.id)) {
       var p = pending.get(m.id);
       pending.delete(m.id);
       if (m.error) { p.reject(new Error(m.error.message || String(m.error))); }
       else { p.resolve(m.result); }
     }
-  });
+  };
+  if (window.chrome && window.chrome.webview && window.chrome.webview.addEventListener) {
+    window.chrome.webview.addEventListener('message', recv);
+  }
+  window.addEventListener('message', recv);
   window.pywebview = {
     api: new Proxy({}, { get: function (_t, name) { return function () { return call(String(name), [].slice.call(arguments)); }; } }),
     _internal: { _call: call }

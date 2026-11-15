@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -256,4 +257,140 @@ func TestURLPathWithQueryAndOrigin(t *testing.T) {
 
 func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
+}
+
+// TestWatchLauncherOrphanGuard 假启动器三案（wait/open 双注入）：死→触发退出、
+// 后台豁免、PID 无效/句柄打不开→不设防。
+func TestWatchLauncherOrphanGuard(t *testing.T) {
+	dir := t.TempDir()
+	log := openLog(dir)
+	defer log.close()
+	cfg := &options{appName: "Holdexar", dataDir: dir, portFree: portFree}
+
+	origOpen, origWait := openLauncherHandle, waitLauncherExit
+	t.Cleanup(func() { openLauncherHandle, waitLauncherExit = origOpen, origWait })
+
+	// 案一：假启动器死亡 → 触发退出（触发走 performQuit/直接退出，退出码 0）
+	t.Setenv("HOLDEXAR_LAUNCHER_PID", "4321")
+	died := make(chan struct{})
+	triggered := make(chan struct{})
+	openLauncherHandle = func(int) uintptr { return 0xCAFE }
+	waitLauncherExit = func(uintptr) { close(died) }
+	watchLauncher(cfg, log, func() { close(triggered) })
+	select {
+	case <-died:
+	case <-time.After(time.Second):
+		t.Fatal("未进入启动器退出等待")
+	}
+	select {
+	case <-triggered:
+	case <-time.After(time.Second):
+		t.Fatal("启动器死亡未触发本实例退出")
+	}
+
+	// 案二：运行期已转后台（托盘化常驻）→ 照常监视，触发时刻豁免不退
+	app := newApp(cfg, log, nil)
+	activeApp.Store(app)
+	defer activeApp.Store(nil)
+	app.background.Store(true)
+	backgroundGone := make(chan struct{})
+	waitLauncherExit = func(uintptr) { close(backgroundGone) }
+	opened := false
+	openLauncherHandle = func(int) uintptr { opened = true; return 0xBEEF }
+	watchLauncher(cfg, log, func() { t.Error("后台实例不得随启动器退出") })
+	if !opened {
+		t.Fatal("非后台旗标应照常监视启动器")
+	}
+	<-backgroundGone
+	time.Sleep(100 * time.Millisecond) // 豁免判定在等待返回后进行；误触发会走 t.Error
+	app.background.Store(false)
+
+	// 案三：后台旗标（--background/--server）→ 启动即豁免，根本不监视
+	backgroundCfg := &options{appName: "Holdexar", dataDir: dir, background: true, portFree: portFree}
+	openLauncherHandle = func(int) uintptr { t.Fatal("后台模式不得监视启动器"); return 0 }
+	watchLauncher(backgroundCfg, log, func() { t.Error("后台实例不得随启动器退出") })
+
+	// 案四：PID 无效（非数字/自身）→ 不设防
+	t.Setenv("HOLDEXAR_LAUNCHER_PID", "not-a-pid")
+	openLauncherHandle = func(int) uintptr { t.Fatal("无效 PID 不得打开句柄"); return 0 }
+	watchLauncher(cfg, log, func() { t.Error("无效 PID 不得触发退出") })
+	t.Setenv("HOLDEXAR_LAUNCHER_PID", strconv.Itoa(os.Getpid()))
+	watchLauncher(cfg, log, func() { t.Error("自身 PID 不得触发退出") })
+
+	// 案五：句柄打不开（启动器已不在）→ 无孤儿风险，不设防
+	t.Setenv("HOLDEXAR_LAUNCHER_PID", "4321")
+	openLauncherHandle = func(int) uintptr { return 0 }
+	watchLauncher(cfg, log, func() { t.Error("句柄打不开不得触发退出") })
+}
+
+// TestCloseGuardRevealsHiddenWindow 关窗守卫双案（可见性注入）：
+// 托盘态点 X → 先亮再问；可见态 → 行为不变。
+func TestCloseGuardRevealsHiddenWindow(t *testing.T) {
+	dir := t.TempDir()
+	log := openLog(dir)
+	defer log.close()
+	a := newApp(&options{appName: "Holdexar", dataDir: dir, portFree: portFree}, log, nil)
+	a.hwnd = 0x1234
+	orig := windowVisible
+	t.Cleanup(func() { windowVisible = orig })
+
+	windowVisible = func(uintptr) bool { return true }
+	if a.closeGuardNeedsReveal() {
+		t.Fatal("可见窗口不得重亮（可见态点 X 行为不变）")
+	}
+	windowVisible = func(uintptr) bool { return false }
+	if !a.closeGuardNeedsReveal() {
+		t.Fatal("隐形窗口须先亮再问（托盘态杂散关闭不得弹孤儿确认框）")
+	}
+	a.background.Store(true)
+	if a.closeGuardNeedsReveal() {
+		t.Fatal("后台模式走隐藏分支，不经询问也不重亮")
+	}
+	a.background.Store(false)
+	a.hwnd = 0
+	if a.closeGuardNeedsReveal() {
+		t.Fatal("无窗口句柄不重亮")
+	}
+}
+
+// TestBrowserFallbackKeepsServiceAlive 渲染层缺失兜底：系统浏览器打开本地
+// 服务 URL，宿主转无窗口服务模式保活（服务生命周期独立于 webview）。
+func TestBrowserFallbackKeepsServiceAlive(t *testing.T) {
+	t.Setenv("HOLDEXAR_NO_DIALOG", "1")
+	dir := t.TempDir()
+	log := openLog(dir)
+	defer log.close()
+	cfg := &options{appName: "Holdexar", dataDir: dir, serverPort: 28765, portFree: portFree}
+	a := newApp(cfg, log, nil)
+	var opened []string
+	a.openExternal = func(uri string) { opened = append(opened, uri) }
+
+	a.enterBrowserFallback("渲染组件（WebView2 Runtime）缺失")
+	if !a.browserMode.Load() {
+		t.Fatal("兜底后宿主必须转入无窗口服务模式（服务保活）")
+	}
+	if len(opened) != 1 || opened[0] != "http://127.0.0.1:28765" {
+		t.Fatalf("系统浏览器应打开本地服务 URL：%v", opened)
+	}
+	a.enterBrowserFallback("重复失败")
+	if len(opened) != 1 {
+		t.Fatalf("兜底重复进入不得重复打开浏览器：%v", opened)
+	}
+}
+
+// TestLocalServiceHostsShape 局域网地址投影：回环齐备、滤链路本地段、端口入 URL。
+func TestLocalServiceHostsShape(t *testing.T) {
+	hosts := localServiceHosts(28765)
+	found := 0
+	for _, h := range hosts {
+		if strings.HasPrefix(h, "http://169.254.") {
+			t.Fatalf("链路本地段不得进入展示集：%s", h)
+		}
+		if h == "http://127.0.0.1:28765" || h == "http://localhost:28765" {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Fatalf("回环地址缺失或端口未拼入：%v", hosts)
+	}
 }

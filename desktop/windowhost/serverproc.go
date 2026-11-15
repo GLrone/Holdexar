@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -50,8 +51,14 @@ func startServer(cfg *options, log *hostLog) (*serverProcess, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 绑定面可配（NAS/局域网场景）：默认回环，行为与历史版本一致；
+	// 与服务端 -addr 默认值同读同源（HOLDEXAR_HOST 为纯主机名）。
+	serverHost := strings.TrimSpace(os.Getenv(envPrefix + "HOST"))
+	if serverHost == "" {
+		serverHost = "127.0.0.1"
+	}
 	cmd := exec.Command(exe,
-		"-addr", "127.0.0.1:"+strconv.Itoa(cfg.serverPort),
+		"-addr", serverHost+":"+strconv.Itoa(cfg.serverPort),
 		"-data-dir", cfg.dataDir,
 		"--bootstrap-file", ticket,
 	)
@@ -60,6 +67,9 @@ func startServer(cfg *options, log *hostLog) (*serverProcess, error) {
 		cmd.Args = append(cmd.Args, "--dev-session")
 	}
 	cmd.Dir = filepath.Dir(exe)
+	// CREATE_NO_WINDOW：服务端是控制台程序，宿主是无控制台的 GUI 进程，
+	// 不显式隐藏时 Windows 会给它分配一个可见终端窗（stdout 已重定向进日志文件）
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
 	// 标准输入寿命管道：宿主退出（含硬杀）子进程即收到 EOF 自行优雅退出
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

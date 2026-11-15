@@ -25,7 +25,6 @@ import (
 
 const (
 	tcpTableOwnerPIDListener = 3 // TCP_TABLE_OWNER_PID_LISTENER
-	jobKillOnJobClose        = 0x2000
 )
 
 var (
@@ -160,7 +159,7 @@ func pidAlive(pid int) bool {
 	}
 	defer windows.CloseHandle(handle)
 	event, _ := windows.WaitForSingleObject(handle, 0)
-	return event == uint32(0xFFFFFFFF) // WAIT_TIMEOUT = 仍在运行
+	return event == uint32(windows.WAIT_TIMEOUT) // WAIT_TIMEOUT(0x102)=仍在运行；0=已退出；0xFFFFFFFF=调用失败
 }
 
 // probeTree Job 对象：宿主被硬杀时验收进程树一并终止。
@@ -181,10 +180,11 @@ func assignProbeTree(proc *os.Process) *probeTree {
 	if job == 0 {
 		return nil
 	}
-	// JOBOBJECT_EXTENDED_LIMIT_INFORMATION { LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE }
-	var info [144]byte
-	*(*uint32)(unsafe.Pointer(&info[32])) = jobKillOnJobClose // JobObjectExtendedLimitInformation.LimitFlags 偏移
-	procSetInformationJobObject.Call(job, 9, uintptr(unsafe.Pointer(&info[0])), uintptr(len(info)))
+	// JOBOBJECT_EXTENDED_LIMIT_INFORMATION { LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE }：
+	// LimitFlags 在结构偏移 16（Basic 段第 3 个字段），手写偏移曾是 32=MaximumWorkingSetSize，静默失效
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	procSetInformationJobObject.Call(job, 9, uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Sizeof(info)))
 	procAssignProcessToJobObject.Call(job, uintptr(processHandleForJob(proc)))
 	return &probeTree{job: windows.Handle(job)}
 }

@@ -1,8 +1,9 @@
 //go:build windows
 
-// WebView2 COM 事件接线：绑定未暴露 NavigationStarting / NewWindowRequested
-// 的高层封装，这里按官方接口槽位自建事件处理器与参数读取，槽位顺序对齐
-// WebView2 IDL（接口一经发布不再变动）。
+// WebView2 COM 事件接线。槽位与参数封装全部来自 com_generated.go（tools/comgen
+// 从官方头机械产出，槽位不再手数）；本文件只剩与接口无关的固定形状面：
+// 事件处理器 COM 对象（IUnknown+Invoke 标准形状）与通用出/入参助手。
+// 约定：所有 self/raw 参数都是 COM 对象指针，对象首 8 字节即 vtable 地址。
 package main
 
 import (
@@ -14,60 +15,83 @@ import (
 	"github.com/wailsapp/go-webview2/pkg/edge"
 )
 
-// comRaw 任意 COM 对象的裸头：首字即 vtable 指针。
-type comRaw struct {
-	vtbl unsafe.Pointer
+// comRaw COM 对象指针视图：首 8 字节即 vtable 地址。
+type comRaw struct{ vtbl unsafe.Pointer }
+
+// comProc COM 对象指针 + 槽位 → 方法入口。槽位来自生成常量（com_generated.go），
+// 视图定界 4096 只是声明，实际访问的槽号永远落在真实 vtable 内。
+func comProc(self unsafe.Pointer, slot int) uintptr {
+	return (*[4096]uintptr)((*comRaw)(self).vtbl)[slot]
 }
 
-// wv2Vtbl 镜像 ICoreWebView2 vtable（首槽 IUnknown，随后官方接口顺序）。
-type wv2Vtbl struct {
-	QueryInterface, AddRef, Release                    uintptr
-	GetSettings, GetSource, Navigate, NavigateToString uintptr
-	AddNavigationStarting, RemoveNavigationStarting    uintptr
-	AddContentLoading, RemoveContentLoading            uintptr
-	AddSourceChanged, RemoveSourceChanged              uintptr
-	AddHistoryChanged, RemoveHistoryChanged            uintptr
-	AddNavigationCompleted, RemoveNavigationCompleted  uintptr
-	AddFrameNavigationStarting, RemoveFrameNavigationStarting   uintptr
-	AddFrameNavigationCompleted, RemoveFrameNavigationCompleted uintptr
-	AddScriptDialogOpening, RemoveScriptDialogOpening  uintptr
-	AddPermissionRequested, RemovePermissionRequested  uintptr
-	AddProcessFailed, RemoveProcessFailed              uintptr
-	AddScriptToExecuteOnDocumentCreated, RemoveScriptToExecuteOnDocumentCreated uintptr
-	ExecuteScript, CapturePreview                      uintptr
-	Reload, PostWebMessageAsJSON, PostWebMessageAsString uintptr
-	AddWebMessageReceived, RemoveWebMessageReceived    uintptr
-	CallDevToolsProtocolMethod                         uintptr
-	GetBrowserProcessID, GetCanGoBack, GetCanGoForward uintptr
-	GoBack, GoForward                                  uintptr
-	GetDevToolsProtocolEventReceiver, Stop             uintptr
-	AddNewWindowRequested, RemoveNewWindowRequested    uintptr
-	AddDocumentTitleChanged, RemoveDocumentTitleChanged uintptr
-	GetDocumentTitle                                   uintptr
-	AddHostObjectToScript, RemoveHostObjectFromScript  uintptr
-	OpenDevToolsWindow                                 uintptr
-	AddContainsFullScreenElementChanged, RemoveContainsFullScreenElementChanged uintptr
-	GetContainsFullScreenElement                       uintptr
-	AddWebResourceRequested, RemoveWebResourceRequested uintptr
-	AddWebResourceRequestedFilter, RemoveWebResourceRequestedFilter uintptr
-	AddWindowCloseRequested, RemoveWindowCloseRequested uintptr
+// comArgsString 读 LPWSTR* 出参字符串；返回串由系统堆分配，读后必须释放。
+func comArgsString(self unsafe.Pointer, slot int) string {
+	var value *uint16
+	hr, _, _ := syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
+	if hr != 0 || value == nil {
+		return ""
+	}
+	text := windows.UTF16PtrToString(value)
+	windows.CoTaskMemFree(unsafe.Pointer(value))
+	return text
 }
 
-// comEventHandler 事件处理器 COM 对象：WebView2 直接经 vtable 调 Invoke，
-// 不做接口查询（与绑定内置事件同一事实）。
+// comArgsBool 读 BOOL* 出参。
+func comArgsBool(self unsafe.Pointer, slot int) bool {
+	var value int32
+	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
+	return value != 0
+}
+
+// comArgsUint32 读枚举出参；comArgsUint64 读 UINT64 出参。
+func comArgsUint32(self unsafe.Pointer, slot int) uint32 {
+	var value uint32
+	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
+	return value
+}
+
+func comArgsUint64(self unsafe.Pointer, slot int) uint64 {
+	var value uint64
+	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
+	return value
+}
+
+// comArgsSetBool 调 [in] BOOL 属性写入口：参数按值传，不取地址
+// （取地址等价把本地变量地址塞给按值槽位）。
+func comArgsSetBool(self unsafe.Pointer, slot int, on bool) {
+	var value int32
+	if on {
+		value = 1
+	}
+	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(value))
+}
+
+// comRegister 注册事件处理器：(this, handler, token*)；HRESULT 非 0 报错。
+func comRegister(self unsafe.Pointer, slot int, handler unsafe.Pointer) error {
+	var token int64
+	hr, _, _ := syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(handler), uintptr(unsafe.Pointer(&token)))
+	if hr != 0 {
+		return windows.Errno(hr)
+	}
+	return nil
+}
+
+// comEventHandler 事件处理器 COM 对象：WebView2 注册后只走 AddRef/Release/
+// Invoke（无身份查询），QI 按契约回 E_NOINTERFACE 不填出参；生命周期由 Go 侧
+// navEventHandlers 持引用，引用计数恒 1。
 type comEventHandler struct {
 	vtbl   *handlerVtbl
-	onFire func(sender, args *comRaw)
+	onFire func(sender, args unsafe.Pointer)
 }
 
 type handlerVtbl struct {
 	QueryInterface, AddRef, Release, Invoke uintptr
 }
 
-func handlerQueryInterface(this *comEventHandler, _, _ uintptr) uintptr { return 0 }
+func handlerQueryInterface(this *comEventHandler, _, _ uintptr) uintptr { return 0x80004002 }
 func handlerAddRef(this *comEventHandler) uintptr                       { return 1 }
 func handlerRelease(this *comEventHandler) uintptr                      { return 1 }
-func handlerInvoke(this *comEventHandler, sender, args *comRaw) uintptr {
+func handlerInvoke(this *comEventHandler, sender, args unsafe.Pointer) uintptr {
 	if this.onFire != nil {
 		this.onFire(sender, args)
 	}
@@ -81,89 +105,38 @@ var handlerFn = handlerVtbl{
 	Invoke:         syscall.NewCallback(handlerInvoke),
 }
 
-func newEventHandler(onFire func(sender, args *comRaw)) *comEventHandler {
+func newEventHandler(onFire func(sender, args unsafe.Pointer)) *comEventHandler {
 	return &comEventHandler{vtbl: &handlerFn, onFire: onFire}
 }
 
-// navEventHandlers 持有注册后的处理器与令牌，防 Go 侧回收。
+// navEventHandlers 持有注册后的处理器，防 Go 侧回收（宿主生命周期内不移除）。
 type navEventHandlers struct {
 	navigationStarting *comEventHandler
 	newWindow          *comEventHandler
-	token1, token2     int64
 }
 
 func newNavEventHandlers(a *app, webview *edge.ICoreWebView2) *navEventHandlers {
-	vtbl := (*wv2Vtbl)((*comRaw)(unsafe.Pointer(webview)).vtbl)
+	wv := newCoreWebView2(unsafe.Pointer(webview))
 	handlers := &navEventHandlers{
-		navigationStarting: newEventHandler(func(_, args *comRaw) {
-			uri := comArgsString(args, 3)
-			if !a.onNavigationStarting(uri) {
-				comArgsSetFlag(args, 6, 1) // PutCancel：槽 3 GetUri 后第 4 槽
+		navigationStarting: newEventHandler(func(_, args unsafe.Pointer) {
+			nav := &NavigationStartingArgs{raw: args}
+			if !a.onNavigationStarting(nav.Uri()) {
+				nav.SetCancel(true)
 			}
 		}),
-		newWindow: newEventHandler(func(_, args *comRaw) {
-			if uri := comArgsString(args, 3); uri != "" && a.openExternal != nil {
+		newWindow: newEventHandler(func(_, args unsafe.Pointer) {
+			wn := &NewWindowArgs{raw: args}
+			if uri := wn.Uri(); uri != "" && a.openExternal != nil {
 				a.openExternal(uri)
 			}
-			comArgsSetFlag(args, 4, 1) // PutHandled：GetUri 后第 2 槽
+			wn.SetHandled(true)
 		}),
 	}
-	webviewPtr := uintptr(unsafe.Pointer(webview))
-	if vtbl.AddNavigationStarting != 0 {
-		syscall.SyscallN(vtbl.AddNavigationStarting,
-			webviewPtr,
-			uintptr(unsafe.Pointer(handlers.navigationStarting)),
-			uintptr(unsafe.Pointer(&handlers.token1)))
+	if err := wv.AddNavigationStarting(unsafe.Pointer(handlers.navigationStarting)); err != nil {
+		a.log.write("导航拦截事件注册失败：" + err.Error())
 	}
-	if vtbl.AddNewWindowRequested != 0 {
-		syscall.SyscallN(vtbl.AddNewWindowRequested,
-			webviewPtr,
-			uintptr(unsafe.Pointer(handlers.newWindow)),
-			uintptr(unsafe.Pointer(&handlers.token2)))
+	if err := wv.AddNewWindowRequested(unsafe.Pointer(handlers.newWindow)); err != nil {
+		a.log.write("新窗口事件注册失败：" + err.Error())
 	}
 	return handlers
-}
-
-// comArgsString 读事件参数字符串（槽位以 IUnknown 之后计）；
-// 返回字符串由系统堆分配，读后必须释放。
-func comArgsString(args *comRaw, slot int) string {
-	if args == nil || args.vtbl == nil {
-		return ""
-	}
-	vtbl := (*[8]uintptr)(args.vtbl)
-	var value *uint16
-	hr, _, _ := syscall.SyscallN(vtbl[slot], uintptr(unsafe.Pointer(args)), uintptr(unsafe.Pointer(&value)))
-	if hr != 0 || value == nil {
-		return ""
-	}
-	text := windows.UTF16PtrToString(value)
-	windows.CoTaskMemFree(unsafe.Pointer(value))
-	return text
-}
-
-// comArgsSetFlag 置事件参数布尔位（PutCancel / PutHandled）。
-func comArgsSetFlag(args *comRaw, slot int, value int32) {
-	if args == nil || args.vtbl == nil {
-		return
-	}
-	vtbl := (*[8]uintptr)(args.vtbl)
-	syscall.SyscallN(vtbl[slot], uintptr(unsafe.Pointer(args)), uintptr(unsafe.Pointer(&value)))
-}
-
-// processFailedKind 读失败类型（GetProcessFailedKind，槽位 3）。
-func processFailedKind(args *edge.ICoreWebView2ProcessFailedEventArgs) uint32 {
-	if args == nil {
-		return ^uint32(0)
-	}
-	raw := (*comRaw)(unsafe.Pointer(args))
-	if raw.vtbl == nil {
-		return ^uint32(0)
-	}
-	vtbl := (*[4]uintptr)(raw.vtbl)
-	var kind uint32
-	hr, _, _ := syscall.SyscallN(vtbl[3], uintptr(unsafe.Pointer(args)), uintptr(unsafe.Pointer(&kind)))
-	if hr != 0 {
-		return ^uint32(0)
-	}
-	return kind
 }
