@@ -10,10 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"unsafe"
 
 	"golang.org/x/crypto/scrypt"
-	"golang.org/x/sys/windows"
 )
 
 // 数据主密钥托管：三模式（落点数据目录 secret.master；文件不存在 = legacy）。
@@ -37,9 +35,6 @@ const (
 	scryptDKLen = keyBytes
 )
 
-// dpapiEntropy DPAPI 附加熵（第二因素）：blob 被其他进程拿到也无法在白盒外解封。
-var dpapiEntropy = []byte("holdexar:keyring:dpapi:v1")
-
 // ── 进程内解封态 ─────────────────────────────────────────
 
 var (
@@ -47,10 +42,14 @@ var (
 	unlockedKey []byte
 )
 
-// ResetState 清进程内主密钥缓存（换钥 / 换数据目录 / 测试隔离后调用）。
+// ResetState 清进程内主密钥缓存（换钥 / 换数据目录 / 测试隔离后调用）：
+// 显式擦除字节后置 nil（GC 复制语义下尽力擦除，锁定后不留可回收明文）。
 func ResetState() {
 	lockMu.Lock()
 	defer lockMu.Unlock()
+	for i := range unlockedKey {
+		unlockedKey[i] = 0
+	}
 	unlockedKey = nil
 }
 
@@ -120,7 +119,6 @@ func IsLocked(dataDir string) (bool, error) {
 }
 
 // DpapiAvailable 系统凭据保护是否可用（仅 Windows）。
-func DpapiAvailable() bool { return runtime.GOOS == "windows" }
 
 // Status 面向界面的状态投影（不泄露主密钥）。
 func Status(dataDir string) map[string]any {
@@ -222,13 +220,102 @@ func unwrapDPAPI(rec map[string]any) ([]byte, error) {
 
 // ── 口令封装（scrypt 派生 KEK + AES-256-GCM）────────────────
 
+// ── 口令封装记录校验（P0-2：记录来自不可信文件，昂贵派生前全量校验）──
+
+// KDF 参数边界：age 以 log2(N)≤22 硬顶限制不可信文件的解锁工作量（x/crypto
+// 自身只有相对 maxInt 的关系式，64 位平台拦不住大 N 内存耗尽）；内存帽按 NAS
+// 实测裁决前的保守值收紧。
+const (
+	kdfNMin     = 1 << 12
+	kdfNMax     = 1 << 22
+	kdfRMax     = 64
+	kdfPMax     = 8
+	kdfMemLimit = 256 << 20 // 128·N·r 峰值内存上限
+	gcmTagBytes = 16
+)
+
+// scryptMu 口令派生串行化：合法高成本参数也不允许并发叠加内存（派生只由
+// 解锁/换钥/改口令触发，低频操作）。
+var scryptMu sync.Mutex
+
+type passphraseRecord struct {
+	n, r, p, dk int
+	salt, nonce []byte
+	sealed      []byte
+}
+
+// validatePassphraseRecord 校验并解析口令封装记录：算法白名单、KDF 参数
+// 边界、盐/Nonce/密文长度。全部通过才允许派生——参数缺失不做默认降级，
+// 非法记录在昂贵调用前拒绝（恶意大 N 曾可致解锁内存耗尽）。
+func validatePassphraseRecord(rec map[string]any) (*passphraseRecord, error) {
+	if v, ok := pyIntStrict(rec, "v"); !ok || v != fileVersion {
+		return nil, keyringErrf("密钥记录版本非法：%v", rec["v"])
+	}
+	if mode := pyStrOrEmpty(rec["mode"]); mode != ModePassphrase {
+		return nil, keyringErrf("密钥记录模式非法：%q", mode)
+	}
+	kdf, ok := rec["kdf"].(map[string]any)
+	if !ok {
+		return nil, keyringErr("密钥记录缺少 KDF 参数")
+	}
+	if name := pyStrOrEmpty(kdf["name"]); name != "scrypt" {
+		return nil, keyringErrf("KDF 算法非法：%q", name)
+	}
+	n, okN := pyIntStrict(kdf, "n")
+	r, okR := pyIntStrict(kdf, "r")
+	p, okP := pyIntStrict(kdf, "p")
+	dk, okDK := pyIntStrict(kdf, "dklen")
+	if !okN || !okR || !okP || !okDK {
+		return nil, keyringErr("密钥记录 KDF 参数不完整")
+	}
+	if n%2 != 0 || n < kdfNMin || n > kdfNMax {
+		return nil, keyringErrf("KDF 参数 N 越界：%d", n)
+	}
+	if r < 1 || r > kdfRMax || p < 1 || p > kdfPMax {
+		return nil, keyringErrf("KDF 参数 r/p 越界：%d/%d", r, p)
+	}
+	if uint64(r)*uint64(p) >= 1<<30 || uint64(n)*uint64(r)*128 > kdfMemLimit {
+		return nil, keyringErrf("KDF 参数组合超出内存帽：%d/%d/%d", n, r, p)
+	}
+	if dk != keyBytes {
+		return nil, keyringErrf("KDF 派生长度非法：%d", dk)
+	}
+	salt, err1 := unb64(pyStrOrEmpty(rec["salt"]))
+	nonce, err2 := unb64(pyStrOrEmpty(rec["nonce"]))
+	sealed, err3 := unb64(pyStrOrEmpty(rec["ct"]))
+	if err1 != nil || err2 != nil || err3 != nil {
+		return nil, keyringErr("密钥记录字段编码非法")
+	}
+	if len(salt) != saltBytes {
+		return nil, keyringErrf("盐长度非法：%d", len(salt))
+	}
+	if len(nonce) != nonceBytes {
+		return nil, keyringErrf("Nonce 长度非法：%d", len(nonce))
+	}
+	if len(sealed) < nonceBytes+gcmTagBytes+1 {
+		return nil, keyringErr("密文长度非法")
+	}
+	return &passphraseRecord{n: n, r: r, p: p, dk: dk, salt: salt, nonce: nonce, sealed: sealed}, nil
+}
+
+// pyIntStrict 严格整型提取：字段缺失/为 null 返回 false（不做默认降级——
+// pyIntOr 的默认值分支仅服务兼容读，不可用于不可信记录）。
+func pyIntStrict(m map[string]any, key string) (int, bool) {
+	if v, present := m[key]; !present || v == nil {
+		return 0, false
+	}
+	return pyIntOr(m, key, 0)
+}
+
 // WrapPassphrase 随机主密钥 → 口令封装记录。
 func WrapPassphrase(master []byte, passphrase string) (map[string]any, error) {
 	if passphrase == "" {
 		return nil, keyringErr("口令不能为空")
 	}
 	salt := randBytes(saltBytes)
+	scryptMu.Lock()
 	kek, err := scrypt.Key([]byte(passphrase), salt, scryptN, scryptR, scryptP, scryptDKLen)
+	scryptMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -244,26 +331,19 @@ func WrapPassphrase(master []byte, passphrase string) (map[string]any, error) {
 }
 
 // unwrapPassphrase 口令封装 → 主密钥；口令不正确返回 nil。
+// 记录先经全量校验（廉价拒绝），再进入昂贵派生。
 func unwrapPassphrase(rec map[string]any, passphrase string) ([]byte, error) {
-	kdf, _ := rec["kdf"].(map[string]any)
-	salt, e1 := unb64(pyStr(rec["salt"]))
-	nonce, e2 := unb64(pyStr(rec["nonce"]))
-	sealed, e3 := unb64(pyStr(rec["ct"]))
-	if e1 != nil || e2 != nil || e3 != nil {
-		return nil, keyringErr("口令密钥记录不完整")
-	}
-	n, ok1 := pyIntOr(kdf, "n", scryptN)
-	r, ok2 := pyIntOr(kdf, "r", scryptR)
-	p, ok3 := pyIntOr(kdf, "p", scryptP)
-	dk, ok4 := pyIntOr(kdf, "dklen", scryptDKLen)
-	if !ok1 || !ok2 || !ok3 || !ok4 {
-		return nil, keyringErr("口令密钥记录不完整")
-	}
-	kek, err := scrypt.Key([]byte(passphrase), salt, n, r, p, dk)
+	parsed, err := validatePassphraseRecord(rec)
 	if err != nil {
 		return nil, err
 	}
-	plain, ok := gcmOpen(kek, nonce, sealed)
+	scryptMu.Lock()
+	defer scryptMu.Unlock()
+	kek, err := scrypt.Key([]byte(passphrase), parsed.salt, parsed.n, parsed.r, parsed.p, parsed.dk)
+	if err != nil {
+		return nil, keyringErrf("KDF 派生失败：%v", err)
+	}
+	plain, ok := gcmOpen(kek, parsed.nonce, parsed.sealed)
 	if !ok {
 		return nil, nil // 认证标签不符 = 口令错误
 	}
@@ -488,6 +568,8 @@ func pyIntOr(m map[string]any, key string, def int) (int, bool) {
 		return def, true
 	}
 	switch t := v.(type) {
+	case int:
+		return t, true
 	case json.Number:
 		if n, err := t.Int64(); err == nil {
 			return int(n), true
@@ -510,31 +592,4 @@ func pyIntOr(m map[string]any, key string, def int) (int, bool) {
 		return 0, true
 	}
 	return 0, false
-}
-
-// ── DPAPI 系统调用 ───────────────────────────────────────
-
-func dpapiProtect(data []byte) ([]byte, error) { return dpapiCall(data, true) }
-
-func dpapiUnprotect(blob []byte) ([]byte, error) { return dpapiCall(blob, false) }
-
-func dpapiCall(data []byte, protect bool) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, keyringErr("系统凭据数据为空")
-	}
-	in := &windows.DataBlob{Size: uint32(len(data)), Data: &data[0]}
-	ent := &windows.DataBlob{Size: uint32(len(dpapiEntropy)), Data: &dpapiEntropy[0]}
-	var out windows.DataBlob
-	var err error
-	if protect {
-		err = windows.CryptProtectData(in, nil, ent, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)
-	} else {
-		err = windows.CryptUnprotectData(in, nil, ent, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)
-	}
-	if err != nil {
-		return nil, err
-	}
-	result := bytes.Clone(unsafe.Slice(out.Data, out.Size))
-	windows.LocalFree(windows.Handle(unsafe.Pointer(out.Data)))
-	return result, nil
 }

@@ -67,7 +67,9 @@ func seedKV(t *testing.T, db *sql.DB, key, jsonText string) {
 const defaultBody = `{"account":{"steam_id":"","steam_api_key":"","has_api_key":false},` +
 	`"onboarding_done":false,"auto_price":true,"backup_auto":true,"update_notified":"",` +
 	`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
-	`"theme":"dark","mcp_enabled":false,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
+	`"theme":"dark","mcp_enabled":false,` +
+	`"lan_access":{"enabled":false,"env_forced":false,"has_password":false},` +
+	`"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
 
 func TestGetSettingsDefaults(t *testing.T) {
 	_, h := newTestEnv(t)
@@ -96,7 +98,9 @@ func TestGetSettingsSeeded(t *testing.T) {
 	want := `{"account":{"steam_id":"76561198000000000","steam_api_key":"****efgh","has_api_key":true},` +
 		`"onboarding_done":true,"auto_price":true,"backup_auto":true,"update_notified":"1.2.3",` +
 		`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
-		`"theme":"light","mcp_enabled":true,"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
+		`"theme":"light","mcp_enabled":true,` +
+		`"lan_access":{"enabled":false,"env_forced":false,"has_password":false},` +
+		`"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("种子形状不一致\n got: %s\nwant: %s", got, want)
 	}

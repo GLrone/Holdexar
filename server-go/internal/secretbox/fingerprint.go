@@ -9,8 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"golang.org/x/sys/windows/registry"
 )
 
 // 机器指纹（同机稳定）：Windows MachineGuid → Linux machine-id → macOS
@@ -50,19 +48,6 @@ func machineFingerprint() []byte {
 		}
 	}
 	return nil
-}
-
-func machineGuid() string {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Cryptography`, registry.QUERY_VALUE)
-	if err != nil {
-		return ""
-	}
-	defer k.Close()
-	v, _, err := k.GetStringValue("MachineGuid")
-	if err != nil {
-		return ""
-	}
-	return v
 }
 
 func ioPlatformUUID() string {

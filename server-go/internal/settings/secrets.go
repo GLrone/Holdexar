@@ -12,7 +12,7 @@ import (
 )
 
 func SealSecrets(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string) (int, error) {
-	rows, e := db.QueryContext(ctx, `SELECT key,value_json FROM app_settings WHERE key IN('account.steam_api_key','pilot.llm.api_key','pilot.llm.provider_key.legacy-v1')`)
+	rows, e := db.QueryContext(ctx, `SELECT key,value_json FROM app_settings WHERE key IN('account.steam_api_key','pilot.llm.api_key','pilot.llm.provider_key.legacy-v1','access.lan_password')`)
 	if e != nil {
 		return 0, e
 	}
