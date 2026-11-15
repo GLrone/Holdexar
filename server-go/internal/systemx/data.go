@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/backup"
 	"holdexar/server-go/internal/dataexport"
 	"holdexar/server-go/internal/derived"
@@ -26,7 +27,7 @@ const RestartExitCode = 75
 
 // RegisterData 数据维护与用户数据面：原位恢复、空间回收、加密导出、
 // 旧爬虫库导入、密钥保护。onRequestRestart 在响应送达后触发服务重启。
-func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, dataDir string,
+func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, sessions *access.Gate, dataDir string,
 	backups *backup.Service, onRequestRestart func()) {
 	mux.HandleFunc("POST /api/v1/system/backup/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
 		result, err := backups.Restore(r.Context(), r.PathValue("name"))
@@ -48,7 +49,7 @@ func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, dataDir
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
-			writeData(w, nil, fmt.Errorf("请求体无法读取"))
+			writeData(w, nil, statusError{http.StatusBadRequest, "请求体无法读取"})
 			return
 		}
 		result, err := dataexport.Create(r.Context(), db, dataDir, req.Password)
@@ -121,19 +122,30 @@ func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, dataDir
 			writeData(w, nil, statusError{http.StatusBadRequest, "请求体无法读取"})
 			return
 		}
+		// 解锁失败限速：与局域网解锁通道共享同一限速器——两条通道认证的是
+		// 同一把口令，任一通道穷举都触发全局锁定（共同根因修复）。
+		if remaining := access.UnlockLockedSeconds(); remaining > 0 {
+			writeData(w, nil, statusError{http.StatusTooManyRequests,
+				fmt.Sprintf("解锁失败次数过多，%.0f 秒后可重试", remaining)})
+			return
+		}
 		ok, err := secretbox.Unlock(dataDir, req.Passphrase)
 		if err != nil {
 			writeData(w, nil, classifyKeyring(err))
 			return
 		}
 		if !ok {
+			access.RecordUnlockFailure()
 			writeData(w, nil, statusError{http.StatusBadRequest, "口令不正确"})
 			return
 		}
+		access.RecordUnlockSuccess()
 		writeData(w, map[string]any{"ok": true, "security": secretbox.Status(dataDir)}, nil)
 	})
 	mux.HandleFunc("POST /api/v1/system/security/lock", func(w http.ResponseWriter, r *http.Request) {
 		secretbox.Lock()
+		// 会话随之轮换：旧会话签发于解锁态，锁定后必须失效（P0 审计修复）
+		sessions.InvalidateSessions()
 		writeData(w, map[string]any{"ok": true, "security": secretbox.Status(dataDir)}, nil)
 	})
 	mux.HandleFunc("POST /api/v1/import-legacy", func(w http.ResponseWriter, r *http.Request) {
@@ -368,6 +380,10 @@ func classifyExport(err error) error {
 	var boxErr *secretbox.SecretBoxError
 	if errors.As(err, &boxErr) {
 		return statusError{http.StatusConflict, err.Error()}
+	}
+	var inputErr dataexport.ValidationError
+	if errors.As(err, &inputErr) {
+		return statusError{http.StatusBadRequest, inputErr.Error()}
 	}
 	return err
 }

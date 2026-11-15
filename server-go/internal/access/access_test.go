@@ -92,11 +92,42 @@ func newGateHandler(t *testing.T) (*Gate, http.Handler) {
 func TestMiddlewareGate(t *testing.T) {
 	g, h := newGateHandler(t)
 
-	// 非 API 路径不拦
+	// 无会话页面导航 → 独立解锁页（200 HTML，零主应用内容）
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://127.0.0.1:28765/page", nil))
-	if rec.Code != 200 {
-		t.Fatalf("静态路径被拦截: %d", rec.Code)
+	if rec.Code != 200 || rec.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("锁定态页面导航=%d/%s，应为 200 text/html", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(rec.Body.String(), "holdexar-unlock-page") {
+		t.Fatalf("锁定态应返回解锁页")
+	}
+	if strings.Contains(rec.Body.String(), ">page<") {
+		t.Fatalf("解锁页混入了受保护内容")
+	}
+	// 无会话资源形态路径 → 404（主应用资产不可探测）
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://127.0.0.1:28765/assets/app-abc12345.js", nil))
+	if rec.Code != 404 {
+		t.Fatalf("锁定态资源探测=%d，应为 404", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://127.0.0.1:28765/favicon.ico", nil))
+	if rec.Code != 404 {
+		t.Fatalf("锁定态图标探测=%d，应为 404", rec.Code)
+	}
+	// 无会话写操作 → 404
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "http://127.0.0.1:28765/page", nil))
+	if rec.Code != 404 {
+		t.Fatalf("锁定态写操作=%d，应为 404", rec.Code)
+	}
+	// 带会话 → 放行
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "http://127.0.0.1:28765/page", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: g.Token()})
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || rec.Body.String() != "page" {
+		t.Fatalf("会话放行状态码/体=%d/%s", rec.Code, rec.Body.String())
 	}
 	// 健康检查公开
 	rec = httptest.NewRecorder()
@@ -115,7 +146,7 @@ func TestMiddlewareGate(t *testing.T) {
 	}
 	// 伪造令牌 401
 	rec = httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "http://127.0.0.1:28765/api/v1/regions", nil)
+	req = httptest.NewRequest("GET", "http://127.0.0.1:28765/api/v1/regions", nil)
 	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: "forged"})
 	h.ServeHTTP(rec, req)
 	if rec.Code != 401 {

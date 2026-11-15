@@ -26,10 +26,16 @@ const (
 // PublicPaths 无会话即可访问的 API 路径。健康检查是判活唯一入口；更新验收
 // 确认要在页面拿到会话之前调用。清单是唯一事实源，禁止在路由里另行标注。
 var PublicPaths = map[string]bool{
-	"/api/v1/health":              true,
-	"/api/v1/system/update-ready": true,
-	"/api/v1/session/bootstrap":   true,
-	"/api/v1/session/dev":         true,
+	"/api/v1/health":                        true,
+	"/api/v1/system/update-ready":           true,
+	"/api/v1/session/bootstrap":             true,
+	"/api/v1/session/dev":                   true,
+	"/api/v1/session/unlock":                true,
+	"/api/v1/session/recovery/login/start":  true,
+	"/api/v1/session/recovery/login/code":   true,
+	"/api/v1/session/recovery/login/status": true,
+	"/api/v1/session/recovery/complete":     true,
+	"/api/v1/session/recovery/cancel":       true,
 }
 
 // Gate 持有进程内会话令牌与 MCP 闸挂点。MCP 面未接线时 MCP 前缀为空。
@@ -65,6 +71,11 @@ func (g *Gate) Reset() {
 	g.token = ""
 	g.mu.Unlock()
 }
+
+// InvalidateSessions 轮换会话令牌：既有 Cookie/头会话全部失效。安全锁定
+// 时调用——旧会话签发于解锁态，锁定后随之失效（P0 审计：锁定不轮换曾让
+// 旧会话穿透锁定态）。
+func (g *Gate) InvalidateSessions() { g.Reset() }
 
 // RegisterMCPGate 注册 MCP 路由闸：Host/Origin 之后、会话之前生效。
 // 返回 0 放行；401 凭据缺失；404 未启用。MCP 面接线前不注册即一律 404。
@@ -107,21 +118,77 @@ func (g *Gate) authorized(r *http.Request) bool {
 	return false
 }
 
-// HostAllowed 只接受回环 Host，挡住 DNS 重绑定：重绑定后浏览器带来的 Host
-// 是攻击者域名，端口不限（端口协商会换），只看回环名。
-func HostAllowed(host string) bool {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" {
+// 局域网模式放行的本机地址集合（字面量、小写、无端口）；空＝默认回环-only。
+var (
+	extraHostsMu sync.RWMutex
+	extraHosts   map[string]struct{}
+)
+
+// SetExtraHosts 更新局域网模式放行的本机地址集合（内部按 Host 名规范化）；
+// 空集合＝回环-only 默认模式。
+func SetExtraHosts(hosts []string) {
+	normalized := map[string]struct{}{}
+	for _, host := range hosts {
+		if hostname := hostnameOf(host); hostname != "" {
+			normalized[hostname] = struct{}{}
+		}
+	}
+	extraHostsMu.Lock()
+	extraHosts = normalized
+	extraHostsMu.Unlock()
+}
+
+func extraHostsHas(host string) bool {
+	hostname := hostnameOf(host)
+	if hostname == "" {
 		return false
 	}
-	// IPv6 字面量形如 [::1]:port
+	extraHostsMu.RLock()
+	defer extraHostsMu.RUnlock()
+	_, ok := extraHosts[hostname]
+	return ok
+}
+
+// HostAllowed 只接受回环 Host 与局域网模式登记的本机地址，挡住 DNS 重绑定：
+// 重绑定的本质是让攻击者域名解析到本机——浏览器随后发出的请求带的是攻击者
+// 域名作为 Host，永远不在字面地址白名单里。端口不限（端口协商会换）。
+// 默认模式白名单为空＝历史行为（仅回环）。
+func HostAllowed(host string) bool {
+	return LoopbackHost(host) || extraHostsHas(host)
+}
+
+// LoopbackHost Host 头是否指向本机回环。仅用于 DNS 重绑定防御（攻击者域名
+// 解析到本机时其域名作 Host，永不在字面地址白名单）——禁止作为信任判定：
+// Host 是客户端可控字段，回环/局域网/代理来源的可信判定一律用对端地址
+// （P0-1：曾用它判定明文回显，被伪造 Host 实测绕过）。
+func LoopbackHost(host string) bool {
+	switch hostnameOf(host) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
+}
+
+// hostnameOf 取 Host 头的主机名部分（剥离端口；IPv6 字面量剥方括号；
+// 裸 IPv6 形态不带端口，原样返回）。
+func hostnameOf(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return ""
+	}
 	if strings.HasPrefix(host, "[") {
-		return strings.HasPrefix(host, "[::1]")
+		if end := strings.Index(host, "]"); end > 0 {
+			return host[1:end]
+		}
+		return ""
+	}
+	if strings.Count(host, ":") > 1 {
+		return host
 	}
 	if i := strings.LastIndex(host, ":"); i >= 0 {
-		host = host[:i]
+		return host[:i]
 	}
-	return host == "127.0.0.1" || host == "localhost"
+	return host
 }
 
 // OriginAllowed 请求来源是否属于本应用自身。Cookie 作用域不含端口，跨端口
@@ -167,11 +234,20 @@ func OriginAllowed(r *http.Request) bool {
 }
 
 // Middleware 统一准入：所有 /api/ 路径默认要求会话，公开路径显式白名单。
-// 非 API 路径（SPA 静态与页面回退）不含用户数据，不拦。
+// 非 API 路径同样受会话闸约束：无会话（锁定态）只发独立解锁页，主应用
+// 资源不可达——客户端路由守卫只是 UX，服务端分流才挡得住 UI 级绕过。
 func (g *Gate) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if !strings.HasPrefix(path, apiPrefix) {
+			if !HostAllowed(r.Host) {
+				writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
+				return
+			}
+			if !g.authorized(r) {
+				serveLockedPage(w, r)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
