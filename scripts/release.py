@@ -19,6 +19,7 @@
     python scripts/release.py --bump patch --dry-run   # 全流程演练（不出网、不推送）
     python scripts/release.py --bump patch             # 正式发版
     python scripts/release.py --version 0.3.5-beta --yes    # 免交互
+    python scripts/release.py --go --dry-run           # 纯 Go 链演练（不出网、不推送）
 
 前置：gh auth login（说明见 scripts/publish_release.py 顶部）。
 """
@@ -392,8 +393,27 @@ def commit_and_push(version: str, dry: bool, yes: bool) -> None:
 # ── 步骤 5/6：构建与发布 ────────────────────────────────────
 
 
-def build(dry: bool) -> None:
+def build(dry: bool, version: str, go: bool = False) -> None:
     print(f"\n── 构建 ────────────────────────────────────────")
+    if go:
+        # 纯 Go 链：build_release_go.ps1 出包（无 Python 参与）。产物与混合链
+        # 归一——zip 名与落位对齐 publish_release/build_manifest 判据
+        # （release/Holdexar-win64-v<版本>.zip，包内根目录 Holdexar/）；版本号
+        # 显式传入（dry-run 下版本未写盘，也不能依赖 Go 侧 config.go 默认值）。
+        # 清单与 Scoop 渠道清单仍走既有生成链（build_manifest.py 只认 role=app
+        # 包，与构建链路无关），publish/复验两步对两条链完全同构。
+        run(
+            [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                str(SCRIPTS / "build_release_go.ps1"),
+                "-Version", version,
+                "-OutDir", str(RELEASE),
+            ],
+            dry,
+            label="构建",
+        )
+        run([str(pick_python()), str(SCRIPTS / "build_manifest.py")], dry, label="清单")
+        return
     run([str(pick_python()), str(SCRIPTS / "build_release.py")], dry)
 
 
@@ -490,6 +510,11 @@ def main() -> None:
         help="自动递增版本号并写回 app_info.py（比 --version 省一次手改）",
     )
     parser.add_argument("--check", action="store_true", help="只跑预检，不改任何东西")
+    parser.add_argument(
+        "--go", action="store_true",
+        help="构建走纯 Go 链（build_release_go.ps1，无 PyInstaller 参与）；"
+             "发布/复验流程与混合链完全同构",
+    )
     parser.add_argument("--dry-run", action="store_true", help="走完流程但不推送、不出网")
     parser.add_argument("--yes", "-y", action="store_true", help="跳过推送前的确认")
     parser.add_argument("--allow-dirty", action="store_true", help="允许带着未提交改动发版")
@@ -524,7 +549,7 @@ def main() -> None:
         check_stale_version_refs(version)
 
     commit_and_push(version, args.dry_run, args.yes)
-    build(args.dry_run)
+    build(args.dry_run, version, args.go)
     publish(args.dry_run)
     verify(version, args.dry_run)
     summarize(version)

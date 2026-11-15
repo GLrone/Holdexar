@@ -8,6 +8,7 @@
 #   versions/<v>/_internal/serverd.exe + seed/
 #   web/dist/                        前端产物（安装根级，服务端同源解析）
 #   assets/seed/...                  随包基础资料（miniseed 候选位）
+#   assets/clash/                    mihomo 许可原文与来源说明（内核二进制不随包）
 param(
     [string]$Version = "",
     [string]$OutDir = "release-go",
@@ -76,6 +77,35 @@ if (Test-Path $seedSrc) {
     Copy-Item $seedSrc (Join-Path $App 'assets\seed\holdexar_mini_seed.db')
 }
 
+# 随包 mihomo 许可原文与来源说明（GPL-3.0 §4 合规红线：二进制旁附许可文本）。
+# 许可从仓库 packaging/licenses 复制，缺失 fail-fast 拒绝出包；内核二进制不随包，
+# 运行时按需由服务端独立下载维护（clashservice 随包资产目录 = 安装根 assets/clash）。
+Write-Output '[pack] 随包 mihomo 许可与来源说明'
+$licSrc = Join-Path $RepoRoot 'packaging\licenses\LICENSE-mihomo.txt'
+if (-not (Test-Path $licSrc)) { throw "随包许可缺失：$licSrc（GPL-3.0 要求许可原文随包，缺失不得出包）" }
+$clashDir = Join-Path $App 'assets\clash'
+New-Item -ItemType Directory -Force -Path $clashDir | Out-Null
+Copy-Item $licSrc (Join-Path $clashDir 'LICENSE-mihomo.txt') -Force
+# 版本与来源读 Go 侧单一来源（clashkernel），避免与随包内核版本漂移
+$mihomoLine = Select-String -Path (Join-Path $RepoRoot 'server-go\internal\clashkernel\kernel.go') -Pattern 'MIHOMOVersion\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $mihomoLine) { throw '无法从 server-go\internal\clashkernel\kernel.go 读取内核版本号' }
+$mihomoRepoLine = Select-String -Path (Join-Path $RepoRoot 'server-go\internal\clashkernel\download.go') -Pattern 'mihomoRepo\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $mihomoRepoLine) { throw '无法从 server-go\internal\clashkernel\download.go 读取内核来源地址' }
+$clashReadme = @"
+Holdexar 代理内核资产与许可说明（按需组件）
+==================================================
+mihomo         $($mihomoLine.Matches[0].Groups[1].Value)
+               来源 $($mihomoRepoLine.Matches[0].Groups[1].Value)
+               许可 GPL-3.0（原文见同目录 LICENSE-mihomo.txt）
+mihomo 以独立进程运行（非链接、非派生），本项目自身以 GPL-3.0 分发；
+内核二进制不随安装包内置，由用户按需下载或自备维护；
+对应源码即上游仓库上述地址，所用二进制未做任何修改。
+"@
+[IO.File]::WriteAllText((Join-Path $clashDir 'README.txt'), $clashReadme, (New-Object System.Text.UTF8Encoding($false)))
+foreach ($clashAsset in @('LICENSE-mihomo.txt', 'README.txt')) {
+    if (-not (Test-Path (Join-Path $clashDir $clashAsset))) { throw "随包内核许可资产缺失：$clashAsset" }
+}
+
 # 版本目录自带前端：跨运行时换装只装版本目录，根级 web/dist 在旧版安装里
 # 不存在——服务端按根级优先、版本目录回退解析，任何安装路径都自洽
 Write-Output '[pack] 版本目录携带 web/dist'
@@ -93,6 +123,13 @@ foreach ($f in @(
     (Join-Path $VerDir '_internal\serverd.exe'),
     (Join-Path $App 'web\dist\index.html'))) {
     if (-not (Test-Path $f)) { throw "关键件缺失：$f" }
+}
+
+Write-Output '[pack] 产物消毒：内核二进制不得随包（内核独立下载维护，许可文本随包）'
+$kernelResidue = @(Get-ChildItem -Path $App -Recurse -File |
+    Where-Object { $_.Name -ieq 'mihomo.exe' -or $_.Name -ieq 'mihomo' -or $_.Name -ieq 'holdexar-mihomo.exe' -or $_.Name -ieq 'holdexar-mihomo' })
+if ($kernelResidue.Count -gt 0) {
+    throw ("产物内发现内核二进制残留，中止出包： " + (($kernelResidue | ForEach-Object { $_.FullName }) -join '；'))
 }
 
 Write-Output '[pack] 打包 zip'

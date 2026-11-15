@@ -265,7 +265,7 @@ def sanitize() -> None:
                 path.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
                 and path.name != MINI_SEED_BASENAME
             )
-            or path.name.lower() in ("mihomo.exe", "mihomo")
+            or path.name.lower() in ("mihomo.exe", "mihomo", "holdexar-mihomo.exe", "holdexar-mihomo")
         ):
             residue.append(path)
     for path in residue:
@@ -283,7 +283,7 @@ def sanitize() -> None:
                     p.suffix.lower() in (".log", ".db", ".sqlite3", ".db-wal", ".db-shm")
                     and p.name != MINI_SEED_BASENAME
                 )
-                or p.name.lower() in ("mihomo.exe", "mihomo")
+                or p.name.lower() in ("mihomo.exe", "mihomo", "holdexar-mihomo.exe", "holdexar-mihomo")
             )
         )
     ]
