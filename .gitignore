@@ -212,5 +212,6 @@ scripts/upload_cloud_packs.py
 # ── 工具会话残留（自动化 CLI 工作目录与构建缓存，不入库）──
 .playwright-cli/
 server/.vite/
+.mimosa/
 # ZCode 工具的本机排除清单（镜像 .gitignore，工具自动同步生成）
 /.zcodeignore
