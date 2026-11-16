@@ -286,6 +286,29 @@ async function deleteProviderNow() {
   }
 }
 
+/** 总开关与同页其他开关同口径：点击即落库（乐观更新，失败回弹并挂页头错误条）。
+    保存按钮仍负责上限/工具预算两处草稿，重复携带 enabled 幂等无害。 */
+const pilotSwitchSaving = ref(false)
+const pilotEnabledSwitch = computed({
+  get: () => pilotEnabled.value,
+  set: (on: boolean) => void togglePilotEnabled(on),
+})
+
+async function togglePilotEnabled(on: boolean) {
+  if (pilotSwitchSaving.value || pilotEnabled.value === on) return
+  const prev = pilotEnabled.value
+  pilotEnabled.value = on
+  pilotSwitchSaving.value = true
+  try {
+    await pilotApi.updateConfig({ enabled: on })
+  } catch (e) {
+    pilotEnabled.value = prev
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    pilotSwitchSaving.value = false
+  }
+}
+
 async function savePilotGlobal() {
   globalSaving.value = true
   try {
@@ -634,8 +657,8 @@ async function removeBackup(name: string) {
 }
 
 /* ── 应用更新 ──
- * 更新交互已全部收进全局更新弹窗（components/business/UpdateDialog.vue）与
- * 左上角气泡（UpdateBubble.vue），本页不设常驻更新面板。
+ * 更新交互已全部收进全局更新弹窗（components/business/UpdateDialog.vue），
+ * 常驻提示由灵动岛的更新活动承担，本页不设常驻更新面板。
  * 手动「检查更新」入口在「关于」页版本徽标旁。 */
 
 /* ── 更新行为开关 ──
@@ -1822,7 +1845,7 @@ onUnmounted(() => {
           <div class="pilot-form__row">
             <span class="pilot-form__label">{{ t('pilot.settings.enabled') }}</span>
             <div class="pilot-form__field pilot-form__field--inline">
-              <HlSwitch v-model="pilotEnabled" accent />
+              <HlSwitch v-model="pilotEnabledSwitch" accent :disabled="pilotSwitchSaving || globalSaving" />
               <span class="pilot-form__hint">
                 {{ t('pilot.model.current') }}：{{ pilotModel || t('pilot.model.none') }} · {{ activeProviderName }}
               </span>

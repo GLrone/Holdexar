@@ -339,19 +339,23 @@ function closeRegionPop() {
 }
 
 function chooseRegion(m: FamilyMember, code: string | number) {
+  const prev = { region: m.region, source: m.regionSource }
   m.region = String(code)
   m.regionSource = 'manual'
   closeRegionPop()
-  void persistRegion(m.steamid, m.region)
+  void persistRegion(m, prev)
 }
 
-/** 成员地区落库：只上报被改动的成员（后端按键合并；失败静默不扰交互）。
-    地区的自动判定（钱包/资料国家）在服务端完成，这里只落真手动值。 */
-async function persistRegion(sid: string, region: string | null) {
+/** 成员地区落库：只上报被改动的成员（后端按键合并；失败回滚显示值并提示，
+    避免界面停在与后端不一致的假地区）。地区的自动判定（钱包/资料国家）
+    在服务端完成，这里只落真手动值。 */
+async function persistRegion(m: FamilyMember, prev: { region: string | null; source: string | null }) {
   try {
-    await familyApi.saveMemberRegions({ [sid]: region ?? '' })
-  } catch {
-    /* 静默：下次切换重试 */
+    await familyApi.saveMemberRegions({ [m.steamid]: m.region ?? '' })
+  } catch (e) {
+    m.region = prev.region
+    m.regionSource = prev.source
+    message.error(e instanceof Error ? e.message : String(e))
   }
 }
 

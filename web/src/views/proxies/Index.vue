@@ -4,6 +4,7 @@ import { storeToRefs } from 'pinia'
 import { ElMessageBox } from 'element-plus'
 
 import {
+  invalidateGetCache,
   poolHealthApi,
   proxiesApi,
   proxypoolApi,
@@ -66,6 +67,9 @@ const batchInput = ref('')
 const singleInput = ref('')
 const installing = ref(false)
 const starting = ref(false)
+const strategySaving = ref(false)
+const stopping = ref(false)
+const togglingId = ref<number | null>(null)
 
 // 内核下载进度弹窗（保存订阅缺内核自动下载 / 手动安装共用）：
 // 进度数据与轮询在 proxyTasks store（跨页存活、灵动岛同步展示），弹窗是本页 UI
@@ -553,9 +557,23 @@ async function importPlainSubscription(sub: ProxySubscriptionItem) {
 
 // ─── 策略 / 节点池 ───
 
-function pickStrategy(card: StrategyCard) {
+async function pickStrategy(card: StrategyCard) {
+  // 只发策略字段：端口/开关有各自的保存口，混发会把「改端口」误判成
+  // 用户表达了策略偏好（后端据此永久关闭订阅导入的自动切换）
+  if (strategySaving.value) return
+  const prev = strategy.value.strategy
+  if (prev === card.value) return
   strategy.value.strategy = card.value
-  applyStrategy()
+  strategySaving.value = true
+  try {
+    await proxiesApi.setStrategy({ strategy: card.value })
+    message.success(t('proxies.strategy.updated'))
+  } catch (e) {
+    strategy.value.strategy = prev
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    strategySaving.value = false
+  }
 }
 
 /* ── 直连模式加速器建议弹窗 ──
@@ -607,16 +625,17 @@ watch(
 
 onUnmounted(() => window.clearTimeout(directNoticeTimer))
 
-async function applyStrategy() {
-  // 只发策略字段：端口/开关有各自的保存口，混发会把「改端口」误判成
-  // 用户表达了策略偏好（后端据此永久关闭订阅导入的自动切换）
-  try {
-    await proxiesApi.setStrategy({ strategy: strategy.value.strategy })
-    message.success(t('proxies.strategy.updated'))
-  } catch (e) {
-    message.error(e instanceof Error ? e.message : String(e))
-  }
-}
+/* 后端侧策略变更（订阅导入自动切换 / 另一端）：SSE 通知 → 本页即时重读，
+   卡片高亮不再停在旧值等刷新（写请求不清 GET 缓存，重读前先失效） */
+watch(
+  () => settingsStore.backendChangeTick,
+  () => {
+    if (settingsStore.backendChangeKeys.includes('proxy.strategy') && !strategySaving.value) {
+      invalidateGetCache('/proxies')
+      void load()
+    }
+  },
+)
 
 async function saveClashPortMode(mode: string | number) {
   const portMode = String(mode) as 'auto' | 'fixed'
@@ -705,9 +724,17 @@ async function addBatch() {
 }
 
 async function toggle(item: ProxyItem) {
-  await proxiesApi.update(item.id, { enabled: !item.enabled })
-  message.success(t(item.enabled ? 'proxies.node.disabled' : 'proxies.node.enabled'))
-  await load()
+  if (togglingId.value === item.id) return
+  togglingId.value = item.id
+  try {
+    await proxiesApi.update(item.id, { enabled: !item.enabled })
+    message.success(t(item.enabled ? 'proxies.node.disabled' : 'proxies.node.enabled'))
+    await load()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    togglingId.value = null
+  }
 }
 
 async function remove(item: ProxyItem) {
@@ -830,10 +857,18 @@ async function startClash() {
 }
 
 async function stopClash() {
-  await proxiesApi.clashStop()
-  proxyTasks.clearTest()
-  message.success(t('proxies.clash.hasStopped'))
-  clash.value = await proxiesApi.clashStatus()
+  if (stopping.value) return
+  stopping.value = true
+  try {
+    await proxiesApi.clashStop()
+    proxyTasks.clearTest()
+    message.success(t('proxies.clash.hasStopped'))
+    clash.value = await proxiesApi.clashStatus()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e))
+  } finally {
+    stopping.value = false
+  }
 }
 
 /** 启动检测：后端立即返回会话快照，探测在后台推进；面板展开看逐节点过程 */
@@ -1202,7 +1237,7 @@ async function loadHealthRuns() {
             <HlIcon v-if="!starting" name="play" />
             {{ t('proxies.clash.start') }}
           </HlButton>
-          <HlButton art="outline" tone="dark" size="sm" :disabled="!clash?.running" @click="stopClash">
+          <HlButton art="outline" tone="dark" size="sm" :disabled="!clash?.running || stopping" :loading="stopping" @click="stopClash">
             {{ t('proxies.clash.stop') }}
           </HlButton>
           <span class="proxyx-hint">{{
@@ -1444,7 +1479,7 @@ async function loadHealthRuns() {
               </td>
               <td class="mono">{{ p.latencyMs !== null ? `${p.latencyMs}ms` : '—' }}</td>
               <td>
-                <button class="pxswitch" :class="{ on: p.enabled }" @click="toggle(p)">
+                <button class="pxswitch" :class="{ on: p.enabled }" :disabled="togglingId === p.id" @click="toggle(p)">
                   <span />
                 </button>
               </td>
