@@ -245,3 +245,47 @@ async def test_export_blocked_when_locked(db, tmp_path):
     secretbox.clear_key_cache()
     with pytest.raises(SecretBoxError):
         await data_export.build_payload()
+
+
+# ── P0-2 回归：口令封装记录校验（恶意文件在昂贵派生前拒绝）──────────────
+
+
+def _valid_passphrase_record():
+    return keyring.wrap_passphrase(bytes(range(32)), "atk-test-passphrase")
+
+
+def test_validate_passphrase_record_accepts_current_format():
+    record = _valid_passphrase_record()
+    keyring._validate_passphrase_record(record)  # 不抛即通过
+    master = keyring._unwrap_passphrase(record, "atk-test-passphrase")
+    assert master == bytes(range(32))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda r: r["kdf"].update(name="argon2id"),
+        lambda r: r["kdf"].update(n=1 << 40),
+        lambda r: r["kdf"].update(n=1 << 23),
+        lambda r: r["kdf"].update(n=2),
+        lambda r: r["kdf"].update(n=(1 << 15) + 1),
+        lambda r: r["kdf"].update(n=-(1 << 15)),
+        lambda r: r["kdf"].update(r=0),
+        lambda r: r["kdf"].update(r=1 << 20),
+        lambda r: r["kdf"].update(p=0),
+        lambda r: (r["kdf"].update(r=1 << 29), r["kdf"].update(p=4)),
+        lambda r: r.update(salt="AAAA"),
+        lambda r: r.update(nonce="AAAA"),
+        lambda r: r.update(ct="AAAA"),
+        lambda r: r.update(v=2),
+        lambda r: r.pop("kdf"),
+        lambda r: r["kdf"].pop("n"),
+    ],
+)
+def test_malicious_passphrase_record_rejected_before_kdf(mutate):
+    record = _valid_passphrase_record()
+    mutate(record)
+    with pytest.raises(keyring.KeyringError):
+        keyring._validate_passphrase_record(record)
+    with pytest.raises(keyring.KeyringError):
+        keyring._unwrap_passphrase(record, "atk-test-passphrase")

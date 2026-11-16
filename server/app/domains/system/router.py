@@ -5,13 +5,15 @@ import asyncio
 import json
 import os
 import platform
+import re
 import sqlite3
 import sys
 import time
 from datetime import datetime
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -52,15 +54,35 @@ async def health(request: Request) -> dict:
     settings = get_settings()
     from app.core.scheduler import scheduler
 
-    data = {
+    from app.core import access as access_gate
+
+    # 无会话局域网对端只获判活最小面：版本号/更新窗口/内部快照全部收敛，
+    # 更新验收票据不公开面泄露（对端回环或持会话才见完整快照）。
+    if not (
+        access_gate.peer_is_loopback(request.scope)
+        or access_gate.request_authorized(request.scope)
+    ):
+        return {"status": "ok"}
+    data: dict = {
         "status": "ok",
         "app": settings.app_name,
         "version": settings.version,
-        "pid": os.getpid(),
-        "dataDir": str(settings.data_dir),
-        "executable": os.path.abspath(sys.executable),
         "schedulerReady": scheduler.running,
     }
+    # 内部快照（pid/数据目录/解释器路径）仅回环对端可见：桌面壳身份核对
+    # 依赖 dataDir。
+    if request.client is not None:
+        try:
+            addr = ip_address(request.client.host)
+        except ValueError:
+            addr = None
+        if addr is not None:
+            mapped = getattr(addr, "ipv4_mapped", None)
+            loopback = addr.is_loopback or (mapped is not None and mapped.is_loopback)
+            if loopback:
+                data["pid"] = os.getpid()
+                data["dataDir"] = str(settings.data_dir)
+                data["executable"] = os.path.abspath(sys.executable)
     attempt_id = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
     if attempt_id is not None:
         data["updateAttemptId"] = attempt_id
@@ -104,7 +126,12 @@ async def readiness(request: Request) -> dict:
 @router.post("/system/update-ready")
 async def update_page_ready(request: Request) -> dict:
     verification = getattr(request.app.state, "update_verification", {})
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求体无效")
     attempt = os.environ.get(f"{ENV_PREFIX}UPDATE_ATTEMPT_ID")
     if not attempt or not verification.get("protected") or body.get("attemptId") != attempt:
         raise HTTPException(status_code=409, detail="当前不在更新验收期间")
@@ -164,12 +191,17 @@ def _fetch_legacy_snapshot(src: Path) -> tuple[list[sqlite3.Row], list[sqlite3.R
 
 
 @router.post("/import-legacy")
-async def import_legacy(req: LegacyImport) -> dict:
+async def import_legacy(req: LegacyImport, request: Request) -> dict:
     """从旧爬虫 SQLite（steam_games / steam_prices）导入最新快照。
 
     current 表并入每 (appid, region) 的最新快照，history 落同一条；
-    旧库整表读取在线程池执行，不占事件循环。
+    旧库整表读取在线程池执行，不占事件循环。路径参数直通本机文件系统，
+    是主机文件触点——仅限本机回环对端（旧数据目录迁移是本机维护动作）。
     """
+    from app.core import access as access_gate
+
+    if not access_gate.peer_is_loopback(request.scope):
+        raise HTTPException(status_code=403, detail="该操作仅限本机执行")
     src = Path(req.path)
     if not src.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {src}")
@@ -335,10 +367,15 @@ async def security_unlock(req: SecurityUnlock) -> dict:
 
 
 @router.post("/system/security/lock")
-async def security_lock() -> dict:
-    """锁定：清空进程内主密钥（仅口令模式有意义）。"""
+async def security_lock(response: Response) -> dict:
+    """锁定：清空进程内主密钥（仅口令模式有意义），并轮换会话令牌——
+    锁定是安全动作，被窃会话的 Cookie 应一并失效。"""
+    from app.core import access as access_gate
+
     keyring.lock()
     secretbox.clear_key_cache()
+    access_gate.reset_token()
+    access_gate.issue_session(response)
     return {"ok": True, "security": keyring.status(get_settings().data_dir)}
 
 
@@ -502,6 +539,10 @@ class UpdateDownload(BaseModel):
     notes: str | None = None  # 更新说明（供换装后首次启动展示）
 
 
+# tag/asset 进 GitHub URL 路径段：白名单字符，堵路径注入（../、?、#）
+_RELEASE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
 @router.post("/system/update-download")
 async def update_download(req: UpdateDownload) -> dict:
     """下载 release zip → data/update-staging/ 解包校验；重启后由桌面壳换装。
@@ -511,6 +552,10 @@ async def update_download(req: UpdateDownload) -> dict:
     """
     from app.core import updater
 
+    if not _RELEASE_NAME_RE.fullmatch(req.tag) or (
+        req.asset and not _RELEASE_NAME_RE.fullmatch(req.asset)
+    ):
+        raise HTTPException(status_code=400, detail="更新标识包含非法字符")
     if not (req.sha256 or "").strip():
         raise HTTPException(status_code=400, detail="更新源未提供校验值，已拒绝下载")
     if not updater.mark_download_starting(req.tag, req.size):

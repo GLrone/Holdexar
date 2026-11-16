@@ -16,10 +16,11 @@
 from __future__ import annotations
 
 import hmac
+from ipaddress import ip_address
 import secrets
 from typing import Callable
 
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 SESSION_COOKIE = "holdexar_session"
@@ -111,8 +112,31 @@ def host_allowed(host: str) -> bool:
 
 
 def is_loopback_host(host: str) -> bool:
-    """Host 是否指向本机回环（默认模式唯一放行面）。"""
+    """Host 是否指向本机回环（Host 头形态；仅用于 dev 通道诊断性判定）。
+
+    信任判定禁止使用 Host——客户端可伪造（P0）。
+    """
     return _hostname(host) in {"127.0.0.1", "localhost", "::1"}
+
+
+def peer_is_loopback(scope: Scope) -> bool:
+    """对端地址是否回环：来源可信判定的唯一事实源（对端地址不可伪造）。
+
+    合成 scope（无 client 键，测试直调）按本机处理；IPv4-mapped 回环段
+    一并覆盖（::ffff:127.0.0.1 形态）。
+    """
+    client = scope.get("client")
+    if not client:
+        return True
+    addr_text = client[0] if isinstance(client, (list, tuple)) else str(client)
+    try:
+        addr = ip_address(addr_text)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        return mapped.is_loopback
+    return addr.is_loopback
 
 
 def set_extra_hosts(hosts) -> None:
@@ -127,7 +151,11 @@ def set_extra_hosts(hosts) -> None:
 
 
 def _hostname(host: str) -> str:
-    """取 Host 头的主机名部分（剥离端口；IPv6 字面量剥方括号）。"""
+    """取 Host 头的主机名部分（剥离端口；IPv6 字面量剥方括号）。
+
+    端口段必须全数字才剥——垃圾端口（`127.0.0.1:evil`）整串按主机名
+    对待，不会归一成白名单条目。
+    """
     host = (host or "").strip().lower()
     if not host:
         return ""
@@ -135,7 +163,10 @@ def _hostname(host: str) -> str:
         return host[1 : host.find("]")] if "]" in host else ""
     if host.count(":") > 1:
         return host  # 裸 IPv6 字面量（该形态本就不带端口）
-    return host.rsplit(":", 1)[0] if ":" in host else host
+    if ":" in host:
+        name, _, port = host.rpartition(":")
+        return name if port.isdigit() else host
+    return host
 
 
 def _is_api(path: str) -> bool:
@@ -174,11 +205,86 @@ def origin_allowed(scope: Scope) -> bool:
         return False
 
 
-class LocalAccessMiddleware:
-    """统一准入：所有 `/api/` 路径默认要求会话，公开路径显式白名单。
+def request_authorized(scope: Scope) -> bool:
+    """请求是否携带有效本地会话（路由层公开面分级用）。"""
+    return _authorized(scope)
 
-    非 API 路径（SPA 静态资源与页面回退）不拦——它们不含用户数据，
-    拦截只会让用户看到白屏；页面拿到会话后自会带着 Cookie 调 API。
+
+# 局域网无会话对端的唯一可见页面：自包含（零外部资源），脚本走一次性
+# nonce——全局 CSP 收紧后内联脚本只有这里放行。
+_LOCK_PAGE_TEMPLATE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Holdexar 访问锁定</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; background: #10141a; color: #dbe2ea;
+         font: 15px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  main { width: min(340px, 88vw); padding: 32px 28px; border-radius: 14px;
+         background: #171d26; box-shadow: 0 8px 30px rgba(0,0,0,.35); text-align: center; }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  p { margin: 0 0 18px; color: #8b97a5; }
+  input { width: 100%; box-sizing: border-box; padding: 10px 12px; border-radius: 8px;
+          border: 1px solid #2a3441; background: #10141a; color: #dbe2ea; margin-bottom: 12px; }
+  button { width: 100%; padding: 10px 0; border: 0; border-radius: 8px;
+           background: #3b82f6; color: #fff; font-size: 15px; cursor: pointer; }
+  #msg { min-height: 1.2em; margin: 12px 0 0; color: #f87171; white-space: pre-line; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Holdexar</h1>
+  <p>此设备需要访问密码才能继续</p>
+  <form id="f">
+    <input id="pw" type="password" autocomplete="current-password" placeholder="访问密码">
+    <button type="submit">解锁</button>
+  </form>
+  <p id="msg"></p>
+</main>
+<script nonce="__NONCE__">
+var msg = document.getElementById('msg');
+var pw = document.getElementById('pw');
+document.getElementById('f').addEventListener('submit', function (e) {
+  e.preventDefault();
+  fetch('/api/v1/session/unlock', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: pw.value })
+  }).then(function (r) {
+    if (r.ok) { location.replace('/'); return null; }
+    return r.json().catch(function () { return {}; });
+  }).then(function (d) {
+    if (d && d.detail) { msg.textContent = d.detail; }
+  }).catch(function () { msg.textContent = '服务暂不可用'; });
+});
+pw.focus();
+</script>
+</body>
+</html>
+"""
+
+
+async def _lock_page(scope: Scope, receive: Receive, send: Send) -> None:
+    nonce = secrets.token_urlsafe(16)
+    response = HTMLResponse(_LOCK_PAGE_TEMPLATE.replace("__NONCE__", nonce))
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'unsafe-inline'; "
+        f"script-src 'nonce-{nonce}'; connect-src 'self'; "
+        "object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    )
+    await response(scope, receive, send)
+
+
+class LocalAccessMiddleware:
+    """统一准入：闸覆盖全部路径，`/api/` 默认要求会话，公开路径显式白名单。
+
+    非 API 路径（SPA 静态资源与页面回退）不做「无闸放行」：对端回环
+    （本机同用户基线）或持会话才放行；局域网无会话对端只拿到内联
+    锁定页——静态资源与端点结构不再对外暴露（与 Go 侧 lockedpage 同型）。
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -190,17 +296,41 @@ class LocalAccessMiddleware:
             return
 
         path = scope.get("path", "")
-        if not _is_api(path):
-            await self.app(scope, receive, send)
-            return
 
         if not host_allowed(_header_value(scope, b"host")):
             response = JSONResponse({"detail": "请求来源不被信任"}, status_code=421)
             await response(scope, receive, send)
             return
 
+        # 默认模式（未开局域网）下对端必须回环：Host 头客户端可伪造，
+        # 伪造 Host: 127.0.0.1 的局域网请求在这里被对端地址拦截（P0）。
+        from app.core import lan_access
+
+        if not lan_access.is_enabled() and not peer_is_loopback(scope):
+            response = JSONResponse({"detail": "请求来源不被信任"}, status_code=421)
+            await response(scope, receive, send)
+            return
+
+        if not _is_api(path):
+            if peer_is_loopback(scope) or _authorized(scope):
+                await self.app(scope, receive, send)
+                return
+            if path in {"/", "/index.html"}:
+                await _lock_page(scope, receive, send)
+                return
+            response = JSONResponse({"detail": "需要本地会话"}, status_code=401)
+            await response(scope, receive, send)
+            return
+
+        # 预检请求只放行本机对端（开发态跨端口预检全部来自回环浏览器）；
+        # 无凭据局域网对端的 OPTIONS 不再先于会话闸短路，端点方法表
+        # 不构成无凭据探测通道。
         if scope["method"] == "OPTIONS":
-            await self.app(scope, receive, send)
+            if peer_is_loopback(scope) or _authorized(scope):
+                await self.app(scope, receive, send)
+                return
+            response = JSONResponse({"detail": "请求来源不被信任"}, status_code=403)
+            await response(scope, receive, send)
             return
 
         if not origin_allowed(scope):
@@ -257,6 +387,7 @@ __all__ = [
     "is_loopback_host",
     "origin_allowed",
     "issue_session",
+    "request_authorized",
     "reset_token",
     "session_token",
     "set_extra_hosts",

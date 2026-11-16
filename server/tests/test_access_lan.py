@@ -15,8 +15,8 @@ from httpx import ASGITransport, AsyncClient
 from app.core import access, lan_access
 from app.domains.system.router import router as system_router
 from app.domains.system.session_router import (
-    ensure_lan_password,
     reset_bootstrap,
+    resolve_lan_password_verifier,
     router as session_router,
 )
 
@@ -57,14 +57,15 @@ def _client(app: FastAPI, *, host: str = "127.0.0.1:28765") -> AsyncClient:
 
 
 def _enable_lan(monkeypatch, *, password: str | None = _TEST_PASSWORD):
-    """开启局域网模式并注入固定密码（DB 无关路径）。"""
+    """开启局域网模式并注入固定验证器（DB 无关路径；解锁走真实 PHC 校验）。"""
     lan_access.set_enabled(True)
     # 合成局域网地址与真实本机地址都入白名单，测试与真机两形态都覆盖
     access.set_extra_hosts([*lan_access.local_ips(), "192.168.1.5"])
     if password is not None:
+        phc = lan_access.hash_password(password)
         monkeypatch.setattr(
-            "app.domains.system.session_router.ensure_lan_password",
-            lambda: _async_of(password),
+            "app.domains.system.session_router.resolve_lan_password_verifier",
+            lambda: _async_of(phc),
         )
 
 
@@ -82,6 +83,63 @@ def test_default_mode_lan_host_still_rejected():
     assert asyncio.run(run()).status_code == 421
 
 
+def test_default_mode_rejects_non_loopback_peer():
+    """P0 回归：默认模式（未开局域网）下局域网对端伪造 Host: 127.0.0.1
+    也必须被对端判定拦截——Host 是客户端可控字段，不是信任事实源。"""
+    access.session_token()
+    app = _app()
+    client = AsyncClient(
+        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
+        base_url="http://127.0.0.1:28765",
+    )
+    async def run():
+        async with client:
+            return await client.get(
+                "/api/v1/health", headers={"Host": "127.0.0.1:28765"}
+            )
+    assert asyncio.run(run()).status_code == 421
+
+
+def test_dev_channel_peer_gated(monkeypatch):
+    """P0 回归：dev 会话通道按对端地址判定——局域网对端（伪造回环 Host）
+    404，回环对端 200（Vite 调试工作流不受影响）。"""
+    _enable_lan(monkeypatch)
+    app = _app()
+    async def run(client):
+        async with client:
+            return await client.get("/api/v1/session/dev")
+    lan_client = AsyncClient(
+        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
+        base_url="http://192.168.1.5:28765",
+    )
+    local_client = AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1:28765"
+    )
+    assert asyncio.run(run(lan_client)).status_code == 404
+    assert asyncio.run(run(local_client)).status_code == 200
+
+
+def test_health_remote_peer_minimal():
+    """P2 回归：health 内部快照（pid/数据目录/解释器路径）仅回环对端可见，
+    局域网对端只获判活最小面。"""
+    lan_access.set_enabled(True)
+    access.set_extra_hosts([*lan_access.local_ips(), "192.168.1.5"])
+    app = _app()
+    async def run(client):
+        async with client:
+            return (await client.get("/api/v1/health")).json()
+    remote = asyncio.run(run(AsyncClient(
+        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
+        base_url="http://192.168.1.5:28765",
+    )))
+    local = asyncio.run(run(AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://127.0.0.1:28765",
+    )))
+    assert "dataDir" not in remote and "pid" not in remote
+    assert remote.get("status") == "ok"
+    assert "dataDir" in local
+
+
 def test_default_mode_unlock_disabled():
     """默认模式：解锁入口不存在（发行版无自助通道语义保持）。"""
     async def run():
@@ -91,6 +149,31 @@ def test_default_mode_unlock_disabled():
                 "/api/v1/session/unlock", json={"password": _WRONG_PASSWORD}
             )
     assert asyncio.run(run()).status_code == 404
+
+
+def test_lan_state_never_echoes_password(monkeypatch):
+    """P0-1 回归：局域网访问密码原文永不进入设置响应（PHC 哈希 KV 同样
+    只暴露 has_password 布尔）。"""
+    from app.domains.settings import router as settings_router
+    from app.domains.settings import service as settings_service
+    from app.domains.settings.router import LanAccessState
+
+    phc = lan_access.hash_password(_TEST_PASSWORD)
+
+    async def fake_get_value(key, default=None):
+        return phc if key == settings_service.LAN_PASSWORD_HASH_KEY else default
+
+    async def fake_get_secret(key, default=None):
+        return default
+
+    monkeypatch.setattr("app.domains.settings.service.get_value", fake_get_value)
+    monkeypatch.setattr(
+        "app.domains.settings.service.get_secret_value", fake_get_secret
+    )
+    state = asyncio.run(settings_router._lan_state())
+    assert state.has_password is True
+    # 模型级回归：响应模型不存在明文密码字段（防止后续把回显加回来）
+    assert "password" not in LanAccessState.model_fields
 
 
 def test_lan_mode_allows_local_ip_host(monkeypatch):
@@ -158,6 +241,42 @@ def test_unlock_flow_wrong_password_then_limit(monkeypatch):
     assert protected == 200
 
 
+def test_unlock_lockout_escalation():
+    """P2 回归：锁窗过期后再穷举，锁时按连续轮次加倍（30s→120s，帽 600s）。"""
+    for _ in range(5):
+        lan_access.unlock_record_failure()
+    first = lan_access.unlock_locked_seconds()
+    assert 29 <= first <= 31  # 首轮 30s
+    for _ in range(5):
+        lan_access.unlock_record_failure()  # 锁窗内继续失败也计数
+    second = lan_access.unlock_locked_seconds()
+    assert second > first  # 升级轮：约 120s
+    lan_access.unlock_record_success()
+    assert lan_access.unlock_locked_seconds() == 0
+
+
+def test_unlock_non_ascii_password_roundtrip(monkeypatch):
+    """P2 回归：非 ASCII 口令的设置与解锁不再触发 TypeError 500——
+    比较统一 bytes 化；错误猜测 401 且计入限速（不再是限速失效双杀）。"""
+    _enable_lan(monkeypatch, password="口令测试-八字符")
+    async def run():
+        app = _app()
+        async with _client(app) as client:
+            wrong = await client.post(
+                "/api/v1/session/unlock", json={"password": "错密码-不是对的"}
+            )
+            wrong_code = wrong.status_code
+            await client.post("/api/v1/session/unlock", json={"password": "错密码-不是对的"})
+            lan_access.reset_unlock_state()
+            ok = await client.post(
+                "/api/v1/session/unlock", json={"password": "口令测试-八字符"}
+            )
+            return wrong_code, ok.status_code
+    wrong_code, ok_code = asyncio.run(run())
+    assert wrong_code == 401, "非 ASCII 错误口令应 401（修复前 TypeError→500）"
+    assert ok_code == 200
+
+
 def test_unlock_env_password_channel(monkeypatch):
     """无窗口通道：环境变量指定的密码直接生效。"""
     lan_access.set_enabled(True)
@@ -200,28 +319,148 @@ def test_host_helpers_normalize_host_header():
     assert not access.host_allowed("192.168.1.5:28765")
 
 
-def test_ensure_lan_password_generates_once(monkeypatch):
-    """密码解析：无 KV 无环境变量时生成并回读同值（monkeypatch 存取通道）。"""
-    monkeypatch.delenv(lan_access.ENV_ACCESS_PASSWORD, raising=False)
+# ── PHC 验证器与解析链（P0-1 终态：访问密码不可逆存储）────────────────────
+
+
+def _patch_resolver_store(monkeypatch) -> dict[str, str]:
+    """把 settings 服务的 KV 读写替换为进程内字典（DB 无关），返回字典。"""
+    from app.domains.settings import service as settings_service
+
     stored: dict[str, str] = {}
-    import app.domains.system.session_router as session_router_mod
+
+    async def fake_get_value(key, default=None):
+        return stored.get(key, default)
 
     async def fake_get_secret(key, default=None):
         return stored.get(key, default)
 
-    async def fake_set_values(values, *, secret_values=None):
-        stored.update(secret_values or {})
+    async def fake_set_value(key, value):
+        stored[key] = value
 
-    monkeypatch.setattr(
-        "app.domains.settings.service.get_secret_value", fake_get_secret
+    async def fake_delete_value(key):
+        stored.pop(key, None)
+
+    monkeypatch.setattr(settings_service, "get_value", fake_get_value)
+    monkeypatch.setattr(settings_service, "get_secret_value", fake_get_secret)
+    monkeypatch.setattr(settings_service, "set_value", fake_set_value)
+    monkeypatch.setattr(settings_service, "delete_value", fake_delete_value)
+    return stored
+
+
+def test_phc_hash_verify_roundtrip():
+    """PHC 验证器：正确口令通过、错误口令拒绝、参数自包含于串内。"""
+    phc = lan_access.hash_password("口令-测试-12345678")
+    assert phc.startswith("$scrypt$")
+    assert lan_access.verify_password("口令-测试-12345678", phc)
+    assert not lan_access.verify_password("口令-测试-12345679", phc)
+    assert not lan_access.verify_password("", phc)
+
+
+def test_phc_salt_unique_and_params_in_bounds():
+    """同口令两次哈希盐不同（防彩虹表）；参数内嵌且落在边界白名单内。"""
+    a = lan_access.hash_password("same-password-8")
+    b = lan_access.hash_password("same-password-8")
+    assert a != b
+    for phc in (a, b):
+        parts = phc.split("$")
+        assert parts[1] == "scrypt"
+        n, r, p = (int(x) for x in parts[2].split(","))
+        assert n % 2 == 0 and 1 << 12 <= n <= 1 << 22
+        assert 1 <= r <= 64 and 1 <= p <= 8
+
+
+def test_phc_verify_rejects_tampered_verifier():
+    """篡改验证器（N 抬出边界 / 坏格式 / 短哈希）一律失败，不触发大内存重算。"""
+    phc = lan_access.hash_password("tamper-check-12345")
+    assert not lan_access.verify_password("tamper-check-12345", "not-a-phc")
+    assert not lan_access.verify_password(
+        "tamper-check-12345", "$scrypt$1,1,1$AAAA$AAAA"
     )
-    monkeypatch.setattr(
-        "app.domains.settings.service.set_values", fake_set_values
-    )
+    evil = phc.replace(str(1 << 15), str(1 << 30), 1)  # N 越界
+    assert not lan_access.verify_password("tamper-check-12345", evil)
+
+
+def test_resolve_verifier_prefers_hash_kv(monkeypatch):
+    """验证器解析：哈希 KV 存在时直接采用，不读旧密文。"""
+    monkeypatch.delenv(lan_access.ENV_ACCESS_PASSWORD, raising=False)
+    stored = _patch_resolver_store(monkeypatch)
+    phc = lan_access.hash_password(_TEST_PASSWORD)
+    stored["access.lan_password_hash"] = phc
+
     async def run():
-        first = await session_router_mod.ensure_lan_password()
-        second = await session_router_mod.ensure_lan_password()
-        return first, second
-    first, second = asyncio.run(run())
-    assert first == second
-    assert len(first) >= 8
+        return await resolve_lan_password_verifier()
+
+    assert asyncio.run(run()) == phc
+
+
+def test_resolve_verifier_migrates_legacy_secret(monkeypatch):
+    """一次性迁移：旧可逆密文解密→重哈希落库→清密文；迁移后验证器校验
+    旧口令通过。"""
+    monkeypatch.delenv(lan_access.ENV_ACCESS_PASSWORD, raising=False)
+    stored = _patch_resolver_store(monkeypatch)
+    stored["access.lan_password"] = "legacy-pw-123456"  # 模拟已解密明文
+
+    async def run():
+        return await resolve_lan_password_verifier()
+
+    verifier = asyncio.run(run())
+    assert verifier.startswith("$scrypt$")
+    assert lan_access.verify_password("legacy-pw-123456", verifier)
+    assert "access.lan_password" not in stored  # 明文事实已清账
+    assert stored["access.lan_password_hash"] == verifier
+
+
+def test_resolve_verifier_user_hash_wins(monkeypatch):
+    """用户设置口令恒优先于环境口令（界面改密即吊销运维通道，不静默遮蔽）。"""
+    monkeypatch.setenv(lan_access.ENV_ACCESS_PASSWORD, _ENV_PASSWORD)
+    stored = _patch_resolver_store(monkeypatch)
+    stored["access.lan_password_hash"] = lan_access.hash_password(_TEST_PASSWORD)
+
+    async def run():
+        return await resolve_lan_password_verifier()
+
+    verifier = asyncio.run(run())
+    assert lan_access.verify_password(_TEST_PASSWORD, verifier)
+    assert not lan_access.verify_password(_ENV_PASSWORD, verifier)
+
+
+def test_resolve_verifier_env_fallback(monkeypatch):
+    """库内无用户口令时环境口令兜底（无窗口运维场景保持可用）。"""
+    monkeypatch.setenv(lan_access.ENV_ACCESS_PASSWORD, _ENV_PASSWORD)
+    _patch_resolver_store(monkeypatch)
+
+    async def run():
+        return await resolve_lan_password_verifier()
+
+    verifier = asyncio.run(run())
+    assert lan_access.verify_password(_ENV_PASSWORD, verifier)
+
+
+def test_resolve_verifier_empty_when_unset(monkeypatch):
+    """库内无哈希无旧密文：返回空串（解锁入口据此明确拒绝）。"""
+    monkeypatch.delenv(lan_access.ENV_ACCESS_PASSWORD, raising=False)
+    _patch_resolver_store(monkeypatch)
+
+    async def run():
+        return await resolve_lan_password_verifier()
+
+    assert asyncio.run(run()) == ""
+
+
+def test_unlock_without_password_rejected(monkeypatch):
+    """未设访问密码：解锁 401 且计入限速，不产生会话。"""
+    _enable_lan(monkeypatch, password=None)
+    monkeypatch.setattr(
+        "app.domains.system.session_router.resolve_lan_password_verifier",
+        lambda: _async_of(""),
+    )
+
+    async def run():
+        app = _app()
+        async with _client(app) as client:
+            r = await client.post(
+                "/api/v1/session/unlock", json={"password": _WRONG_PASSWORD}
+            )
+            return r.status_code
+
+    assert asyncio.run(run()) == 401

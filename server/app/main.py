@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -109,7 +110,6 @@ async def _init_lan_access() -> None:
     失败按关闭处理（fail-closed），不影响正常启动。
     """
     from app.core import lan_access
-    from app.domains.system.session_router import ensure_lan_password
 
     try:
         from app.domains.settings import service as settings_service
@@ -120,7 +120,8 @@ async def _init_lan_access() -> None:
         lan_mode = lan_access.set_enabled(kv_enabled)
         lan_access.refresh_extra_hosts()
         if lan_mode:
-            await ensure_lan_password()
+            # 访问密码不启动期自动生成：PHC 验证器随设置/环境口令落库，
+            # 未设置时解锁入口明确拒绝（服务端不掌握任何可复现明文）
             log_event(logger, "局域网访问模式已开启，本机地址已加入访问白名单")
     except Exception as error:
         lan_access.set_enabled(False)
@@ -284,7 +285,17 @@ def create_app() -> FastAPI:
     if warning:
         log_event(logger, warning, level=logging.WARNING)
 
-    app = FastAPI(title=settings.app_name, version=settings.version, lifespan=lifespan)
+    # 文档面（/docs /redoc /openapi.json）打包态整体禁用：API 地图对
+    # 局域网攻击者是定向构造的地图（P1 审计）；源码态保留调试能力。
+    _packaged = bool(getattr(sys, "frozen", False))
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.version,
+        lifespan=lifespan,
+        docs_url=None if _packaged else "/docs",
+        redoc_url=None if _packaged else "/redoc",
+        openapi_url=None if _packaged else "/openapi.json",
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -319,16 +330,21 @@ def create_app() -> FastAPI:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
-        # CSP：页面只加载同源资源；内联样式与脚本是当前构建产物的现实
-        # （Vue 注入的 style 标签、index.html 的内联引导），这里放开
-        # unsafe-inline 但禁止一切外部来源与 object/embed。
+        # CSP：页面只加载同源资源；内联样式是 Vue 运行时的现实，脚本无
+        # 内联形态（构建产物 index.html 仅外链 module），锁定页内联脚本走
+        # 一次性 nonce（access._lock_page 自带 CSP 头）。禁止一切外部脚本
+        # 来源与 object/embed。
+        # img-src 白名单含白拿卡实际图片域族：Epic 主/视频 CDN、unrealengine
+        # 素材、GamerPower 移动白拿缩略图、Epic 大陆边缘节点重定向落点。
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
             "img-src 'self' data: https://cdn.cloudflare.steamstatic.com "
-            "https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com; "
+            "https://shared.akamai.steamstatic.com https://store.fastly.steamstatic.com "
+            "https://*.epicgames.com https://*.epicgamescdn.com https://*.unrealengine.com "
+            "https://*.gamerpower.com https://*.file.myqcloud.com; "
             "style-src 'self' 'unsafe-inline'; "
-            "script-src 'self' 'unsafe-inline'; "
+            "script-src 'self'; "
             "connect-src 'self'; "
             "frame-ancestors 'none'; "
             "object-src 'none'; "

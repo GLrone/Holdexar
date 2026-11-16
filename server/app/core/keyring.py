@@ -24,6 +24,7 @@ import json
 import logging
 import secrets
 import sys
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,20 @@ _SCRYPT_DKLEN = _KEY_BYTES
 _SCRYPT_MAXMEM = 64 * 1024 * 1024
 _SALT_BYTES = 16
 _NONCE_BYTES = 12
+# KDF 参数边界（P0-2：记录来自不可信文件，昂贵派生前全量校验）。age 以
+# log2(N)≤22 硬顶限制不可信文件的解锁工作量；内存帽取 256MiB 保守上限。
+# 与 Go 侧 secretbox.keyring 校验逐条一致。
+_KDF_N_MIN = 1 << 12
+_KDF_N_MAX = 1 << 22
+_KDF_R_MAX = 64
+_KDF_P_MAX = 8
+_KDF_MEM_LIMIT = 256 * 1024 * 1024
+_GCM_TAG_BYTES = 16
 
 # DPAPI 附加熵（第二因素）：同一 blob 即使被别的进程拿到也无法在白盒外解封
+# 口令派生串行化：scrypt 释放 GIL，并发解锁会叠加峰值内存
+_SCRYPT_LOCK = threading.Lock()
+
 _DPAPI_ENTROPY = b"holdexar:keyring:dpapi:v1"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
@@ -246,24 +259,71 @@ def wrap_passphrase(master: bytes, passphrase: str) -> dict:
     }
 
 
-def _unwrap_passphrase(record: dict, passphrase: str) -> bytes | None:
-    """口令封装 → 主密钥；口令不正确返回 None。"""
-    kdf = record.get("kdf") if isinstance(record.get("kdf"), dict) else {}
+def _validate_passphrase_record(record: dict) -> None:
+    """口令封装记录校验：算法白名单、KDF 参数边界、字段长度。
+
+    非法记录在昂贵派生前拒绝（恶意大 N 曾可致解锁内存耗尽）；参数缺失
+    不做默认降级。与 Go 侧 secretbox.keyring 校验逐条一致。
+    """
+    if record.get("v") != _FILE_VERSION:
+        raise KeyringError("密钥记录版本非法")
+    if record.get("mode") != MODE_PASSPHRASE:
+        raise KeyringError("密钥记录模式非法")
+    kdf = record.get("kdf")
+    if not isinstance(kdf, dict):
+        raise KeyringError("密钥记录缺少 KDF 参数")
+    if kdf.get("name") != "scrypt":
+        raise KeyringError("KDF 算法非法")
+    try:
+        n = int(kdf["n"])
+        r = int(kdf["r"])
+        p = int(kdf["p"])
+        dklen = int(kdf["dklen"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise KeyringError("密钥记录 KDF 参数不完整") from exc
+    if n % 2 or not _KDF_N_MIN <= n <= _KDF_N_MAX:
+        raise KeyringError(f"KDF 参数 N 越界：{n}")
+    if not 1 <= r <= _KDF_R_MAX or not 1 <= p <= _KDF_P_MAX:
+        raise KeyringError(f"KDF 参数 r/p 越界：{r}/{p}")
+    if r * p >= 1 << 30 or 128 * n * r > _KDF_MEM_LIMIT:
+        raise KeyringError(f"KDF 参数组合超出内存帽：{n}/{r}/{p}")
+    if dklen != _KEY_BYTES:
+        raise KeyringError(f"KDF 派生长度非法：{dklen}")
     try:
         salt = _unb64(str(record["salt"]))
         nonce = _unb64(str(record["nonce"]))
         sealed = _unb64(str(record["ct"]))
     except (KeyError, ValueError) as exc:
-        raise KeyringError("口令密钥记录不完整") from exc
-    kek = hashlib.scrypt(
-        passphrase.encode("utf-8"),
-        salt=salt,
-        n=int(kdf.get("n", _SCRYPT_N)),
-        r=int(kdf.get("r", _SCRYPT_R)),
-        p=int(kdf.get("p", _SCRYPT_P)),
-        dklen=int(kdf.get("dklen", _SCRYPT_DKLEN)),
-        maxmem=_SCRYPT_MAXMEM,
-    )
+        raise KeyringError("密钥记录字段编码非法") from exc
+    if len(salt) != _SALT_BYTES:
+        raise KeyringError(f"盐长度非法：{len(salt)}")
+    if len(nonce) != _NONCE_BYTES:
+        raise KeyringError(f"Nonce 长度非法：{len(nonce)}")
+    if len(sealed) < _NONCE_BYTES + _GCM_TAG_BYTES + 1:
+        raise KeyringError("密文长度非法")
+
+
+def _unwrap_passphrase(record: dict, passphrase: str) -> bytes | None:
+    """口令封装 → 主密钥；口令不正确返回 None。
+
+    记录先经全量校验（廉价拒绝），再进入昂贵派生；maxmem 按校验后的
+    内存帽下发（合法参数组合必然 ≤ 256MiB）。
+    """
+    _validate_passphrase_record(record)
+    kdf = record["kdf"]
+    salt = _unb64(str(record["salt"]))
+    nonce = _unb64(str(record["nonce"]))
+    sealed = _unb64(str(record["ct"]))
+    with _SCRYPT_LOCK:
+        kek = hashlib.scrypt(
+            passphrase.encode("utf-8"),
+            salt=salt,
+            n=int(kdf["n"]),
+            r=int(kdf["r"]),
+            p=int(kdf["p"]),
+            dklen=int(kdf["dklen"]),
+            maxmem=_KDF_MEM_LIMIT,
+        )
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
