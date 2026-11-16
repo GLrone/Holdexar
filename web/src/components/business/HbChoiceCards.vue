@@ -17,7 +17,7 @@ import { metadataApi, type HbChoiceGame } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { useI18n, type MessageKey } from '@/locales'
 import { useOwnershipStore, type OwnershipInfo, type OwnershipType } from '@/stores/ownership'
-import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
+import { HlAvatar, HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -31,6 +31,31 @@ const skipUrl = ref('')
 const state = ref<'loading' | 'ok' | 'failed'>('loading')
 /** 手动强刷进行中（按钮转圈防重入） */
 const refreshing = ref(false)
+/** 最近一次手动刷新的失败原因（成功即清空；空态卡片与头部下沿各可呈现） */
+const refreshNote = ref('')
+
+/** 非 Steam 平台标识 → 本地化名；未知平台回传原值（新平台无需改码即显示） */
+const PLATFORM_LABEL_KEYS: Record<string, MessageKey> = {
+  steam: 'hbChoice.platform.steam',
+  blizzard: 'hbChoice.platform.blizzard',
+  epic: 'hbChoice.platform.epic',
+  ubisoft: 'hbChoice.platform.ubisoft',
+  gog: 'hbChoice.platform.gog',
+  origin: 'hbChoice.platform.origin',
+  ea: 'hbChoice.platform.ea',
+  itch: 'hbChoice.platform.itch',
+  'drm-free': 'hbChoice.platform.drm-free',
+}
+
+function platformLabel(platform: string): string {
+  const key = PLATFORM_LABEL_KEYS[platform]
+  return key ? t(key) : platform
+}
+
+/** 非 Steam 平台游戏：appid=0，无站内详情页，不参与归属/价格体系 */
+function isPlatformGame(g: HbChoiceGame): boolean {
+  return Boolean(g.platform) && g.appid === 0
+}
 
 async function load() {
   try {
@@ -41,8 +66,11 @@ async function load() {
       monthUrl.value = res.monthUrl
       skipUrl.value = res.skipUrl
       state.value = 'ok'
-      // 归属徽章按需取数：同帧合并为一次批量请求（与游戏库同 store 缓存）
-      games.value.forEach((g) => ownershipStore.ensure(g.appid))
+      // 归属徽章按需取数：同帧合并为一次批量请求（与游戏库同 store 缓存）；
+      // 非 Steam 平台游戏（appid=0）无归属体系，跳过
+      games.value.forEach((g) => {
+        if (g.appid > 0) ownershipStore.ensure(g.appid)
+      })
     } else if (games.value.length === 0) {
       state.value = 'failed'
     }
@@ -52,29 +80,28 @@ async function load() {
 }
 
 /** 手动强刷：强制重打标后重读清单（空态卡片的恢复入口） */
+/** 手动强刷：强制重打标后重读清单（空态卡片的恢复入口）。失败必须可见，
+ *  静默吞掉会让「点了没反应」被当成假刷新。 */
 async function refresh() {
   if (refreshing.value) return
   refreshing.value = true
+  refreshNote.value = ''
   try {
-    await metadataApi.hbRefresh()
+    const res = await metadataApi.hbRefresh()
+    if (!res.ok) refreshNote.value = res.error || t('hbChoice.refreshFailed')
   } catch {
-    // 强刷失败保持原状态，清单重读不受阻
+    refreshNote.value = t('hbChoice.refreshFailed')
   }
   await load()
   refreshing.value = false
 }
 
-// ─── 归属徽章（与游戏库 status-badge 同源词条/配色；存 key 渲染期 t()）───
+// ─── 归属徽章（与游戏库 status-badge 同源词条；存 key 渲染期 t()）───
 
 const STATUS_BADGE_KEYS: Record<OwnershipType, MessageKey> = {
   owned: 'gameCard.status.owned',
   family: 'gameCard.status.family',
   wishlist: 'gameCard.status.wishlist',
-}
-const STATUS_TITLE_KEYS: Record<OwnershipType, MessageKey> = {
-  owned: 'gameCard.status.ownedTitle',
-  family: 'gameCard.status.familyTitle',
-  wishlist: 'gameCard.status.wishlistTitle',
 }
 
 function ownershipOf(g: HbChoiceGame): OwnershipInfo | null {
@@ -89,10 +116,52 @@ function badgeText(o: OwnershipInfo): string {
   return t(STATUS_BADGE_KEYS[o.type])
 }
 
-/** 悬停提示：归属维度 + 账号名（仪表盘轻量形态，native title） */
-function badgeTip(o: OwnershipInfo): string {
-  const owners = o.owners.length > 0 ? o.owners.join('、') : t('gameCard.owner.unknown')
-  return `${t(STATUS_TITLE_KEYS[o.type])}：${owners}`
+/** 悬停提示：归属维度 + 账号名（沿用游戏商店归属弹窗视觉，Teleport 落 body） */
+const STATUS_META: Record<OwnershipType, { titleKey: MessageKey; color: string; border: string }> = {
+  owned: { titleKey: 'gameCard.status.ownedTitle', color: 'var(--success)', border: 'var(--success-a40)' },
+  family: { titleKey: 'gameCard.status.familyTitle', color: 'var(--purple)', border: 'var(--purple-a30)' },
+  wishlist: { titleKey: 'gameCard.status.wishlistTitle', color: 'var(--accent)', border: 'var(--accent-a40)' },
+}
+
+/** 归属弹窗状态（悬停归属徽章弹出，账号行 + 头像；离开 120ms 延迟收场） */
+const statusTip = ref<{
+  type: OwnershipType
+  owners: string[]
+  avatars: string[]
+  left: number
+  top: number
+} | null>(null)
+let statusTipTimer: number | null = null
+
+function statusTipEnter(e: MouseEvent, g: HbChoiceGame) {
+  const ownership = ownershipOf(g)
+  if (!ownership) return
+  if (statusTipTimer !== null) {
+    window.clearTimeout(statusTipTimer)
+    statusTipTimer = null
+  }
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  let left = rect.left
+  if (left + 160 > window.innerWidth) left = window.innerWidth - 170
+  const owners = ownership.owners
+  statusTip.value = {
+    type: ownership.type,
+    owners: owners.length > 0 ? owners : [t('gameCard.owner.unknown')],
+    avatars:
+      owners.length > 0
+        ? owners.map((_, i) => ownership.ownerAvatars?.[i] || '')
+        : [''],
+    left: Math.max(8, left),
+    top: rect.bottom + 6,
+  }
+}
+
+function statusTipLeave() {
+  if (statusTipTimer !== null) window.clearTimeout(statusTipTimer)
+  statusTipTimer = window.setTimeout(() => {
+    statusTip.value = null
+    statusTipTimer = null
+  }, 120)
 }
 
 const HOUR_MS = 3_600_000
@@ -156,22 +225,24 @@ onBeforeUnmount(() => {
     <div v-else class="hb-choice__grid">
       <div
         v-for="g in games"
-        :key="g.appid"
+        :key="g.appid || `p-${g.name}`"
         class="hb-card"
-        :class="ownershipOf(g)?.type"
-        :title="g.name"
-        @click="router.push(`/game/${g.appid}`)"
+        :class="[ownershipOf(g)?.type, { 'hb-card--external': isPlatformGame(g) }]"
+        @click="isPlatformGame(g) || router.push(`/game/${g.appid}`)"
       >
         <div class="hb-card__media">
           <HlImg class="hb-card__img" :src="g.headerImage" :alt="g.name" loading="lazy" />
           <span v-if="g.discount > 0" class="hb-card__off">-{{ g.discount }}%</span>
-          <!-- 归属徽章（已拥有/家庭共享/愿望单）：与游戏库 status-badge 同源，
-               悬停 native title 给归属账号 -->
+          <!-- 非 Steam 平台徽章：Battle.net/Epic/育碧…（后端下发原值，本地化渲染） -->
+          <span v-if="g.platform" class="hb-card__platform">{{ platformLabel(g.platform) }}</span>
+          <!-- 归属徽章（已拥有/家庭共享/愿望单）：沿用游戏商店归属弹窗
+               （Teleport 账号行 + 头像），不再走 native title 气泡 -->
           <span
             v-if="ownershipOf(g)"
             class="hb-card__status"
             :class="ownershipOf(g)!.type"
-            :title="badgeTip(ownershipOf(g)!)"
+            @mouseenter="statusTipEnter($event, g)"
+            @mouseleave="statusTipLeave()"
           >{{ badgeText(ownershipOf(g)!) }}</span>
         </div>
         <div class="hb-card__body">
@@ -184,11 +255,38 @@ onBeforeUnmount(() => {
                 class="hb-card__orig"
               >{{ formatCnyFen(g.originalPriceFen) }}</span>
             </template>
+            <template v-else-if="g.originalPriceFen != null">
+              <span class="hb-card__now">{{ formatCnyFen(g.originalPriceFen) }}</span>
+            </template>
             <span v-else class="hb-card__now hb-card__now--none">—</span>
           </span>
         </div>
       </div>
     </div>
+    <p v-if="refreshNote" class="hb-choice__note">{{ refreshNote }}</p>
+
+    <!-- 归属弹窗（沿用游戏商店 cf-status-tip 同款视觉与全局样式） -->
+    <Teleport to="body">
+      <div
+        v-if="statusTip"
+        class="cf-status-tip"
+        :style="{ left: statusTip.left + 'px', top: statusTip.top + 'px', borderColor: STATUS_META[statusTip.type].border }"
+      >
+        <div class="cf-status-tip__title" :style="{ color: STATUS_META[statusTip.type].color }">
+          {{ t(STATUS_META[statusTip.type].titleKey) }}
+        </div>
+        <div class="cf-status-tip__list">
+          <div
+            v-for="(name, i) in statusTip.owners"
+            :key="`${name}-${i}`"
+            class="cf-status-tip__row"
+          >
+            <HlAvatar :src="statusTip.avatars[i]" :name="name" size="sm" square />
+            <span class="cf-status-tip__name">{{ name }}</span>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -219,6 +317,13 @@ onBeforeUnmount(() => {
   display: block;
   width: 18px;
   height: 18px;
+}
+
+.hb-choice__note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
 }
 
 /* 当月标签（后端下发的事实数据，非界面文案） */
@@ -343,8 +448,34 @@ onBeforeUnmount(() => {
   letter-spacing: 0.04em;
 }
 
-/* 归属徽章（右上角，与左上折扣徽章对称）：配色口径同游戏库 status-badge
-   （owned=绿 / family=紫 / wishlist=品牌蓝），令牌跟随双主题 */
+/* 非 Steam 平台徽章（右上角；归属徽章存在时顺移避让）：实底深墨 + 白字，
+   封面上任何主题都保持可读 */
+.hb-card__platform {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--ink-on-fill);
+  color: var(--text-on-fill);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.hb-card__status ~ .hb-card__platform,
+.hb-card__platform ~ .hb-card__status {
+  top: 34px;
+}
+
+/* 非 Steam 平台游戏：无站内详情页，卡片不可点击进入 */
+.hb-card--external {
+  cursor: default;
+}
+
+/* 归属徽章（右上角，与左上折扣徽章对称）：实底语义色 + on-accent 对比字
+   （亮色主题白字、暗色主题深墨），封面上不再用透底彩字 */
 .hb-card__status {
   position: absolute;
   top: 8px;
@@ -355,21 +486,19 @@ onBeforeUnmount(() => {
   font-size: 11px;
   font-weight: 700;
   cursor: help;
+  color: var(--on-accent);
 }
 
 .hb-card__status.owned {
-  background: var(--success-a15);
-  color: var(--success);
+  background: var(--success);
 }
 
 .hb-card__status.family {
-  background: var(--purple-a15);
-  color: var(--purple);
+  background: var(--purple);
 }
 
 .hb-card__status.wishlist {
-  background: var(--accent-a15);
-  color: var(--accent);
+  background: var(--accent);
 }
 
 .hb-card__body {

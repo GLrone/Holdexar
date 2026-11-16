@@ -7,9 +7,19 @@ const hbChoice = {
   'hbChoice.title': 'Humble Choice',
   'hbChoice.refresh': 'Refresh',
   'hbChoice.refreshing': 'Refreshing…',
+  'hbChoice.refreshFailed': 'Refresh did not complete',
   'hbChoice.goMonth': 'Open bundle',
   'hbChoice.skip': 'Skip month',
   'hbChoice.empty': 'This month’s bundle has not been synced yet',
+  'hbChoice.platform.steam': 'Steam',
+  'hbChoice.platform.blizzard': 'Battle.net',
+  'hbChoice.platform.epic': 'Epic',
+  'hbChoice.platform.ubisoft': 'Ubisoft',
+  'hbChoice.platform.gog': 'GOG',
+  'hbChoice.platform.origin': 'Origin',
+  'hbChoice.platform.ea': 'EA App',
+  'hbChoice.platform.itch': 'itch.io',
+  'hbChoice.platform.drm-free': 'DRM-free',
 } as const
 
 export default hbChoice

@@ -14,6 +14,7 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.section.favImport': 'Favorites import',
   'crawl.section.owned': 'Owned games crawl',
   'crawl.section.jobs': 'Job history',
+  'crawl.section.queue': 'Queue composition',
 
   /* Start a crawl */
   'crawl.start.desc':
@@ -193,6 +194,30 @@ const crawl: Partial<Record<MessageKey, string>> = {
   'crawl.kind.specialsBackfill': 'Specials backfill',
   'crawl.kind.comingsoonBackfill': 'Coming soon backfill',
   'crawl.kind.discounts': 'Discount queue',
+
+  /* Queue composition card (flowing-lines view). Data source = GET
+     /crawl/queue-specs (next-round composition in queueing order); the
+     specials tail has no independent switch (it follows the catalog layer).
+     Disabled segments render grey. */
+  'crawl.queue.desc':
+    'Each source is one crawl queue; its switch decides whether it runs with the next price refresh. Disabled queues render grey and changes take effect next round.',
+  'crawl.queue.seg.missing': 'Missing backfill',
+  'crawl.queue.seg.missingDesc': 'Regions that failed last time, retried automatically',
+  'crawl.queue.seg.pool': 'Watched & monitored',
+  'crawl.queue.seg.poolDesc': 'Wishlist, starred and manually added games',
+  'crawl.queue.seg.discounts': 'Discount board',
+  'crawl.queue.seg.discountsDesc': 'Full Steam specials board (direct-connect mode only)',
+  'crawl.queue.seg.catalog': 'Library catalog',
+  'crawl.queue.seg.catalogDesc': 'Catalogued games you do not follow',
+  'crawl.queue.seg.specials': 'Board newcomers',
+  'crawl.queue.seg.specialsDesc': 'New titles on the boards, not yet in the library',
+  'crawl.queue.followCatalog': 'Follows catalog',
+  'crawl.queue.poolOffWarn': 'When off, games you follow will not refresh prices automatically',
+  'crawl.queue.total': 'Task queue',
+  'crawl.queue.stateRunning': 'Updating · crawling in numbered order',
+  'crawl.queue.stateIdle': 'Idle · the order above is what the next round will crawl',
+  'crawl.queue.emptyAll': 'All queues are off — price updates would have nothing to crawl',
+  'crawl.queue.savedNextRound': 'Saved — takes effect next round',
 }
 
 export default crawl

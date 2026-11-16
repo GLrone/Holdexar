@@ -13,6 +13,7 @@ const crawl = {
   'crawl.section.favImport': '收藏列表导入',
   'crawl.section.owned': '已购游戏抓取',
   'crawl.section.jobs': '任务记录',
+  'crawl.section.queue': '队列组成',
 
   /* ── 启动爬取 ── */
   'crawl.start.desc':
@@ -191,6 +192,29 @@ const crawl = {
   'crawl.kind.specialsBackfill': '特惠榜回补',
   'crawl.kind.comingsoonBackfill': '即将推出回补',
   'crawl.kind.discounts': '折扣队列',
+
+  /* ── 任务队列组成（流线卡）──
+     数据源唯一 = GET /crawl/queue-specs（下轮预期组成，组队顺序即返回顺序）；
+     特惠榜尾段无独立开关（跟随目录层）。停用态 = 灰色框。 */
+  'crawl.queue.desc':
+    '每个来源是一个爬取队列，开关决定它是否随下一轮价格更新一起执行；停用的队列显示为灰色，改动从下一轮生效。',
+  'crawl.queue.seg.missing': '欠账补抓',
+  'crawl.queue.seg.missingDesc': '上次没抓成功的地区，自动补齐',
+  'crawl.queue.seg.pool': '关注与监控',
+  'crawl.queue.seg.poolDesc': '愿望单、星标关注与手动加入监控的游戏',
+  'crawl.queue.seg.discounts': '折扣榜单',
+  'crawl.queue.seg.discountsDesc': 'Steam 特惠榜全量（仅直连模式出现）',
+  'crawl.queue.seg.catalog': '游戏库目录',
+  'crawl.queue.seg.catalogDesc': '在库但未关注的大盘子',
+  'crawl.queue.seg.specials': '特惠榜新面孔',
+  'crawl.queue.seg.specialsDesc': '榜单里新出现、还没入库的游戏',
+  'crawl.queue.followCatalog': '跟随目录层',
+  'crawl.queue.poolOffWarn': '停用后你关注的游戏将不再自动刷新价格',
+  'crawl.queue.total': '任务队列',
+  'crawl.queue.stateRunning': '正在更新 · 按编号顺序依次爬取',
+  'crawl.queue.stateIdle': '空闲中 · 以上即下一轮的爬取顺序',
+  'crawl.queue.emptyAll': '所有队列都已停用，价格更新将没有可爬的内容',
+  'crawl.queue.savedNextRound': '已保存，下一轮生效',
 } as const
 
 export default crawl

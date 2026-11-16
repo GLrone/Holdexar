@@ -61,6 +61,7 @@ const NO_CACHE_PATHS = [
   '/bills/sync', // 账单同步进行中的快照轮询
   '/crawl/active', // 任务状态（页内刷新）
   '/crawl/jobs',
+  '/crawl/queue-specs', // 下轮队列组成（开关切换后重拉要立即可见）
   '/system/logs', // 用户点「刷新」要看新日志
   '/system/update-progress', // 更新下载进度 800ms 轮询
   '/system/update-pending',
@@ -248,6 +249,12 @@ export interface FetchSettingsPayload {
   price_interval_hours: number
   /** 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏；下一轮生效 */
   catalog_refresh: boolean
+  /** 任务队列逐段开关（欠账补抓随轮）：下一轮组队生效 */
+  queue_missing: boolean
+  /** 任务队列逐段开关（关注与监控随轮）：下一轮组队生效 */
+  queue_pool: boolean
+  /** 任务队列逐段开关（折扣榜单随轮，仅直连模式出现在组成里）：下一轮组队生效 */
+  queue_discounts: boolean
   /** HB 月包自动刷新节奏（默认每天 02:30） */
   hb_schedule: ContentSchedule
   /** Epic 喜加一自动刷新节奏（默认每天 23:05） */
@@ -257,6 +264,12 @@ export interface FetchSettingsPayload {
 export interface LocalSteamAccountCandidate {
   steam_id: string
   persona_name: string
+}
+
+/** 下轮预期队列组成：段名 = missing/pool/discounts/catalog/specials；
+ *  kind 为通道/段身份标签（missing/specials_backfill/discounts），scope 段无 kind */
+export interface QueueSpecsPayload {
+  specs: { name: string; kind?: string | null }[]
 }
 
 export const settingsApi = {
@@ -2222,6 +2235,9 @@ export const crawlApi = {
     ),
   /** 价格刷新轮次（新→旧）；前端只用来看「最近一轮是否已收敛」 */
   cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
+  /** 下轮预期队列组成：逐段开关过滤后的段名序列（组队顺序即返回顺序）。
+   *  队列组成卡的唯一数据源——开关态与组成同源，前端不自行推导。 */
+  queueSpecs: () => request<QueueSpecsPayload>('GET', '/crawl/queue-specs'),
   /** 全库最近一次成功价格观察（灵动岛时钟事实源，活表 last_success_at 的 MAX；
    *  自动轮/手动/补抓/回填的成功写入同样推进；null=从未成功观察） */
   latestObservation: () => request<{ lastSuccessAt: string | null; serverNow: string | null }>(
@@ -3249,10 +3265,10 @@ export const redeemApi = {
   activateKeys: (keys: string[]) =>
     request<RedeemBatchResult>('POST', '/redeem/keys', { keys }),
   quota: () => request<RedeemQuota>('GET', '/redeem/quota'),
-  activations: (q: { limit?: number; offset?: number } = {}) =>
+  activations: (q: { limit?: number; offset?: number; status?: string; q?: string; key?: string } = {}) =>
     request<RedeemActivationList>(
       'GET',
-      `/redeem/activations${toQuery({ limit: q.limit, offset: q.offset })}`,
+      `/redeem/activations${toQuery({ limit: q.limit, offset: q.offset, status: q.status, q: q.q, key: q.key })}`,
       undefined,
       { noCache: true },
     ),
@@ -3359,6 +3375,9 @@ export interface HbChoiceGame {
   discount: number
   /** 非 CN 区最低 CNY 分（games.min_cny_fen 预计算列）；null = 无 */
   lowestCnyFen: number | null
+  /** 非 Steam 平台标识（blizzard/epic/ubisoft/gog/origin/ea/itch/drm-free…原值，
+   *  展示层本地化）；Steam 游戏无此字段。appid=0（非 Steam 游戏无 Steam 页面） */
+  platform?: string
 }
 
 export interface HbChoiceOffersPayload {
@@ -3385,6 +3404,8 @@ export interface HbRefreshPayload {
   marked?: { appid: number; title: string }[]
   /** 未能匹配出 appid 的条目名（次日自动重试） */
   unresolved?: string[]
+  /** 刷新失败的用户可见原因（ok=false 时下发） */
+  error?: string
 }
 
 // ─── 成就殿堂（奖杯）────────────────────────────────────
