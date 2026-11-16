@@ -83,13 +83,7 @@ const shell = {
   'shell.lang.targetEn': 'EN',
   'shell.lang.targetZh': '中',
 
-  /* 应用更新：左上角气泡（UpdateBubble.vue）+ 侧栏红点 */
-  'update.bubble.available': '新版本 v{version}',
-  'update.bubble.ready': '重启更新 v{version}',
-  'update.bubble.downloading': '下载中 {percent}%',
-  'update.bubble.swapFailed': '上次更新未完成',
-  'update.bubble.hoverPreparing': '正在准备下载…',
-  'update.bubble.clickHint': '点击查看详情并下载',
+  /* 应用更新：侧栏红点（常驻提示由灵动岛更新活动承担） */
   'update.navDot': '有新版本可用',
 
   /* 更新已下载：全局重启提示（下载可能在任意页面完成，提示不能只留在设置页） */

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { stripTypeScriptTypes } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
 import { test, type TestContext } from 'node:test'
+import { nextTick, reactive } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 
 const defaults = {
@@ -10,21 +11,45 @@ const defaults = {
   updateProgress: async () => ({ running: false, ok: false, code: null, error: null }),
   updateCancel: async () => ({}),
   updateAck: async () => ({ acknowledged: true }),
+  updateCheck: async () => ({ available: false }),
   info: async () => ({ version: 'new' }),
 }
 const api = { ...defaults }
 globalThis.__updaterApi = api
+/** 岛活动注册记录：register/remove 全量留痕，供投影语义断言 */
+const activityLog: Array<{ kind: 'register' | 'remove'; payload: unknown }> = []
+globalThis.__updaterActivity = {
+  register: (r: Record<string, unknown>) => activityLog.push({ kind: 'register', payload: r }),
+  remove: (id: string) => activityLog.push({ kind: 'remove', payload: id }),
+}
+const settingsMock = reactive({ updateSkipped: '', updateNotify: true as boolean | undefined })
+globalThis.__updaterSettings = settingsMock
 const source = stripTypeScriptTypes(readFileSync(new URL('../src/stores/updater.ts', import.meta.url), 'utf8'))
   .replace("from 'vue'", `from '${import.meta.resolve('vue')}'`)
   .replace("from 'pinia'", `from '${import.meta.resolve('pinia')}'`)
   .replace(/import .* from '@\/api\/client'/, 'const systemApi = globalThis.__updaterApi')
-  .replace(/import .* from '@\/components\/ui\/activity'/, 'const activityManager = { register() {}, remove() {} }')
+  .replace(/import .* from '@\/components\/ui\/activity'/, 'const activityManager = globalThis.__updaterActivity')
   .replace(/import .* from '@\/locales'/, 'const useI18n = () => ({ t: key => key })')
-  .replace(/import .* from '@\/stores\/settings'/, 'const useSettingsStore = () => ({ updateSkipped: "" })')
+  .replace(/import .* from '@\/stores\/settings'/, 'const useSettingsStore = () => globalThis.__updaterSettings')
 const { useUpdaterStore } = await import(`data:text/javascript,${encodeURIComponent(source)}`)
+
+function lastRegister(): Record<string, unknown> | null {
+  for (let i = activityLog.length - 1; i >= 0; i -= 1) {
+    if (activityLog[i]!.kind === 'register') return activityLog[i]!.payload as Record<string, unknown>
+  }
+  return null
+}
+
+function lastIsRemove(id = 'updater:activity'): boolean {
+  const last = activityLog[activityLog.length - 1]
+  return Boolean(last) && last!.kind === 'remove' && last!.payload === id
+}
 
 function setup(t: TestContext) {
   Object.assign(api, defaults)
+  activityLog.length = 0
+  settingsMock.updateSkipped = ''
+  settingsMock.updateNotify = true
   setActivePinia(createPinia())
   const timers = new Map<number, () => void>()
   let id = 0
@@ -234,4 +259,51 @@ test('确认期间下载完成的旧响应失效，确认后刷新保留下一�
   await setImmediate()
   assert.equal(store.justUpdated, null)
   assert.equal(store.pendingTag, 'vnext')
+})
+
+test('岛活动合并投影：待重启最高优先，点击动作打开更新窗口', async (t) => {
+  const { store } = setup(t)
+  // 待重启与下载中并存时只呈现待重启（最高优先态）
+  store.downloading = true
+  store.progress = { running: true, downloaded: 10, total: 100, speed: '1MB/s' } as never
+  store.pendingTag = 'vnext'
+  await nextTick()
+  const reg = lastRegister()
+  assert.equal(reg?.metadata?.type, 'ready')
+  assert.equal(typeof reg?.onOpen, 'function')
+  // 点击动作打开全局更新弹窗（不再路由跳转设置页）
+  ;(reg!.onOpen as () => void)()
+  assert.equal(store.dialogOpen, true)
+})
+
+test('换装失败上岛，发现新版遵循零打扰与跳过版本', async (t) => {
+  const { store } = setup(t)
+  // 换装失败态上岛（原气泡独有语义并入岛）
+  store.swapFailed = true
+  await nextTick()
+  assert.equal(lastRegister()?.metadata?.type, 'swap-failed')
+  store.swapFailed = false
+  await nextTick()
+  assert.equal(lastIsRemove(), true)
+
+  // 发现新版：默认提示开 → 上岛
+  t.mock.method(api, 'updateCheck', async () => ({ available: true, latest: 'v0.4.0', tag: 'v0.4.0' }))
+  await store.check(true)
+  await nextTick()
+  assert.equal(lastRegister()?.metadata?.type, 'available')
+  // 跳过当前版本（跳过值无 v 前缀）→ 下岛；跳过旧版本不拦新版本
+  settingsMock.updateSkipped = '0.4.0'
+  await nextTick()
+  assert.equal(lastIsRemove(), true)
+  settingsMock.updateSkipped = '0.3.0'
+  await nextTick()
+  assert.equal(lastRegister()?.metadata?.type, 'available')
+  // 零打扰开关关闭 → 发现新版下岛
+  settingsMock.updateNotify = false
+  await nextTick()
+  assert.equal(lastIsRemove(), true)
+  // 开关重开 → 重新上岛
+  settingsMock.updateNotify = true
+  await nextTick()
+  assert.equal(lastRegister()?.metadata?.type, 'available')
 })
