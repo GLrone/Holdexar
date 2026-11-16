@@ -47,10 +47,14 @@ export interface Activity {
   duration?: number
   /** 失败重试动作回调 */
   retry?: (() => void) | null
+  /** 进行中取消动作回调；存在即视为任务自带管理入口 */
+  cancel?: (() => void) | null
   /** 跳转目标路由 */
   to?: string
   /** 跳转按钮文案 */
   toLabel?: string
+  /** 打开动作回调：存在时点击动作优先触发它，不再走 to 路由跳转（to 仍作按钮可见性依据与兜底） */
+  onOpen?: (() => void) | null
   /** 扩展元数据 */
   metadata?: Record<string, unknown>
 }
@@ -71,7 +75,9 @@ export interface ActivityRegistration {
   needsAttention?: boolean
   duration?: number
   retry?: (() => void) | null
+  cancel?: (() => void) | null
   to?: string
   toLabel?: string
+  onOpen?: (() => void) | null
   metadata?: Record<string, unknown>
 }

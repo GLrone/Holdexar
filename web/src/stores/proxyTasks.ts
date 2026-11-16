@@ -133,7 +133,7 @@ export const useProxyTasksStore = defineStore('proxyTasks', () => {
       } else if (p.ok && !p.running) {
         kernelProgress.value = 100
         stopKernelWatch()
-        message.success(t('proxies.kernel.downloadDone'))
+        message.success(t('proxies.kernel.downloadDone'), { to: '/proxies' })
       }
     } catch {
       /* 轮询瞬断忽略，下轮再试 */
@@ -210,9 +210,9 @@ export const useProxyTasksStore = defineStore('proxyTasks', () => {
     }
     endTask(SYNC_ALL_KEY)
     if (failed === 0) {
-      message.success(t('proxies.sub.syncAllDone', { total: subs.length }))
+      message.success(t('proxies.sub.syncAllDone', { total: subs.length }), { to: '/proxies' })
     } else {
-      message.error(t('proxies.sub.syncAllPartial', { failed }))
+      message.error(t('proxies.sub.syncAllPartial', { failed }), { to: '/proxies' })
     }
     syncAll.value = null
     return failed

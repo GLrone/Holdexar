@@ -41,6 +41,7 @@ export const ICONS: Record<string, string> = {
   zap: '<path d="M13 3 4 14h6l-1 7 9-11h-6l1-7Z"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/>',
   monitor: '<rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  smartphone: '<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>',
   gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/><path d="M12 8s-1.5-5-4.5-5S4.7 7.7 7 8c1.4.2 5 0 5 0Zm0 0s1.5-5 4.5-5 2.8 4.7.5 5c-1.4.2-5 0-5 0Z"/>',
   globe:
     '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a13.4 13.4 0 0 1 3.5 9 13.4 13.4 0 0 1-3.5 9 13.4 13.4 0 0 1-3.5-9A13.4 13.4 0 0 1 12 3Z"/>',

@@ -9,7 +9,6 @@ const island = {
   'island.viewLogs': '查看日志',
   'island.dismiss': '忽略',
   'island.hideStatus': '关闭状态提示',
-  'island.returnToPrevious': '返回上一布局',
   'island.collapse': '收起展开卡片',
   'island.more': '还有 {n} 条',
   'island.swap': '打开详情',
@@ -24,6 +23,7 @@ const island = {
   'island.updater.available': '发现新版本 {tag}',
   'island.updater.downloading': '正在下载更新 {pct}%',
   'island.updater.ready': '更新包已就绪，重启生效',
+  'island.updater.swapFailed': '上次更新未完成，点击重新处理',
   'island.updater.failed': '更新下载失败',
   'island.badge.new': '新',
 

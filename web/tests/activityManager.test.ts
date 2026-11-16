@@ -2,6 +2,70 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { ActivityManager } from '../src/components/ui/activity/activityManager.ts'
+import { IslandController } from '../src/components/ui/activity/islandController.ts'
+
+for (const interaction of ['hover', 'expanded', 'overview'] as const) {
+  test(`activity lifetime: ${interaction} holds attention sources but not light notices`, (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const mgr = new ActivityManager()
+    const controller = new IslandController(mgr)
+    t.after(() => mgr.clear())
+    mgr.register({ id: 'future:result', source: 'future-feature', kind: 'notice',
+      title: 'New source', duration: 2400 })
+    mgr.register({ id: 'future:alert', source: 'future-feature', kind: 'notice',
+      status: 'failed', title: 'Needs attention', duration: 2400 })
+    if (interaction === 'hover') controller.setHovered(true)
+    if (interaction === 'expanded') controller.openMain()
+    if (interaction === 'overview') controller.setOverview(true)
+    t.mock.timers.tick(3000)
+    /* 轻量结果到点即走，不被悬停/展开/总览钉住 */
+    assert.equal(mgr.get('future:result'), undefined)
+    /* 需要关注的活动被挽留，交互结束才重新计时 */
+    assert.ok(mgr.get('future:alert'))
+    controller.setHovered(false)
+    controller.collapseExpanded()
+    controller.setOverview(false)
+    t.mock.timers.tick(2399)
+    assert.ok(mgr.get('future:alert'))
+    t.mock.timers.tick(1)
+    assert.equal(mgr.get('future:alert'), undefined)
+    assert.equal(controller.expandedActivity, null)
+  })
+}
+
+test('activity lifetime: waiting activities start expiry when displayed', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const mgr = new ActivityManager()
+  const controller = new IslandController(mgr)
+  t.after(() => mgr.clear())
+  for (const id of ['main', 'secondary']) mgr.register({ id, source: 'task', title: id })
+  mgr.register({ id: 'future:waiting', source: 'future-feature', kind: 'notice',
+    title: 'Waiting', duration: 500 })
+  assert.ok(controller.layout.waitingIds.includes('future:waiting'))
+  t.mock.timers.tick(1000)
+  assert.ok(mgr.get('future:waiting'))
+  controller.selectPrimary('future:waiting')
+  t.mock.timers.tick(499)
+  assert.ok(mgr.get('future:waiting'))
+  t.mock.timers.tick(1)
+  assert.equal(mgr.get('future:waiting'), undefined)
+})
+
+test('activity lifetime: retry atomically retires any source before its callback', () => {
+  const mgr = new ActivityManager()
+  let calls = 0
+  mgr.register({ id: 'future:failure', source: 'future-feature', title: 'Failure',
+    retry: () => {
+      calls++
+      assert.equal(mgr.count, 0)
+      mgr.register({ id: 'future:replacement', source: 'future-feature', title: 'Done' })
+    } })
+  mgr.retry('future:failure')
+  assert.equal(calls, 1)
+  assert.deepEqual(mgr.activities.map(a => a.id), ['future:replacement'])
+  mgr.remove('future:replacement')
+  assert.equal(mgr.count, 0)
+})
 
 test('ActivityManager：相同 ID 注册时原位更新，保留既有创建时间戳', () => {
   const mgr = new ActivityManager()

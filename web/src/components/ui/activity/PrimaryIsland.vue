@@ -1,8 +1,8 @@
 <script setup lang="ts">
 /**
  * PrimaryIsland — 主岛呈现组件
- * 呈现当前主岛活动的模块标识、文案、进度条、动作按钮与展开折叠态。
- * 遵循收口契约：模块标识永远真实可见，不被通用 Spinner 掩盖，运行态由精细外圈进度环体现。
+ * 呈现当前主岛活动的模块标识、文案、进度条与动作按钮，紧凑与展开共用同一实例结构。
+ * 动作按钮只由活动数据能力决定（retry/cancel/to），新增信息来源零视图改动。
  */
 import { computed } from 'vue'
 
@@ -10,34 +10,22 @@ import HlIcon from '@/components/ui/HlIcon.vue'
 import { useI18n } from '@/locales'
 
 import ActivityMark from './ActivityMark.vue'
-import { resolvePresentation } from './presentationResolver'
+import { resolveActivityCardView, resolvePresentation } from './presentationResolver'
 import type { Activity } from './types'
 
 const props = defineProps<{
   activity: Activity | null
   mode: 'idle' | 'notice' | 'task' | 'expanded'
   isPinned?: boolean
-  leadSpin: boolean
-  leadIcon: string
-  leadToneClass: string
+  priceRunning: boolean
   showingPrice: boolean
   canDismissStatus?: boolean
   priceColor?: string
   headText: string
   headTextStyle: Record<string, string>
   headTruncated: boolean
-  trailing: string
-  crawlOnlyTask: boolean
-  showBar: boolean
-  taskPercent: number | null
-  expandedShowsTasks: boolean
-  taskLines: { key: string; text: string; percent: number | null }[]
-  taskGoto?: string
+  trailing?: string
   detailText?: string
-  expandedIsTask: boolean
-  canRetry: boolean
-  goto?: string
-  gotoLabel?: string
 }>()
 
 const emit = defineEmits<{
@@ -45,9 +33,6 @@ const emit = defineEmits<{
   (e: 'retry'): void
   (e: 'dismiss'): void
   (e: 'goDetail'): void
-  (e: 'goTask'): void
-  (e: 'openTask'): void
-  (e: 'return'): void
   (e: 'collapse'): void
 }>()
 
@@ -57,19 +42,25 @@ const { t } = useI18n()
 const presentation = computed(() =>
   resolvePresentation(props.activity, {
     showingPrice: props.showingPrice,
-    priceRunning: props.leadSpin,
+    priceRunning: props.priceRunning,
   }),
 )
 
-/** 收起态右侧紧凑进度数值（若有） */
-const compactPercent = computed<number | null>(() => {
-  if (props.mode === 'expanded') return null
-  if (props.taskPercent !== null) return props.taskPercent
-  if (props.activity && props.activity.progress !== undefined && props.activity.progress !== null) {
-    return props.activity.progress
-  }
-  return null
+/** 动作与进度统一派生（与 HlIsland 处理器共用同一套规则） */
+const view = computed(() =>
+  resolveActivityCardView(props.activity, { showingPrice: props.showingPrice }),
+)
+
+const targetLabel = computed(() => {
+  if (view.value.targetLabelKind === 'task') return t('island.task.open')
+  if (view.value.targetLabelKind === 'logs') return t('island.viewLogs')
+  return props.activity?.toLabel || t('island.view')
 })
+
+/** 收起态右侧紧凑进度数值（若有） */
+const compactPercent = computed(() =>
+  props.mode !== 'expanded' && view.value.percent !== null ? view.value.percent : null,
+)
 
 </script>
 
@@ -81,7 +72,7 @@ const compactPercent = computed<number | null>(() => {
       <ActivityMark
         class="hl-island__lead"
         :presentation="presentation"
-        :progress="mode === 'expanded' ? taskPercent : activity?.progress"
+        :progress="mode === 'expanded' ? view.percent : activity?.progress"
         :image-url="activity?.iconImageUrl"
         :animation-key="activity?.id"
         :activity-id="activity?.id ?? (showingPrice ? '@price-status' : undefined)"
@@ -112,14 +103,14 @@ const compactPercent = computed<number | null>(() => {
       <span v-if="trailing" class="hl-island__trail">{{ trailing }}</span>
 
       <button
-        v-if="mode === 'expanded'"
+        v-if="mode === 'expanded' && view.dismissible"
         class="hl-island__slot-control"
         type="button"
-        :title="t('island.returnToPrevious')"
-        :aria-label="t('island.returnToPrevious')"
-        @click.stop="emit('return')"
+        :title="t('island.dismiss')"
+        :aria-label="t('island.dismiss')"
+        @click.stop="emit('dismiss')"
       >
-        <HlIcon name="chevron-left" :size="12" />
+        <HlIcon name="close" :size="12" />
       </button>
       <button
         v-if="mode === 'expanded'"
@@ -142,73 +133,50 @@ const compactPercent = computed<number | null>(() => {
         <HlIcon name="close" :size="12" />
       </button>
 
-      <!-- 快速取消按钮 -->
-      <button v-if="crawlOnlyTask && mode === 'task'" class="hl-island__btn is-tiny" @click.stop="emit('cancel')">
+      <!-- 收起态快速取消（任务运行中且自带取消能力时呈现） -->
+      <button
+        v-if="mode !== 'expanded' && view.cancelable"
+        class="hl-island__btn is-tiny"
+        @click.stop="emit('cancel')"
+      >
         {{ t('island.task.cancel') }}
       </button>
     </div>
 
     <!-- 进度条：仅展开态呈现；收起态进度加载动效完整嵌入 Logo 图标环与右侧数值 -->
     <span
-      v-if="mode === 'expanded' && showBar && taskPercent !== undefined"
+      v-if="mode === 'expanded' && view.busy"
       class="hl-island__bar"
-      :class="{ 'is-slide': taskPercent === null }"
+      :class="{ 'is-slide': view.percent === null }"
     >
-      <i :style="taskPercent === null ? undefined : { width: `${taskPercent}%` }" />
+      <i :style="view.percent === null ? undefined : { width: `${view.percent}%` }" />
     </span>
 
-    <!-- 展开面：正文与动作分级落入 -->
+    <!-- 展开面：正文与动作按能力落入 -->
     <Transition name="island-fold">
       <div v-if="mode === 'expanded'" class="hl-island__fold">
-        <template v-if="expandedShowsTasks">
-          <div v-if="taskLines.length" class="hl-island__tasks">
-            <span v-for="task in taskLines" :key="task.key" class="hl-island__taskline">
-              <span class="hl-island__tasktext">{{ task.text }}</span>
-              <b v-if="task.percent !== null" class="hl-island__taskpct">{{ task.percent }}%</b>
-            </span>
-          </div>
-          <span v-else class="hl-island__spacer" />
-          <div v-if="taskGoto" class="hl-island__actions">
-            <button class="hl-island__btn is-primary" @click.stop="emit('goTask')">
-              {{ t('island.view') }}
-            </button>
-          </div>
-          <span v-else class="hl-island__spacer" />
-        </template>
-        <template v-else>
-          <p v-if="detailText" class="hl-island__detail">{{ detailText }}</p>
-          <span v-else class="hl-island__spacer" />
+        <p v-if="detailText" class="hl-island__detail">{{ detailText }}</p>
 
-          <div class="hl-island__actions">
-            <template v-if="expandedIsTask">
-              <button class="hl-island__btn is-primary" @click.stop="emit('openTask')">
-                {{ t('island.task.open') }}
-              </button>
-              <button class="hl-island__btn" @click.stop="emit('cancel')">
-                {{ t('island.task.cancel') }}
-              </button>
-            </template>
-            <template v-else-if="showingPrice">
-              <button class="hl-island__btn is-primary" @click.stop="emit('openTask')">
-                {{ t('island.task.open') }}
-              </button>
-            </template>
-            <template v-else>
-              <button v-if="canRetry" class="hl-island__btn is-primary" @click.stop="emit('retry')">
-                {{ t('island.retry') }}
-              </button>
-              <button
-                v-if="goto"
-                class="hl-island__btn"
-                :class="{ 'is-primary': !canRetry }"
-                @click.stop="emit('goDetail')"
-              >
-                {{ gotoLabel }}
-              </button>
-              <button class="hl-island__btn" @click.stop="emit('dismiss')">{{ t('island.dismiss') }}</button>
-            </template>
-          </div>
-        </template>
+        <div class="hl-island__actions">
+          <button v-if="view.canRetry" class="hl-island__btn is-primary" @click.stop="emit('retry')">
+            {{ t('island.retry') }}
+          </button>
+          <button
+            v-if="view.target"
+            class="hl-island__btn"
+            :class="{ 'is-primary': !view.canRetry }"
+            @click.stop="emit('goDetail')"
+          >
+            {{ targetLabel }}
+          </button>
+          <button
+            v-if="view.cancelable"
+            class="hl-island__btn"
+            @click.stop="emit('cancel')"
+          >
+            {{ t('island.task.cancel') }}
+          </button>
+        </div>
       </div>
     </Transition>
   </div>

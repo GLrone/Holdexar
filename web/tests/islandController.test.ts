@@ -21,6 +21,21 @@ function assertNoDuplicateSlots(controller: IslandController) {
   assert.equal(allIds.length, controller.count)
 }
 
+test('IslandController: progress updates keep a pinned activity in its opened slot', () => {
+  const { manager, controller } = setup(['A', 'B', 'C'])
+  controller.pin('A')
+  controller.openMain()
+  const opened = controller.layout
+  manager.update('A', { progress: 55 })
+  assert.deepEqual(controller.layout, opened)
+  manager.update('B', { progress: 70 })
+  assert.deepEqual(controller.layout, opened)
+  controller.collapseExpanded()
+  assert.equal(controller.primaryId, 'A')
+  assert.equal(controller.pinnedId, 'A')
+  assertNoDuplicateSlots(controller)
+})
+
 test('IslandController: urgent activity preempts main while keeping other slots unique', () => {
   const { manager, controller } = setup(['crawl-task', 'secondary-task'])
   controller.openSecondary()
@@ -53,6 +68,23 @@ test('IslandController: progress refresh preserves the user-selected layout', ()
 
   assert.deepEqual(controller.layout, before)
   assert.equal(controller.expandedActivity?.progress, 20)
+})
+
+test('IslandController: updates do not take an acknowledged error out of expanded', () => {
+  const { manager, controller } = setup(['task'])
+  manager.register({ id: 'future:warning', source: 'future-feature', kind: 'system',
+    status: 'failed', title: 'New failure' })
+  controller.openMain()
+  const layout = controller.layout
+  manager.update('future:warning', { detail: 'More details' })
+  assert.deepEqual(controller.layout, layout)
+  manager.register({ id: 'future:warning', source: 'future-feature', kind: 'system',
+    status: 'failed', title: 'Refreshed failure' })
+  assert.deepEqual(controller.layout, layout)
+  manager.register({ id: 'future:new-warning', source: 'another-feature', kind: 'notice',
+    status: 'failed', title: 'Another failure', priority: 100 })
+  assert.equal(controller.primaryId, 'future:new-warning')
+  assert.equal(controller.expandedId, 'future:warning')
 })
 
 test('IslandController: secondary opens directly and fills from waiting candidates', () => {
@@ -126,25 +158,6 @@ test('IslandController: a single activity expands while the compact anchor remai
   assert.equal(controller.count, 1)
 })
 
-test('IslandController: return restores only the previous layout snapshot', () => {
-  const { controller } = setup(['A', 'B', 'C', 'D'])
-  const initial = controller.layout
-  controller.openSecondary()
-  controller.openMain()
-  assert.equal(controller.primaryId, 'B')
-
-  controller.returnPreviousLayout()
-  assert.deepEqual(controller.layout, {
-    mainId: 'A',
-    secondaryId: 'C',
-    expandedId: 'B',
-    waitingIds: ['D'],
-  })
-
-  controller.returnPreviousLayout()
-  assert.deepEqual(controller.layout, initial)
-})
-
 test('IslandController: collapse returns the expanded task to its origin slot', () => {
   const { controller } = setup(['A', 'B', 'C', 'D'])
   controller.openSecondary()
@@ -166,7 +179,8 @@ test('IslandController: collapse returns the expanded task to its origin slot', 
   })
 })
 
-test('IslandController: removed and expired activities leave no stale slot or duplicate', async () => {
+test('IslandController: removed and expired activities leave no stale slot or duplicate', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   const manager = new ActivityManager()
   const controller = new IslandController(manager)
   manager.register({ id: 'A', source: 'test', title: 'A' })
@@ -174,7 +188,10 @@ test('IslandController: removed and expired activities leave no stale slot or du
   manager.register({ id: 'C', source: 'test', title: 'C' })
   controller.openSecondary()
 
-  await new Promise((resolve) => setTimeout(resolve, 30))
+  t.mock.timers.tick(30)
+  assert.equal(controller.expandedId, 'B')
+  controller.collapseExpanded()
+  t.mock.timers.tick(30)
   assert.equal(controller.primaryId, 'A')
   assert.equal(controller.expandedId, null)
   assert.equal(controller.secondaryId, 'C')
@@ -214,7 +231,6 @@ test('IslandController: repeated transitions do not duplicate or lose activities
   for (let index = 0; index < 25; index += 1) {
     controller.openSecondary()
     controller.openMain()
-    if (index % 2 === 0) controller.returnPreviousLayout()
     assertNoDuplicateSlots(controller)
     assert.equal(controller.count, 6)
     assert.equal(controller.layout.waitingIds.length + [controller.primaryId, controller.secondaryId, controller.expandedId].filter((id) => id && !id.startsWith('@')).length, 6)

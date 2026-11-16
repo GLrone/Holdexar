@@ -34,6 +34,7 @@ function onRowClick() {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  if (e.target !== e.currentTarget) return
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault()
     emit('select', props.activity.id)

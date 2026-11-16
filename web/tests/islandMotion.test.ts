@@ -43,8 +43,8 @@ test('island motion source：槽位容器与任务标识分别连续迁移', () 
   assert.doesNotMatch(motionSource, /setTimeout|setInterval/)
   assert.doesNotMatch(secondarySource, /is-phase-sliding|is-phase-settling|hl-secondary-settle|translateY\(4px\)/)
   assert.doesNotMatch(secondarySource, /\.hl-secondary-island:hover\s*\{[^}]*transform:\s*scale/s)
-  assert.match(primarySource, /returnToPrevious/)
   assert.match(primarySource, /emit\(['"]collapse['"]\)/)
+  assert.doesNotMatch(primarySource, /returnToPrevious/)
 })
 
 test('island motion overlays：候补动画副本清理后不会留成重复槽位', () => {
@@ -83,7 +83,7 @@ test('island controls：实验室触发副岛直开且主活动列表不用边�
   assert.ok(playgroundSource.includes('function toggleIslandExpanded()'))
   assert.doesNotMatch(itemSource, /\.hl-activity-item\.is-primary\s*\{[^}]*border\s*:/s)
   assert.doesNotMatch(islandSource, /@after-close="onActivityPanelAfterLeave"/)
-  assert.match(islandSource, /@return="returnToPreviousLayout"/)
+  assert.doesNotMatch(islandSource, /returnToPreviousLayout/)
   assert.match(islandSource, /@collapse="collapseExpanded"/)
 })
 
@@ -93,25 +93,32 @@ test('island controls：活动提示不提供类别静音入口', () => {
   assert.doesNotMatch(activityManagerSource, /_mutedTones|muteTone|unmuteTone/)
 })
 
-test('idle island status：空闲价格状态可关闭并在新活动到达后恢复', () => {
+test('idle island status：空闲价格状态可关闭且关闭只作用于空闲价格卡', () => {
   assert.match(primarySource, /v-if="showingPrice && canDismissStatus"[\s\S]*?t\('island\.hideStatus'\)[\s\S]*?emit\('dismiss'\)/)
   assert.match(islandSource, /:can-dismiss-status="!islandController\.isExpanded\.value"/)
   assert.match(islandSource, /:can-dismiss-status="true"/)
   assert.match(islandSource, /const idleStatusDismissed = ref\(false\)/)
-  assert.match(islandSource, /!idleStatusDismissed\.value &&/)
-  assert.match(islandSource, /if \(showingPrice\.value\) \{[\s\S]*?idleStatusDismissed\.value = true/)
-  assert.match(islandSource, /watch\([\s\S]*?idleStatusDismissed\.value = false/)
+  /* 关闭态只隐藏空闲价格卡：消息与任务不因它整岛隐藏 */
+  assert.match(islandSource, /priceStale\.value && !idleStatusDismissed\.value/)
+  assert.doesNotMatch(islandSource, /!idleStatusDismissed\.value && \(/)
+  assert.match(islandSource, /PRICE_STATUS_TTL_MS/)
+  assert.match(islandSource, /if \(idleShowing\) \{[\s\S]*?idleStatusDismissed\.value = true/)
+  assert.match(islandSource, /watch\(\s*\(\) => \[priceKind\.value, priceLabel\.value, priceStale\.value\]/)
+  assert.match(islandSource, /watch\(\s*\(\) => \[priceKind\.value, priceLabel\.value, priceStale\.value\][\s\S]*?idleStatusDismissed\.value = false/)
+  /* 忽略动作收口在展开卡控制区（✕），折叠动作行不再重复提供 */
+  assert.match(primarySource, /mode === 'expanded' && view\.dismissible/)
+  assert.doesNotMatch(primarySource, /v-if="view\.dismissible" class="hl-island__btn"/)
 })
 
-test('idle price expansion：紧凑岛体直接形变为卡片且不重复保留主岛', () => {
+test('single island expansion：紧凑岛体直接形变为卡片且不补空闲主岛', () => {
   const compactIsland = islandSource.match(/<div[\s\S]*?data-island-slot="main"[\s\S]*?>/)?.[0] ?? ''
 
-  assert.match(islandSource, /const showCompactMain = computed\(\(\) => !\(showingPrice\.value && islandController\.isIdleExpanded\)\)/)
+  assert.match(islandSource, /const showCompactMain = computed\(\(\) => Boolean\(primaryAct\.value\) \|\| !islandController\.isExpanded\.value\)/)
   assert.match(compactIsland, /v-if="showCompactMain"/)
   assert.match(islandSource, /:data-activity-id="mainDataId"[\s\S]*?data-island-slot="main"/)
   assert.match(islandSource, /:data-activity-id="islandController\.expandedId"[\s\S]*?data-island-slot="expanded"/)
-  assert.match(islandSource, /'is-idle-expanded': expandedShowingPrice/)
-  assert.match(islandStyle, /\.hl-expanded-island\.is-idle-expanded\s*\{[^}]*top:\s*var\(--island-top\)/s)
+  assert.match(islandSource, /'is-solo-expanded': !showCompactMain/)
+  assert.match(islandStyle, /\.hl-expanded-island\.is-solo-expanded\s*\{[^}]*top:\s*var\(--island-top\)/s)
 })
 
 test('expanded main interaction：只触发 Main 与 Expanded 身份交换', () => {
