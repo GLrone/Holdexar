@@ -375,6 +375,89 @@ def test_dialog_gets_owner_in_showdialog(monkeypatch):
     assert _SHOW_ARGS and _SHOW_ARGS[-1] == (owner,)
 
 
+# ── 隐形窗口锚点不变量（孤儿确认框防线） ────────────────────────────────────
+#
+# closing 落在不可见（托盘态）主窗上时，CenterParent 对隐形 parent 不生效，
+# 弹窗落回默认 (0,0)——「托盘退出后确认框孤零零出现在桌面左上角」。不变量：
+# ① 隐形窗口绝不弹询问；② 锚点失效时落点退到屏幕居中；③ 守卫先亮窗再问。
+
+
+def test_ask_close_intent_skips_hidden_owner(monkeypatch):
+    """主窗口不可见（托盘态）→ 不弹询问，直接按最小化处理。"""
+    _patch_winforms(monkeypatch)
+    _SHOW_ARGS.clear()
+    hidden_owner = SimpleNamespace(Visible=False)
+    assert desktop._ask_close_intent(hidden_owner) == "minimize"
+    assert not _SHOW_ARGS, "隐形窗口不得弹确认框（会落在屏幕左上角）"
+
+
+def test_ask_close_intent_asks_visible_owner(monkeypatch):
+    """可见窗口照常询问（门禁不得误伤正常关窗路径）。"""
+    _patch_winforms(monkeypatch)
+    _SHOW_ARGS.clear()
+    visible_owner = SimpleNamespace(Visible=True)
+    _SHOW_OUTCOME["value"] = object()
+    desktop._ask_close_intent(visible_owner)
+    assert _SHOW_ARGS and _SHOW_ARGS[-1] == (visible_owner,)
+
+
+def _patch_startposition(monkeypatch, fake_wf):
+    """给假 StartPosition/WindowState 发独立哨兵，便于断言选档。"""
+    center_parent, center_screen, minimized = object(), object(), object()
+    fake_wf.FormStartPosition = SimpleNamespace(
+        CenterParent=center_parent, CenterScreen=center_screen
+    )
+    fake_wf.FormWindowState = SimpleNamespace(Minimized=minimized)
+    return center_parent, center_screen, minimized
+
+
+def test_dialog_startposition_centers_parent_for_visible_owner(monkeypatch):
+    """可见且未最小化的 owner → CenterParent（居中于主窗）。"""
+    fake_wf, _, _, _ = _patch_winforms(monkeypatch)
+    center_parent, _, _ = _patch_startposition(monkeypatch, fake_wf)
+    owner = SimpleNamespace(Visible=True, WindowState=object())
+    dialog, _ = desktop._build_close_dialog(owner)
+    assert dialog.StartPosition is center_parent
+
+
+def test_dialog_startposition_falls_back_for_hidden_or_minimized_owner(monkeypatch):
+    """隐形 / 最小化的 owner 锚不上 → 退到屏幕居中，绝不落 (0,0)。"""
+    fake_wf, _, _, _ = _patch_winforms(monkeypatch)
+    _, center_screen, minimized = _patch_startposition(monkeypatch, fake_wf)
+    hidden_owner = SimpleNamespace(Visible=False)
+    dialog, _ = desktop._build_close_dialog(hidden_owner)
+    assert dialog.StartPosition is center_screen
+
+    minimized_owner = SimpleNamespace(Visible=True, WindowState=minimized)
+    dialog, _ = desktop._build_close_dialog(minimized_owner)
+    assert dialog.StartPosition is center_screen
+
+
+def test_guard_restores_hidden_window_before_asking(monkeypatch):
+    """守卫：closing 落在隐形窗口（托盘态杂散关闭）→ 先亮主窗再询问。
+
+    确认框必须锚在看得见的主窗上：既不给隐形窗口弹孤儿框，也不能无声
+    放行/无声取消（前者误杀常驻后端，后者托盘退出会变成关不掉）。"""
+    shown: list = []
+    asked: list = []
+
+    def _fake_ask(owner=None, window=None):
+        asked.append(owner)
+        return "minimize"
+
+    monkeypatch.setattr(desktop, "_ask_close_intent", _fake_ask)
+    window = SimpleNamespace(
+        show=lambda: shown.append(1),
+        hide=lambda: None,
+        minimize=lambda: None,
+        native=SimpleNamespace(Visible=False),
+    )
+    guard = desktop._make_closing_guard(window)
+    assert guard() is False  # 最小化语义：取消关闭，进程常驻
+    assert shown == [1], "询问前必须先亮出主窗口"
+    assert asked, "亮窗后必须走询问链拿用户意图"
+
+
 # ── 关窗守卫（closing 契约） ────────────────────────────────────────────────
 
 

@@ -212,7 +212,8 @@ def _start_server(ready: threading.Event, error_box: list[str]) -> None:
         import uvicorn
         from app.main import app
 
-        uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+        # proxy_headers=False：桌面形态没有可信反代，XFF 解析面直接关闭
+        uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info", proxy_headers=False)
     except Exception:  # noqa: BLE001 —— 启动失败要完整带回主线程
         error_box.append(traceback.format_exc())
     finally:
@@ -378,11 +379,19 @@ def _app_icon() -> str | None:
     return None
 
 
+def _probe_host() -> str:
+    """健康探测固定回环：HOLDEXAR_HOST=0.0.0.0 时按原地址拼 Host 会被本应用来源闸判 421。"""
+    host = SERVER_HOST.strip().lower().strip("[]")
+    if host in ("", "0.0.0.0", "::", "::1", "localhost", "127.0.0.1"):
+        return "127.0.0.1"
+    return SERVER_HOST
+
+
 def _wait_health(timeout: float) -> bool:
     """直连回环并校验服务身份；每次网络等待均受剩余预算约束。"""
     deadline = time.monotonic() + timeout
     while (remaining := deadline - time.monotonic()) > 0:
-        response = _http_get_json(SERVER_HOST, SERVER_PORT, "/api/v1/health", timeout=min(2.0, remaining))
+        response = _http_get_json(_probe_host(), SERVER_PORT, "/api/v1/health", timeout=min(2.0, remaining))
         if _health_is_ours(*response):
             return True
         time.sleep(max(0, min(0.05, deadline - time.monotonic())))
@@ -395,7 +404,7 @@ def _server_port_listening() -> bool:
     watchdog 用它区分「探测链路被代理/TUN 劫持」与「服务进程没起来」。
     """
     try:
-        with socket.create_connection((SERVER_HOST, SERVER_PORT), timeout=2.0):
+        with socket.create_connection((_probe_host(), SERVER_PORT), timeout=2.0):
             return True
     except OSError:
         return False
@@ -483,7 +492,7 @@ class DesktopApi:
             return {"ok": False, "error": "仅打包态支持一键重启，请手动重启应用。"}
 
         # os._exit 不触发 atexit / lifespan 清理：手动停掉代理内核，否则
-        # mihomo.exe 作为孤儿进程继续持有 _internal/ 目录的文件锁，换装
+        # 内核进程作为孤儿继续持有 _internal/ 目录的文件锁，换装
         # 进程在 os.replace 时会因 PermissionError 失败并回滚。
         try:
             from app.domains.proxies import clash_manager
@@ -711,6 +720,18 @@ def _handoff_pending_update() -> bool:
         _log_update(
             f"暂存包 {tag or '(无 tag)'} 不比现装 {APP_VERSION} 新，清理暂存跳过换装"
         )
+        _remove_path(staging)
+        _clear_handoff_ledger()
+        return False
+
+    # 信任锚复核先于一切暂存执行（含协议探测）：下载期的验签+sha256 结论
+    # 持久化在数据目录，暂存目录自带的 manifest 不作数；旧版本留下的无记录
+    # 暂存包同样在此清掉，用户重新下载即可
+    from app.core.update_host import verify_staged_trust
+
+    trust_error = verify_staged_trust(staging, _data_dir(), staged_version)
+    if trust_error:
+        _log_update(f"暂存包信任复核未通过（{trust_error}），已清理暂存；请重新下载更新")
         _remove_path(staging)
         _clear_handoff_ledger()
         return False
@@ -1436,9 +1457,11 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     dialog.BackColor = _c("bg")
     dialog.ForeColor = _c("text")
     dialog.ShowInTaskbar = False
+    # 锚点失效（owner 缺席/隐形/最小化）时 CenterParent 不生效，弹窗会落回
+    # 默认 (0,0)——必须退到屏幕居中，绝不让确认框孤零零出现在桌面左上角。
     dialog.StartPosition = (
         FormStartPosition.CenterParent
-        if owner is not None
+        if _owner_anchorable(owner)
         else FormStartPosition.CenterScreen
     )
     dialog.ClientSize = Size(WIDTH, HEIGHT)
@@ -1614,6 +1637,32 @@ def _toggle_close_curtain(window, on: bool) -> None:
         pass
 
 
+def _owner_hidden(owner) -> bool:
+    """主窗口是否处于不可见态（托盘隐藏）。读不到可见性（替身/异构对象）按可见处理。"""
+    try:
+        return not bool(owner.Visible)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _owner_anchorable(owner) -> bool:
+    """owner 能否当弹窗 CenterParent 锚点：可见且未最小化。
+
+    CenterParent 对隐形/最小化的 parent 不生效，弹窗会落回默认 (0,0)
+    （「确认框孤零零出现在桌面左上角」的成因），此时必须改用 CenterScreen。
+    """
+    if owner is None or _owner_hidden(owner):
+        return False
+    try:
+        from System.Windows.Forms import FormWindowState
+
+        if owner.WindowState == FormWindowState.Minimized:
+            return False
+    except Exception:  # noqa: BLE001 —— 读不到窗口态按可锚处理
+        pass
+    return True
+
+
 def _ask_close_intent(owner=None, window=None) -> str:
     """关窗意图询问：二选一（最小化到托盘 / 退出程序），同步模态对话框。
 
@@ -1621,7 +1670,11 @@ def _ask_close_intent(owner=None, window=None) -> str:
     降级 'minimize'（问不出意图时保持「点 X = 后台常驻」语义，不误杀进程）。
     同步弹窗：closing handler 本就同步跑在 UI 线程，阻塞拿用户决定。幕布与
     出入场动效在此装配，任一步失败只是少幕布/动效，弹窗照常弹出。
+    主窗口不可见（托盘态）时无从询问：任何杂散关闭都按「最小化」处理，
+    绝不为隐形窗口弹模态——用户看不到主窗，弹窗只会孤零零落在屏幕左上角。
     """
+    if owner is not None and _owner_hidden(owner):
+        return "minimize"
     dialog = None
     try:
         theme = _app_theme()
@@ -1656,6 +1709,14 @@ def _make_closing_guard(window):
         if _tray_state["quit"]:
             return True  # 托盘「退出」：放行真关闭
         owner = getattr(window, "native", None)
+        if not _background_mode and owner is not None and _owner_hidden(owner):
+            # closing 落在不可见窗口上（托盘态的杂散关闭）：意图无从判断，
+            # 先亮出主窗口再问——绝不给隐形窗口弹孤儿确认框，也不能无声放行
+            # 或无声取消（前者误杀常驻，后者托盘退出会变成关不掉）。
+            try:
+                window.show()
+            except Exception:  # noqa: BLE001 —— 亮不了窗就照常走询问降级链
+                pass
         intent = "minimize" if _background_mode else _ask_close_intent(owner, window)
         if intent == "quit":
             # 先撤窗再放行：点「退出程序」窗口必须当场消失，进程收尾期间窗口
@@ -1899,7 +1960,7 @@ def main() -> None:
             if args.server:
                 if not _activate_running(background=True):
                     sys.exit(1)
-                _, health = _http_get_json(SERVER_HOST, SERVER_PORT, "/api/v1/health", timeout=2)
+                _, health = _http_get_json(_probe_host(), SERVER_PORT, "/api/v1/health", timeout=2)
                 sys.exit(_wait_service_exit(int(health["pid"])))
             if not _focus_running_window():
                 if _activate_running():
