@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -32,6 +33,20 @@ from .schemas import (AskRequest, AskResponse, DetectRequest, DetectResponse,
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pilot", tags=["pilot"])
+
+# 已存密钥同源闸的统一文案：只说「不一致 + 该怎么做」，不回显任何已存地址
+_KEY_SCOPE_HINT = "该地址与已配置服务不一致，请填写该服务的 API 密钥后再试"
+
+
+def _same_origin(a: str, b: str) -> bool:
+    """scheme+host+port 同源判定；任一侧解析失败即不同源。"""
+    try:
+        ua, ub = urlsplit(a), urlsplit(b)
+        pa, pb = ua.port, ub.port
+    except ValueError:
+        return False
+    return (ua.scheme.lower(), (ua.hostname or "").lower(), pa) == (
+        ub.scheme.lower(), (ub.hostname or "").lower(), pb)
 
 
 async def _config_payload() -> PilotConfigPayload:
@@ -124,13 +139,24 @@ async def detect(payload: DetectRequest) -> DetectResponse:
     """网址 + 密钥 → 协议 / 服务商 / 可用模型清单（智能识别）。
 
     密钥缺省时：带 provider_id 只用该供应商已存密钥（可为空=匿名探测，
-    不得跨家回落活跃供应商）；无 provider_id 才回落活跃配置密钥。"""
+    不得跨家回落活跃供应商）；无 provider_id 才回落活跃配置密钥。已存
+    密钥只在检测地址与其所属配置同源时携带，跨源一律要求显式填密钥。"""
     api_key = payload.api_key
-    if not api_key and payload.provider_id:
-        api_key = await pilot_config.provider_key(payload.provider_id)
-    elif not api_key:
-        cfg = await pilot_config.load_config()
-        api_key = cfg.get("api_key") or ""
+    if not api_key:
+        if payload.provider_id:
+            providers = await pilot_config.load_providers()
+            owner_base = next(
+                (p["base_url"] for p in providers if p["id"] == payload.provider_id), "")
+            stored = await pilot_config.provider_key(payload.provider_id)
+        else:
+            cfg = await pilot_config.load_config()
+            owner_base = cfg.get("base_url") or ""
+            stored = cfg.get("api_key") or ""
+        if stored and (
+            not payload.base_url.strip() or not _same_origin(payload.base_url, owner_base)
+        ):
+            raise HTTPException(status_code=422, detail=_KEY_SCOPE_HINT)
+        api_key = stored
     try:
         result = await pilot_llm.detect_provider(payload.base_url, api_key, payload.protocol)
     except Exception as e:  # noqa: BLE001
@@ -149,7 +175,14 @@ async def test_connection(payload: TestRequest) -> TestResponse:
     model = payload.model if payload.model is not None else cfg["model"]
     api_key = payload.api_key
     if api_key is None:
-        api_key = cfg.get("api_key") or ""
+        stored = cfg.get("api_key") or ""
+        # 已存密钥同源闸：实际请求地址与配置地址同源才携带（密钥只去配置过的源）
+        if stored and not _same_origin(
+            pilot_llm.effective_base_url(protocol, base_url),
+            pilot_llm.effective_base_url(protocol, cfg.get("base_url") or ""),
+        ):
+            raise HTTPException(status_code=422, detail=_KEY_SCOPE_HINT)
+        api_key = stored
     if not base_url or not model:
         return TestResponse(ok=False, latency_ms=0, model=model, reason="missing_fields")
     messages = [

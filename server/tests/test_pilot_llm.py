@@ -159,14 +159,21 @@ async def test_detect_reason_upstream_and_unreachable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_detect_uses_provider_key_not_active(monkeypatch):
-    """编辑态识别：带 provider_id 用该供应商密钥；无 provider_id 才回落活跃配置。"""
+    """编辑态识别：带 provider_id 用该供应商密钥；无 provider_id 才回落活跃配置。
+
+    已存密钥只在检测地址与其所属配置同源（scheme+host+port）时携带，
+    跨源一律 422 要求显式密钥——密钥只去配置过的源。"""
     captured: dict = {}
 
     async def fake_provider_key(pid: str) -> str:
         return {"p-1": "sk-p1"}.get(pid, "")
 
+    async def fake_load_providers() -> list[dict]:
+        return [{"id": "p-1", "name": "", "protocol": "openai",
+                 "base_url": "https://x/v1", "models": [], "models_disabled": []}]
+
     async def fake_load_config() -> dict:
-        return {"api_key": "sk-active"}
+        return {"api_key": "sk-active", "base_url": "https://x/v1"}
 
     async def fake_detect(base_url: str, api_key: str, protocol: str | None) -> dict:
         captured["key"] = api_key
@@ -174,6 +181,7 @@ async def test_detect_uses_provider_key_not_active(monkeypatch):
                 "key_valid": True, "reason": None}
 
     monkeypatch.setattr(pilot_router.pilot_config, "provider_key", fake_provider_key)
+    monkeypatch.setattr(pilot_router.pilot_config, "load_providers", fake_load_providers)
     monkeypatch.setattr(pilot_router.pilot_config, "load_config", fake_load_config)
     monkeypatch.setattr(pilot_router.pilot_llm, "detect_provider", fake_detect)
 
@@ -186,6 +194,97 @@ async def test_detect_uses_provider_key_not_active(monkeypatch):
     assert captured["key"] == ""
     assert r.models == ["m"]
     assert r.reason is None
+
+
+@pytest.mark.asyncio
+async def test_detect_refuses_cross_origin_stored_key(monkeypatch):
+    """已存密钥同源闸：跨源探测不带密钥、422 要求显式密钥；显式密钥随意去。"""
+    captured: dict = {}
+
+    async def fake_provider_key(pid: str) -> str:
+        return {"p-1": "sk-p1"}.get(pid, "")
+
+    async def fake_load_providers() -> list[dict]:
+        return [{"id": "p-1", "name": "", "protocol": "openai",
+                 "base_url": "https://x/v1", "models": [], "models_disabled": []}]
+
+    async def fake_load_config() -> dict:
+        return {"api_key": "sk-active", "base_url": "https://x/v1"}
+
+    async def fake_detect(base_url: str, api_key: str, protocol: str | None) -> dict:
+        captured["key"] = api_key
+        return {"protocol": "openai", "vendor": "", "models": [], "suggested": [],
+                "key_valid": None, "reason": None}
+
+    monkeypatch.setattr(pilot_router.pilot_config, "provider_key", fake_provider_key)
+    monkeypatch.setattr(pilot_router.pilot_config, "load_providers", fake_load_providers)
+    monkeypatch.setattr(pilot_router.pilot_config, "load_config", fake_load_config)
+    monkeypatch.setattr(pilot_router.pilot_llm, "detect_provider", fake_detect)
+
+    # 供应商已存密钥：base_url 换 host / 换端口 / 换 scheme → 一律 422 且不触网
+    for url in ("https://evil.example/v1", "https://x:8443/v1", "http://x/v1"):
+        with pytest.raises(pilot_router.HTTPException) as ei:
+            await pilot_router.detect(DetectRequest(base_url=url, provider_id="p-1"))
+        assert ei.value.status_code == 422
+        assert captured.get("key", "") == ""  # detect 从未带密钥发出
+
+    # 活跃配置密钥：跨源同理 422
+    with pytest.raises(pilot_router.HTTPException) as ei:
+        await pilot_router.detect(DetectRequest(base_url="https://evil.example/v1"))
+    assert ei.value.status_code == 422
+    assert captured.get("key", "") == ""
+
+    # 同源（scheme+host+port 一致，路径不同也算同源）才携带
+    await pilot_router.detect(DetectRequest(base_url="https://x/other", provider_id="p-1"))
+    assert captured["key"] == "sk-p1"
+
+    # 显式提供的密钥：调用方自有选择，跨源也原样携带
+    await pilot_router.detect(
+        DetectRequest(base_url="https://evil.example/v1", api_key="sk-explicit"))
+    assert captured["key"] == "sk-explicit"
+
+
+@pytest.mark.asyncio
+async def test_test_connection_refuses_cross_origin_stored_key(monkeypatch):
+    """连通性测试：回落已存密钥仅在测试地址与配置地址同源时携带，跨源 422。"""
+    import time as _time
+
+    captured: dict = {}
+
+    async def fake_load_config() -> dict:
+        return {"api_key": "sk-cfg", "base_url": "https://x/v1", "protocol": "openai",
+                "model": "m"}
+
+    async def fake_chat_stream(**kwargs):
+        captured["key"] = kwargs["api_key"]
+        captured["base_url"] = kwargs["base_url"]
+        yield "answer", "pong"
+
+    monkeypatch.setattr(pilot_router.pilot_config, "load_config", fake_load_config)
+    monkeypatch.setattr(pilot_router.pilot_llm, "chat_stream", fake_chat_stream)
+
+    with pytest.raises(pilot_router.HTTPException) as ei:
+        await pilot_router.test_connection(
+            pilot_router.TestRequest(base_url="https://evil.example/v1", model="m"))
+    assert ei.value.status_code == 422
+    assert captured == {}  # 未发出任何请求
+
+    # 缺省 base_url = 配置地址本身：携带已存密钥
+    r = await pilot_router.test_connection(pilot_router.TestRequest(model="m"))
+    assert r.ok is True
+    assert captured["key"] == "sk-cfg"
+    assert captured["base_url"] == "https://x/v1"
+
+    # 同源自定义路径：携带
+    await pilot_router.test_connection(
+        pilot_router.TestRequest(base_url="https://x/alt", model="m"))
+    assert captured["key"] == "sk-cfg"
+
+    # 显式密钥：跨源也原样携带
+    await pilot_router.test_connection(
+        pilot_router.TestRequest(base_url="https://evil.example/v1", model="m",
+                                 api_key="sk-explicit"))
+    assert captured["key"] == "sk-explicit"
 
 
 OPENAI_FRAMES = [

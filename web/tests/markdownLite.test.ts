@@ -201,3 +201,27 @@ test('SVG 图卡：缺省文案回落英文，不渲染空标签', () => {
   assert.ok(html.includes('data-action="quote"'))
   assert.ok(html.includes('aria-label="Quote"'))
 })
+
+test('PUA 占位符：只回填标签外文本位，链接 title 属性内丢弃不回填（属性逃逸回归）', () => {
+  const html = mdLiteToHtml('<svg><rect/></svg>\n[link](x "title\uE0000\uE001")')
+  assert.equal((html.match(/<div class="pilot-svg"/g) ?? []).length, 1, html)
+  assert.ok(html.includes('<a href="x" title="title">link</a>'), html)
+  const gt = mdLiteToHtml('<svg><rect/></svg>\n[link](x "a>b\uE0000\uE001")')
+  assert.ok(gt.includes('<a href="x" title="a&gt;b">link</a>'), gt)
+})
+
+test('PUA 占位符：URL 目的地内经百分号编码免疫，不产生卡片注入', () => {
+  const whole = mdLiteToHtml('<svg><rect/></svg>\n[x](\uE0000\uE001)')
+  assert.ok(whole.includes('<a href="%EE%80%800%EE%80%81">x</a>'), whole)
+  const mid = mdLiteToHtml('<svg><rect/></svg>\n[x](a\uE0000\uE001b)')
+  assert.ok(mid.includes('<a href="a%EE%80%800%EE%80%81b">x</a>'), mid)
+})
+
+test('PUA 占位符：正文文本内正常回填，段落级整段回填剥 <p> 包裹', () => {
+  const inline = mdLiteToHtml('<svg><rect/></svg>\n前\uE0000\uE001后')
+  assert.ok(inline.includes('<p>前<div class="pilot-svg"'), inline)
+  assert.ok(inline.endsWith('后</p>'), inline)
+  const block = mdLiteToHtml('<svg><rect/></svg>\n\n\uE0000\uE001\n\n尾')
+  assert.equal((block.match(/<div class="pilot-svg"/g) ?? []).length, 2, block)
+  assert.ok(block.endsWith('<p>尾</p>'), block)
+})

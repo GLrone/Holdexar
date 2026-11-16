@@ -21,6 +21,25 @@ function escapeHtml(s: string): string {
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
 md.use(mark)
 
+/* validateLink 覆写：判定前百分号解码并剥控制字符/空白，挡「jav\tascript:」类协议伪装（判定语义同默认实现） */
+const BAD_PROTO_RE = /^(vbscript|javascript|file|data):/
+const GOOD_DATA_RE = /^data:image\/(gif|png|jpeg|webp);/
+md.validateLink = (url: string): boolean => {
+  let str = url.toLowerCase()
+  try {
+    str = decodeURIComponent(str)
+  } catch {
+    /* 残缺百分号编码按原样判 */
+  }
+  let cleaned = ''
+  for (const ch of str) {
+    const code = ch.codePointAt(0)!
+    if (code <= 0x20 || code === 0x7F || ch.trim() === '') continue
+    cleaned += ch
+  }
+  return BAD_PROTO_RE.test(cleaned) ? GOOD_DATA_RE.test(cleaned) : true
+}
+
 /* 紧凑输出：块级标签间不产生换行，与既有对话气泡的视觉契约一致；
    紧凑列表的段落 hidden 时不套 <p>（与默认渲染同判据） */
 md.renderer.rules.paragraph_open = (tokens, idx) => (tokens[idx]!.hidden ? '' : '<p>')
@@ -220,6 +239,45 @@ function prepareSource(src: string, opts?: MdLiteOpts): { text: string; cards: s
   return { text: out.join('\n'), cards }
 }
 
+/* 占位符只回填到标签外文本位：标签内（含属性值）出现即丢弃——卡片 HTML 含原生引号，
+   回进属性值会逃逸属性上下文；扫描时引号状态优先于 > 判定（<a title="x>y"> 形态） */
+function placeholderEndAt(html: string, i: number): number {
+  let j = i + 1
+  while (j < html.length && html[j]! >= '0' && html[j]! <= '9') j++
+  return j > i + 1 && html[j] === PUA_CLOSE ? j + 1 : -1
+}
+
+function backfillCards(html: string, cards: string[]): string {
+  let out = ''
+  let inTag = false
+  let quote = ''
+  for (let i = 0; i < html.length; ) {
+    const ch = html[i]!
+    if (ch === PUA_OPEN) {
+      const end = placeholderEndAt(html, i)
+      if (end !== -1) {
+        if (!inTag) out += cards[Number(html.slice(i + 1, end - 1))] ?? ''
+        i = end
+        continue
+      }
+    }
+    if (inTag) {
+      if (quote) {
+        if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      } else if (ch === '>') {
+        inTag = false
+      }
+    } else if (ch === '<') {
+      inTag = true
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
 /* 渲染期标签文案（复制钮等）由入口按次传入；md.render 为同步执行，取值后即清 */
 let renderOpts: MdLiteOpts | undefined
 
@@ -228,9 +286,10 @@ export function mdLiteToHtml(src: string, opts?: MdLiteOpts): string {
   try {
     const prepared = prepareSource((src || '').replace(/\r\n?/g, '\n'), opts)
     const html = md.render(protectTableCodePipes(prepared.text))
-    return html
-      .replace(/<p>\uE000(\d+)\uE001<\/p>/g, (_, n) => prepared.cards[Number(n)] ?? '')
-      .replace(/\uE000(\d+)\uE001/g, (_, n) => prepared.cards[Number(n)] ?? '')
+    return backfillCards(
+      html.replace(/<p>\uE000(\d+)\uE001<\/p>/g, (_, n) => prepared.cards[Number(n)] ?? ''),
+      prepared.cards,
+    )
   } finally {
     renderOpts = undefined
   }
