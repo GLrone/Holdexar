@@ -1149,16 +1149,21 @@ async def default_queue_specs(*, full_library: bool = False) -> list[dict]:
     """自动维护按策略选范围；手动全部始终包含符合条件的目录。"""
     from app.domains.settings.service import get_value
 
-    specs: list[dict] = [
-        {"kind": "missing"},
-        {"scope": "pool"},
-    ]
+    specs: list[dict] = []
+    if await get_value("crawl.queue_missing", True):
+        specs.append({"kind": "missing"})
+    if await get_value("crawl.queue_pool", True):
+        specs.append({"scope": "pool"})
     # 默认 direct_only（与 proxies.get_strategy 同源）
     direct_mode = (
         (await get_value("proxy.strategy", "direct_only")) == "direct_only"
     )
     catalog_default = False if direct_mode else True
-    if direct_mode and not full_library:
+    if (
+        direct_mode
+        and not full_library
+        and await get_value("crawl.queue_discounts", True)
+    ):
         specs.append({"scope": "discounts", "kind": "discounts"})
     catalog_refresh = await get_value("crawl.catalog_refresh", catalog_default)
     if full_library or catalog_refresh:

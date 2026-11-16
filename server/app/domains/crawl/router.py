@@ -85,6 +85,19 @@ async def jobs(limit: int = Query(20, ge=1, le=100)):
     return await service.list_jobs(limit)
 
 
+@router.get("/crawl/queue-specs")
+async def queue_specs():
+    """下轮预期队列组成（逐段开关过滤后的段名序列，prioritize 重排后
+    即真实组队顺序）——任务中心队列组成卡的唯一数据源。"""
+    specs = await service.default_queue_specs()
+    return {
+        "specs": [
+            {"name": s.get("scope") or s.get("kind"), "kind": s.get("kind")}
+            for s in specs
+        ]
+    }
+
+
 @router.get("/crawl/active")
 async def active():
     """当前活动任务、爬取占用与系统侧活动。

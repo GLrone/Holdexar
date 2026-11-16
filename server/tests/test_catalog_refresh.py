@@ -58,9 +58,9 @@ async def _seed_games() -> None:
 async def test_specials_scope_keeps_board_only_diff(monkeypatch):
     await _seed_games()
     # 榜单：200 在目录层（重合剔除）/ 300 在监控层（重合剔除）/
-    # 400 已下架（过宽限期）、500 免费（业务状态剔除）/
+    # 500 免费（业务状态剔除；下架宽限排除层已退役，removed_at 不再剔除）/
     # 999 榜上出现两次（榜内去重保一）/ 888 榜单独有（保留）
-    # → 尾段只剩 999、888
+    # → 尾段只剩 400、999、888
     async def _fake_board(key: str) -> list[int]:
         return [200, 300, 400, 500, 999, 888, 999]
 
@@ -68,7 +68,7 @@ async def test_specials_scope_keeps_board_only_diff(monkeypatch):
     from app.domains.crawl.service import resolve_scope_appids
 
     pairs = await resolve_scope_appids("specials", None)
-    assert pairs == [(999, ""), (888, "")]
+    assert pairs == [(400, ""), (999, ""), (888, "")]
 
 
 @pytest.mark.asyncio
@@ -96,8 +96,9 @@ async def test_discounts_scope_keeps_catalog_games(monkeypatch):
 
     pairs = await resolve_scope_appids("discounts", None)
     # 200 目录层保留（与 specials 差集段的关键差异）/ 300 监控层剔除 /
-    # 400 已下架、500 免费（业务状态剔除）/ 999 新面孔保留
-    assert pairs == [(200, ""), (999, "")]
+    # 500 免费（业务状态剔除；下架宽限排除层已退役，removed_at 不再剔除）/
+    # 999 新面孔保留
+    assert pairs == [(200, ""), (400, ""), (999, "")]
 
 
 @pytest.mark.asyncio
@@ -320,3 +321,95 @@ async def test_plan_and_resolve_share_one_exit():
         assert planned == resolved, scope
     assert await plan_scope_appids("appids", [42, 7]) == [42, 7]
     assert [a for a, _ in await resolve_scope_appids("appids", [42, 7])] == [42, 7]
+
+
+@pytest.mark.asyncio
+async def test_queue_segment_switches_gate_specs():
+    """任务队列逐段开关：各段 False = 不随轮组队（自动与手动同射程），
+    KV 缺失默认开；catalog 段沿用 catalog_refresh（手动全库恒含不变），
+    特惠榜尾段跟随它，不设独立开关。"""
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value("proxy.strategy", "proxy_first")
+    base_full = [
+        {"kind": "missing"},
+        {"scope": "pool"},
+        {"scope": "catalog"},
+        {"scope": "specials", "kind": "specials_backfill"},
+    ]
+    assert await crawl_service.default_queue_specs() == base_full
+
+    await settings_service.set_value("crawl.queue_missing", False)
+    assert await crawl_service.default_queue_specs() == base_full[1:]
+
+    await settings_service.set_value("crawl.queue_pool", False)
+    assert await crawl_service.default_queue_specs() == base_full[2:]
+
+    # 手动全库：catalog 恒含不受 catalog_refresh 影响，但逐段开关同样生效
+    assert await crawl_service.default_queue_specs(full_library=True) == [
+        {"scope": "catalog"},
+        {"scope": "specials", "kind": "specials_backfill"},
+    ]
+
+    await settings_service.set_value("crawl.queue_missing", True)
+    await settings_service.set_value("crawl.queue_pool", True)
+    assert await crawl_service.default_queue_specs() == base_full
+
+
+@pytest.mark.asyncio
+async def test_queue_discounts_switch_gates_direct_segment():
+    """折扣段开关：直连形态下 False = 折扣段不进组成（与 queue_missing/
+    queue_pool/queue_specials 同模式）。"""
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value("proxy.strategy", "direct_only")
+    await settings_service.set_value("crawl.queue_discounts", False)
+    assert await crawl_service.default_queue_specs() == [
+        {"kind": "missing"},
+        {"scope": "pool"},
+    ]
+
+    await settings_service.set_value("crawl.queue_discounts", True)
+    assert await crawl_service.default_queue_specs() == [
+        {"kind": "missing"},
+        {"scope": "pool"},
+        {"scope": "discounts", "kind": "discounts"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_settings_queue_switches_roundtrip():
+    """队列逐段开关读写：PUT 落 KV → GET 如实回显（默认开，缺失即开）。"""
+    from app.domains.settings import service as settings_service
+    from app.domains.settings.router import (
+        FetchSettingsUpdate,
+        get_fetch_settings,
+        update_fetch_settings,
+    )
+
+    payload = await get_fetch_settings()
+    assert payload.queue_missing and payload.queue_pool and payload.queue_discounts
+
+    await update_fetch_settings(FetchSettingsUpdate(queue_missing=False, queue_pool=False))
+    payload = await get_fetch_settings()
+    assert not payload.queue_missing and not payload.queue_pool
+    assert payload.queue_discounts
+    assert await settings_service.get_value("crawl.queue_missing", True) is False
+    assert await settings_service.get_value("crawl.queue_pool", True) is False
+
+
+@pytest.mark.asyncio
+async def test_queue_specs_readout_reflects_switches():
+    """组成读取面：GET 口径返回经开关过滤的段名序列（前端队列组成卡的
+    唯一数据源；prioritize 重排后的顺序即真实组队顺序）。"""
+    from app.domains.crawl import router as crawl_router
+    from app.domains.settings import service as settings_service
+
+    await settings_service.set_value("proxy.strategy", "proxy_first")
+    names = [s["name"] for s in (await crawl_router.queue_specs())["specs"]]
+    assert names == ["missing", "pool", "catalog", "specials"]
+
+    await settings_service.set_value("crawl.queue_missing", False)
+    await settings_service.set_value("crawl.catalog_refresh", False)
+    names = [s["name"] for s in (await crawl_router.queue_specs())["specs"]]
+    assert names == ["pool"]
