@@ -19,7 +19,6 @@ import asyncio
 import logging
 
 import httpx
-from app.core.net import is_ssl_error
 
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
@@ -100,25 +99,13 @@ async def _login_session() -> tuple[dict, str, str]:
 
 
 async def _post_steam(url: str, data: dict, jar: dict, *, referer: str | None = None) -> httpx.Response:
-    """商店端点 POST：代理优先 + SSL 证书降级重试（经 Clash vless 链路的既有规则）。"""
+    """商店端点 POST：代理优先；凭据只走证书校验通道，TLS 失败即失败。"""
     headers = dict(_HEADERS)
     if referer:
         headers["Referer"] = referer
     proxy = await strategy_proxy_or_direct()
-    try:
-        async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
-            resp = await client.post(url, data=data, cookies=jar, headers=headers)
-    except httpx.HTTPError as e:
-        if not is_ssl_error(e):
-            raise
-        log_event(
-            logger,
-            "商店端点证书校验失败（经代理场景），降级跳过校验重试",
-            tag="降级",
-        )
-        async with httpx.AsyncClient(timeout=20, proxy=proxy, verify=False) as client:
-            resp = await client.post(url, data=data, cookies=jar, headers=headers)
-    return resp
+    async with httpx.AsyncClient(timeout=20, proxy=proxy) as client:
+        return await client.post(url, data=data, cookies=jar, headers=headers)
 
 
 def _summary_from_receipt(receipt: dict) -> tuple[str, str]:
@@ -211,6 +198,49 @@ async def list_activations(limit: int = 50, offset: int = 0) -> dict:
                 for r in rows
             ],
         }
+
+
+# 检索窗：search_activations 经既有分页读取聚合的全量检索窗。
+# shortcut: 2000 条≈本地激活账本全量（账本增速约数十条/日）；
+# 账本超窗后把筛选下推为参数化 SQL（status/q/key），本函数契约不变。
+ACTIVATIONS_SEARCH_WINDOW = 2000
+
+
+async def search_activations(status: str = "", q: str = "", key: str = "", limit: int = 200, offset: int = 0) -> dict:
+    """激活历史检索：筛选+搜索+按码回查，覆盖检索窗内全部库内记录。
+
+    复用既有 list_activations 分页读取聚合检索窗（零 SQL 构建）：在
+    本地激活账本（增速约数十条/日）上等价于全库检索。status=ok/own/fail
+    按结果过滤；key=激活码精确匹配（结果表失败码回查历史成功记录）；
+    q 不分大小写子串匹配激活码/版本名/说明/账号。返回过滤后总数与分页行。
+    """
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    status = status.strip().lower()
+    if status and status not in {"ok", "own", "fail"}:
+        raise ValueError(f"未知的结果筛选：{status}")
+    needle = q.strip().lower()
+    code = key.strip()
+    window: list[dict] = []
+    while len(window) < ACTIVATIONS_SEARCH_WINDOW:
+        page = await list_activations(limit=200, offset=len(window))
+        if not page["rows"]:
+            break
+        window.extend(page["rows"])
+    filtered = [
+        r
+        for r in window
+        if (not status or r["status"] == status)
+        and (not code or r["key"] == code)
+        and (
+            not needle
+            or needle in r["key"].lower()
+            or needle in r["subName"].lower()
+            or needle in r["detail"].lower()
+            or needle in r["steamId"].lower()
+        )
+    ]
+    return {"total": len(filtered), "rows": filtered[offset : offset + limit]}
 
 
 async def activate_key(product_key: str) -> dict:

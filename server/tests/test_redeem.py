@@ -303,6 +303,54 @@ async def test_list_activations_order_and_paging(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_search_activations_filter_and_paging(db, monkeypatch):
+    """检索函数：status/key 精确过滤 + q 子串搜索 + 分页，覆盖检索窗内全部记录。"""
+    await settings_service.set_value(
+        "account.steam_cookies",
+        "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
+    )
+    # 三条不同状态的账本行（ok 回执带版本名，失败行无版本名）
+    ok_resp = FakeResponse(payload={
+        "success": 1,
+        "purchase_receipt_info": {"line_items": [
+            {"packageid": 307574, "line_item_description": "Dark Envoy"}]},
+    })
+    fail_resp = FakeResponse(payload={"success": 2, "purchase_result_details": 13})
+    monkeypatch.setattr(redeem_service, "_post_steam", _async(ok_resp))
+    await redeem_service.activate_key("AAAAA-BBBBB-CCCC1")
+    monkeypatch.setattr(redeem_service, "_post_steam", _async(fail_resp))
+    await redeem_service.activate_key("AAAAA-BBBBB-CCCC2")
+    await redeem_service.activate_key("EEEEE-FFFFF-GGGG1")
+
+    # status 过滤：ok 一条 / fail 两条
+    ok_page = await redeem_service.search_activations(status="ok")
+    assert ok_page["total"] == 1 and ok_page["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
+    assert ok_page["rows"][0]["subName"] == "Dark Envoy"
+    fail_page = await redeem_service.search_activations(status="fail")
+    assert fail_page["total"] == 2
+
+    # key 精确回查（失败码回查历史成功记录的场景）
+    by_key = await redeem_service.search_activations(key="AAAAA-BBBBB-CCCC1", status="ok", limit=5)
+    assert by_key["total"] == 1 and by_key["rows"][0]["detail"] == "激活成功"
+    none_key = await redeem_service.search_activations(key="EEEEE-FFFFF-GGGG1", status="ok")
+    assert none_key["total"] == 0
+
+    # q 子串（不分大小写）+ 分页
+    hit = await redeem_service.search_activations(q="dark envoy")
+    assert hit["total"] == 1 and hit["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
+    hit2 = await redeem_service.search_activations(q="aaaa")
+    assert hit2["total"] == 2
+    paged0 = await redeem_service.search_activations(q="aaaa", limit=1, offset=0)
+    assert paged0["rows"][0]["key"] == "AAAAA-BBBBB-CCCC2"  # 时间倒序：后激活的在前
+    paged = await redeem_service.search_activations(q="aaaa", limit=1, offset=1)
+    assert len(paged["rows"]) == 1 and paged["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
+
+    # 非法 status → ValueError（路由 400）
+    with pytest.raises(ValueError, match="未知的结果筛选"):
+        await redeem_service.search_activations(status="bogus")
+
+
+@pytest.mark.asyncio
 async def test_ledger_raw_truncated(db):
     """超长回执原文落账被截断到 RAW_MAX：不炸、不整段入库。"""
     big = "x" * (RAW_MAX * 3)
@@ -353,3 +401,25 @@ def _async(value):
     async def _wrapper(*args, **kwargs):
         return value
     return _wrapper
+
+
+@pytest.mark.asyncio
+async def test_post_steam_never_downgrades_tls(monkeypatch):
+    """TLS/网络失败即失败：绝不用未验证通道重试（激活凭据不出验证 TLS）。"""
+    constructed = []
+
+    class _FailClient:
+        def __init__(self, timeout=None, proxy=None, verify=None):
+            constructed.append(verify)
+            raise httpx.ConnectError("certificate verify failed")
+
+    async def _fake_proxy():
+        return None
+
+    monkeypatch.setattr(redeem_service.httpx, "AsyncClient", _FailClient)
+    monkeypatch.setattr(redeem_service, "strategy_proxy_or_direct", _fake_proxy)
+    with pytest.raises(httpx.HTTPError):
+        await redeem_service._post_steam(
+            redeem_service.REGISTER_KEY_URL, {"product_key": "K"}, {"sessionid": "s"})
+    # 只建过一个客户端，且从未带 verify=False（降级重试分支已删）
+    assert constructed == [None]

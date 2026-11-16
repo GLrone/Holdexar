@@ -31,9 +31,9 @@ async def quota():
 
 
 @router.get("/activations")
-async def activations(limit: int = 50, offset: int = 0):
-    """激活历史（时间倒序分页；成功/已拥有/失败与免费领取都在内）。"""
+async def activations(limit: int = 50, offset: int = 0, status: str = "", q: str = "", key: str = ""):
+    """激活历史检索（时间倒序分页；可按结果筛选、按码精确回查、按码/版本/说明/账号搜索）。"""
     try:
-        return await service.list_activations(limit=limit, offset=offset)
+        return await service.search_activations(limit=limit, offset=offset, status=status, q=q, key=key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
