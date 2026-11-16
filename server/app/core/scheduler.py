@@ -433,6 +433,34 @@ async def content_fetch_enabled(key: str) -> bool:
     return bool(await get_value(key, True))
 
 
+async def kick_source_jobs(job_ids: list[str]) -> None:
+    """内容源开启即补一拍首跑：把对应任务下一拍提前到现在。
+
+    只动 next_run_time 不换触发器——补拍跑完按原节奏继续；任务未注册
+    或改排失败时跳过该项，下一次定时拍兜底，永不抛异常。
+    """
+    from app.crawler.utils import get_beijing_time_obj
+
+    for job_id in job_ids:
+        try:
+            if scheduler.get_job(job_id) is None:
+                continue
+            scheduler.modify_job(job_id, next_run_time=get_beijing_time_obj())
+            log_event(
+                logger,
+                "内容源已开启，本轮立即补一拍",
+                detail={"任务": _JOB_LABELS.get(job_id, job_id)},
+            )
+        except Exception:  # noqa: BLE001 —— 提前失败无害，下一次定时拍照常
+            log_event(
+                logger,
+                "内容源补拍提前失败，按原节奏等待",
+                level=logging.WARNING,
+                detail={"任务": job_id},
+                exc_info=True,
+            )
+
+
 # ─── 内容源自定义刷新节奏（自动抓取页：HB 月包 / Epic 喜加一）─────────────
 # KV `fetch.<source>_schedule` = {"time": "HH:MM", "days": N}（1=每天，上限 30）。
 # 注册用默认；启动链（apply_content_schedules_from_settings）与设置保存

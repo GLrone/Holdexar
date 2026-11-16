@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import access, lan_access  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.database import get_engine, get_session_factory, init_db  # noqa: E402
 from app.core import scheduler as core_scheduler  # noqa: E402
@@ -26,7 +28,10 @@ from app.domains.metadata import service as metadata_service  # noqa: E402
 from app.domains.proxies import service as proxies_service  # noqa: E402
 from app.domains.rates import service as rates_service  # noqa: E402
 from app.domains.settings import service as settings_service  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
+
 from app.domains.settings.router import (  # noqa: E402
+    LanAccessUpdate,
     ContentSchedule,
     FetchSettingsUpdate,
     SettingsUpdate,
@@ -51,6 +56,10 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
         "price_interval_hours": 6,
         # 目录层默认随策略：默认直连下目录段不随轮出网
         "catalog_refresh": False,
+        # 任务队列逐段开关：缺失即开
+        "queue_missing": True,
+        "queue_pool": True,
+        "queue_discounts": True,
         # 内容源节奏默认（与调度器注册同一套常量）
         "hb_schedule": {"time": "02:30", "days": 1},
         "epic_schedule": {"time": "23:05", "days": 1},
@@ -262,3 +271,128 @@ async def test_epic_offers_request_path_gate(tmp_data_dir, monkeypatch):
     assert cached["ok"] is True
     assert cached["cached"] is True
     assert calls == []
+
+
+# ── 设置变更广播（批次二）与内容源开启补拍（批次三）──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_values_publishes_settings_changed(tmp_data_dir):
+    """KV 写口唯一收口处的变更广播：一次批量一条事件、键列表可订阅。"""
+    from app.core.events import bus
+
+    await init_db()
+    sub = bus.subscribe()
+    try:
+        await settings_service.set_values({"ui.probe.a": 1, "ui.probe.b": 2})
+        event = sub.critical.get_nowait()
+        assert event.type == "settings.changed"
+        assert event.payload["keys"] == ["ui.probe.a", "ui.probe.b"]
+        assert sub.critical.empty()
+    finally:
+        bus.unsubscribe(sub)
+
+
+def test_kick_job_ids_only_for_off_to_on():
+    """补拍判定：只有 off→on 翻转才补；缺省=开 的键首存 on 不算翻转。"""
+    from app.domains.settings.router import _kick_job_ids_for_enabled_source
+
+    assert _kick_job_ids_for_enabled_source(
+        {"fetch.epic_free": False, "fetch.boards": True},
+        {"fetch.epic_free": True, "fetch.boards": True},
+    ) == ["epic_free"]
+    # 一直开着：不补
+    assert _kick_job_ids_for_enabled_source({"fetch.epic_free": True}, {"fetch.epic_free": True}) == []
+    # 关闭方向：不补
+    assert _kick_job_ids_for_enabled_source({"fetch.epic_free": True}, {"fetch.epic_free": False}) == []
+
+
+class _StubScheduler:
+    """kick 单测替身：记录 modify_job 调用。"""
+
+    running = True
+
+    def __init__(self, existing: bool = True):
+        self.existing = existing
+        self.modified: list[tuple[str, object]] = []
+
+    def get_job(self, job_id):
+        return object() if self.existing else None
+
+    def modify_job(self, job_id, next_run_time):
+        self.modified.append((job_id, next_run_time))
+
+
+@pytest.mark.asyncio
+async def test_kick_source_jobs_modifies_next_run(monkeypatch):
+    stub = _StubScheduler()
+    monkeypatch.setattr(core_scheduler, "scheduler", stub)
+    await core_scheduler.kick_source_jobs(["epic_free", "fx_refresh"])
+    assert [job for job, _ in stub.modified] == ["epic_free", "fx_refresh"]
+    assert all(next_run is not None for _, next_run in stub.modified)
+
+    # 未注册任务跳过
+    gone = _StubScheduler(existing=False)
+    monkeypatch.setattr(core_scheduler, "scheduler", gone)
+    await core_scheduler.kick_source_jobs(["epic_free"])
+    assert gone.modified == []
+
+
+@pytest.mark.asyncio
+async def test_update_fetch_settings_kicks_enabled_source(tmp_data_dir, monkeypatch):
+    """off→on 补拍接线：调度在跑时提前下一拍；已开着再保存不补。"""
+    import asyncio
+
+    stub = _StubScheduler()
+    monkeypatch.setattr(core_scheduler, "scheduler", stub)
+    await init_db()
+    await settings_service.set_value("fetch.epic_free", False)
+
+    await update_fetch_settings(FetchSettingsUpdate(epic_free=True))
+    await asyncio.sleep(0.01)
+    assert [job for job, _ in stub.modified] == ["epic_free"]
+
+    stub.modified.clear()
+    await update_fetch_settings(FetchSettingsUpdate(epic_free=True))
+    await asyncio.sleep(0.01)
+    assert stub.modified == []
+
+
+# ── P2 回归：访问密码最短 8 位（一字符口令让解锁防穷举形同虚设）──────────
+
+
+@pytest.mark.asyncio
+async def test_lan_password_minimum_length(tmp_data_dir):
+    await init_db()
+    with pytest.raises(HTTPException) as short_exc:
+        await update_settings(
+            payload=SettingsUpdate(lan_access=LanAccessUpdate(password="1")),
+        )
+    assert short_exc.value.status_code == 422
+    await update_settings(
+        payload=SettingsUpdate(lan_access=LanAccessUpdate(password="x" * 8)),
+    )  # 合法长度不再拒绝
+    # PHC 终态：哈希 KV 存验证器串，旧可逆密文键清账
+    stored = await settings_service.get_value(settings_service.LAN_PASSWORD_HASH_KEY)
+    assert isinstance(stored, str) and stored.startswith("$scrypt$")
+    assert lan_access.verify_password("x" * 8, stored)
+    assert await settings_service.get_secret_value(settings_service.LAN_PASSWORD_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_lan_password_change_revokes_old_sessions(tmp_data_dir):
+    """改密即吊销：已设密码下再改，进程会话令牌轮换（旧解锁会话全失效）。
+
+    测试口令运行时生成，与真实凭据无关。
+    """
+    await init_db()
+    pw_a = "pw-" + secrets.token_hex(8)
+    pw_b = "pw-" + secrets.token_hex(8)
+    await update_settings(
+        payload=SettingsUpdate(lan_access=LanAccessUpdate(password=pw_a))
+    )
+    old_token = access.session_token()
+    await update_settings(
+        payload=SettingsUpdate(lan_access=LanAccessUpdate(password=pw_b))
+    )
+    assert access.session_token() != old_token

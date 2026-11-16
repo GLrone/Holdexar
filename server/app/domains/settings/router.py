@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from app.core import access, lan_access
@@ -30,7 +30,7 @@ class LocalSteamAccountImport(BaseModel):
 
 class LanAccessUpdate(BaseModel):
     enabled: bool | None = None
-    # 空串=清空（下次解锁自动重生成）；**** 前缀的掩码回显不回写
+    # 空串不改动（自动生成机制已随 PHC 化移除）；**** 前缀的掩码回显不回写
     password: str | None = None
 
 
@@ -39,8 +39,9 @@ class LanAccessState(BaseModel):
     # 环境变量强制开启时设置页开关只是显示值，关闭不生效
     env_forced: bool = False
     has_password: bool = False
-    # 仅回环请求回显明文（桌面端可看）；局域网请求一律掩码
-    password: str = ""
+    # 生效口令的来源：user=设置页口令（恒优先）、env=环境变量兜底、none=未设置
+    password_source: str = "none"
+    # 密码原文永不回显；设置/修改走独立输入端点，读取面只有 has_password 布尔
 
 
 class SettingsUpdate(BaseModel):
@@ -106,6 +107,28 @@ _FETCH_SETTING_KEYS: dict[str, str] = {
     "fx_history": "fetch.fx_history",
 }
 
+# 开启内容源即补一拍首跑：键 → 对应的主拍任务。热门新品/即将推出是每日档
+# 大抓取，不由本开关逐次补拍，跟随各自日节奏；榜单即时需求由每小时热销榜覆盖。
+_SOURCE_KICK_JOBS: dict[str, tuple[str, ...]] = {
+    "fetch.epic_free": ("epic_free",),
+    "fetch.hb_choice": ("hb_choice",),
+    "fetch.boards": ("board_topsellers",),
+    "fetch.bundle_counts": ("bartervg_bundles",),
+    "crawl.auto_refresh_rates": ("fx_refresh",),
+    "fetch.fx_history": ("fx_history_repair",),
+}
+
+
+def _kick_job_ids_for_enabled_source(
+    old_effective: dict[str, bool], new_values: dict[str, bool]
+) -> list[str]:
+    """收集 off→on 翻转的内容源键对应的补拍任务（旧值按「缺省=开」口径）。"""
+    kicks: list[str] = []
+    for key, jobs in _SOURCE_KICK_JOBS.items():
+        if new_values.get(key) is True and not old_effective.get(key, True):
+            kicks.extend(jobs)
+    return kicks
+
 
 class ContentSchedule(BaseModel):
     """内容源自动刷新节奏：时刻（HH:MM）+ 间隔天数（1=每天，上限 30）。"""
@@ -146,6 +169,12 @@ class FetchSettingsPayload(BaseModel):
     # 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏
     # （特惠榜尾段恒随轮）；改动从下一轮生效，不打断在跑的轮
     catalog_refresh: bool = False
+    # 任务队列逐段开关（任务中心队列组成卡）：False = 该段不随轮组队，
+    # 改动从下一轮组队生效；catalog 段沿用 catalog_refresh（特惠榜尾段
+    # 跟随它，不设独立开关）
+    queue_missing: bool = True
+    queue_pool: bool = True
+    queue_discounts: bool = True
     # 内容源自定义刷新节奏（自动抓取页；改动即时重排对应定时拍）
     hb_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("hb_choice"))
     epic_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("epic_free"))
@@ -160,28 +189,31 @@ class FetchSettingsUpdate(BaseModel):
     fx_history: bool | None = None
     price_interval_hours: int | None = None
     catalog_refresh: bool | None = None
+    queue_missing: bool | None = None
+    queue_pool: bool | None = None
+    queue_discounts: bool | None = None
     hb_schedule: ContentSchedule | None = None
     epic_schedule: ContentSchedule | None = None
 
 
-async def _lan_state(request: Request | None) -> LanAccessState:
-    """局域网访问模式状态：明文密码只回显给回环请求（桌面端）。
-
-    request 为 None 仅出现在测试直调（视为回环视角）；真实请求由 FastAPI
-    注入，局域网来源一律掩码。
+async def _lan_state() -> LanAccessState:
+    """局域网访问模式状态。密码原文永不回显；读取面只有 has_password 布尔，
+    设置/修改走独立的输入端点。
     """
-    loopback = (
-        access.is_loopback_host(request.headers.get("host") or "")
-        if request is not None
-        else True
-    )
+    stored_hash = await service.get_value(service.LAN_PASSWORD_HASH_KEY, "")
     stored = await service.get_secret_value(service.LAN_PASSWORD_KEY, "")
-    password = lan_access.env_password() or (stored or "")
+    if stored_hash or stored:
+        source = "user"
+    elif lan_access.env_password():
+        source = "env"
+    else:
+        source = "none"
     return LanAccessState(
         enabled=lan_access.is_enabled(),
         env_forced=lan_access.env_forced(),
-        has_password=bool(password),
-        password=password if loopback else "",
+        # 哈希 KV（PHC 终态）/ 旧可逆密文（迁移前存量）/ 环境口令，任一存在即可解锁
+        has_password=bool(stored_hash or stored or lan_access.env_password()),
+        password_source=source,
     )
 
 
@@ -220,12 +252,15 @@ async def get_settings(request: Request = None) -> SettingsPayload:
         mcp_running=bool(mcp_state["running"]),
         mcp_error=str(mcp_state["error"]),
         mcp_forced_by_env=bool(mcp_state["forcedByEnv"]),
-        lan_access=await _lan_state(request),
+        lan_access=await _lan_state(),
     )
 
 
 @router.put("")
-async def update_settings(payload: SettingsUpdate, request: Request = None) -> SettingsPayload:
+async def update_settings(
+    payload: SettingsUpdate, request: Request = None, response: Response = None
+) -> SettingsPayload:
+    rotate_session = False
     if payload.account:
         if payload.account.steam_id is not None:
             await service.set_value(
@@ -281,12 +316,40 @@ async def update_settings(payload: SettingsUpdate, request: Request = None) -> S
             lan_access.set_enabled(bool(payload.lan_access.enabled))
         if payload.lan_access.password is not None:
             password = payload.lan_access.password.strip()
-            # 前端掩码回显不回写，避免把掩码存成真值
-            if password and not password.startswith("****"):
-                await service.set_secret_value(service.LAN_PASSWORD_KEY, password)
+            if password == "":
+                # 显式清空：可设可清对称；清密码即吊销全部解锁会话
+                await service.delete_value(service.LAN_PASSWORD_HASH_KEY)
+                await service.delete_value(service.LAN_PASSWORD_KEY)
+                access.reset_token()
+                rotate_session = True
+            elif not password.startswith("****"):
+                # 前端掩码回显不回写，避免把掩码存成真值；最短 8 位（防一字符
+                # 口令让解锁防穷举形同虚设——P0 审计修复）
+                if len(password) < 8:
+                    raise HTTPException(status_code=422, detail="访问密码至少 8 位")
+                # 用户口令恒优先于环境口令（界面改密即吊销运维通道），所以
+                # 环境口令在场也算「改密前有验证器」——旧解锁会话一并吊销
+                previous = bool(
+                    await service.get_value(service.LAN_PASSWORD_HASH_KEY, "")
+                ) or bool(await service.get_secret_value(service.LAN_PASSWORD_KEY, "")) or bool(
+                    lan_access.env_password()
+                )
+                await service.set_value(
+                    service.LAN_PASSWORD_HASH_KEY,
+                    lan_access.hash_password(password),
+                )
+                await service.delete_value(service.LAN_PASSWORD_KEY)
+                if previous:
+                    # 改密即吊销旧解锁会话：本次响应重新签发（当前会话不中断），
+                    # 其余持旧口令解锁的会话全部失效
+                    access.reset_token()
+                    rotate_session = True
         lan_access.refresh_extra_hosts()
 
-    return await get_settings(request)
+    result = await get_settings(request)
+    if rotate_session and response is not None:
+        access.issue_session(response)
+    return result
 
 
 @router.get("/steam-local-accounts")
@@ -332,6 +395,9 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
     payload.catalog_refresh = bool(
         await service.get_value("crawl.catalog_refresh", catalog_default)
     )
+    # 任务队列逐段开关：与 crawl.default_queue_specs 同源（KV 缺失默认开）
+    for field in ("queue_missing", "queue_pool", "queue_discounts"):
+        setattr(payload, field, bool(await service.get_value(f"crawl.{field}", True)))
     # 内容源自定义节奏：KV 缺失/非法逐项回落注册默认（同一套默认）
     from app.core.scheduler import CONTENT_SCHEDULE_KEYS, normalize_schedule
 
@@ -349,10 +415,32 @@ async def get_fetch_settings() -> FetchSettingsPayload:
 
 @router.put("/fetch")
 async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPayload:
+    # off→on 补拍判定要用旧值：先按「缺省=开」口径读一轮有效旧值再写
+    old_effective = {
+        key: bool(await service.get_value(key, True))
+        for key in set(_FETCH_SETTING_KEYS.values())
+    }
     for field, key in _FETCH_SETTING_KEYS.items():
         value = getattr(payload, field)
         if value is not None:
             await service.set_value(key, bool(value))
+    kicks = _kick_job_ids_for_enabled_source(
+        old_effective,
+        {
+            key: bool(getattr(payload, field))
+            for field, key in _FETCH_SETTING_KEYS.items()
+            if getattr(payload, field) is not None
+        },
+    )
+    if kicks:
+        # 开源即补一拍首跑：不等下一个定时拍（改排失败不阻塞保存）
+        try:
+            from app.core import scheduler as core_scheduler
+
+            if core_scheduler.scheduler.running:
+                asyncio.create_task(core_scheduler.kick_source_jobs(kicks))
+        except Exception:  # noqa: BLE001
+            pass
     if payload.price_interval_hours is not None:
         hours = max(1, min(72, int(payload.price_interval_hours)))
         await service.set_value("crawl.price_interval_hours", hours)
@@ -370,6 +458,11 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
     if payload.catalog_refresh is not None:
         # 只落偏好：价格轮每轮开工时现读，改动从下一轮生效
         await service.set_value("crawl.catalog_refresh", bool(payload.catalog_refresh))
+    for field in ("queue_missing", "queue_pool", "queue_discounts"):
+        value = getattr(payload, field)
+        if value is not None:
+            # 只落偏好：组队时现读，改动从下一轮生效
+            await service.set_value(f"crawl.{field}", bool(value))
     # 内容源自定义节奏：落 KV + 调度在跑时立即重排（下次启动按 KV 再应用）
     from app.core.scheduler import CONTENT_SCHEDULE_KEYS
 

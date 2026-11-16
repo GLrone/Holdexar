@@ -13,15 +13,15 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app.core import secretbox
 from app.core.database import WritePriority, get_session_factory, write_session
+from app.core.events import bus
 from app.core.secretbox import SecretBoxError
 from app.domains.settings.models import AppSetting
 from app.crawler.utils import get_beijing_time_obj
 
-# 凭据类设置键：落库即 AES-256-GCM 密文（secretbox 按机器派生密钥），
-# 读取时解密；存量明文由启动加密步骤（seal_secret_values）封装
 # 局域网访问模式（core/lan_access.py 持内存态，这里持持久化事实）
 LAN_ENABLED_KEY = "access.lan_enabled"
 LAN_PASSWORD_KEY = "access.lan_password"
+LAN_PASSWORD_HASH_KEY = "access.lan_password_hash"
 
 # 凭据类设置键：落库即 AES-256-GCM 密文（secretbox 按机器派生密钥），
 # 读取时解密；存量明文由启动加密步骤（seal_secret_values）封装
@@ -54,6 +54,7 @@ async def delete_value(key: str) -> None:
     async with write_session(WritePriority.INTERACTIVE, label="settings") as session:
         await session.execute(delete(AppSetting).where(AppSetting.key == key))
         await session.commit()
+    bus.publish("settings.changed", keys=[key])
 
 
 async def set_value(key: str, value) -> None:
@@ -79,6 +80,9 @@ async def set_values(values: dict, *, secret_values: dict | None = None) -> None
             )
         )
         await session.commit()
+    # KV 写口唯一收口处的变更广播：前端经 SSE settings.changed 静默重读，
+    # 覆盖另一端/另一标签页/后端内部改动（无订阅者时发布为空操作）。
+    bus.publish("settings.changed", keys=sorted(values.keys()))
 
 
 async def get_secret_value(key: str, default=None):
