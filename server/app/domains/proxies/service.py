@@ -27,7 +27,7 @@ from sqlalchemy import delete, func, select
 
 from app.core import secretbox
 from app.core.database import WritePriority, get_session_factory, write_session
-from app.core.logging import log_event
+from app.core.logging import log_event, redact_url
 from app.crawler.browse_store import StoreBrowseAPI
 from app.crawler.utils import get_beijing_time_obj
 from . import clash_manager, credentials
@@ -994,7 +994,7 @@ async def resolve_startable_clash(
                 detail={
                     "订阅编号": sub["id"],
                     "名称": sub["label"],
-                    "订阅": sub["url"],
+                    "订阅": redact_url(sub["url"]),
                     "原因": str(e),
                 },
             )
@@ -1018,7 +1018,7 @@ async def resolve_startable_clash(
                     detail={
                         "订阅编号": sub["id"],
                         "名称": sub["label"],
-                        "订阅": sub["url"],
+                        "订阅": redact_url(sub["url"]),
                     },
                 )
             continue
@@ -1407,20 +1407,8 @@ async def migrate_legacy_subscription() -> None:
 
 
 def mask_url(url: str) -> str:
-    """订阅链接掩码：保留主机名，隐藏路径与查询串（token 都在那里）。
-
-    展示层只需要「这是哪家机场」，恢复完整链接是显式的、单独的取用动作。
-    """
-    if not url:
-        return ""
-    from urllib.parse import urlsplit
-
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return "***"
-    host = parts.hostname or "***"
-    return f"{parts.scheme}://{host}/***" if parts.scheme else f"{host}/***"
+    """订阅链接掩码（展示层）：与日志层同一实现——保留主机名，路径与查询打码。"""
+    return redact_url(url)
 
 
 async def list_subscriptions(kind: str | None = None, *, reveal: bool = False) -> list[dict]:

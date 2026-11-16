@@ -102,13 +102,17 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 def redact_url(url: str | None) -> str:
-    """订阅类 URL 的日志展示形态：保留 scheme+host，路径与查询一律打码。
+    """订阅类 URL 的展示形态（日志与响应体共用）：保留 scheme+host，路径与查询一律打码。
 
     订阅地址的身份凭据在路径段里的 token——逐行 redact 的正则对路径型
-    token 天然失明，所以落日志前在这里先降级成主机形态。"""
+    token 天然失明，所以落日志前在这里先降级成主机形态。打码函数自身
+    不得抛异常：畸形 URL 宁可整体掩码。"""
     if not url:
         return ""
-    parts = urlsplit(url.strip())
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return "***"
     if not parts.netloc:
         return "***"
     return f"{parts.scheme}://{parts.netloc}/***"
@@ -124,7 +128,38 @@ def redact(text: str) -> str:
         return text
     for pattern, repl in _REDACTIONS:
         text = pattern.sub(repl, text)
-    return text
+    return _mask_token_urls(text)
+
+
+# 路径型 token 的第二道网：订阅凭据常嵌在 URL 路径段里（`/api/v1/pq/<32 位随机串>`），
+# 上面的行级正则对它失明，只能靠调用点先过 redact_url——而调用点是纪律不是机制，
+# 漏写即泄漏。路径里出现「整段长随机串」时整条 URL 降级为主机形态，堵住这一缺口。
+# 锚定整段控制误伤面：带点的发布资产文件名、纯数字段（SteamID64）、纯字母词
+# （API 路径段）都不命中，普通 URL 的路径排障价值保留。残余盲区（短 token、
+# 纯字母或纯数字的 token）与普通路径形状不可区分，仍依赖调用点降级。
+_URL_IN_LINE = re.compile(r"(?i)https?://[^\s\"'<>│]+")
+_TOKEN_SEGMENT = re.compile(r"[A-Za-z0-9_-]{16,}")
+
+
+def _segment_is_token(segment: str) -> bool:
+    """路径段是否形如随机凭据：长度达标且字母数字混合（排除词语段与纯数字序号段）。"""
+    if not _TOKEN_SEGMENT.fullmatch(segment):
+        return False
+    return any(c.isdigit() for c in segment) and any(c.isalpha() for c in segment)
+
+
+def _mask_token_urls(text: str) -> str:
+    def _downgrade(match: re.Match[str]) -> str:
+        url = match.group(0)
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return url
+        if any(_segment_is_token(seg) for seg in parts.path.split("/")):
+            return f"{parts.scheme}://{parts.netloc}/***"
+        return url
+
+    return _URL_IN_LINE.sub(_downgrade, text)
 
 
 # ── 人话渲染 ────────────────────────────────────────────────

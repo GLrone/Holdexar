@@ -435,3 +435,112 @@ def test_redact_url_edge_cases():
     assert app_logging.redact_url("not a url") == "***"
     out = app_logging.redact_url("https://" + "host.example")
     assert out == "https://host.example/***"
+
+
+def test_redact_url_survives_malformed_url():
+    """打码函数自身不得抛异常：畸形 URL（残缺 IPv6 等）宁可整体掩码。"""
+    assert app_logging.redact_url("http://[::1") == "***"
+
+
+# ── 路径型 token：日志层的第二道网 ──────────────────────────
+# 订阅凭据常嵌在 URL 路径段里（`/api/v1/pq/<32 位随机串>`），调用点必须先过
+# redact_url；但调用点是纪律不是机制，漏写即泄漏。redact() 对「路径含整段
+# 长随机串」的 URL 整体降级为主机形态，堵住调用点漏网。误伤面同样钉死：
+# 纯字母词段 / 纯数字段 / 带点文件名段都不是 token，路径排障价值必须保留。
+# URL 与 token 一律拼接构造（字面订阅形状会被提交门禁拦住本文件）。
+
+SUB_HOST = "sub.example.com"
+SUB_TOKEN = "d4c6b1a9" + "8f3e2715" + "0c9a4e6d" + "2b8f15c7"
+
+
+def _subscribe_url(path_prefix: str) -> str:
+    return f"https://{SUB_HOST}{path_prefix}{SUB_TOKEN}"
+
+
+@pytest.mark.parametrize(
+    "path_prefix",
+    ["/api/v1/client/subscribe/", "/kcyun/", "/api/v1/pq/"],
+)
+def test_redact_masks_path_token_url(path_prefix):
+    line = f"订阅抓取失败：{_subscribe_url(path_prefix)}"
+    out = app_logging.redact(line)
+    assert SUB_TOKEN not in out
+    assert SUB_HOST in out           # 主机保留：排障仍知道是哪家
+    assert path_prefix.strip("/") not in out  # 路径整段降级
+    assert "/***" in out
+
+
+def test_redact_masks_path_token_in_query_too():
+    """路径 token 与查询参数并存时一并消失（旧日志里 `?nodeType=1` 形状）。"""
+    url = _subscribe_url("/kcyun/") + "?nodeType=1&flag=clash"
+    out = app_logging.redact(f"候选不可用：{url}")
+    assert SUB_TOKEN not in out and "nodeType=1" not in out
+
+
+def test_redact_keeps_ordinary_path_segments():
+    """整段锚定的误伤面：API 词段、纯数字段、带点文件名段都不是 token。"""
+    steam_api = (
+        "钱包轮询: https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+        f"?key={FAKE_STEAM_KEY}"
+    )
+    out = app_logging.redact(steam_api)
+    assert "GetPlayerSummaries" in out      # 纯字母词段保留
+    assert "api.steampowered.com" in out
+    assert "key=***" in out                  # 查询串凭据仍由既有规则抹除
+
+    profile = "档案: https://steamcommunity.com/profiles/76561190000000000/inventoryhistory/"
+    assert app_logging.redact(profile) == profile  # 纯数字 SteamID64 段保留
+
+    asset = "下载: https://github.com/owner/repo/releases/download/v1.2.3/Holdexar-1.2.3-win64.zip"
+    assert app_logging.redact(asset) == asset      # 带点文件名段保留
+
+
+def test_real_log_line_masks_path_token_in_detail(root_logging):
+    """启动候选失败日志的真实形状：整条订阅 URL 在 detail 里。
+
+    调用点漏写 redact_url 也不能把 token 写进日志——真实日志文件里已复现过
+    这条泄漏，本用例是日志层兜底的回归防线。"""
+    root, sinks = root_logging
+    sink = _capture(root, sinks)
+    app_logging.log_event(
+        logging.getLogger("app.domains.proxies.service"),
+        "启动候选订阅 7 不可用，换下一个候选",
+        level=logging.WARNING,
+        detail={
+            "订阅编号": 7,
+            "名称": "测试机场",
+            "订阅": _subscribe_url("/api/v1/client/subscribe/"),
+            "原因": "HTTP 404",
+        },
+    )
+    line = sink.lines[0]
+    assert SUB_TOKEN not in line
+    assert SUB_HOST in line
+    assert "/***" in line
+
+
+def test_real_log_line_masks_path_token_in_message(root_logging):
+    root, sinks = root_logging
+    sink = _capture(root, sinks)
+    app_logging.log_event(
+        logging.getLogger("app.domains.proxies.service"),
+        f"订阅下载失败: {_subscribe_url('/api/v1/pq/')}",
+        level=logging.WARNING,
+    )
+    assert SUB_TOKEN not in sink.lines[0]
+    assert "/***" in sink.lines[0]
+
+
+def test_real_log_line_masks_path_token_in_traceback(root_logging):
+    """异常链文本是第三条通路：HTTP 客户端的错误消息会带完整 URL，
+    exc_info 落栈时 traceback 一并渲染进日志行，兜底必须覆盖到栈文本。"""
+    root, sinks = root_logging
+    sink = _capture(root, sinks)
+    try:
+        raise RuntimeError(f"订阅下载失败: {_subscribe_url('/kcyun/')}")
+    except RuntimeError:
+        logging.getLogger("app.domains.proxies.service").error(
+            "订阅重拉异常", exc_info=True
+        )
+    assert len(sink.lines) == 1
+    assert SUB_TOKEN not in sink.lines[0]

@@ -38,8 +38,9 @@ from app.domains.proxypool.subscription import (  # noqa: E402
     FORMAT_HTML, FORMAT_PROVIDER_YAML, FORMAT_UNKNOWN, FORMAT_URI, FORMAT_YAML,
     SUB_USER_AGENT,
     EmptyNodeSetError, FetchAttempt, FetchFailedError, FetchResult,
-    InvalidEncodingError, Snapshot,
-    SnapshotRecoveryError, UnsupportedFormatError,
+    InvalidEncodingError, RedirectPolicyError, Snapshot,
+    SnapshotError, SnapshotRecoveryError, SubscriptionTooLargeError,
+    UnsupportedFormatError,
     Channel,
     build_channels, build_snapshot, decode_utf8, detect_format,
     fetch_subscription, latest_snapshot, parse_nodes, persist_fetch_failure,
@@ -996,3 +997,127 @@ async def test_egress_scores_ignore_target_http_failures(tmp_data_dir):
         scores = await fetch_egress_success_scores(session)
 
     assert scores[egress_id] == pytest.approx(1 / 3)
+
+
+# ── SSRF 纵深：scheme 白名单 / 手动重定向循环 / 尺寸上限 / 深嵌套收拢 ──
+def _hopping_factory(script):
+    """按请求序号出牌：script = [resp1, resp2, ...]，越界复用最后一项。"""
+    def factory(_ch):
+        state = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            idx = min(state["n"], len(script) - 1)
+            state["n"] += 1
+            item = script[idx]
+            if isinstance(item, tuple):
+                status, body = item
+                return httpx.Response(status, content=body)
+            return httpx.Response(302, headers={"location": item})
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return factory
+
+
+_YAML_OK = _yaml_bytes([_node()])
+
+
+@pytest.mark.asyncio
+async def test_fetch_follows_http_redirects_within_budget():
+    """合法 http(s) 重定向仍逐跳跟随（含跨主机跨端口），≤3 跳内拿到内容。"""
+    result = await fetch_subscription(
+        "http://a.invalid/sub", build_channels(),
+        client_factory=_hopping_factory([
+            "http://b.invalid:8443/sub2",
+            "http://c.invalid/sub3",
+            (200, _YAML_OK),
+        ]),
+    )
+    assert result.fmt == FORMAT_YAML
+    assert parse_nodes(result.raw, result.fmt)
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_redirect_beyond_three_hops():
+    """第 4 跳起拒绝：报「订阅地址重定向过多」，不回显跳转目标。"""
+    with pytest.raises(FetchFailedError) as ei:
+        await fetch_subscription(
+            "http://a.invalid/sub", build_channels(),
+            client_factory=_hopping_factory([
+                "http://b.invalid/1", "http://c.invalid/2",
+                "http://d.invalid/3", "http://e.invalid/4",
+                (200, _YAML_OK),
+            ]),
+        )
+    assert "订阅地址重定向过多" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_redirect_to_non_http_scheme():
+    """重定向链里出现非 http(s) 目标 → 当跳拒绝（SSRF 纵深闸）。"""
+    with pytest.raises(FetchFailedError) as ei:
+        await fetch_subscription(
+            "http://a.invalid/sub", build_channels(),
+            client_factory=_hopping_factory([
+                "file:///C:/Windows/win.ini",
+                (200, _YAML_OK),
+            ]),
+        )
+    assert "http/https" in str(ei.value)
+    assert "win.ini" not in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_non_http_initial_url():
+    """初始地址 scheme 白名单：file:// 等一律拒绝，且不发任何请求。"""
+    calls: list[str] = []
+    with pytest.raises(SnapshotError) as ei:
+        await fetch_subscription(
+            "file:///etc/passwd", build_channels(),
+            client_factory=_scripted({}, calls, []),
+        )
+    assert "http/https" in str(ei.value)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_rejects_oversized_body():
+    """正文超过 20 MiB → 「订阅内容过大」，不进入快照链。"""
+    oversized = b"x" * (20 * 1024 * 1024 + 1)
+    with pytest.raises(FetchFailedError) as ei:
+        await fetch_subscription(
+            SUB_URL, build_channels(),
+            client_factory=_hopping_factory([(200, oversized)]),
+        )
+    assert "订阅内容过大" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_deep_nested_yaml_does_not_escape_as_recursion_error():
+    """深层嵌套 YAML 抛的 RecursionError 收拢为订阅格式失败，不逃出 SnapshotError 族。"""
+    deep = b"proxies:\n- name: a\n  type: ss\n  payload: " + b"[[" * 30000
+    with pytest.raises(SnapshotError) as ei:
+        await fetch_subscription(
+            SUB_URL, build_channels(),
+            client_factory=_hopping_factory([(200, deep)]),
+        )
+    assert not isinstance(ei.value, RecursionError)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_restore_traps_recursion_error(tmp_data_dir, monkeypatch):
+    """恢复上一份快照遇深嵌套字节 → SnapshotRecoveryError（fail-closed），不裸崩。"""
+    await init_db()
+    snap = await _refresh(1, build_channels(),
+                          _scripted({CHANNEL_DIRECT: (200, _yaml_bytes([_node()]))},
+                                    [], []))
+    async with get_session_factory()() as s:
+        await persist_snapshot(s, snap, data_dir=tmp_data_dir)
+        await s.commit()
+
+    def _boom(*_args, **_kwargs):
+        raise RecursionError("maximum recursion depth exceeded while parsing")
+
+    monkeypatch.setattr(yaml, "safe_load", _boom)
+    async with get_session_factory()() as s:
+        with pytest.raises(SnapshotRecoveryError):
+            await latest_snapshot(s, 1, url=SUB_URL)

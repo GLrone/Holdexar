@@ -39,6 +39,11 @@ DEFAULT_SUBSCRIPTION_DEADLINE = 24.0
 DEFAULT_HEDGE_DELAY = 0.25
 DEFAULT_FETCH_PARALLELISM = 2
 
+# SSRF 纵深闸：scheme 白名单、重定向跳数上限、正文尺寸上限
+_ALLOWED_SCHEMES = ("http", "https")
+MAX_REDIRECT_HOPS = 3
+MAX_BODY_BYTES = 20 * 1024 * 1024
+
 # ── 格式 ──────────────────────────────────────────────────────────
 FORMAT_YAML = "yaml"
 FORMAT_PROVIDER_YAML = "provider_yaml"
@@ -102,6 +107,8 @@ class UnsupportedFormatError(SnapshotError):
             "provider_proxy_unavailable": "订阅节点来源指定的代理出口当前不可用",
             "provider_direct_route_unavailable": "订阅节点来源要求直连，但当前没有直连通道",
             "provider_proxy_rejected": "订阅节点来源的代理设置拒绝连接",
+            "provider_redirect_blocked": "订阅节点来源重定向过多",
+            "provider_size_limit": "订阅内容过大",
         }
         super().__init__(messages.get(fmt, f"不支持的订阅格式：{fmt}"))
 
@@ -152,12 +159,37 @@ class ProviderResolutionError(SnapshotError):
 
     def __init__(
         self, code: str, stage: str = "provider",
-        attempts: list["FetchAttempt"] | None = None,
+        attempts: list[FetchAttempt] | None = None,
     ) -> None:
         self.code = code
         self.stage = stage
         self.attempts = attempts or []
         super().__init__(code)
+
+
+class RedirectPolicyError(SnapshotError):
+    """地址/重定向策略拒绝（scheme 白名单、跳数上限）。
+
+    文案不回显跳转目标：重定向链可能被用来探测内网，目标细节不进用户面。
+    """
+
+    _REASONS = {
+        "bad_scheme": "订阅地址不支持（仅 http/https）",
+        "too_many_redirects": "订阅地址重定向过多",
+    }
+
+    def __init__(self, reason: str, attempts: list["FetchAttempt"] | None = None) -> None:
+        self.reason = reason
+        self.attempts = attempts or []
+        super().__init__(self._REASONS.get(reason, reason))
+
+
+class SubscriptionTooLargeError(SnapshotError):
+    """订阅正文超过尺寸上限：拒绝进入快照，不覆盖旧快照。"""
+
+    def __init__(self, attempts: list["FetchAttempt"] | None = None) -> None:
+        self.attempts = attempts or []
+        super().__init__("订阅内容过大")
 
 
 # ── 数据对象 ──────────────────────────────────────────────────────
@@ -372,13 +404,56 @@ def _provider_definitions(raw: bytes) -> tuple[dict, dict[str, dict]]:
 
 def default_client_factory(channel: Channel, *, timeout: float = DEFAULT_FETCH_TIMEOUT
                            ) -> httpx.AsyncClient:
-    """生产默认：按通道的 proxy 建客户端。"""
+    """生产默认：按通道的 proxy 建客户端。重定向由 _fetch_body 逐跳复检，
+    客户端不得自动跟随（自动跟随没有逐跳 scheme 复检）。"""
     return httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=min(timeout, 5.0)),
         proxy=channel.proxy,
-        follow_redirects=True,
+        follow_redirects=False,
         trust_env=False,
     )
+
+
+def _assert_http_url(url: str) -> None:
+    """scheme 白名单：非 http/https 一律拒绝。"""
+    try:
+        scheme = urlsplit(url).scheme.lower()
+    except ValueError:
+        scheme = ""
+    if scheme not in _ALLOWED_SCHEMES:
+        raise RedirectPolicyError("bad_scheme")
+
+
+async def _fetch_body(client: httpx.AsyncClient, url: str,
+                      headers: Mapping[str, str] | list[tuple[str, str]] | None = None,
+                      ) -> httpx.Response:
+    """GET：手动重定向循环（每跳复检 scheme、总跳数≤3）+ 正文尺寸上限。
+
+    初始地址与每个跳转目标都过 scheme 白名单；跳数超限报「订阅地址重定向
+    过多」，正文超限报「订阅内容过大」，两者都不回显目标地址。
+    """
+    _assert_http_url(url)
+    target = url
+    hops = 0
+    while True:
+        async with client.stream("GET", target, headers=headers) as stream:
+            if not stream.has_redirect_location:
+                body = bytearray()
+                async for chunk in stream.aiter_bytes(65536):
+                    body.extend(chunk)
+                    if len(body) > MAX_BODY_BYTES:
+                        raise SubscriptionTooLargeError()
+                return httpx.Response(
+                    stream.status_code, headers=stream.headers, content=bytes(body),
+                )
+            if hops >= MAX_REDIRECT_HOPS:
+                raise RedirectPolicyError("too_many_redirects")
+            hops += 1
+            next_request = stream.next_request
+        if next_request is None:
+            raise RedirectPolicyError("too_many_redirects")
+        target = str(next_request.url)
+        _assert_http_url(target)
 
 
 def _validate_fetch_response(
@@ -420,7 +495,7 @@ def _validate_fetch_response(
                 error="empty_node_set", stage="validation", elapsed_ms=elapsed_ms,
                 egress_id=egress_id,
             ), FORMAT_EMPTY
-        except (UnsupportedFormatError, yaml.YAMLError, ValueError):
+        except (UnsupportedFormatError, yaml.YAMLError, ValueError, RecursionError):
             return None, FetchAttempt(
                 channel.name, False, resp.status_code, fmt,
                 error="invalid_subscription_yaml", stage="validation",
@@ -429,7 +504,7 @@ def _validate_fetch_response(
     elif fmt == FORMAT_PROVIDER_YAML:
         try:
             _provider_definitions(raw)
-        except (UnsupportedFormatError, yaml.YAMLError, ValueError):
+        except (UnsupportedFormatError, yaml.YAMLError, ValueError, RecursionError):
             return None, FetchAttempt(
                 channel.name, False, resp.status_code, fmt,
                 error="invalid_provider_subscription", stage="validation",
@@ -484,7 +559,13 @@ async def _fetch_provider_nodes(
     request_timeout: float,
     deadline: float,
 ) -> tuple[list[dict], dict[str, list[dict]], list[FetchAttempt]]:
-    doc, providers = _provider_definitions(raw)
+    try:
+        doc, providers = _provider_definitions(raw)
+    except (SnapshotError, yaml.YAMLError, ValueError, RecursionError) as exc:
+        # 深层嵌套 YAML 抛 RecursionError（不在 yaml.YAMLError 族内），一并归入格式无效
+        raise ProviderResolutionError(
+            "invalid_provider_content", "provider_validation"
+        ) from exc
     semaphore = asyncio.Semaphore(3)
 
     def _request_channel(config: Mapping[str, Any]) -> Channel:
@@ -569,9 +650,29 @@ async def _fetch_provider_nodes(
             async with semaphore:
                 async with asyncio.timeout(timeout):
                     async with client_factory(request_channel) as client:
-                        response = await client.get(
-                            str(config["url"]), headers=headers
+                        response = await _fetch_body(
+                            client, str(config["url"]), headers
                         )
+        except RedirectPolicyError as exc:
+            attempt = FetchAttempt(
+                f"provider:{name}", False, None, FORMAT_UNKNOWN,
+                "provider_redirect_blocked", "provider_redirect",
+                int((time.monotonic() - started) * 1000),
+                request_channel.egress_id or request_channel.name,
+            )
+            raise ProviderResolutionError(
+                "provider_redirect_blocked", "provider_redirect", [attempt]
+            ) from exc
+        except SubscriptionTooLargeError as exc:
+            attempt = FetchAttempt(
+                f"provider:{name}", False, None, FORMAT_UNKNOWN,
+                "provider_size_limit", "provider_validation",
+                int((time.monotonic() - started) * 1000),
+                request_channel.egress_id or request_channel.name,
+            )
+            raise ProviderResolutionError(
+                "provider_size_limit", "provider_validation", [attempt]
+            ) from exc
         except (TimeoutError, httpx.TimeoutException) as exc:
             attempt = FetchAttempt(
                 f"provider:{name}", False, None, FORMAT_UNKNOWN,
@@ -636,7 +737,7 @@ async def _fetch_provider_nodes(
         try:
             fmt = detect_format(response.content)
             nodes = parse_nodes(response.content, fmt)
-        except (SnapshotError, yaml.YAMLError, ValueError) as exc:
+        except (SnapshotError, yaml.YAMLError, ValueError, RecursionError) as exc:
             attempt = FetchAttempt(
                 f"provider:{name}", False, response.status_code, FORMAT_UNKNOWN,
                 "invalid_provider_content", "provider_validation",
@@ -730,6 +831,7 @@ async def fetch_subscription(
     response_parser: Callable[[bytes, str], list[dict]] | None = None,
 ) -> FetchResult:
     """有限竞速，返回第一份格式和节点内容都有效的订阅。"""
+    _assert_http_url(url)
     ordered = list(channels)
     scores = egress_scores or {}
     if preferred_egress or scores:
@@ -757,9 +859,15 @@ async def fetch_subscription(
         try:
             async with asyncio.timeout(max(0.01, request_timeout)):
                 async with client_factory(channel) as client:
-                    response = await client.get(
-                        url, headers={"User-Agent": SUB_USER_AGENT}
+                    response = await _fetch_body(
+                        client, url, {"User-Agent": SUB_USER_AGENT}
                     )
+        except (RedirectPolicyError, SubscriptionTooLargeError) as exc:
+            elapsed = int((time.monotonic() - channel_started) * 1000)
+            return None, FetchAttempt(
+                channel.name, False, None, FORMAT_UNKNOWN, str(exc),
+                "policy", elapsed, channel.egress_id or channel.name,
+            ), None, []
         except TimeoutError:
             elapsed = int((time.monotonic() - channel_started) * 1000)
             return None, FetchAttempt(
@@ -1221,7 +1329,7 @@ def _restore_snapshot(row: SubscriptionSnapshot, *, url: str = "") -> Snapshot:
                 raise EmptyNodeSetError(row.format or fmt)
         else:
             nodes = parse_nodes(raw, row.format or fmt)
-    except (SnapshotError, yaml.YAMLError, TypeError, ValueError) as e:
+    except (SnapshotError, yaml.YAMLError, TypeError, ValueError, RecursionError) as e:
         raise SnapshotRecoveryError(subscription_id, f"原始字节已不可解析：{e}") from e
 
     attempts: list[FetchAttempt] = []
@@ -1330,7 +1438,7 @@ async def load_source_documents(
                 ).encode("utf-8")
             try:
                 doc = yaml.safe_load(decode_utf8(raw))
-            except (SnapshotError, yaml.YAMLError) as exc:
+            except (SnapshotError, yaml.YAMLError, RecursionError) as exc:
                 raise SnapshotRecoveryError(sid, "订阅原文无法解析") from exc
             if not isinstance(doc, dict):
                 raise SnapshotRecoveryError(sid, "订阅原文不是映射")
