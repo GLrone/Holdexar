@@ -54,13 +54,11 @@ async def region_display_name(code: str) -> str:
 async def _owner_region_code() -> str:
     """号主所在地区：主账号钱包快照 region_code（小写；钱包从未同步过则未知）。
 
-    新史低速报与监控池折扣速报共用「可直接入手的地区优先」口径，两处必须
-    同源，所以出口只有一个。
+    只服务捆绑包精选的「可直接入手地区优先」选区口径；通知地区走
+    notifications.region 的完整解析链（显式 → 手动 → 钱包），两者语义不同。
     """
     try:
-        primary = await account_service.get_primary_account()
-        wallet = primary.wallet_json if primary and isinstance(primary.wallet_json, dict) else None
-        return str((wallet or {}).get("region_code") or "")
+        return await account_service.primary_wallet_region()
     except Exception:  # noqa: BLE001 — 账号域异常不阻断价格检查
         log_event(logger, "读取主账号地区失败，按无号主地区兜底", tag="降级", level=logging.WARNING)
         return ""
@@ -433,12 +431,12 @@ async def _featured_results(session, config: dict, region: str, appids: list[int
 
 
 async def preview_featured(payload: dict) -> dict:
-    from app.domains.notifications.policy import load_prefs, type_enabled
-    from app.domains.notifications.region import resolve_region
+    from app.domains.notifications.policy import load_prefs
+    from app.domains.notifications.region import effective_region
 
     prefs = await load_prefs()
     config = rules.validate_featured(payload.get("featured", payload.get("config", payload)))
-    selected = resolve_region(explicit=payload.get("region"), prefs=prefs)
+    selected = await effective_region(explicit=payload.get("region"), prefs=prefs)
     if not selected["region"]:
         return {"items": [], "matched": 0, "total": 0, "region": selected, "config": config,
                 "exclusions": [{"code": "region_unknown"}]}
@@ -450,15 +448,17 @@ async def preview_featured(payload: dict) -> dict:
 
 async def check_featured(appids: list[int] | None = None) -> list[dict]:
     from app.domains.notifications.policy import load_prefs, type_enabled
-    from app.domains.notifications.region import resolve_region
+    from app.domains.notifications.region import effective_region
     from app.domains.notifications.service import dispatch
 
     prefs = await load_prefs()
     if not type_enabled(prefs, "FEATURED"):
         return []
     config = rules.validate_featured(prefs.get("featured"))
-    selected = resolve_region(prefs=prefs)
+    selected = await effective_region(prefs=prefs)
     if not selected["region"]:
+        log_event(logger, "精选通知地区无法确定，本轮跳过", tag="跳过",
+                  detail={"提示": "需在通知设置手动指定地区，或绑定主账号并同步钱包"})
         return []
     now = _naive(get_beijing_time_obj())
     async with write_session(WritePriority.BACKGROUND) as session:
@@ -569,7 +569,7 @@ async def check_bundle_deals() -> list[dict]:
             })
             entry["prices"].append({
                 "region": (region or "").upper(),
-                "currency": currency or "CNY",
+                "currency": currency or REGION_TO_CURRENCY.get(str(region or "").upper(), ""),
                 "price": int(price) if price is not None else None,
                 "cny": int(cny) if cny is not None else 0,
                 "discount": int(discount or 0),
@@ -900,7 +900,8 @@ async def list_events(limit: int = 50) -> list[dict]:
             "price": int(e.price) if e.price else None,
             "priceCny": int(e.price_cny) if e.price_cny else None,
             "priceText": (
-                format_minor_units(int(e.price), REGION_TO_CURRENCY.get(e.region, "CNY"))
+                format_minor_units(int(e.price), str((e.details_json or {}).get("currency"))
+                                   or REGION_TO_CURRENCY.get(e.region, "CNY"))
                 if e.price
                 else ""
             ),

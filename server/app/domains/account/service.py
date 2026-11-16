@@ -409,6 +409,13 @@ async def wallet_regions() -> dict[str, str]:
     return out
 
 
+async def primary_wallet_region() -> str:
+    """主账号钱包快照派生的结算区 code（小写）；未绑定或未同步返回空串。"""
+    primary = await get_primary_account()
+    wallet = primary.wallet_json if primary and isinstance(primary.wallet_json, dict) else None
+    return str((wallet or {}).get("region_code") or "")
+
+
 # ── 绑定 / 切换 / 删除 ──────────────────────────────────────
 
 async def save_cookies(cookies_raw: str) -> dict:

@@ -117,7 +117,8 @@ async def test_recipient_change_moves_unsent_and_preserves_completed(db, deliver
         return {"to_addr": new_recipient}
 
     monkeypatch.setattr(service, "smtp_config", config)
-    await _enable(db)
+    # 偏好保存是合并语义：显式关掉静默窗，这一批才能发出
+    await _enable(db, quietEnabled=False)
     result = await service.dispatch(cid)
     rows = await _candidates(db)
     assert result["sent"] == 1
@@ -132,6 +133,27 @@ async def test_recipient_change_moves_unsent_and_preserves_completed(db, deliver
     await service.dispatch(cid)
     assert len(delivery) == 1
     assert (await _candidates(db))[0].recipient == new_recipient
+
+
+@pytest.mark.asyncio
+async def test_candidate_dedup_is_scoped_to_source_kind(db, delivery):
+    """候选预去重按来源身份判定：alert_event 的同号 event_id 不吞价格事件候选。"""
+    from app.domains.notifications.models import NotificationCandidate
+
+    await _enable(db)
+    cid = await _cycle(db)
+    eid = await _seed_event(db, cid, "PRICE_DROP")
+    now = datetime.now()
+    async with db() as session:
+        session.add(NotificationCandidate(
+            source_kind="alert_event", event_id=eid, cycle_id=0, appid=APP,
+            event_type="RULE_PRICE", category="rules", recipient="x@example.test",
+            status="pending", attempts=0, created_at=now, updated_at=now))
+        await session.commit()
+    result = await service.dispatch(cid)
+    rows = await _candidates(db)
+    assert result["created"] == 1
+    assert any(r.source_kind == "price_event" and r.event_id == eid for r in rows)
 
 
 @pytest.mark.asyncio

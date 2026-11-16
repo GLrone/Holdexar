@@ -691,8 +691,8 @@ async def send_test_mail(
     }, subject, html)
     if ok:
         return {"ok": True}
-    if error and error.startswith("SMTPAuthenticationError: "):
-        raise ValueError(error.removeprefix("SMTPAuthenticationError: "))
     if is_delivery_unknown(error):
         raise ValueError("邮件发送结果无法确认，请先检查收件箱再决定是否重新测试")
-    raise ValueError(f"连接失败：{error}")
+    # 失败形态不进响应体：拨号/超时/认证被拒同一文案，防任意 host:port 探测；
+    # 细节只留内部日志（_send_mail_sync 已按形态分别落日志）
+    raise ValueError("通知服务器连接失败，请检查地址与端口")

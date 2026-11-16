@@ -53,9 +53,9 @@ async def _smtp_view() -> dict:
     }
 
 
-def _prefs_view(prefs: dict, *, extras: dict | None = None) -> dict:
+async def _prefs_view(prefs: dict, *, extras: dict | None = None) -> dict:
     """设置页与提醒页共用的偏好投影；region 为当前生效地区解析结果。"""
-    from app.domains.notifications.region import resolve_region
+    from app.domains.notifications.region import effective_region
 
     view = {
         "enabled": prefs["enabled"],
@@ -68,7 +68,7 @@ def _prefs_view(prefs: dict, *, extras: dict | None = None) -> dict:
         "digestTime": prefs.get("digestTime", "08:00"),
         "digestWeekday": prefs.get("digestWeekday", 0),
         "featured": prefs.get("featured") or {},
-        "region": resolve_region(prefs=prefs),
+        "region": await effective_region(prefs=prefs),
         "types": [
             {
                 "key": key,
@@ -118,14 +118,14 @@ async def get_prefs():
             "reason": row.reason,
             "retryable": notification_service.retryable(row.last_error),
         }
-    return _prefs_view(prefs, extras={"smtp": await _smtp_view(), "lastDelivery": last})
+    return await _prefs_view(prefs, extras={"smtp": await _smtp_view(), "lastDelivery": last})
 
 
 @router.put("/notifications/prefs")
 async def update_prefs(payload: dict):
     """写用户偏好；未知键忽略，类别只认已知类别。"""
     prefs = await save_prefs(payload or {})
-    return {"ok": True, **_prefs_view(prefs)}
+    return {"ok": True, **await _prefs_view(prefs)}
 
 
 @router.post("/notifications/test")
@@ -134,7 +134,7 @@ async def send_test():
 
     与 Price Event / Candidate / Cycle **完全无关**：不读事件、不建候选、不建
     轮次，只走一次 SMTP——用户点一次测试不能污染业务数据。
-    失败（含凭据错误）直接 HTTP 400，消息来自 SMTP 服务端原文。
+    失败（含凭据错误）直接 HTTP 400，统一文案不区分失败形态（细节留内部日志）。
     """
     cfg = await smtp_config()
     try:

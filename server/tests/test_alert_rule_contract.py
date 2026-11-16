@@ -189,6 +189,42 @@ async def test_featured_unchanged_price_refresh_does_not_repeat(delivery):
     assert await service.check_featured([42]) == []
 
 
+@pytest.mark.asyncio
+async def test_featured_falls_back_to_primary_account_wallet_region(delivery):
+    """未手动指定地区时，通知判断与预览回退主账号钱包地区并保持同源。"""
+    from app.core.database import get_session_factory, write_session
+    from app.domains.account.models import SteamAccount
+    from app.domains.alerts.models import AlertEvent
+
+    delivery[1].pop("manualRegion")
+    await seed_prices()
+    async with write_session() as session:
+        session.add(SteamAccount(steam_id="76561198000000099",
+                                 wallet_json={"region_code": "us"}, bound_at=NOW))
+        await session.commit()
+    preview = await service.preview_featured({"featured": {"scope": ["followed"], "minDiscount": 50}})
+    assert preview["matched"] == 1 and preview["region"] == {
+        "region": "US", "source": "account", "currency": "USD",
+        "currencySource": "region_mapping"}
+    assert len(await service.check_featured([42])) == 1
+    async with get_session_factory()() as session:
+        events = (await session.execute(select(AlertEvent))).scalars().all()
+    assert len(events) == 1 and events[0].region == "US"
+
+
+@pytest.mark.asyncio
+async def test_featured_without_region_or_account_is_skipped(delivery):
+    """显式、手动、主账号钱包都给不出地区时，检查明确跳过而不误发。"""
+    from app.core.database import get_session_factory
+    from app.domains.alerts.models import AlertEvent
+
+    delivery[1].pop("manualRegion")
+    await seed_prices()
+    assert await service.check_featured([42]) == []
+    async with get_session_factory()() as session:
+        assert (await session.execute(select(func.count()).select_from(AlertEvent))).scalar_one() == 0
+
+
 async def seed_referenced_event(status):
     from app.core.database import write_session
     from app.domains.alerts.models import AlertEvent

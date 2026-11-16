@@ -117,8 +117,11 @@ async def test_missing_config_raises_with_field_names(fake_smtp, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_smtp_error_wrapped_as_chinese_valueerror(fake_smtp, stored_password, monkeypatch):
-    """非认证类 SMTP 失败 → ValueError「连接失败：<原因>」，前端可直接展示。"""
+async def test_smtp_error_unified_response(fake_smtp, stored_password, monkeypatch):
+    """会话层 SMTP 失败 → 统一文案；失败形态（错误码/类名）不进响应体。
+
+    拨号/超时/认证被拒同一文案：任意 host:port 的连通性测试不能成为探测 oracle。
+    """
     import smtplib
 
     class _FailSMTP(_FakeSMTP):
@@ -128,16 +131,18 @@ async def test_smtp_error_wrapped_as_chinese_valueerror(fake_smtp, stored_passwo
     monkeypatch.setattr(notify.smtplib, "SMTP_SSL", _FailSMTP)
     with pytest.raises(ValueError) as ei:
         await notify.send_test_mail(**FORM)
-    assert "连接失败" in str(ei.value)
-    assert "421" in str(ei.value)
+    msg = str(ei.value)
+    assert "通知服务器连接失败" in msg
+    assert "421" not in msg
+    assert "SMTPConnectError" not in msg
 
 
 @pytest.mark.asyncio
-async def test_auth_rejection_surfaces_first_535(fake_smtp, stored_password, monkeypatch):
-    """认证被拒：首个 535 即作为用户可读原因上抛，不在被拒连接上换机制重试。
+async def test_auth_rejection_unified_response_single_auth(fake_smtp, stored_password, monkeypatch):
+    """认证被拒：响应同统一文案（不区分失败形态）；内部仍单次 AUTH 不换机制重试。
 
     smtplib.login 会在同一条连接上继续尝试下一机制，部分服务商会直接断开
-    连接，调用方只能看到「连接被断」——真实拒绝原因丢失。
+    连接——单次 AUTH 让拒绝原因直达内部日志，响应体则保持不可区分。
     """
     import smtplib
 
@@ -151,7 +156,26 @@ async def test_auth_rejection_surfaces_first_535(fake_smtp, stored_password, mon
     with pytest.raises(ValueError) as ei:
         await notify.send_test_mail(**FORM)
     msg = str(ei.value)
-    assert "邮箱拒绝登录（535）" in msg
-    assert "IMAP/SMTP" in msg
-    assert "连接失败" not in msg
+    assert "通知服务器连接失败" in msg
+    assert "邮箱拒绝登录" not in msg
+    assert "535" not in msg
     assert _QQLikeSMTP.last_instance.auth_attempts == ["PLAIN"]
+
+
+@pytest.mark.asyncio
+async def test_connect_refused_unified_response(fake_smtp, stored_password, monkeypatch):
+    """拨号失败（连接拒绝类）与其它失败形态同文案：开放/拒绝不可区分。"""
+    import socket
+
+    class _RefusedSMTP(_FakeSMTP):
+        def __init__(self, host, port, timeout=0):
+            super().__init__(host, port, timeout)
+            raise ConnectionRefusedError(f"[Errno 111] Connect call failed ({host}:{port})")
+
+    monkeypatch.setattr(notify.smtplib, "SMTP_SSL", _RefusedSMTP)
+    with pytest.raises(ValueError) as ei:
+        await notify.send_test_mail(**FORM)
+    msg = str(ei.value)
+    assert "通知服务器连接失败" in msg
+    assert "Errno" not in msg
+    assert "ConnectionRefused" not in msg

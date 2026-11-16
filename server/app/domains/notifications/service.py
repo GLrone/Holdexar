@@ -253,6 +253,7 @@ async def _create_candidates(
             select(events_service.PriceEvent).where(events_service.PriceEvent.id.in_(ids))
         )).scalars().all()} if ids else {}
         existing = set((await session.execute(select(NotificationCandidate.event_id).where(
+            NotificationCandidate.source_kind == "price_event",
             NotificationCandidate.event_id.in_(ids)
         ))).scalars().all()) if ids else set()
         payloads = [row for row in payloads if row["event_id"] not in existing
@@ -261,7 +262,7 @@ async def _create_candidates(
                     (cycle_id, row["appid"], row["region_code"], row["event_type"])]
         if payloads:
             result = await session.execute(sqlite_insert(NotificationCandidate.__table__)
-                                           .on_conflict_do_nothing(index_elements=["event_id", "recipient"]),
+                                           .on_conflict_do_nothing(index_elements=["source_kind", "event_id", "recipient"]),
                                            payloads)
             created = int(result.rowcount or 0)
         if source is not None:

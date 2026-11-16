@@ -139,6 +139,7 @@ async def load_prefs() -> dict:
 
 async def save_prefs(raw: dict) -> dict:
     from app.core.database import WritePriority, write_session
+    from app.core.events import bus
     from app.domains.alerts.rules import validate_featured
     from app.domains.settings.models import AppSetting
     from app.crawler.config import CC_LIST
@@ -167,6 +168,8 @@ async def save_prefs(raw: dict) -> dict:
         else:
             row.value_json, row.updated_at = prefs, datetime.now()
         await session.commit()
+    # 本键不经 settings.service 收口（自有校验事务），变更广播在此对齐
+    bus.publish("settings.changed", keys=[PREFS_KEY])
     return prefs
 
 

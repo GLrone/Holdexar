@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.database import Base  # noqa: E402
 from app.domains.alerts import service as alerts_service  # noqa: E402
 from app.domains.alerts.models import AlertEvent, PriceAlert  # noqa: E402
-from app.domains.games.models import Game, GameCurrentPrice  # noqa: E402
+from app.domains.games.models import Game, GameCurrentPrice, GamePriceHistory  # noqa: E402
 
 
 @pytest_asyncio.fixture
@@ -36,6 +36,11 @@ async def alerts_db(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(database_module, "get_session_factory", lambda: factory)
     monkeypatch.setattr(alerts_service, "get_session_factory", lambda: factory)
 
+    # 规则求值与候选资格都读库内通知偏好（默认关）：本文件只测规则口径，固定开启
+    from app.domains.notifications.policy import save_prefs
+
+    await save_prefs({"enabled": True})
+
     async def _region_name(code: str) -> str:
         return code
 
@@ -43,18 +48,26 @@ async def alerts_db(tmp_path: Path, monkeypatch):
 
     sent: dict[str, object] = {}
 
-    async def _fake_send_mail(subject: str, html: str) -> bool:
+    async def _fake_send_mail(subject: str, html_body: str, *, recipient=None) -> bool:
         sent["subject"] = subject
-        sent["html"] = html
-        return True
+        sent["html"] = html_body
+        return True, None
 
-    monkeypatch.setattr(alerts_service.notify, "send_mail", _fake_send_mail)
+    # 触发投递走统一候选管线，发信缝隙在通知服务
+    from app.domains.notifications import service as notification_service
+    from app.domains.settings.service import set_value
+
+    await set_value("smtp.to_addr", "owner@example.test")
+    monkeypatch.setattr(notification_service, "send_mail_ex", _fake_send_mail)
     yield factory, sent
     await engine.dispose()
 
 
 async def _seed_game(factory, *, price: int | None, cny_fen: int | None, discount: int = 0) -> None:
     """Steam 现价行：US 区 $10（本币 1000 分 / cny_fen 7250）为基准场景。"""
+    from datetime import datetime
+
+    now = datetime.now()
     async with factory() as session:
         session.add(Game(appid=100, name="测试游戏", header_image="https://example/header.jpg"))
         session.add(
@@ -65,9 +78,19 @@ async def _seed_game(factory, *, price: int | None, cny_fen: int | None, discoun
                 price=price,
                 cny_fen=cny_fen,
                 discount_percent=discount,
+                sub_id=7,
                 price_status="ok",
+                attempt_outcome="success",
+                steam_answer="ok",
+                last_success_at=now,
+                updated_at=now,
             )
         )
+        # 当前观测需在历史链中确立产品身份（known_product 闸）
+        if price is not None:
+            session.add(GamePriceHistory(
+                appid=100, region_code="US", currency="USD", sub_id=7, price=price,
+                source="steam", price_status="ok", snapshot_at=now))
         await session.commit()
 
 
@@ -93,10 +116,9 @@ async def test_price_hit_compares_cny_fen_and_snapshots(alerts_db) -> None:
     assert len(triggered) == 1
     row = triggered[0]
     assert row["price"] == 1000
-    assert row["price_cny"] == 7250
-    assert row["price_text"] == "$10.00"
-    assert row["cn_price_text"] == "¥72.50"
-    assert sent["subject"]  # 触发即合并发信
+    assert row["currency"] == "USD"
+    assert sent["subject"]  # 触发即合并发信，邮件带本币价文本
+    assert "$10.00" in sent["html"]
 
     async with factory() as session:
         event = (await session.execute(select(AlertEvent))).scalars().one()
@@ -144,20 +166,21 @@ async def test_events_listing_carries_cover_and_local_price(alerts_db) -> None:
     assert ev["priceText"] == "$10.00"
     assert ev["priceCny"] == 7250
 
-    # 单条删除
-    assert await alerts_service.delete_event(ev["id"]) is True
-    assert await alerts_service.list_events() == []
+    # 候选账本引用保护：被通知结果引用的触发记录不可删
+    with pytest.raises(ValueError):
+        await alerts_service.delete_event(ev["id"])
+    assert len(await alerts_service.list_events()) == 1
 
 
 @pytest.mark.asyncio
 async def test_clear_events_removes_all(alerts_db) -> None:
-    """清空全部触发历史：返回删除条数，表清零。"""
+    """清空只移除无引用记录：被候选账本引用的触发记录保留。"""
     factory, _ = alerts_db
     await _seed_game(factory, price=1000, cny_fen=7250)
     await _add_alert(factory, target_value=7300)
     await alerts_service.check_appids([100])
 
     removed = await alerts_service.clear_events()
-    assert removed == 1
-    assert await alerts_service.list_events() == []
-    assert await alerts_service.clear_events() == 0
+    assert removed == {"removed": 0, "protected": 1}
+    assert len(await alerts_service.list_events()) == 1
+    assert (await alerts_service.clear_events())["removed"] == 0
