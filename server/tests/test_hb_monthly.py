@@ -1,8 +1,8 @@
 """HB 当月包游戏侧标记链验收（refresh_hb_choice，无账本表）。
 
-纯逻辑：月份标签换算 / 页面解析（转义 JSON + 区块重复去重）/ storesearch
-命中匹配。链路：合成 membership 页 + 合成解析结果，走真实标记落库
-（合成 990xxx appid 播种 + 清理，不污染真实库），验证：
+纯逻辑：月份标签换算 / 页面解析（RSC flight 流 + subscriptionProducts +
+平台交付分类）/ storesearch 命中匹配。链路：合成 membership 页 + 合成解析
+结果，走真实标记落库（合成 990xxx appid 播种 + 清理，不污染真实库），验证：
 - steam 条目打标（is_hb + hb_data 月份标签），非 steam 条目跳过；
 - 缺行占位 updated_at NULL（回补池判据），已有行保留旧标记并逗号续写；
 - 解析失败条目进 unresolved 不阻塞其余条目；
@@ -10,7 +10,6 @@
 - 补价通道：无任何价格行的标记行进首爬候选，已有价格行（missing 状态）
   的归补抓账本不进，空候选不发起爬取。
 """
-import html
 import json
 import sys
 from pathlib import Path
@@ -27,8 +26,8 @@ from app.domains.metadata import service as hb  # noqa: E402
 from app.domains.settings.models import AppSetting  # noqa: E402
 
 TEST_STATE_KEY = "hb_choice_last_month_test"
-MACHINE = "septtest_2026_choice"
-PRODUCT = "September 2026 Humble Choice"
+MACHINE = "september_2026_choice"
+PRODUCT = "September 2026"
 LABEL = "HB慈善包26年9月包"
 
 APP_NEW = 990_401  # 缺行占位
@@ -43,42 +42,50 @@ _RESOLVE_MAP = {
 }
 
 
-def _item(title: str, delivery: list[str], steam_count: int | None = 100) -> dict:
-    rating = {} if steam_count is None else {
-        "steam_count": steam_count, "steam_percent": 0.9,
-    }
-    return {
-        "recommendation_copy_dict": {"copy": " synth "},
-        "delivery_methods": delivery,
+def _product(title: str, delivery: list[str], cent_amount: float | None = 1999) -> dict:
+    product = {
+        "id": title.lower().replace(" ", "-"),
         "title": title,
-        "msrp": {"currency": "USD", "amount": 9.99},
-        "user_rating": rating,
+        "deliveryMethods": delivery,
+        "endDate": "2026-10-06T17:00:00",
+        "thumbnail": f"https://hb.test/{title.lower().replace(' ', '-')}.jpg",
     }
+    if cent_amount is not None:
+        product["displayPrice"] = {"currentPrice": {"centAmount": cent_amount}}
+    return product
 
 
 def _membership_html() -> str:
-    """合成 membership 页：条目为转义 JSON（引号 &#34;），清单重复两轮，
-    另含一个 recommendation 文案内嵌花括号的条目（验证 raw_decode 抗性）。"""
-    items = {
-        "frosttest2": _item("Frosttest 2", ["steam"]),
-        "keytest": _item("Keytest", ["steam"]),
-        "plustest": _item("Plus Test", ["other-key"]),
-        "missinggame": _item("Missing Game", ["steam"]),
-    }
-    # 花括号进字符串：模拟真实页 recommendation 文案含 {} 的场景
-    items["keytest"]["recommendation_copy_dict"]["copy"] = "build {oil} coal"
-    blocks = []
-    for name, obj in items.items():
-        blocks.append(f'"{name}": {json.dumps(obj, ensure_ascii=False)}')
-    # quote=True：引号转义成 &#34;，与真实页转义形态一致
-    blob = html.escape(", ".join(blocks))
-    header = (
-        f'{{"activeContentMachineName": "{MACHINE}", '
-        f'"navbarOptions": {{"productHumanName": "{PRODUCT}", '
-        f'"activeContentEndDate|datetime": "2026-10-06T17:00:00"}}}}'
+    """合成 membership 页（2026-11 RSC 改版形态）：flight 流分段内嵌
+    subscriptionProducts 清单与期号描述，清单劈两段验证跨段拼接，重复 key
+    首见生效；含字符串内嵌花括号与中括号的条目（验证括号配平扫描抗性）。"""
+    products = [
+        _product("Frosttest 2", ["steam"]),
+        _product("Keytest", ["steam"]),
+        _product("GOGtest Odyssey", ["gog"]),
+        _product("Epictest Rider", ["epic", "external_key"]),
+        _product("Plus } {Test [x]", ["external_key"], cent_amount=None),
+        _product("Missing Game", ["steam"]),
+    ]
+    payload = (
+        "Get September 2026 Humble Choice - monthly games. "
+        '"subscriptionProducts": ' + json.dumps(products, ensure_ascii=False) + " "
+        '"subscriptionProducts": ' + json.dumps(products[:1], ensure_ascii=False)
     )
-    return f"<html><script>var X = {header};</script><div data-json=\"{blob}\"></div>" \
-           f"<div data-json=\"{blob}\"></div></html>"
+
+    def _js_escape(text: str) -> str:
+        return json.dumps(text)[1:-1]
+
+    mid = len(payload) // 2
+    chunk_a, chunk_b = payload[:mid], payload[mid:]
+    return (
+        "<html><head>"
+        '<meta name="description" content="Get September 2026 Humble Choice">'
+        "</head><body>"
+        f"<script>self.__next_f.push([1,\"{_js_escape(chunk_a)}\"])</script>"
+        f"<script>self.__next_f.push([1,\"{_js_escape(chunk_b)}\"])</script>"
+        "</body></html>"
+    )
 
 
 # ─── 纯逻辑 ────────────────────────────────────────────────────────
@@ -96,17 +103,22 @@ def test_month_label_fallback_generic():
     assert hb._choice_month_label("whatever", "Mystery Box") == "HB慈善包"
 
 
-def test_parse_choice_page_dedup_and_fields():
+def test_parse_choice_page_products_and_dedup():
     parsed = hb._parse_choice_page(_membership_html())
     assert parsed["machineName"] == MACHINE
     assert parsed["productName"] == PRODUCT
     assert parsed["endDate"] == "2026-10-06T17:00:00"
-    assert set(parsed["items"]) == {
-        "frosttest2", "keytest", "plustest", "missinggame",
-    }
-    assert parsed["items"]["keytest"]["delivery_methods"] == ["steam"]
-    # 区块重复去重：条目对象完整解析（花括号文案不截断）
-    assert parsed["items"]["keytest"]["recommendation_copy_dict"]["copy"] == "build {oil} coal"
+    # Steam 交付标题（保序去重）；重复 subscriptionProducts 首见生效
+    assert parsed["steamTitles"] == ["Frosttest 2", "Keytest", "Missing Game"]
+    # 非 Steam 平台游戏：平台取交付方式原值，原价分取展示价（分，四舍五入）
+    assert parsed["platformGames"] == [
+        {"title": "GOGtest Odyssey", "platform": "gog",
+         "thumbnail": "https://hb.test/gogtest-odyssey.jpg",
+         "retailFen": 1999, "endDate": "2026-10-06T17:00:00"},
+        {"title": "Epictest Rider", "platform": "epic",
+         "thumbnail": "https://hb.test/epictest-rider.jpg",
+         "retailFen": 1999, "endDate": "2026-10-06T17:00:00"},
+    ]
 
 
 def test_pick_appid_matching_tiers():
@@ -176,7 +188,7 @@ async def test_offers_payload_and_empty_month(monkeypatch):
     res = await hb.hb_choice_offers()
     assert res["ok"] is True
     assert res["label"] == LABEL
-    assert res["monthUrl"] == "https://www.humblebundle.com/membership/Septtest-2026"
+    assert res["monthUrl"] == "https://www.humblebundle.com/membership/September-2026"
     assert res["skipUrl"].endswith("/user/skip-month")
     by_id = {g["appid"]: g for g in res["games"]}
     assert by_id[APP_NEW]["priceFen"] == 14900
@@ -189,6 +201,22 @@ async def test_offers_payload_and_empty_month(monkeypatch):
     await set_value(TEST_STATE_KEY, {"machineName": "september_2019_choice"})
     empty = await hb.hb_choice_offers()
     assert empty["ok"] is False
+
+    # 平台游戏合并：状态记录里的非 Steam 游戏（appid=0）随清单下发
+    await set_value(TEST_STATE_KEY, {
+        "machineName": MACHINE, "productName": PRODUCT,
+        "platformGames": [{"title": "GOGtest Odyssey", "platform": "gog",
+                           "thumbnail": "https://hb.test/g.jpg",
+                           "retailFen": 1999, "endDate": ""}],
+    })
+    merged = await hb.hb_choice_offers()
+    assert merged["ok"] is True
+    platform_rows = [g for g in merged["games"] if g["appid"] == 0]
+    assert len(platform_rows) == 1
+    assert platform_rows[0]["name"] == "GOGtest Odyssey"
+    assert platform_rows[0]["platform"] == "gog"
+    assert platform_rows[0]["originalPriceFen"] == 1999
+    assert platform_rows[0]["priceFen"] is None
 
 
 # ─── 链路（真实落库 + 合成数据）──────────────────────────────────
@@ -306,6 +334,8 @@ async def test_refresh_records_state_and_skips_when_resolved(monkeypatch):
         assert state is not None
         assert state.value_json["machineName"] == MACHINE
         assert state.value_json["marked"] == 3
+        # 非 Steam 平台游戏随结案入状态记录（展示链合并下发）
+        assert [pg["platform"] for pg in state.value_json["platformGames"]] == ["gog", "epic"]
 
     second = await hb.refresh_hb_choice()
     assert second["skipped"] is True

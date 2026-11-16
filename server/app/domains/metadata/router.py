@@ -1,7 +1,7 @@
 """metadata 域路由：外部元数据（Epic/XGP/HB）导入与状态。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.domains.metadata import service
@@ -17,17 +17,23 @@ class ImportRequest(BaseModel):
 @router.post("/import")
 async def import_metadata(req: ImportRequest) -> dict:
     source = req.source.strip().lower()
-    if source == "all":
-        return {"results": await service.import_all(req.source_dir)}
-    importer = service.IMPORTERS.get(source)
-    if importer is None:
-        return {"error": f"未知来源: {source}（可选 epic/xgp/hb/all）"}
-    return await importer(req.source_dir)
+    try:
+        if source == "all":
+            return {"results": await service.import_all(req.source_dir)}
+        importer = service.IMPORTERS.get(source)
+        if importer is None:
+            return {"error": f"未知来源: {source}（可选 epic/xgp/hb/all）"}
+        return await importer(req.source_dir)
+    except service.SourceDirRejected as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 @router.get("/status")
 async def metadata_status(source_dir: str | None = None) -> dict:
-    return await service.metadata_status(source_dir)
+    try:
+        return await service.metadata_status(source_dir)
+    except service.SourceDirRejected as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
 
 @router.post("/hb/refresh")

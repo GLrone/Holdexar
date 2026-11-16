@@ -26,7 +26,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -39,6 +38,7 @@ from pathlib import Path
 import aiohttp
 from sqlalchemy import case, func, or_, select, update
 
+from app.core.config import get_settings
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.logging import log_event
 from app.crawler.epic_free import (
@@ -71,9 +71,27 @@ _MONTH_MAP = {
 _HB_RE = re.compile(r"Humble Choice\s*\(([A-Za-z]{3})\s*(\d{4})\)", re.IGNORECASE)
 
 
+class SourceDirRejected(ValueError):
+    """请求给定的导入目录越界/不可用：统一文案，不回显请求路径。"""
+
+
+def constrain_source_dir(source_dir: str | None) -> Path:
+    """请求给定的导入目录 resolve 后必须收容在数据目录内，否则拒绝。
+
+    环境变量默认目录是本机运营者的自有配置（与 API 攻击面不同信任级），不在此闸内。
+    """
+    if not source_dir:
+        return DEFAULT_SOURCE_DIR
+    try:
+        resolved = Path(source_dir).resolve()
+        resolved.relative_to(Path(get_settings().data_dir).resolve())
+    except (OSError, ValueError):
+        raise SourceDirRejected("导入目录不存在或不可用") from None
+    return resolved
+
+
 def resolve_source_path(source_dir: str | None, filename: str) -> Path:
-    base = Path(source_dir) if source_dir else DEFAULT_SOURCE_DIR
-    return base / filename
+    return constrain_source_dir(source_dir) / filename
 
 
 # ─── XGP 名称匹配（名称清洗 + 三级查找）───────────────
@@ -297,7 +315,8 @@ _STORESEARCH_URL = "https://store.steampowered.com/api/storesearch"
 _HB_STATE_KEY = "hb_choice_last_month"
 _CHOICE_TIMEOUT = 25
 
-_ITEM_MARK_RE = re.compile(r'"([a-z0-9_]+)": \{"recommendation_copy_dict"')
+_FLIGHT_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
+_MONTH_DESC_RE = re.compile(r"Get ([A-Za-z]+) (\d{4}) Humble Choice")
 
 
 def _choice_month_label(machine_name: str | None, product_name: str | None) -> str:
@@ -315,42 +334,108 @@ def _choice_month_label(machine_name: str | None, product_name: str | None) -> s
     return "HB慈善包"
 
 
-def _parse_choice_page(html_text: str) -> dict:
-    """membership 页原文 → {machineName, productName, endDate, items}。
-
-    条目以内嵌转义 JSON 形态存在（引号是 &#34;），页面按区块（货币/地区
-    轮播）重复同一份清单，按 machineName 去重取首见。recommendation_copy_dict
-    是条目对象的稳定首键，以此为锚做 JSONDecoder.raw_decode（条目正文含
-    花括号，手工数括号不可靠）。
-    """
-    page = html.unescape(html_text)
-
-    def _field(name: str) -> str | None:
-        m = re.search(rf'"{re.escape(name)}"\s*:\s*"([^"]+)"', page)
-        return m.group(1) if m else None
-
-    machine = _field("activeContentMachineName")
-    product = _field("productHumanName")
-    end_date = _field("activeContentEndDate|datetime")
-
-    items: dict[str, dict] = {}
-    dec = json.JSONDecoder()
-    for m in _ITEM_MARK_RE.finditer(page):
-        name = m.group(1)
-        if name in items:
-            continue
-        brace = page.rfind("{", m.start(), m.end())
+def _flight_payload(page: str) -> str:
+    """抽取并解码页面内嵌的 RSC flight 流（每段 push 是一个 JS 字符串字面量，
+    按 JSON 转义解码；个别段解码失败跳过，数据在其余段仍可拼齐）。"""
+    parts: list[str] = []
+    for m in _FLIGHT_PUSH_RE.finditer(page):
         try:
-            obj, _ = dec.raw_decode(page, brace)
+            parts.append(json.loads(f'"{m.group(1)}"'))
         except ValueError:
             continue
-        if isinstance(obj, dict) and obj.get("title"):
-            items[name] = obj
+    return "".join(parts)
+
+
+def _extract_json_array(payload: str, key: str) -> list | None:
+    """key 后第一个完整 JSON 数组（配平引号/转义/括号），失败返回 None。"""
+    i = payload.find(key)
+    if i < 0:
+        return None
+    start = i + len(key)
+    while start < len(payload) and payload[start] in " :":
+        start += 1
+    if start >= len(payload) or payload[start] != "[":
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for j in range(start, len(payload)):
+        ch = payload[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(payload[start:j + 1])
+                except ValueError:
+                    return None
+                return value if isinstance(value, list) else None
+    return None
+
+
+def _parse_choice_page(html_text: str) -> dict:
+    """membership 页（2026-11 Next.js RSC 改版）→ 结构化当月包。
+
+    页面内容以 RSC flight 流内嵌（每段 self.__next_f.push 是一个 JS 字符串
+    字面量，按 JSON 转义解码后拼接），清单取 subscriptionProducts 全量：
+    Steam 交付走 appid 匹配入 games 账本；其余平台交付（blizzard/epic/
+    ubisoft/…，平台名取交付方式原值，展示层本地化）按平台游戏保留（appid=0，
+    不进 games 账本）；仅 external_key 的条目是订阅/权益类（如 IGN Plus），
+    不是游戏，排除。期号取页内 meta 描述（"Get November 2026 Humble Choice"）。
+    """
+    payload = _flight_payload(html_text)
+    products = _extract_json_array(payload, '"subscriptionProducts"')
+    machine_m = _MONTH_DESC_RE.search(payload)
+
+    steam_titles: list[str] = []
+    platform_games: list[dict] = []
+    seen: set[str] = set()
+    end_date = ""
+    for product in products or []:
+        if not isinstance(product, dict):
+            continue
+        title = str(product.get("title") or "").strip()
+        if not title or title in seen:
+            continue
+        delivery = product.get("deliveryMethods") or []
+        if not end_date:
+            end_date = str(product.get("endDate") or "")
+        if "steam" in delivery:
+            seen.add(title)
+            steam_titles.append(title)
+            continue
+        platform = next((d for d in delivery if d not in ("steam", "external_key")), "")
+        if not platform:
+            continue
+        seen.add(title)
+        cents = ((product.get("displayPrice") or {}).get("currentPrice") or {}).get("centAmount")
+        platform_games.append({
+            "title": title,
+            "platform": platform,
+            "thumbnail": str(product.get("thumbnail") or ""),
+            "retailFen": int(cents + 0.5) if isinstance(cents, (int, float)) and cents > 0 else None,
+            "endDate": str(product.get("endDate") or ""),
+        })
+
+    machine = f"{machine_m.group(1).lower()}_{machine_m.group(2)}_choice" if machine_m else None
+    product_name = f"{machine_m.group(1)} {machine_m.group(2)}" if machine_m else None
     return {
         "machineName": machine,
-        "productName": product,
+        "productName": product_name,
         "endDate": end_date,
-        "items": items,
+        "steamTitles": steam_titles,
+        "platformGames": platform_games,
     }
 
 
@@ -383,10 +468,30 @@ def _pick_appid(title: str, hits: list[dict]) -> int | None:
 
 
 def _hb_headers() -> dict:
+    """Steam storesearch 等纯 JSON 端点用：文档导航形态的头会被对端断连。"""
     return {
         "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    }
+
+
+def _membership_headers() -> dict:
+    """membership 页头指纹：须携带完整 Sec-Fetch/sec-ch-ua 系列，
+    缺失时服务端返回不含内嵌数据的降级壳页。"""
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
     }
 
 
@@ -396,7 +501,7 @@ async def _fetch_membership_page(
     try:
         async with session.get(
             _MEMBERSHIP_URL,
-            headers=_hb_headers(),
+            headers=_membership_headers(),
             proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=_CHOICE_TIMEOUT),
         ) as resp:
@@ -491,7 +596,7 @@ async def refresh_hb_choice(force: bool = False) -> dict:
             return {"source": "hb-choice", "ok": False, "error": "membership 页抓取失败"}
         parsed = _parse_choice_page(page)
         machine = parsed["machineName"]
-        if not machine or not parsed["items"]:
+        if not machine or (not parsed["steamTitles"] and not parsed["platformGames"]):
             return {"source": "hb-choice", "ok": False, "error": "页面无当月包数据"}
 
         last = await get_value(_HB_STATE_KEY) or {}
@@ -502,13 +607,8 @@ async def refresh_hb_choice(force: bool = False) -> dict:
             }
 
         label = _choice_month_label(machine, parsed["productName"])
-        steam_items = {
-            name: item for name, item in parsed["items"].items()
-            if "steam" in (item.get("delivery_methods") or [])
-        }
         marked, unresolved = [], []
-        for name, item in steam_items.items():
-            title = str(item.get("title") or "")
+        for title in parsed["steamTitles"]:
             appid = await _resolve_appid(session, title, proxy)
             if appid is None:
                 unresolved.append(title)
@@ -516,7 +616,7 @@ async def refresh_hb_choice(force: bool = False) -> dict:
                     logger,
                     f"《{title}》未能匹配到 appid，留待人工处理",
                     tag="未完成",
-                    detail={"条目": name},
+                    detail={"条目": title},
                     level=logging.WARNING,
                 )
             else:
@@ -548,6 +648,7 @@ async def refresh_hb_choice(force: bool = False) -> dict:
             "machineName": machine,
             "productName": parsed["productName"],
             "marked": len(marked),
+            "platformGames": parsed["platformGames"],
         },
     )
     # 新月包结案即事实变化（轮次游标 machine 已保证唯一）→ 岛上消息消费
@@ -560,7 +661,7 @@ async def refresh_hb_choice(force: bool = False) -> dict:
         data={
             "label": label,
             "productName": parsed["productName"],
-            "count": len(marked),
+            "count": len(marked) + len(parsed["platformGames"]),
             "url": _month_page_url(machine),
             "end": parsed.get("endDate"),
             "items": [{"appid": item["appid"], "name": item["title"],
@@ -644,11 +745,37 @@ async def hb_choice_offers() -> dict:
             prices = {int(p.appid): (p.price, p.original_price, p.discount_percent)
                       for p in price_rows}
 
-    if not rows:
+    if not rows and not state.get("platformGames"):
         return {
             "source": "hb-offers", "ok": False,
             "error": "当月包尚未入库（等待每日抓取或手动触发 /metadata/hb/refresh）",
         }
+
+    games = [
+        {
+            "appid": r.appid,
+            "name": r.name or str(r.appid),
+            "headerImage": r.header_image,
+            "priceFen": prices.get(int(r.appid), (None, None, 0))[0],
+            "originalPriceFen": prices.get(int(r.appid), (None, None, 0))[1],
+            "discount": prices.get(int(r.appid), (None, None, 0))[2] or 0,
+            "lowestCnyFen": r.min_cny_fen,
+        }
+        for r in rows
+    ]
+    # 非 Steam 平台游戏：games 账本以 Steam appid 主导，平台游戏（appid=0）
+    # 以状态记录直接下发，前端按平台徽章渲染，不参与归属/价格体系
+    for pg in state.get("platformGames") or []:
+        games.append({
+            "appid": 0,
+            "name": str(pg.get("title") or ""),
+            "headerImage": str(pg.get("thumbnail") or "") or None,
+            "priceFen": None,
+            "originalPriceFen": pg.get("retailFen"),
+            "discount": 0,
+            "lowestCnyFen": None,
+            "platform": str(pg.get("platform") or ""),
+        })
 
     return {
         "source": "hb-offers", "ok": True,
@@ -658,18 +785,7 @@ async def hb_choice_offers() -> dict:
         "monthUrl": _month_page_url(machine or None),
         "skipUrl": _SKIP_MONTH_URL,
         "settingsUrl": _HB_SETTINGS_URL,
-        "games": [
-            {
-                "appid": r.appid,
-                "name": r.name or str(r.appid),
-                "headerImage": r.header_image,
-                "priceFen": prices.get(int(r.appid), (None, None, 0))[0],
-                "originalPriceFen": prices.get(int(r.appid), (None, None, 0))[1],
-                "discount": prices.get(int(r.appid), (None, None, 0))[2] or 0,
-                "lowestCnyFen": r.min_cny_fen,
-            }
-            for r in rows
-        ],
+        "games": games,
     }
 
 
@@ -1350,7 +1466,7 @@ async def metadata_status(source_dir: str | None = None) -> dict:
     """各源文件存在性 + 库内标记计数。"""
     from app.domains.settings.service import get_value
 
-    base = Path(source_dir) if source_dir else DEFAULT_SOURCE_DIR
+    base = constrain_source_dir(source_dir)
     async with get_session_factory()() as session:
         epic_count = await session.scalar(
             select(func.count()).select_from(Game).where(Game.is_epic.is_(True))
