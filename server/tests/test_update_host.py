@@ -17,21 +17,39 @@ def _mock_payload_protocol(request, monkeypatch):
         monkeypatch.setattr(update_host, "supports_data_protocol", lambda exe: True)
 
 
-def _create_mock_app_payload(staging_dir: Path, target_version: str, has_exe: bool = True) -> Path:
+def _create_mock_app_payload(
+    staging_dir: Path, target_version: str, has_exe: bool = True, data_dir: Path | None = None,
+) -> Path:
+    """合成带 files 表与信任记录的暂存包（与真实下载产物同构，过信任复核门）。"""
+    import hashlib
+
     payload = staging_dir / APP_NAME
     payload.mkdir(parents=True, exist_ok=True)
     if has_exe:
         (payload / f"{APP_NAME}.exe").write_bytes(b"app_binary")
     (payload / "version.txt").write_text(target_version, encoding="utf-8")
 
+    files = {
+        p.relative_to(payload).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(payload.rglob("*")) if p.is_file()
+    }
     manifest = {
         "tag": f"v{target_version}",
         "attempt_id": "att-mock-1",
         "ready": True,
+        "files": files,
     }
     (staging_dir / STAGING_MANIFEST_NAME).write_text(
         json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
     )
+    if data_dir is not None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / update_host.TRUST_RECORD_NAME).write_text(
+            json.dumps({
+                "version": f"v{target_version}", "zip_sha256": "0" * 64,
+                "files": files, "protocol": 0, "staging_dir": str(staging_dir),
+            }, ensure_ascii=False), encoding="utf-8"
+        )
     return payload
 
 
@@ -46,7 +64,7 @@ def test_update_host_success(tmp_path):
     layout.write_current_state(root, "0.3.5")
 
     # 准备新载荷：0.3.6
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True, data_dir=root / "data")
 
     # 执行更新（跳过进程拉起与网络探活）
     ok = update_host.execute_update(
@@ -92,7 +110,7 @@ def test_update_host_rollback_on_missing_exe(tmp_path):
     layout.write_current_state(root, "0.3.5")
 
     # 损坏载荷：无主程序
-    _create_mock_app_payload(staging, "0.3.6", has_exe=False)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=False, data_dir=root / "data")
 
     ok = update_host.execute_update(
         root=root,
@@ -121,7 +139,7 @@ def test_update_host_rollback_on_health_check_failure(tmp_path, monkeypatch):
     (v035 / f"{APP_NAME}.exe").write_bytes(b"v035_binary")
     layout.write_current_state(root, "0.3.5")
 
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True, data_dir=root / "data")
 
     # 模拟健康检查失败
     monkeypatch.setattr(
@@ -159,7 +177,7 @@ def test_update_host_retention_prunes_older_versions(tmp_path):
     layout.write_current_state(root, "0.3.5", last_known_good="0.3.4")
 
     # 安装 0.3.6
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True, data_dir=root / "data")
 
     ok = update_host.execute_update(
         root=root,
@@ -310,7 +328,7 @@ def test_health_failure_rolls_back_files_and_pointer(tmp_path, monkeypatch):
     (legacy / f"{APP_NAME}.exe").write_bytes(b"old")
     layout.write_current_state(root, "legacy_version")
 
-    _create_mock_app_payload(staging, "0.3.6", has_exe=True)
+    _create_mock_app_payload(staging, "0.3.6", has_exe=True, data_dir=root / "data")
     monkeypatch.setattr(
         update_host, "probe_version_health", lambda *a, **k: (False, "服务崩溃")
     )
@@ -403,9 +421,9 @@ def test_failed_upgrade_restores_database_before_relaunching_source(tmp_path, mo
     old.mkdir(parents=True)
     (old / f"{APP_NAME}.exe").write_bytes(b"old")
     layout.write_current_state(root, "0.3.5")
-    _create_mock_app_payload(staging, "0.3.6")
     data_dir = root / "data"
     data_dir.mkdir()
+    _create_mock_app_payload(staging, "0.3.6", data_dir=data_dir)
     db_path = data_dir / "holdexar.db"
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE user_record (id INTEGER PRIMARY KEY, value TEXT)")
@@ -499,7 +517,7 @@ def test_new_update_cannot_overwrite_unfinished_data_ownership(tmp_path, monkeyp
     old.mkdir(parents=True)
     (old / f"{APP_NAME}.exe").write_bytes(b"old")
     layout.write_current_state(root, "0.3.5")
-    _create_mock_app_payload(staging, "0.3.7")
+    _create_mock_app_payload(staging, "0.3.7", data_dir=root / "data")
     layout.start_transaction(root, "0.3.6", "0.3.5", attempt_id="previous")
     layout.update_transaction(root, "recovery_required", dataPrepared=previous_phase != "preparing",
                               dataRecoveryPhase=previous_phase, dataAccepted=previous_phase == "accepted",
@@ -646,7 +664,7 @@ def test_update_preserves_explicit_external_data_directory(tmp_path, monkeypatch
     layout.write_current_state(root, "0.3.5")
     data = tmp_path / "external-data"
     staging = data / "update-staging"
-    _create_mock_app_payload(staging, "0.3.6")
+    _create_mock_app_payload(staging, "0.3.6", data_dir=data)
     with sqlite3.connect(data / "holdexar.db") as db:
         db.execute("CREATE TABLE user_record(value TEXT)")
         db.execute("INSERT INTO user_record VALUES ('preserved')")
@@ -734,9 +752,8 @@ def test_recovered_verifying_residue_allows_next_upgrade(tmp_path, monkeypatch):
     staging = tmp_path / "staging"
     _seed_version(root, "0.3.5")
     layout.write_current_state(root, "0.3.5")
-    _create_mock_app_payload(staging, "0.3.7")
+    _create_mock_app_payload(staging, "0.3.7", data_dir=root / "data")
     layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
-    (root / "data").mkdir()
     layout.update_transaction(root, "verifying", dataPrepared=True,
                               dataRecoveryPhase="restored", dataDir=str(root / "data"),
                               dataDbPath=str(root / "data" / "holdexar.db"), dataToken="tok",
@@ -760,7 +777,7 @@ def test_unprepared_residue_recovery_clears_and_allows_upgrade(tmp_path):
     staging = tmp_path / "staging"
     _seed_version(root, "0.3.5")
     layout.write_current_state(root, "0.3.5")
-    _create_mock_app_payload(staging, "0.3.7")
+    _create_mock_app_payload(staging, "0.3.7", data_dir=root / "data")
     layout.start_transaction(root, "0.3.7", "0.3.5", attempt_id="previous")
     layout.update_transaction(root, "switching", dataDir=str(root / "data"))
     assert update_host.execute_update(root, staging, target_version="0.3.7",

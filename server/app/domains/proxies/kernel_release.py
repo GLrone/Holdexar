@@ -13,6 +13,13 @@ MIRRORS: tuple[str, ...] = ("https://ghfast.top/", "https://gh-proxy.com/", "")
 _GITHUB = "https://github.com"
 MIHOMO_REPO = f"{_GITHUB}/MetaCubeX/mihomo"
 
+_GITHUB_API = "https://api.github.com"
+# GitHub API release 端点：资产 digest（"sha256:…"）是运行时下载的完整性锚
+RELEASE_API_URL = (
+    f"{_GITHUB_API}/repos/{MIHOMO_REPO.removeprefix(_GITHUB + '/')}"
+    f"/releases/tags/{MIHOMO_VERSION}"
+)
+
 # 随包许可原文（上游逐字，不做改写）：GPL-3.0 要求二进制旁附许可文本。
 LICENSE_ASSETS: dict[str, str] = {
     "LICENSE-mihomo.txt": f"{MIHOMO_REPO}/raw/{MIHOMO_VERSION}/LICENSE",
@@ -24,8 +31,12 @@ def is_windows() -> bool:
 
 
 def kernel_filename() -> str:
-    """内核可执行文件名（Windows 带 .exe）。"""
-    return "mihomo.exe" if is_windows() else "mihomo"
+    """内核可执行文件名（Windows 带 .exe）。
+
+    带应用前缀，与用户机器上其他软件启动的 mihomo 内核进程隔离：
+    按名查/杀进程、误杀防护都以这个名字为准。
+    """
+    return "holdexar-mihomo.exe" if is_windows() else "holdexar-mihomo"
 
 
 def bundled_asset_names() -> tuple[str, ...]:
@@ -60,6 +71,12 @@ def mihomo_asset() -> tuple[str, str]:
     if is_windows():
         return f"mihomo-windows-amd64-compatible-{MIHOMO_VERSION}.zip", "zip"
     return f"mihomo-linux-amd64-compatible-{MIHOMO_VERSION}.gz", "gz"
+
+
+def asset_digest_sha256(asset: dict) -> str | None:
+    """release 资产 digest 字段（"sha256:…"）→ 纯十六进制小写；非该格式返回 None。"""
+    digest = str(asset.get("digest") or "")
+    return digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else None
 
 
 def mihomo_url() -> str:

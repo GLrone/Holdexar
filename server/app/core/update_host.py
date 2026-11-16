@@ -28,6 +28,7 @@ from app.core.app_info import (
     HEALTH_TIMEOUT,
     STAGING_MANIFEST_NAME,
     version_from_tag,
+    version_gt,
 )
 from app.core.app_info import (
     MIGRATION_IDLE_WINDOW,
@@ -55,6 +56,11 @@ def _http_get_json(host: str, port: int, path: str, timeout: float = 3.0) -> tup
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 28765
 UPDATE_DATA_PROTOCOL = 1
+
+# 交接信任锚记录（数据目录落盘，写入侧在 app.core.updater）：下载完成时的
+# 清单验签+sha256 结论持久化于此。暂存目录与自带 manifest 攻击者可写，
+# 执行任何暂存载荷前唯一可对照的锚是这条记录。
+TRUST_RECORD_NAME = "update-trust.json"
 
 # 健康验收失败归因（写入事务与诊断报告的 error 字段前缀）
 HEALTH_BINDING_ERROR = "健康验收未绑定本事务"
@@ -701,6 +707,47 @@ def _verify_staging_payload(staging_dir: Path, manifest: dict[str, Any]) -> str:
     return ""
 
 
+def verify_staged_trust(staging_dir: Path, data_dir: Path, target_version: str | None = None) -> str:
+    """交接信任锚复核：暂存载荷对照数据目录信任记录逐文件复算（fail-closed）。
+
+    下载完成时 updater 已对 zip 过 Ed25519 清单验签与 sha256 校验，并把结论
+    与载荷 files 表写入数据目录记录；暂存目录与自带 manifest 均可被改写，
+    只有这条记录是执行暂存载荷前唯一可对照的锚。返回错误描述，空串=通过。
+    """
+    manifest = _read_manifest(staging_dir)
+    if not manifest:
+        return "暂存清单缺失或不可读"
+    try:
+        record = json.loads((data_dir / TRUST_RECORD_NAME).read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError
+    except (OSError, ValueError):
+        return "信任记录缺失或损坏，拒绝执行暂存载荷；请重新下载更新"
+    recorded_tag = str(record.get("version") or "")
+    manifest_tag = str(manifest.get("tag") or "")
+    if (version_from_tag(recorded_tag) != version_from_tag(manifest_tag)
+            or (target_version and version_from_tag(recorded_tag) != version_from_tag(target_version))):
+        return f"信任记录版本不符：记录 {recorded_tag or '(空)'} / 暂存 {manifest_tag or '(空)'}"
+    files = record.get("files")
+    if not isinstance(files, dict) or not files:
+        return "信任记录缺少载荷校验表，拒绝执行暂存载荷；请重新下载更新"
+    if manifest.get("files") != files:
+        return "暂存清单校验表与信任记录不一致，拒绝执行暂存载荷；请重新下载更新"
+    digest = str(record.get("zip_sha256") or "").lower()
+    if len(digest) != 64 or set(digest) - set("0123456789abcdef"):
+        return "信任记录缺少下载校验值，拒绝执行暂存载荷；请重新下载更新"
+    payload = staging_dir / APP_NAME
+    if not payload.is_dir():
+        return "暂存包载荷缺失"
+    for name in sorted(files):
+        path = payload / name
+        if not path.is_file():
+            return f"暂存包载荷缺失：{name}"
+        if hashlib.sha256(path.read_bytes()).hexdigest() != str(files[name]).lower():
+            return f"暂存包载荷校验不符：{name}"
+    return ""
+
+
 def _resolve_data_dir(root: Path, requested: Path | None) -> Path:
     """本次换装的数据目录：显式传入优先，否则安装根 data/。"""
     candidate = Path(requested).resolve() if requested else (root / layout.DATA_DIR_NAME).resolve()
@@ -1023,7 +1070,16 @@ def _execute_update_locked(
         or (curr_state.get("lastKnownGood") if curr_state else None)
         or "legacy_version"
     )
+    # 方向硬闸：目标不新于来源即拒绝，降级/平级换装在此终止（与来源不符的
+    # 伪造请求随后会被 active_version 校验拦下，两条闸互不替代）
+    if not version_gt(t_ver, s_ver):
+        _log_update(root, f"更新方向不符：目标 {t_ver} 不新于来源 {s_ver}，拒绝降级换装")
+        return False
     expected_data_dir = _resolve_data_dir(root, data_dir)
+    trust_error = verify_staged_trust(staging_dir, expected_data_dir, t_ver)
+    if trust_error:
+        _log_update(root, f"暂存包信任复核未通过：{trust_error}，拒绝换装并保留现装")
+        return False
     pending_self = curr_state.get("pendingVersion") if curr_state else None
     recovering = pending_self is not None and str(pending_self) == t_ver
 

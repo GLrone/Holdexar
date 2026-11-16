@@ -95,9 +95,28 @@ def staging_dir() -> Path:
     return d
 
 
+def _env_update_base() -> str:
+    """显式更新源覆盖仅认回环主机：该分支豁免清单验签，绝不许指向远端。"""
+    from urllib.parse import urlparse
+
+    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    if not base:
+        return ""
+    if (urlparse(base).hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+        return base
+    log_event(
+        logger,
+        "忽略非回环更新源覆盖，回退签名镜像链",
+        tag="安全",
+        detail={"来源": base},
+        level=logging.WARNING,
+    )
+    return ""
+
+
 def manifest_url(mirror: str = "") -> str:
     """清单地址（mirror 为空 = 直连）。"""
-    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    base = _env_update_base()
     if base:
         return f"{base}/{MANIFEST_ASSET}"
     return (
@@ -123,10 +142,10 @@ async def _fetch_manifest() -> dict | None:
     """按镜像链取 latest.json。全通道并发取回，按镜像优先级取**第一个验签通过**者；全失败返回 None。
 
     信任模型：镜像只是运输——清单必须经内嵌公钥验签（update_signing），
-    伪造/篡改/无签名清单按通道失败处理。显式 HOLDEXAR_UPDATE_URL 指向的
-    本地测试源豁免验签（本机自控调试面，能设该变量的进程本就控制本机）。
+    伪造/篡改/无签名清单按通道失败处理。显式 HOLDEXAR_UPDATE_URL 仅当指向
+    回环主机时豁免验签（本机自控调试面），其余覆盖一律忽略。
     """
-    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    base = _env_update_base()
     if base:
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
@@ -534,8 +553,21 @@ async def download_update(
         # 换装失败标记与交接账本落在数据目录（与桌面壳写入侧同一路径判定，
         # 不是安装根——staging 在安装根下，staging.parent 对错文件）
         from app.core.paths import resolve_data_dir
+        from app.core.update_host import TRUST_RECORD_NAME
+
         (resolve_data_dir() / SWAP_FAILED_FLAG).unlink(missing_ok=True)
         (resolve_data_dir() / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
+        # 信任锚持久化：Ed25519 验签只活到下载完成，交接期执行暂存载荷前唯一
+        # 可对照的锚是数据目录这条记录（暂存目录可被改写，自证不作数）；
+        # 写失败即抛——宁可下载报错，不留无锚暂存包
+        _write_trust_record(resolve_data_dir() / TRUST_RECORD_NAME, {
+            "version": tag,
+            "zip_sha256": expected_sha256.strip().lower(),
+            "files": files,
+            # 下载期不执行载荷做协议探测，交接期在记录复核通过后再探
+            "protocol": 0,
+            "staging_dir": str(staging),
+        })
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         log_event(
             logger,
@@ -571,7 +603,7 @@ def _error_code(err: Exception) -> str:
 
 async def _resolve_asset_url(tag: str, asset_name: str | None) -> str:
     """确定资产下载地址：清单给了确切名就直连，否则回落到 API 反查。"""
-    base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
+    base = _env_update_base()
     if base and asset_name:
         return f"{base}/{asset_name}"
     if asset_name:
@@ -820,6 +852,14 @@ def _payload_hashes(payload_root: Path) -> dict[str, str]:
         path.relative_to(payload_root).as_posix(): _sha256_of(path)
         for path in sorted(payload_root.rglob("*")) if path.is_file()
     }
+
+
+def _write_trust_record(path: Path, record: dict) -> None:
+    """信任记录原子落盘（临时文件 + os.replace），交接/换装复核以此为准。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # ── 换装状态查询 ─────────────────────────────────────────────────────

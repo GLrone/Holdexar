@@ -395,8 +395,10 @@ def _machine_info() -> dict:
         if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kb)):
             info["total_mem_gb"] = round(kb.value / (1024 * 1024), 1)
     try:
+        # 不过滤映像名：本应用内核带应用前缀（holdexar-mihomo.exe），
+        # 子串统计把新旧名与其他软件的 mihomo 一并计入环境并发数。
         out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq mihomo.exe", "/FO", "CSV", "/NH"],
+            ["tasklist", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=15,
         ).stdout or ""
         count = sum(1 for line in out.splitlines() if "mihomo" in line.lower())

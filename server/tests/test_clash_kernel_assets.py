@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -241,3 +242,172 @@ def test_kernel_release_constants_are_single_source() -> None:
     assert MIHOMO_VERSION in mihomo_url()
     assert shape in ("zip", "gz")
     assert asset_name.endswith(".zip") is is_windows()
+
+
+# ── 运行时下载哈希锚（双源校验）：镜像只是字节运输，不产生信任 ──────
+def _fake_zip_bytes(payload: bytes = b"MZkernel") -> bytes:
+    import io as _io
+    import zipfile as _zipfile
+
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("mihomo-windows-amd64-compatible.exe", payload)
+    return buf.getvalue()
+
+
+class _FakeAPIResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError("http error")
+
+    def json(self):
+        return self._payload
+
+
+def _release_payload(digest: str | None):
+    entry = {"name": mihomo_asset()[0], "size": 10}
+    if digest:
+        entry["digest"] = digest
+    return {"assets": [entry]}
+
+
+def test_asset_digest_parses_sha256_form():
+    from app.domains.proxies.kernel_release import asset_digest_sha256
+
+    assert asset_digest_sha256({"digest": "sha256:ABC"}) == "abc"
+    assert asset_digest_sha256({"digest": "md5:abc"}) is None
+    assert asset_digest_sha256({}) is None
+
+
+def test_release_api_url_tracks_version():
+    from app.domains.proxies.kernel_release import RELEASE_API_URL
+
+    assert MIHOMO_VERSION in RELEASE_API_URL
+    assert RELEASE_API_URL.startswith(
+        "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/")
+
+
+def test_release_digest_reads_sha256_from_assets(monkeypatch):
+    from app.domains.proxies import kernel_release
+
+    digest = "ab" * 32
+    monkeypatch.setattr(
+        clash_manager.httpx, "get",
+        lambda *a, **k: _FakeAPIResponse(_release_payload(f"sha256:{digest}")))
+    assert clash_manager._release_digest([(None, "直连")]) == digest
+
+
+def test_release_digest_fails_closed_on_missing_digest_field(monkeypatch):
+    monkeypatch.setattr(
+        clash_manager.httpx, "get",
+        lambda *a, **k: _FakeAPIResponse(_release_payload(None)))
+    assert clash_manager._release_digest([(None, "直连")]) is None
+
+
+def test_release_digest_fails_closed_on_api_error(monkeypatch):
+    def _boom(*_a, **_k):
+        raise RuntimeError("network unreachable")
+
+    monkeypatch.setattr(clash_manager.httpx, "get", _boom)
+    assert clash_manager._release_digest(
+        [(None, "直连"), ("http://127.0.0.1:1", "经内核代理")]) is None
+
+
+def test_download_kernel_fails_closed_without_digest(tmp_path, monkeypatch):
+    """校验锚拿不到 → 拒绝安装，不落盘任何 exe。"""
+    monkeypatch.setattr(clash_manager, "_MIRRORS", ("",))
+    monkeypatch.setattr(clash_manager, "_release_digest", lambda _channels: None)
+
+    result = clash_manager.download_kernel(tmp_path / "data")
+
+    assert result["ok"] is False
+    assert "校验未通过" in result["error"]
+    assert not (tmp_path / "data" / "clash" / kernel_filename()).exists()
+
+
+def test_download_kernel_writes_exe_after_digest_match(tmp_path, monkeypatch):
+    """zip 实算 sha256 与上游 digest 一致 → 解出 exe 落盘。"""
+    zip_bytes = _fake_zip_bytes(b"MZkernel")
+    digest = hashlib.sha256(zip_bytes).hexdigest()
+    monkeypatch.setattr(clash_manager, "_MIRRORS", ("",))
+    monkeypatch.setattr(clash_manager, "_release_digest", lambda _channels: digest)
+    monkeypatch.setattr(clash_manager, "_download_zip_kernel", lambda *a, **k: zip_bytes)
+    monkeypatch.setattr(clash_manager, "_download_attempts",
+                        lambda *a, **k: [(None, "直连")])
+
+    result = clash_manager.download_kernel(tmp_path / "data")
+
+    assert result["ok"] is True
+    exe = tmp_path / "data" / "clash" / kernel_filename()
+    assert exe.read_bytes() == b"MZkernel"
+
+
+def test_download_kernel_rejects_hash_mismatch(tmp_path, monkeypatch):
+    """镜像字节被篡改 → 拒绝该源且不落盘，最终以校验失败收场。"""
+    zip_bytes = _fake_zip_bytes(b"MZtampered")
+    monkeypatch.setattr(clash_manager, "_MIRRORS", ("",))
+    monkeypatch.setattr(clash_manager, "_release_digest",
+                        lambda _channels: "00" * 32)
+    monkeypatch.setattr(clash_manager, "_download_zip_kernel", lambda *a, **k: zip_bytes)
+    monkeypatch.setattr(clash_manager, "_download_attempts",
+                        lambda *a, **k: [(None, "直连")])
+
+    result = clash_manager.download_kernel(tmp_path / "data")
+
+    assert result["ok"] is False
+    assert "校验未通过" in result["error"]
+    assert not (tmp_path / "data" / "clash" / kernel_filename()).exists()
+
+
+def test_download_kernel_linux_fails_closed_without_digest(tmp_path, monkeypatch):
+    from app.domains.proxies.kernel_release import RELEASE_API_URL
+
+    monkeypatch.setattr(clash_manager, "_MIRRORS", ("",))
+    monkeypatch.setattr(
+        clash_manager.httpx, "get",
+        lambda url, **k: (
+            _FakeAPIResponse(_release_payload(None))
+            if url == RELEASE_API_URL
+            else _FakeAPIResponse(b"gz-bytes")))
+
+    result = clash_manager.download_kernel_linux(tmp_path / "data")
+
+    assert result["ok"] is False
+    assert "校验未通过" in result["error"]
+    assert not (tmp_path / "data" / "clash" / kernel_filename()).exists()
+
+
+def test_download_kernel_linux_rejects_hash_mismatch(tmp_path, monkeypatch):
+    import gzip as _gzip
+
+    from app.domains.proxies.kernel_release import RELEASE_API_URL
+
+    payload = _gzip.compress(b"ELFfake-tampered")
+    monkeypatch.setattr(clash_manager, "_MIRRORS", ("",))
+    monkeypatch.setattr(
+        clash_manager.httpx, "get",
+        lambda url, **k: (
+            _FakeAPIResponse(_release_payload("sha256:" + "00" * 32))
+            if url == RELEASE_API_URL
+            else _FakeAPIResponse(payload)))
+
+    result = clash_manager.download_kernel_linux(tmp_path / "data")
+
+    assert result["ok"] is False
+    assert "校验未通过" in result["error"]
+    assert not (tmp_path / "data" / "clash" / kernel_filename()).exists()
+
+
+def test_extract_exe_requires_executable_entry():
+    import io as _io
+    import zipfile as _zipfile
+
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(buf, "w") as z:
+        z.writestr("readme.txt", "hi")
+    with pytest.raises(ValueError):
+        clash_manager._extract_exe(buf.getvalue())

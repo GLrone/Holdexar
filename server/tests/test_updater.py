@@ -355,6 +355,8 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         updater, "staging_dir", lambda: tmp_path / "staging"
     )
+    # 信任记录写入侧走数据目录：钉进 tmp，不落真实开发数据目录
+    monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: tmp_path / "data")
     # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
 
@@ -404,6 +406,7 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: tmp_path / "data")
     # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     monkeypatch.setattr(
@@ -446,6 +449,7 @@ async def test_download_skips_missing_channel_before_downloading(
 
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: tmp_path / "data")
     # 用例用的是几百字节的假包：体积下限（防镜像错误页）在测试里归零
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     monkeypatch.setattr(
@@ -597,6 +601,7 @@ async def test_download_sha256_mismatch_falls_back_to_next_channel(
         ]
 
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
+    monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: tmp_path / "data")
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
     monkeypatch.setattr(updater, "_probe_channels", fake_probe)
     monkeypatch.setattr(updater, "_stream_to_file", fake_stream)

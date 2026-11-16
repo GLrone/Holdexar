@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import io
 import logging
 import threading
@@ -40,8 +41,11 @@ from app.core.net import port_listening as _port_listening
 from app.domains.proxies.kernel_release import (
     MIHOMO_VERSION,
     MIRRORS,
+    RELEASE_API_URL,
+    asset_digest_sha256,
     is_windows,
     kernel_filename,
+    mihomo_asset,
     mihomo_url,
 )
 # 运行配置生成与节点依赖解析的唯一实现在 runtime_config；本模块只做转发，
@@ -249,6 +253,22 @@ def ensure_kernel_files(kernel_path: Path) -> dict:
 _KERNEL_FILES_LOCK = threading.Lock()
 
 
+def _adopt_legacy_kernel(kernel_path: Path) -> str | None:
+    """改名迁移：把改名前落位的旧名内核改名为现名，用户免重新下载。
+
+    仅在新名缺失而旧名文件就位时执行；旧内核进程仍占着文件（运行中的
+    exe 不可改名）等 rename 失败场景静默跳过，留给下次启动。
+    """
+    legacy = kernel_path / "mihomo.exe"
+    if not legacy.is_file() or (kernel_path / kernel_filename()).is_file():
+        return None
+    try:
+        legacy.rename(kernel_path / kernel_filename())
+        return "mihomo.exe"
+    except OSError:
+        return None
+
+
 def ensure_kernel(data_dir: Path) -> dict:
     """随包内核就位（data_dir 版本）：把内核与许可原文补进 data/clash/。
 
@@ -258,11 +278,21 @@ def ensure_kernel(data_dir: Path) -> dict:
     kernelReady=False，由调用方决定是回退网络下载还是提示用户。
     """
     with _KERNEL_FILES_LOCK:
+        adopted = _adopt_legacy_kernel(kernel_dir(data_dir))
         result = _copy_bundled(kernel_dir(data_dir), (kernel_filename(),))
+        if adopted:
+            result["adopted"] = adopted
         upgrade = _maybe_upgrade_kernel(kernel_dir(data_dir))
         if upgrade:
             result["upgraded"] = upgrade
         ready = kernel_exe(data_dir).is_file()
+        if adopted:
+            log_event(
+                logger,
+                "已接管旧版文件名的内核，无需重新下载",
+                tag="成功",
+                detail={"旧文件名": adopted, "现文件名": kernel_filename()},
+            )
         if result["copied"]:
             log_event(
                 logger,
@@ -282,6 +312,7 @@ def ensure_kernel(data_dir: Path) -> dict:
             "kernelReady": ready,
             "copied": result["copied"],
             "missing": result["missing"],
+            "adopted": adopted,
             "upgraded": upgrade,
             "bundleDir": str(bundled_clash_dir()),
         }
@@ -507,11 +538,12 @@ def kernel_download_progress() -> dict:
 
 
 def _download_zip_kernel(
-    url: str, proxy: str | None, target: Path, source: str, via: str
-) -> None:
-    """流式下载 mihomo zip 并解出 exe；进度按 Content-Length 上报百分比。
+    url: str, proxy: str | None, source: str, via: str
+) -> bytes:
+    """流式下载 mihomo zip 并返回原始字节（不落盘——落盘前先过哈希锚）。
 
-    连接超时收紧到 10s（被墙通道快速轮转），读超时 120s 容慢速传输。
+    进度按 Content-Length 上报百分比；连接超时收紧到 10s（被墙通道快速轮转），
+    读超时 120s 容慢速传输。
     """
     received = 0
     total = None
@@ -531,19 +563,74 @@ def _download_zip_kernel(
                 "percent": round(received * 100 / total, 1) if total else None,
                 "source": source, "via": via,
             })
-    with zipfile.ZipFile(buf) as z:
+    return buf.getvalue()
+
+
+def _extract_exe(zip_bytes: bytes) -> bytes:
+    """从 mihomo zip 里取出 exe 字节（压缩包内只有这一个可执行文件）。"""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         for name in z.namelist():
             if name.endswith(".exe"):
-                target.write_bytes(z.read(name))
-                return
+                return z.read(name)
     raise ValueError("压缩包中未找到 exe")
+
+
+_KERNEL_VERIFY_FAILED = "内核下载校验未通过，请稍后重试"
+
+
+def _release_digest(channels: list[tuple[str | None, str]]) -> str | None:
+    """从 GitHub API 拉当前版本内核资产的 sha256（双源哈希锚的上游源）。
+
+    与下载共用同一条通道链；API 拉不到 / 资产缺失 / digest 格式异常一律返回
+    None——校验锚拿不到就拒绝安装（fail-closed），绝不落盘执行未锚定的内核。
+    """
+    asset, _shape = mihomo_asset()
+    for proxy, label in channels:
+        try:
+            resp = httpx.get(
+                RELEASE_API_URL,
+                headers={"Accept": "application/vnd.github+json"},
+                timeout=httpx.Timeout(20, connect=10),
+                follow_redirects=True, trust_env=False,
+                proxy=proxy if proxy else None,
+            )
+            resp.raise_for_status()
+            for entry in resp.json().get("assets") or []:
+                if str(entry.get("name") or "") != asset:
+                    continue
+                sha = asset_digest_sha256(entry)
+                if not sha:
+                    log_event(
+                        logger,
+                        "内核校验锚缺失：release 资产未带 sha256 digest",
+                        level=logging.WARNING,
+                        detail={"资产": asset, "通道": label},
+                    )
+                    return None
+                return sha
+            log_event(
+                logger,
+                "内核校验锚缺失：release 里没有当前平台资产",
+                level=logging.WARNING,
+                detail={"资产": asset, "通道": label},
+            )
+            return None
+        except Exception as e:  # noqa: BLE001 —— 换下一条通道
+            log_event(
+                logger,
+                "内核校验锚获取失败，换下一通道",
+                level=logging.WARNING,
+                detail={"通道": label, "原因": str(e)},
+            )
+    return None
 
 
 def download_kernel(data_dir: Path) -> dict:
     """下载 mihomo 内核到 data/clash/（镜像优先，逐镜像过通道链）。
 
     **兜底路径**：正常安装走 install_kernel() 的随包复制。同步阻塞，调用方放
-    线程；进度写 _KERNEL_PROGRESS 供轮询端点上报。
+    线程；进度写 _KERNEL_PROGRESS 供轮询端点上报。落盘前以 GitHub release
+    资产 digest 为哈希锚实算比对——校验不过不写 exe（镜像只是字节运输，不产生信任）。
     """
     _kernel_progress_reset()
     _KERNEL_PROGRESS["running"] = True
@@ -552,6 +639,11 @@ def download_kernel(data_dir: Path) -> dict:
         target = kernel_exe(data_dir)
         # 内核没下载成功自己必然没跑：仅直连 + 本地混合端口（用户 Verge 等）
         channels = _download_attempts(None, None)
+        digest = _release_digest(channels)
+        if not digest:
+            _KERNEL_PROGRESS.update({"running": False, "error": _KERNEL_VERIFY_FAILED})
+            return {"ok": False, "error": _KERNEL_VERIFY_FAILED}
+        downloaded_any = False
         for mirror in _MIRRORS:
             url = mirror + base if mirror else base
             for proxy, label in channels:
@@ -565,7 +657,17 @@ def download_kernel(data_dir: Path) -> dict:
                     _KERNEL_PROGRESS.update({
                         "phase": "连接下载源", "source": mirror or "github", "via": label,
                     })
-                    _download_zip_kernel(url, proxy, target, mirror or "github", label)
+                    zip_bytes = _download_zip_kernel(url, proxy, mirror or "github", label)
+                    downloaded_any = True
+                    if hashlib.sha256(zip_bytes).hexdigest() != digest:
+                        log_event(
+                            logger,
+                            "内核哈希与上游 digest 不符，拒绝该下载源",
+                            level=logging.WARNING,
+                            detail={"镜像": mirror or "github", "通道": label},
+                        )
+                        continue
+                    target.write_bytes(_extract_exe(zip_bytes))
                     _KERNEL_PROGRESS.update({"ok": True, "running": False, "percent": 100})
                     return {
                         "ok": True, "path": str(target),
@@ -578,17 +680,19 @@ def download_kernel(data_dir: Path) -> dict:
                         level=logging.WARNING,
                         detail={"镜像": mirror or "github", "通道": label, "原因": str(e)},
                     )
-        _KERNEL_PROGRESS.update({
-            "running": False,
-            "error": "所有下载源均失败，可手动放置内核到 data/clash/",
-        })
-        return {"ok": False, "error": "所有下载源均失败，可手动放置内核到 data/clash/"}
+        hint = (
+            _KERNEL_VERIFY_FAILED if downloaded_any
+            else f"所有下载源均失败，可手动放置内核到 data/clash/（文件名 {kernel_filename()}）"
+        )
+        _KERNEL_PROGRESS.update({"running": False, "error": hint})
+        return {"ok": False, "error": hint}
     finally:
         _KERNEL_PROGRESS["running"] = False
 
 
 def download_kernel_linux(data_dir: Path) -> dict:
-    """linux: gz 单文件（进度按流式字节数上报）。兜底路径，同上。"""
+    """linux: gz 单文件（进度按流式字节数上报）。兜底路径，同上：
+    落盘前以 GitHub release 资产 digest 为哈希锚，校验不过不写文件。"""
     import gzip
 
     _kernel_progress_reset()
@@ -596,11 +700,24 @@ def download_kernel_linux(data_dir: Path) -> dict:
     try:
         base = mihomo_url()
         target = kernel_exe(data_dir)
+        digest = _release_digest([(None, "直连")])
+        if not digest:
+            return {"ok": False, "error": _KERNEL_VERIFY_FAILED}
+        downloaded_any = False
         for mirror in _MIRRORS:
             url = mirror + base if mirror else base
             try:
                 resp = httpx.get(url, timeout=120, follow_redirects=True, trust_env=False)
                 resp.raise_for_status()
+                downloaded_any = True
+                if hashlib.sha256(resp.content).hexdigest() != digest:
+                    log_event(
+                        logger,
+                        "内核哈希与上游 digest 不符，拒绝该下载源",
+                        level=logging.WARNING,
+                        detail={"镜像": mirror or "github"},
+                    )
+                    continue
                 target.write_bytes(gzip.decompress(resp.content))
                 target.chmod(0o755)
                 return {"ok": True, "path": str(target), "source": mirror or "github"}
@@ -611,6 +728,8 @@ def download_kernel_linux(data_dir: Path) -> dict:
                     level=logging.WARNING,
                     detail={"原因": str(e)},
                 )
+        if downloaded_any:
+            return {"ok": False, "error": _KERNEL_VERIFY_FAILED}
         return {"ok": False, "error": "所有下载源均失败"}
     finally:
         _KERNEL_PROGRESS["running"] = False
@@ -1191,16 +1310,21 @@ class ClashRuntime:
         return False
 
     def _kill_orphans(self, exe_path: str, config_path: str) -> int:
-        """清理同 exe+config 的残留内核进程（服务被强杀后 mihomo 不随父进程退出）。
+        """清理本应用残留内核进程（服务被强杀后内核不随父进程退出）。
 
-        只杀命令行包含本内核 exe 且带 -f 本配置的实例，不动用户自启的
-        Clash / Verge；返回清理数。wmic 已从新版 Windows 移除，用 CIM。
+        只杀映像名为本应用内核名（含改名前的旧名）且命令行带 -f 本配置的实例，
+        不动用户自启的 Clash / Verge；返回清理数。wmic 已从新版 Windows 移除，用 CIM。
         """
         escaped_cfg = config_path.replace("[", "`[").replace("]", "`]").replace("'", "''")
+        kernel_name = kernel_filename()
+        # shortcut: 旧名分支是改名迁移期的收编兜底，随包内核名已更替后仍可移除
+        name_filter = f"Name='{kernel_name}'"
+        if kernel_name != "mihomo.exe":
+            name_filter += " OR Name='mihomo.exe'"
         ps_script = (
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-            "Get-CimInstance Win32_Process -Filter \"Name='mihomo.exe'\" | "
-            "Where-Object { $_.CommandLine -like '*mihomo.exe*' -and "
+            f"Get-CimInstance Win32_Process -Filter \"{name_filter}\" | "
+            "Where-Object { "
             f"$_.CommandLine -like '*{escaped_cfg}*' }} | "
             "Select-Object -ExpandProperty ProcessId"
         )

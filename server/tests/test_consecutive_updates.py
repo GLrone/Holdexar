@@ -38,6 +38,30 @@ def _stage_full_package(tmp_path: Path, name: str, files: dict[str, bytes]) -> P
     return staging
 
 
+def _seal_staging(staging: Path, target_version: str, data_dir: Path) -> None:
+    """补齐换装门禁材料：manifest files 表 + 数据目录信任记录（与真实下载产物同构）。"""
+    import hashlib
+    import json
+
+    payload = staging / APP_NAME
+    hashes = {
+        p.relative_to(payload).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in sorted(payload.rglob("*")) if p.is_file()
+    }
+    (staging / "manifest.json").write_text(
+        json.dumps({"tag": f"v{target_version}", "ready": True, "files": hashes}),
+        encoding="utf-8",
+    )
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / update_host.TRUST_RECORD_NAME).write_text(
+        json.dumps({
+            "version": f"v{target_version}", "zip_sha256": "0" * 64,
+            "files": hashes, "protocol": 0, "staging_dir": str(staging),
+        }),
+        encoding="utf-8",
+    )
+
+
 def test_consecutive_full_package_updates_preserve_user_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -69,7 +93,7 @@ def test_consecutive_full_package_updates_preserve_user_data(
     custom_marker = data_dir / "user_marker.txt"
     custom_marker.write_text("my-important-config", encoding="utf-8")
 
-    kernel_file = data_dir / "clash" / "mihomo.exe"
+    kernel_file = data_dir / "clash" / "holdexar-mihomo.exe"
     kernel_file.parent.mkdir(parents=True, exist_ok=True)
     kernel_file.write_bytes(b"mihomo-binary-v1.19.32-custom")
 
@@ -97,6 +121,7 @@ def test_consecutive_full_package_updates_preserve_user_data(
         "_internal/web/assets/app.js": b"web-v036",
         "_internal/new_feat_v036.dll": b"new-feature-dll",
     })
+    _seal_staging(staging_1, "0.3.6", data_dir)
 
     ok1 = update_host.execute_update(
         root=root,
@@ -133,6 +158,7 @@ def test_consecutive_full_package_updates_preserve_user_data(
         "_internal/new_feat_v036.dll": b"new-feature-dll",
         "_internal/patch_v037.dat": b"extra-patch-data",
     })
+    _seal_staging(staging_2, "0.3.7", data_dir)
 
     ok2 = update_host.execute_update(
         root=root,

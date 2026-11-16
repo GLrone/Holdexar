@@ -32,17 +32,18 @@ def _write_assets(directory: Path, sizes: dict[str, int]) -> None:
             asset.truncate(size)
 
 
-@pytest.mark.parametrize(
-    ("windows", "filename"), [(True, "mihomo.exe"), (False, "mihomo")]
-)
+@pytest.mark.parametrize("windows", [True, False])
 def test_bundled_assets_include_only_kernel_license_and_source_note(
-    monkeypatch, windows, filename
+    monkeypatch, windows
 ):
     monkeypatch.setattr(kernel_release, "is_windows", lambda: windows)
     asset_names = getattr(kernel_release, "bundled_asset_names", None)
 
     assert callable(asset_names)
     assert set(kernel_release.LICENSE_ASSETS) == {"LICENSE-mihomo.txt"}
+    # 内核名带应用前缀（与其他软件的 mihomo 进程隔离），Windows 带 .exe
+    filename = "holdexar-mihomo.exe" if windows else "holdexar-mihomo"
+    assert kernel_release.kernel_filename() == filename
     assert asset_names() == (filename, *kernel_release.LICENSE_ASSETS, "README.txt")
 
 

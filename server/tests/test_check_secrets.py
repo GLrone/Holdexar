@@ -119,7 +119,7 @@ def test_allows_bare_identifier_and_placeholder_mentions(line):
         "reference/notes/x.txt",
         "secrets/fx_maintenance.env",
         "assets/seed/holdexar_seed.db",
-        "assets/clash/mihomo.exe",  # 随包内核资产（二进制不进库，走 Release/脚本补齐）
+        "assets/clash/holdexar-mihomo.exe",  # 随包内核资产（二进制不进库，走 Release/脚本补齐）
         "assets/clash/geoip.dat",
         ".tmp-pytest/x/test.db",
         "gui-test-screenshots/a.png",
