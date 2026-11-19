@@ -700,9 +700,7 @@ func stringOrStar(value *string) string {
 }
 
 func writeRunJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+	httpx.WriteJSON(w, status, payload)
 }
 
 func randomHex16() string {

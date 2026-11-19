@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 var releaseNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
@@ -44,11 +46,7 @@ func Get(deps Deps) *Service {
 
 func Register(mux *http.ServeMux, deps Deps) {
 	service := Get(deps)
-	writeJSON := func(w http.ResponseWriter, status int, payload any) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(payload)
-	}
+	writeJSON := httpx.WriteJSON
 	mux.HandleFunc("GET /api/v1/system/update-check", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, service.CheckUpdate(nil))
 	})

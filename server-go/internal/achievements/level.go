@@ -3,7 +3,6 @@ package achievements
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
@@ -66,8 +66,7 @@ func (s LevelService) Register(mux *http.ServeMux) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(profile)
+		httpx.WriteJSON(w, http.StatusOK, profile)
 	})
 }
 

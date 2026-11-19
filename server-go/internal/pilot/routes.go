@@ -14,11 +14,7 @@ import (
 )
 
 func Register(mux *http.ServeMux, service *Service) {
-	writeJSON := func(w http.ResponseWriter, status int, payload any) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(payload)
-	}
+	writeJSON := httpx.WriteJSON
 	writeErr := func(w http.ResponseWriter, status int, detail string) {
 		writeJSON(w, status, map[string]string{"detail": detail})
 	}

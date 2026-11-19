@@ -2,10 +2,8 @@
 package systemx
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"math"
 	"net/http"
 	"os"
@@ -14,6 +12,7 @@ import (
 
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/crawl"
+	"holdexar/server-go/internal/httpx"
 )
 
 // githubRepo 默认发布仓库标识（/api/v1/info 的 repo 字段输出）。
@@ -127,18 +126,9 @@ func isReadMethod(r *http.Request) bool {
 }
 
 func detailNull() map[string]any {
-	return map[string]any{"detail": nil}
+	return httpx.DetailNull()
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(payload); err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}))
+	httpx.WriteJSON(w, status, payload)
 }

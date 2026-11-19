@@ -1,7 +1,6 @@
 package systemx
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -465,14 +464,5 @@ func writeData(w http.ResponseWriter, value any, err error) {
 		}
 		value = map[string]string{"detail": detail}
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(value); err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}))
+	writeJSON(w, status, value)
 }

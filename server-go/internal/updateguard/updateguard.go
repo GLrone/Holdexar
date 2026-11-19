@@ -15,6 +15,7 @@ import (
 
 	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
@@ -212,37 +213,31 @@ func ClearProtection() {
 }
 
 func HandleUpdateReady(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	if !access.PeerIsLoopback(r.RemoteAddr) {
-		w.WriteHeader(http.StatusForbidden)
-		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "该操作仅限本机执行"})
+		httpx.WriteJSON(w, http.StatusForbidden, map[string]string{"detail": "该操作仅限本机执行"})
 		return
 	}
 	if r.Body == nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
 		return
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
 	var body map[string]any
 	if err := dec.Decode(&body); err != nil || body == nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
 		return
 	}
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
 		return
 	}
 	attemptID, _ := body["attemptId"].(string)
 	if err := SetPageReady(attemptID); err != nil {
-		w.WriteHeader(http.StatusConflict)
-		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "当前不在更新验收期间"})
+		httpx.WriteJSON(w, http.StatusConflict, map[string]string{"detail": "当前不在更新验收期间"})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]bool{"ready": true})
+	httpx.WriteJSON(w, http.StatusOK, map[string]bool{"ready": true})
 }
 
 // Middleware 验收期内拦截非安全方法的 /api/* 请求并返回 503，仅放行 update-ready。
@@ -251,9 +246,7 @@ func Middleware(next http.Handler) http.Handler {
 		if Active() && r.Method != http.MethodGet && r.Method != http.MethodHead &&
 			r.Method != http.MethodOptions && strings.HasPrefix(r.URL.Path, "/api/") &&
 			r.URL.Path != "/api/v1/system/update-ready" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"detail": "正在完成更新，请稍后再试"})
+			httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "正在完成更新，请稍后再试"})
 			return
 		}
 		next.ServeHTTP(w, r)
