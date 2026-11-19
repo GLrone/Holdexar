@@ -1,8 +1,5 @@
 package proxypool
 
-// 三层探测落账单测：假内核三件套（桩控制器 / 桩 HTTP 代理 / 桩业务与回显目标）
-// 承载真实网络语义；落账边界、状态推进、冷却复位、回滚全清用临时库真写闸验证。
-
 import (
 	"context"
 	"database/sql"
@@ -22,13 +19,10 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// ── 假内核三件套 ─────────────────────────────────────────────────────────────
-
-// stubTarget 业务与回显目标：按路径给 StoreBrowse 形状 / 纯文本出口 / 204。
 type stubTarget struct {
 	server    *httptest.Server
-	browseOK  atomic.Bool // false = 返回目标服务 500
-	closeHard func()      // 模拟目标整体失联（传输失败归因用）
+	browseOK  atomic.Bool
+	closeHard func()
 }
 
 func newStubTarget(t *testing.T) *stubTarget {
@@ -57,8 +51,6 @@ func newStubTarget(t *testing.T) *stubTarget {
 	return st
 }
 
-// liveProxyHandler 桩出口代理的转发逻辑：兼容绝对 URI 与 origin-form 两种
-// 入站形态（mihomo 的 http 出站对明文目标发 origin-form）。
 func liveProxyHandler(client *http.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		target := r.URL.String()
@@ -67,7 +59,6 @@ func liveProxyHandler(client *http.Client) http.HandlerFunc {
 		}
 		upstream, err := client.Get(target)
 		if err != nil {
-			// 上游失联：本地代理入口建隧失败的空体 502（与真内核同形状）
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
@@ -86,8 +77,6 @@ func liveProxyHandler(client *http.Client) http.HandlerFunc {
 	}
 }
 
-// newStubProxy 桩内核混合口 / lane listener：对绝对 URI 请求做真实转发
-// （经它出去的请求真的会打到目标服务器，语义与真内核代理链一致）。
 func newStubProxy(t *testing.T) *httptest.Server {
 	t.Helper()
 	client := &http.Client{Transport: &http.Transport{Proxy: nil}}
@@ -96,13 +85,11 @@ func newStubProxy(t *testing.T) *httptest.Server {
 	return server
 }
 
-// stubController 桩内核控制器：记录各 selector 的选中节点并回读核验，
-// delay 端点按名字给延迟（failDelay 非 0 时对全部名字返回该状态码）。
 type stubController struct {
 	server    *httptest.Server
-	mu        sync.Mutex // now 由各请求 goroutine 读写，httptest 每请求独立 goroutine
+	mu        sync.Mutex
 	now       map[string]string
-	delayFail atomic.Int32 // 0=正常回 delay；非 0 = 返回该 HTTP 状态码
+	delayFail atomic.Int32
 }
 
 func newStubController(t *testing.T) *stubController {
@@ -160,8 +147,6 @@ func readAllBody(r *http.Request) string {
 	return string(buf)
 }
 
-// newHealthChecker 组一个 HealthChecker：库 + 写闸 + 桩内核端点 + 运行配置文件。
-// lanes>0 时把对应数量的假 lane listener（桩代理端口）写进配置。
 func newHealthChecker(t *testing.T, lanes int) (*HealthChecker, *stubController, *stubTarget, []*httptest.Server) {
 	t.Helper()
 	db, gate, dir := newTestDB(t)
@@ -185,7 +170,6 @@ func newHealthChecker(t *testing.T, lanes int) (*HealthChecker, *stubController,
 	for i := 0; i < lanes; i++ {
 		groupLines.WriteString(fmt.Sprintf("  - name: HlProbeLane-%d\n    type: select\n    include-all: true\n", i+1))
 	}
-	// 无 lane 的桩里混合口也指向一个桩代理，GLOBAL 串行路径才有真实可达性。
 	mixedPort := 0
 	if lanes == 0 {
 		mixedProxy := newStubProxy(t)
@@ -229,7 +213,6 @@ func mustConn(t *testing.T, db *sql.DB) *sql.Conn {
 	return conn
 }
 
-// seedNode 插一个节点行（默认 NEW、归属订阅 1、失败计数 0），返回库内 id。
 func seedNode(t *testing.T, db *sql.DB, runtimeName string, state string, failures int64, subID any) int64 {
 	t.Helper()
 	res, err := db.Exec(`INSERT INTO proxy_nodes
@@ -250,7 +233,7 @@ func queryInt(t *testing.T, db *sql.DB, query string, args ...any) int64 {
 		t.Fatalf("查询 %s 失败：%v", query, err)
 	}
 	if !out.Valid {
-		return -1 // 显式区分 NULL
+		return -1
 	}
 	return out.Int64
 }
@@ -272,8 +255,6 @@ func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
 	}
 	return n
 }
-
-// ── L0 整池落账 ──────────────────────────────────────────────────────────────
 
 func TestL0CheckPoolWriteBack(t *testing.T) {
 	h, _, _, _ := newHealthChecker(t, 0)
@@ -316,7 +297,6 @@ func TestL0CheckPoolFailureObservationOnly(t *testing.T) {
 	if n := countRows(t, h.DB, `SELECT COUNT(*) FROM health_observations WHERE level = 'L0'`); n != 2 {
 		t.Fatalf("失败应落 L0 观测，实际 %d 行", n)
 	}
-	// L0 只诊断不推状态：状态与失败计数都不许动
 	if state := queryString(t, h.DB, `SELECT state FROM proxy_nodes WHERE runtime_name = 'n1'`); state.String != NodeActive {
 		t.Fatalf("L0 失败不得推进状态，实际 %s", state.String)
 	}
@@ -324,8 +304,6 @@ func TestL0CheckPoolFailureObservationOnly(t *testing.T) {
 		t.Fatalf("L0 失败不得累加计数，实际 %d", failures)
 	}
 }
-
-// ── L1 出口身份 ──────────────────────────────────────────────────────────────
 
 func TestExitIPCheckPoolLanePath(t *testing.T) {
 	h, _, _, proxies := newHealthChecker(t, 2)
@@ -356,12 +334,11 @@ func TestExitIPCheckPoolLanePath(t *testing.T) {
 }
 
 func TestExitIPCheckPoolFailureKeepsExitIP(t *testing.T) {
-	h, _, _, _ := newHealthChecker(t, 0) // 无 lane → GLOBAL 串行路径
+	h, _, _, _ := newHealthChecker(t, 0)
 	seedNode(t, h.DB, "n1", NodeActive, 0, int64(1))
 	if _, err := h.DB.Exec(`UPDATE proxy_nodes SET exit_ip = '9.9.9.9' WHERE runtime_name = 'n1'`); err != nil {
 		t.Fatal(err)
 	}
-	// 混合口 0 不可能连通 → 目标请求失败归因，不得擦已有出口事实
 	outcomes, err := h.ExitIPCheckPool(context.Background(), []string{"n1"}, ExitProbeOptions{Timeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -376,8 +353,6 @@ func TestExitIPCheckPoolFailureKeepsExitIP(t *testing.T) {
 		t.Fatalf("L1 失败不得推进状态，实际 %s", state.String)
 	}
 }
-
-// ── L2 业务准入 ──────────────────────────────────────────────────────────────
 
 func TestBusinessCheckPoolLanePathPromotes(t *testing.T) {
 	h, _, target, _ := newHealthChecker(t, 3)
@@ -410,7 +385,6 @@ func TestBusinessCheckPoolLanePathPromotes(t *testing.T) {
 func TestBusinessCommitTargetFailureNoPenalty(t *testing.T) {
 	h, _, target, _ := newHealthChecker(t, 0)
 	seedNode(t, h.DB, "n1", NodeActive, 2, int64(1))
-	// Steam 侧 500（归因 target）：只记观测，不罚节点
 	outcomes, err := h.BusinessCheckPool(context.Background(), []string{"n1"},
 		BusinessProbeOptions{URL: target.server.URL + "/IStoreBrowseService/GetItems/v1/", Timeout: 3 * time.Second})
 	if err != nil {
@@ -431,7 +405,6 @@ func TestBusinessCommitTargetFailureNoPenalty(t *testing.T) {
 func TestBusinessCommitTransportFailureFailsFast(t *testing.T) {
 	h, _, _, _ := newHealthChecker(t, 0)
 	seedNode(t, h.DB, "n1", NodeActive, 0, int64(1))
-	// 经节点连不上（无归因、无状态码）= 节点失败证据：fail-fast 判死
 	result := BusinessResult{RuntimeName: "n1",
 		Detail: fmt.Sprintf("%s: ConnectTimeout", TargetServiceFail)}
 	if _, err := h.commitBusinessWave(context.Background(), []struct {
@@ -448,8 +421,6 @@ func TestBusinessCommitTransportFailureFailsFast(t *testing.T) {
 	}
 }
 
-// L2 写入失败全部回滚：观测插入中途炸掉（触发器 RAISE），同事务里已写的
-// 状态推进必须一并消失——落账失败不能只写一半健康证据。
 func TestBusinessCommitRollbackAll(t *testing.T) {
 	db, gate, dir := newTestDB(t)
 	if err := EnsureSchema(context.Background(), mustConn(t, db)); err != nil {
@@ -482,14 +453,12 @@ func TestBusinessCommitRollbackAll(t *testing.T) {
 	if _, err := h.commitBusinessWave(context.Background(), probed, time.Now(), "target", 0); err == nil {
 		t.Fatalf("注入的写入失败必须浮出")
 	}
-	// 整波回滚：n1 的晋升与 n1/n2 的观测行都不存在
 	if state := queryString(t, db, `SELECT state FROM proxy_nodes WHERE runtime_name = 'n1'`); state.String != NodeNew {
 		t.Fatalf("回滚后 n1 应保持 NEW，实际 %s", state.String)
 	}
 	if n := countRows(t, db, `SELECT COUNT(*) FROM health_observations`); n != 0 {
 		t.Fatalf("回滚后不应有观测行，实际 %d", n)
 	}
-	// 写闸必须仍然可用（lease 正常释放，不悬挂）
 	if err := gate.WithWrite(context.Background(), store.PriorityBackground, func(c *sql.Conn) error {
 		_, err := c.ExecContext(context.Background(), `SELECT 1`)
 		return err
@@ -497,8 +466,6 @@ func TestBusinessCommitRollbackAll(t *testing.T) {
 		t.Fatalf("回滚后写闸应可用：%v", err)
 	}
 }
-
-// ── 手动体检落账（冷却语义）─────────────────────────────────────────────────
 
 func TestIngestNodeCheckSuccessClearsCooldown(t *testing.T) {
 	db, _, _ := newTestDB(t)
@@ -552,7 +519,6 @@ func TestIngestNodeCheckTransportFailureCooldownTiers(t *testing.T) {
 	}
 	seedNode(t, db, "n1", NodeActive, 0, int64(1))
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.Local)
-	// 第 1 次传输失败：30 分钟冷却 + fail-fast 判死
 	if _, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "n1", Alive: false, Probed: true,
 	}}, map[string]string{"n1": "fp-n1"}, now, 0, ""); err != nil {
@@ -574,7 +540,6 @@ func TestIngestNodeCheckTransportFailureCooldownTiers(t *testing.T) {
 	if n := countRows(t, db, `SELECT COUNT(*) FROM health_observations WHERE detail='CLASH_STEAM_TRANSPORT_FAILURE'`); n != 1 {
 		t.Fatalf("应落传输失败观测，实际 %d", n)
 	}
-	// 第 2 次失败（失败计数已是 1）：升档 60 分钟
 	if _, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "n1", Alive: false, Probed: true,
 	}}, map[string]string{"n1": "fp-n1"}, now, 0, ""); err != nil {
@@ -603,7 +568,6 @@ func TestIngestNodeCheckSteamResponseNoPenalty(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.Local)
-	// 收到 Steam HTTP 错误响应（503）：不罚节点、清冷却、记 HTTP_ERROR 观测
 	result, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "n1", Alive: false, SteamStatus: 503, HasSteam: true, Probed: true,
 	}}, map[string]string{"n1": "fp-n1"}, now, 0, "")
@@ -640,19 +604,16 @@ func TestIngestNodeCheckValidationAndSkip(t *testing.T) {
 	seedNode(t, db, "n1", NodeActive, 0, int64(1))
 	seedNode(t, db, "foreign", NodeActive, 0, int64(2))
 	now := time.Now()
-	// 未登记身份拒绝落账
 	if _, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "ghost", Alive: true, Probed: true,
 	}}, map[string]string{"ghost": "fp-missing"}, now, 0, ""); err == nil {
 		t.Fatalf("未登记身份必须报错")
 	}
-	// 归属其他订阅拒绝落账
 	if _, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "foreign", Alive: true, Probed: true,
 	}}, map[string]string{"foreign": "fp-foreign"}, now, 0, ""); err == nil {
 		t.Fatalf("跨订阅归属必须报错")
 	}
-	// probed=false 的行整条跳过，不产生证据
 	if _, err := IngestNodeCheck(context.Background(), conn, 1, []CheckRow{{
 		Name: "n1", Alive: false, Probed: false,
 	}}, map[string]string{"n1": "fp-n1"}, now, 0, ""); err != nil {
@@ -666,26 +627,22 @@ func TestIngestNodeCheckValidationAndSkip(t *testing.T) {
 	}
 }
 
-// 502 归因：有响应体 = 目标服务；无响应体回探控制器定节点隧道成败。
 func TestAttributeGateway502(t *testing.T) {
 	ctx := context.Background()
 	detail, attr := AttributeGateway502(ctx, "http://127.0.0.1:1", "", "n1", "http://t", "upstream says no", time.Second)
 	if attr != "target" || !strings.HasPrefix(detail, TargetServiceFail) {
 		t.Fatalf("有响应体应归因目标服务：%s %s", attr, detail)
 	}
-	// 控制器 delay 正常 → 通道通 → 目标服务
 	controller := newStubController(t)
 	detail, attr = AttributeGateway502(ctx, controller.server.URL, "", "n1", "http://t", "", time.Second)
 	if attr != "target" {
 		t.Fatalf("通道通时应归因目标服务：%s %s", attr, detail)
 	}
-	// 控制器 delay 也挂（有效失败）→ 节点隧道失败
 	controller.delayFail.Store(500)
 	detail, attr = AttributeGateway502(ctx, controller.server.URL, "", "n1", "http://t", "", time.Second)
 	if attr != "node" || !strings.HasPrefix(detail, NodeTunnelFailed) {
 		t.Fatalf("通道断应归因节点隧道：%s %s", attr, detail)
 	}
-	// 控制器不可达 → 归因不确定，不罚节点
 	detail, attr = AttributeGateway502(ctx, "http://127.0.0.1:1", "", "n1", "http://t", "", time.Second)
 	if attr != "uncertain" || !strings.HasPrefix(detail, UncertainFailure) {
 		t.Fatalf("控制器不可达应归因不确定：%s %s", attr, detail)

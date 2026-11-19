@@ -11,17 +11,13 @@ import (
 	"time"
 )
 
-// transportKey：传输层缓存键。超时进入键是因为拨号/TLS/响应头等待上限随
-// 超时档变化，不同档不共享连接池。
 type transportKey struct {
 	proxy   string
 	verify  bool
 	timeout time.Duration
 }
 
-// transportFor：按 (代理, TLS 校验档, 超时) 缓存传输层——同参同实例，连接池
-// 跨请求复用。请求逐发带 Connection: close 且客户端不挂 Cookie jar，响应
-// Cookie 不留存，复用的只是 TCP/TLS 连接本身，无会话串味面。
+// transportFor：按 (代理, TLS 校验档, 超时) 缓存 *http.Transport 实例；请求带 Connection: close 且无 Cookie jar，不跨请求复用连接或会话。
 func (c *Client) transportFor(verify bool) (*http.Transport, error) {
 	key := transportKey{proxy: c.cfg.ProxyURL, verify: verify, timeout: c.cfg.Timeout}
 	c.mu.Lock()
@@ -35,9 +31,8 @@ func (c *Client) transportFor(verify bool) (*http.Transport, error) {
 		DialContext:           (&net.Dialer{Timeout: c.cfg.Timeout, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   c.cfg.Timeout,
 		ResponseHeaderTimeout: c.cfg.Timeout,
-		// 校验档按调用分档：跳过校验仅用于本机自签证书加速器场景
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: !verify},
-		IdleConnTimeout: 90 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: !verify},
+		IdleConnTimeout:       90 * time.Second,
 		// 自建 Transport 默认 HTTP/1.1：Connection: close 逐发生效
 	}
 	if c.cfg.ProxyURL != "" {
@@ -53,8 +48,7 @@ func (c *Client) transportFor(verify bool) (*http.Transport, error) {
 	return tr, nil
 }
 
-// 传输层错误分类：等待超时记 timeout 且可重试；建连类（拨号/DNS/TLS 握手）
-// 记 connect_error 并计数换出口；其余传输错误记 connect_error 但可重试。
+// classifyTransportError：超时记 timeout 可重试；dial/DNS/x509 证书错记 connect_error 并计数换出口；其余记 connect_error 但可重试。
 func classifyTransportError(err error) (outcome string, connectClass bool) {
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {

@@ -1,15 +1,11 @@
 package clashcfg
 
-// 运行配置生成：机场整份配置 → 不消费地理数据的纯节点配置；节点连接依赖
-// （dialer-proxy / 组）按闭包解析，缺失、歧义、循环一律拒绝生成。
-
 import (
 	"fmt"
 	"strings"
 )
 
-// 内核自己解析的内置逻辑节点：dialer-proxy 指向它们是合法用法（直连/拒绝），
-// 不经过订阅节点表，不做映射也不判「目标不存在」。
+// 内核内置逻辑节点不经过订阅节点表，也不判缺失。
 var builtinProxyNames = map[string]bool{
 	"DIRECT": true, "REJECT": true, "REJECT-DROP": true, "GLOBAL": true,
 	"COMPATIBLE": true, "PASS": true, "PASS-RULE": true,
@@ -28,14 +24,12 @@ var groupMemberFilterKeys = []string{"filter", "exclude-filter", "exclude-type"}
 
 var includeAllFlags = []string{"include-all", "include-all-proxies", "include-all-providers"}
 
-// Bundle render_node_bundle 的产物：节点与组（均按依赖闭包重排）。
 type Bundle struct {
 	Proxies []map[string]any
 	Groups  []map[string]any
 }
 
-// BundleOptions render_node_bundle 可选参数；零值等价 Python 默认。
-// RootsSet/SourceNamesSet 区分「未提供」与「显式空」（Python None vs ()）。
+// RootsSet/SourceNamesSet 区分「未提供」与「显式空」。
 type BundleOptions struct {
 	Groups          []map[string]any
 	Namespace       string
@@ -47,7 +41,6 @@ type BundleOptions struct {
 	SourceNamesSet  bool
 }
 
-// strOr 对齐 str(v or "")：None/空串归空，非字符串按展示文本。
 func strOr(v any, _ string) string {
 	return pyStr(v)
 }
@@ -328,7 +321,6 @@ func RenderNodeBundle(payloads []map[string]any, names map[string]string, opts B
 	return Bundle{Proxies: proxies, Groups: groups}, nil
 }
 
-// ResolveNodeDependencies 按同一依赖闭包解析节点运行名。
 func ResolveNodeDependencies(payloads []map[string]any, names map[string]string) ([]map[string]any, error) {
 	originals := map[string]string{}
 	for original, runtime := range names {
@@ -384,9 +376,6 @@ func RenderDNS(raw any) *Doc {
 	return out
 }
 
-// RenderSubscriptionConfig 机场整份配置 → 项目运行配置（YAML 文本）。
-// 保留：节点、中转组（自动组降为 select，成员顺序即默认选择）、基础解析。
-// 剥离：规则/规则集/子规则、tun 接管、控制器凭据、地区 DNS 过滤。
 func RenderSubscriptionConfig(text string) (string, error) {
 	doc, err := LoadYAML(text)
 	if err != nil {

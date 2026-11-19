@@ -1,8 +1,5 @@
 package dbwriter
 
-// 写路径语义单元测试：重放保 ID、失败章保旧价、缺价穷尽转终态、
-// 免费态分组、事务回滚不落半批。建库用与现网逐字一致的表 DDL。
-
 import (
 	"context"
 	"database/sql"
@@ -106,8 +103,6 @@ COALESCE(price, 0), COALESCE(is_gold, 0))`,
 	updated_at DATETIME,
 	PRIMARY KEY (key)
 )`,
-	// 捆绑包排序缓存联动的关联查询表（派生链 UpdateMemberBundles 依赖；
-	// 与现网 DDL 逐字一致，缺表会让所有触发派生重算的写批失败）
 	`CREATE TABLE bundle_region_prices (
 	id INTEGER NOT NULL,
 	bundle_id INTEGER NOT NULL,
@@ -178,8 +173,6 @@ func gameData(appid int64, name string) GameData {
 	return gameDataAt(appid, name, testNow())
 }
 
-// gameDataAt 元数据夹具：UpdatedAt/CreatedAt 定格到指定挂钟（game_data
-// 携带的 updated_at 优先于写层时钟，与 Python 同语义）。
 func gameDataAt(appid int64, name string, at time.Time) GameData {
 	n := at
 	return GameData{
@@ -204,7 +197,6 @@ func priceRow(appid int64, region string, price int64) PriceRow {
 	}
 }
 
-// dumpRows 通用逐行 dump：DATETIME 列 CAST 出原文，规避驱动扫描伪影。
 func dumpRows(t *testing.T, db *sql.DB, query string) []map[string]any {
 	t.Helper()
 	rows, err := db.Query(query)
@@ -271,8 +263,6 @@ func runBatch(t *testing.T, w *Writer, entries []BatchEntry) []bool {
 	return results
 }
 
-// TestReplayKeepsRowIdentity 同观测重放：唯一键冲突走 DO UPDATE，非键详情
-// 更新、原行 ID 与旧促销描述（COALESCE 兜底）保留。
 func TestReplayKeepsRowIdentity(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -291,8 +281,6 @@ func TestReplayKeepsRowIdentity(t *testing.T) {
 	}
 	origID := first[0]["id"]
 
-	// 重放：价格/原价/版本/gold 不变（差量门禁放行），折扣比例变化 →
-	// 唯一键仍冲突（同观测时刻同价）→ 更新详情
 	p2 := p
 	p2.DiscountPercent = i64Ptr(10)
 	p2.DiscountDesc = nil
@@ -321,8 +309,6 @@ func TestReplayKeepsRowIdentity(t *testing.T) {
 	}
 }
 
-// TestFailedAttemptKeepsLastGoodPrice 失败章保底：失败观察只推进尝试，
-// 价格三件套与最近成功时刻保留旧行值。
 func TestFailedAttemptKeepsLastGoodPrice(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -334,7 +320,6 @@ func TestFailedAttemptKeepsLastGoodPrice(t *testing.T) {
 		t.Fatalf("应落 1 行现价，实际 %d", len(before))
 	}
 
-	// 第二轮：ok 但无价格（坏数据）→ 门禁降级 → 失败章
 	w.Now = func() time.Time { return testNow().Add(time.Hour) }
 	bad := priceRow(1002, "CN", 0)
 	bad.Price = nil
@@ -364,7 +349,6 @@ func TestFailedAttemptKeepsLastGoodPrice(t *testing.T) {
 	}
 }
 
-// TestMissingFiveTimesTurnsBlocked 连续 5 次真实缺价穷尽补抓预算转终态。
 func TestMissingFiveTimesTurnsBlocked(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -389,8 +373,6 @@ func TestMissingFiveTimesTurnsBlocked(t *testing.T) {
 	}
 }
 
-// TestFreeKindGrouping 免费态分组：带免费态字段的组随行落标记；纯
-// locked/missing 响应（无 ok 行）不进语句不洗标记；CN 付费行显式清标记。
 func TestFreeKindGrouping(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -418,8 +400,6 @@ func TestFreeKindGrouping(t *testing.T) {
 	if got := dumpGameCol(t, db, 2003, "free_kind"); got != nil {
 		t.Fatalf("付费游戏不应有免费标记，实际 %v", got)
 	}
-	// 限时赠送 price=0+original>0 是真实价格事件照写历史；付费行照写；
-	// 永久免费 price=0+original=0 不进历史
 	hist := dumpHistory(t, db)
 	if len(hist) != 2 {
 		t.Fatalf("赠送与付费各落一行历史，实际 %+v", hist)
@@ -432,12 +412,10 @@ func TestFreeKindGrouping(t *testing.T) {
 		t.Fatalf("历史行集应为 {2001, 2003}，实际 %+v", hist)
 	}
 
-	// 第二批：locked-only（无 ok 行）不洗 promo；付费 CN 行显式清 promo
 	locked := priceRow(2001, "CN", 0)
 	locked.Price = nil
 	locked.PriceStatus = strPtr("locked")
-	paidAgain := priceRow(2001+3, "CN", 59900) // appid 2004 造 promo 后付费
-	// 先给 2004 打 promo
+	paidAgain := priceRow(2001+3, "CN", 59900)
 	runBatch(t, w, []BatchEntry{{
 		Game:   gameData(2004, "再赠送"),
 		Prices: []PriceRow{func() PriceRow { p := priceRow(2004, "CN", 0); p.OriginalPrice = i64Ptr(500); return p }()},
@@ -457,15 +435,13 @@ func TestFreeKindGrouping(t *testing.T) {
 	}
 }
 
-// TestChunkRollbackNoPartialBatch 段体失败整段回滚后转逐款隔离回退：坏款
-// 单独失败标记 false，好款照常落库——整段作废不放大为整段丢账（B1）。
 func TestChunkRollbackNoPartialBatch(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
 	w.FxRates = map[string]float64{"USD": 7.25}
 
 	broken := gameData(3002, "坏行")
-	broken.Name = nil // name 非空约束 → INSERT 失败
+	broken.Name = nil
 	results, err := w.UpsertTaskBatch(context.Background(), []BatchEntry{
 		{Game: gameData(3001, "好行"), Prices: []PriceRow{priceRow(3001, "CN", 19900)}},
 		{Game: broken, Prices: []PriceRow{priceRow(3002, "CN", 9900)}},
@@ -489,7 +465,6 @@ func TestChunkRollbackNoPartialBatch(t *testing.T) {
 	}
 }
 
-// TestVersionSuffixBackfill 丢名行沿用同 sub 的历史名后再做差量比较。
 func TestVersionSuffixBackfill(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -499,7 +474,6 @@ func TestVersionSuffixBackfill(t *testing.T) {
 	first.VersionSuffix = strPtr("Deluxe Edition")
 	runBatch(t, w, []BatchEntry{{Game: gameData(4001, "版本游戏"), Prices: []PriceRow{first}}})
 
-	// 第二轮丢名 + 涨价：回填历史名后与 prev 比较（价格变了 → 新快照）
 	w.Now = func() time.Time { return testNow().Add(time.Hour) }
 	second := priceRow(4001, "CN", 25900)
 	second.VersionSuffix = nil
@@ -514,7 +488,6 @@ func TestVersionSuffixBackfill(t *testing.T) {
 	}
 }
 
-// TestOkRegionsClearFailCount 补抓成功结转：missing → 成功 → 回 ok 清欠账。
 func TestOkRegionsClearFailCount(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -543,8 +516,6 @@ func TestOkRegionsClearFailCount(t *testing.T) {
 	}
 }
 
-// TestMarkRegionStatusMissingBatch 传输类失败只盖失败章：不递增欠账、
-// 不改价格状态，保留 last good price。
 func TestMarkRegionStatusMissingBatch(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -555,7 +526,7 @@ func TestMarkRegionStatusMissingBatch(t *testing.T) {
 	w.Now = func() time.Time { return testNow().Add(time.Hour) }
 	n, err := w.MarkRegionStatusMissingBatch(context.Background(), []RegionPair{
 		{AppID: 6001, RegionCode: "cn"},
-		{AppID: 6001, RegionCode: "CN"}, // 同批重复：去重防双章
+		{AppID: 6001, RegionCode: "CN"},
 		{AppID: 6002, RegionCode: "US"},
 	})
 	if err != nil {
@@ -588,7 +559,6 @@ func TestMarkRegionStatusMissingBatch(t *testing.T) {
 	}
 }
 
-// TestPyDumpsAligned Python json.dumps 缺省参数逐字节对齐。
 func TestPyDumpsAligned(t *testing.T) {
 	cases := []struct {
 		in   any

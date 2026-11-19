@@ -1,8 +1,7 @@
 package clashkernel
 
-// 单元测试：环境清洗、版本解析、预检分类与配置文本一致性闸。
-
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +63,6 @@ func TestValidateConfigRejections(t *testing.T) {
 	exePath := filepath.Join(dir, "no-such-kernel.exe")
 	workDir := t.TempDir()
 
-	// 准入拒绝（地理规则）在跑内核之前就被拦下
 	admissionPath := filepath.Join(dir, "bad-admission.yaml")
 	if err := os.WriteFile(admissionPath, []byte("proxies:\n- name: n\n  type: ss\n  server: s\n  port: 1\nrules:\n- GEOIP,CN,DIRECT\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -75,8 +73,6 @@ func TestValidateConfigRejections(t *testing.T) {
 		t.Fatalf("准入拒绝应归类 admission，实际 %v", err)
 	}
 
-	// 内核拒载（协议不识别）需要真内核，由 kernel_live_test 覆盖；
-	// 这里验证不可执行文件的 unlaunchable 分类。
 	unlaunchPath := filepath.Join(dir, "ok.yaml")
 	if err := os.WriteFile(unlaunchPath, []byte("proxies:\n- name: n\n  type: ss\n  server: s\n  port: 1\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -119,7 +115,6 @@ func TestEnsureKernelPlaceAndSkip(t *testing.T) {
 	if err := os.MkdirAll(bundledDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 非内核文件：-v 解析不出版本 → 版本不可辨保留（升级不夺回的不可辨分支）
 	bundled := filepath.Join(bundledDir, KernelFilename())
 	if err := os.WriteFile(bundled, []byte("placeholder"), 0o755); err != nil {
 		t.Fatal(err)
@@ -139,7 +134,6 @@ func TestEnsureKernelPlaceAndSkip(t *testing.T) {
 	if len(res.Copied) != 0 || res.Upgraded != "" {
 		t.Fatalf("同名不覆盖不应再复制或升级：%+v", res)
 	}
-	// 随包缺失
 	res, err = EnsureKernel(filepath.Join(dir, "no-assets"), filepath.Join(dir, "data2"))
 	if err != nil {
 		t.Fatalf("缺随包就位失败：%v", err)
@@ -157,7 +151,6 @@ func TestEnsureKernelAdoptsLegacyKernel(t *testing.T) {
 	if err := os.MkdirAll(kernelPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 改名前落位的旧名内核：收编改名后免重新下载
 	legacy := filepath.Join(kernelPath, legacyKernelFilename())
 	if err := os.WriteFile(legacy, []byte("legacy-kernel-bytes"), 0o755); err != nil {
 		t.Fatal(err)
@@ -175,7 +168,6 @@ func TestEnsureKernelAdoptsLegacyKernel(t *testing.T) {
 	if fileExists(legacy) {
 		t.Fatal("收编后旧名文件应不存在")
 	}
-	// 新名已就位时用户自备的旧名文件不被触碰
 	if err := os.WriteFile(legacy, []byte("user-custom"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -188,5 +180,58 @@ func TestEnsureKernelAdoptsLegacyKernel(t *testing.T) {
 	}
 	if !fileExists(legacy) {
 		t.Fatal("用户自备旧名文件应保留")
+	}
+}
+
+func TestEnsureRunningPreservesReloadRejectedError(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	original := "proxies:\n  - name: node-a\n    type: socks5\n    server: 127.0.0.1\n    port: 1080\n"
+	if err := os.WriteFile(cfgPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runtime{
+		Process: &KernelProcess{done: make(chan struct{}), pid: 1},
+	}
+	_, err := r.EnsureRunning(filepath.Join(dir, "missing-mihomo.exe"), cfgPath, EnsureRunningOptions{MixedPort: 7890})
+	if err == nil {
+		t.Fatal("expected EnsureRunning error when kernel validation rejects")
+	}
+	var rejected *ReloadRejectedError
+	if !errors.As(err, &rejected) {
+		t.Fatalf("expected *ReloadRejectedError preserved for HTTP 400 mapping, got %T (%v)", err, err)
+	}
+	if !r.Process.Running() {
+		t.Fatal("running process should remain untouched on ReloadRejectedError")
+	}
+	after, rerr := os.ReadFile(cfgPath)
+	if rerr != nil || string(after) != original {
+		t.Fatalf("config should remain intact before write: err=%v body=%q", rerr, string(after))
+	}
+}
+
+func TestProcTCPTableOwnsLoopbackPort(t *testing.T) {
+	tableV4 := "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n" +
+		"   0: 0100007F:1ED2 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 42424 1 0000000000000000 100 0 0 10 0\n" +
+		"   1: 00000000:1ED3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 42425 1 0000000000000000 100 0 0 10 0\n" +
+		"   2: 0100007F:1ED4 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 42426 1 0000000000000000 20 4 30 10 -1\n"
+	inodes := map[string]bool{"42424": true, "42425": true, "42426": true}
+	if !procTCPTableOwnsLoopbackPort(tableV4, 7890, inodes) {
+		t.Fatal("127.0.0.1 LISTEN socket with owned inode must match")
+	}
+	if procTCPTableOwnsLoopbackPort(tableV4, 7891, inodes) {
+		t.Fatal("0.0.0.0 wildcard socket must not match loopback-only check")
+	}
+	if procTCPTableOwnsLoopbackPort(tableV4, 7892, inodes) {
+		t.Fatal("ESTABLISHED socket (state 01) must not match")
+	}
+	if procTCPTableOwnsLoopbackPort(tableV4, 7890, map[string]bool{"99999": true}) {
+		t.Fatal("unowned inode must not match")
+	}
+
+	tableV6 := "  sl  local_address                         rem_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n" +
+		"   0: 0000000000000000FFFF00000100007F:1ED2 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 55555 1 0000000000000000 100 0 0 10 0\n"
+	if !procTCPTableOwnsLoopbackPort(tableV6, 7890, map[string]bool{"55555": true}) {
+		t.Fatal("IPv4-mapped loopback ::ffff:127.0.0.1 LISTEN socket must match")
 	}
 }

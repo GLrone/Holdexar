@@ -1,16 +1,18 @@
 package crawl
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 type Spec struct {
@@ -228,9 +230,6 @@ func (p *Planner) ResolveScope(ctx context.Context, scope string, ids []int64) (
 	return p.planIDs(ctx, query)
 }
 
-// clearEmptyRegionRows 空区行即拾即清（写闸 BACKGROUND 事务）：missing 过
-// 补抓冷却、blocked 过 7 天老化窗（BLOCKED_REPROBE_DAYS）的空区行删除；
-// 删除行数>0 记日志。
 func (p *Planner) clearEmptyRegionRows(ctx context.Context, missingCutoff, blockedCutoff string) error {
 	deleted := int64(0)
 	err := p.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
@@ -329,16 +328,16 @@ func (p *Planner) DefaultSpecs(ctx context.Context, full bool) ([]Spec, error) {
 	for i, key := range order {
 		rank[key] = i
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, ok := rank[planSpecKey(out[i])]
+	slices.SortStableFunc(out, func(a, b Spec) int {
+		ra, ok := rank[planSpecKey(a)]
 		if !ok {
-			a = len(rank)
+			ra = len(rank)
 		}
-		b, ok := rank[planSpecKey(out[j])]
+		rb, ok := rank[planSpecKey(b)]
 		if !ok {
-			b = len(rank)
+			rb = len(rank)
 		}
-		return a < b
+		return cmp.Compare(ra, rb)
 	})
 	return out, nil
 }
@@ -371,12 +370,9 @@ const planUnobservedSQL = jobTargetResultsSQL + `
 SELECT DISTINCT appid,region FROM unit_results WHERE settled=0 AND threshold<?2`
 
 func (p *Planner) Missing(ctx context.Context, cooldown time.Duration) ([]TargetBatch, error) {
-	now := p.planNow().In(time.FixedZone("Asia/Shanghai", 8*3600))
+	now := p.planNow().In(timeutil.Beijing)
 	format := "2006-01-02 15:04:05.000000"
-	// 空区行是「全球不可见」的尝试痕迹（无对应真实区服），发给 Steam 的
-	// country_code 会是空串，一发必 400，且永远没有 bump fail_count 的路径
-	// ——留在账本只会永久占位，即拾即清；与选取解耦（不占 LIMIT 槽位），
-	// 冷却窗内的新鲜空区行等过冷却再清（Python generate_missing_tasks 开头同款）
+	// 空区行无对应区服且永不重抓，过冷却即清理以免长期占位。
 	if err := p.clearEmptyRegionRows(ctx, now.Add(-cooldown).Format(format),
 		now.Add(-7*24*time.Hour).Format(format)); err != nil {
 		return nil, err
@@ -426,11 +422,11 @@ func (p *Planner) Missing(ctx context.Context, cooldown time.Duration) ([]Target
 	for u := range picked {
 		units = append(units, u)
 	}
-	sort.Slice(units, func(i, j int) bool {
-		if units[i].id == units[j].id {
-			return units[i].cc < units[j].cc
+	slices.SortFunc(units, func(a, b unit) int {
+		if c := cmp.Compare(a.id, b.id); c != 0 {
+			return c
 		}
-		return units[i].id < units[j].id
+		return cmp.Compare(a.cc, b.cc)
 	})
 	byRegion := map[string][]int64{}
 	for _, u := range units {
@@ -440,7 +436,7 @@ func (p *Planner) Missing(ctx context.Context, cooldown time.Duration) ([]Target
 	for cc := range byRegion {
 		codes = append(codes, cc)
 	}
-	sort.Strings(codes)
+	slices.Sort(codes)
 	out := []TargetBatch{}
 	for _, cc := range codes {
 		ids := byRegion[cc]

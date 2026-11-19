@@ -392,19 +392,8 @@ func Classify(appid int64, cc, currency string, item Item, game dbwriter.GameDat
 	return dbwriter.BatchEntry{Game: g, Prices: prices}, status, len(prices) > 0
 }
 
-// BundleDiscoveries 游戏条目 purchase_options → 捆绑包发现桩列表。
-// 读**原始**选项（ParseOptions 的 default 组过滤对 bundle 选项无差别放行，
-// 但其产物丢掉了 must_purchase_as_set，这里要原始键）。
-//
-// 收录判据（垃圾来源：DLC 页的单 DLC sub / 每游戏页都有的本体 sub）：
-//   - bundleid 键（真捆绑包）一律收；
-//   - packageid 键（sub 形态）仅当选项名 ≠ 条目名才收——同名即本体 sub
-//     （「游戏名 == 游戏名」）或单 DLC sub，都不是捆绑包；异名的升级包
-//     （Orange Box 469 / Gourmet Edition 1066582）是真实整包购买单元，收。
-//
-// 语义与形态同时落（对齐 Python _discover_bundles_from_item）：
-//   - bundleid 键：选项级 must_purchase_as_set 是权威语义（bool→0/1）；
-//   - packageid 键：sub 恒不可拆——由形态蕴含为 1。
+// BundleDiscoveries 从原始 purchase_options 提取捆绑包发现桩（不经过 package_group 过滤，读取 must_purchase_as_set）：
+// bundleid 全收并保留 must_purchase_as_set（0/1）；packageid 仅收选项名 ≠ 条目名的升级包且整包标记恒为 1。
 func BundleDiscoveries(item Item) []dbwriter.BundleDiscovery {
 	if item == nil || value(item["success"]) != 1 || !truth(item["visible"]) {
 		return nil

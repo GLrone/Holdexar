@@ -54,6 +54,7 @@ func subscriptionRouteRequest(t *testing.T, server *httptest.Server, method, suf
 }
 
 func TestSubscriptionRoutesSaveRefreshAndReveal(t *testing.T) {
+	allowLocalDirectForTest(t)
 	db, gate, dir := subscriptionRouteDB(t)
 	var fetches atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +109,7 @@ func TestSubscriptionRoutesSaveRefreshAndReveal(t *testing.T) {
 }
 
 func TestSubscriptionRoutesReplaceURLAndRetainUserInputWhenFetchFails(t *testing.T) {
+	allowLocalDirectForTest(t)
 	db, gate, dir := subscriptionRouteDB(t)
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "fixture failure", http.StatusServiceUnavailable)
@@ -153,5 +155,56 @@ func TestSubscriptionRoutesReplaceURLAndRetainUserInputWhenFetchFails(t *testing
 	var oldOwners int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM proxy_nodes WHERE subscription_id=1`).Scan(&oldOwners); err != nil || oldOwners != 0 {
 		t.Fatalf("old URL's nodes still belong to the new subscription: %d, %v", oldOwners, err)
+	}
+}
+
+func TestSubscriptionRoutesPlainAddUpdateAndSyncReloadFlags(t *testing.T) {
+	allowLocalDirectForTest(t)
+	db, gate, dir := subscriptionRouteDB(t)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, validSubscriptionBody)
+	}))
+	t.Cleanup(provider.Close)
+	syncer := Syncer{DB: db, Gate: gate, DataDir: dir}
+	var beforeCalled, reloaded, checked int32
+	mux := http.NewServeMux()
+	RegisterSubscriptionRoutes(mux, db, gate, dir, SubscriptionRouteOptions{
+		BeforeAdd: func(_ context.Context, kind string) error {
+			atomic.AddInt32(&beforeCalled, 1)
+			return nil
+		},
+		Refresh: func(ctx context.Context, id int64) (*SyncResult, error) {
+			res, err := syncer.SyncOne(ctx, id)
+			if err == nil && res != nil {
+				res.UsedCache[id] = true
+			}
+			return res, err
+		},
+		ReloadActive: func(_ context.Context, id int64) bool {
+			atomic.AddInt32(&reloaded, 1)
+			return true
+		},
+		PostSyncCheck: func(id int64) {
+			atomic.AddInt32(&checked, 1)
+		},
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	plainResp := subscriptionRouteRequest(t, server, "POST", "", `{"kind":"plain","url":"https://plain.example.com/list?t=1","label":"Plain"}`, http.StatusOK)
+	if !strings.Contains(plainResp, `"kind":"plain"`) || atomic.LoadInt32(&beforeCalled) != 0 {
+		t.Fatalf("plain add failed or called beforeAdd: resp=%s beforeCalled=%d", plainResp, beforeCalled)
+	}
+	plainUpd := subscriptionRouteRequest(t, server, "PUT", "/1", `{"url":"https://plain.example.com/list?t=2","label":"Plain2"}`, http.StatusOK)
+	if !strings.Contains(plainUpd, `"synced":false`) || !strings.Contains(plainUpd, `"kind":"plain"`) {
+		t.Fatalf("plain update failed: %s", plainUpd)
+	}
+
+	clashIn, _ := json.Marshal(map[string]string{"kind": "clash", "url": provider.URL + "/sub"})
+	_ = subscriptionRouteRequest(t, server, "POST", "", string(clashIn), http.StatusOK)
+	synced := subscriptionRouteRequest(t, server, "POST", "/2/sync", "", http.StatusOK)
+	if !strings.Contains(synced, `"usedCache":true`) || !strings.Contains(synced, `"restarted":true`) ||
+		atomic.LoadInt32(&reloaded) != 1 || atomic.LoadInt32(&checked) != 1 {
+		t.Fatalf("clash sync flags/hooks mismatch: %s reloaded=%d checked=%d", synced, reloaded, checked)
 	}
 }

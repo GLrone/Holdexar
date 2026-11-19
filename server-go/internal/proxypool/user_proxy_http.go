@@ -1,6 +1,3 @@
-// user_proxy_http.go 用户代理条目 CRUD 与策略出口解析（等价 Python
-// proxies/router.py 的 POST /proxies、PUT/DELETE /{proxy_id}、GET /resolve
-// 与 service.py 的 add_proxy / _parse_proxy_url / resolve_proxy_url）。
 package proxypool
 
 import (
@@ -11,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,32 +17,29 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/clashkernel"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
 )
 
-// 策略引擎加权随机的速度/健康分常量（Python service.py:88-94 同值）。
 var (
 	localMixedPorts = []int{7897}
 )
 
 const (
-	speedRefMS  = 12000 // TEST_TIMEOUT=12s
+	speedRefMS  = 12000
 	speedFloor  = 0.5
 	untestedSpd = 0.7
 	weightScale = 100000
 	maxFails    = 5
 )
 
-// UserProxyOptions 用户代理路由装配选项：KernelStatus 由 serverd 注入订阅
-// 内核混合口快照（proxypool 不持有内核进程）。
 type UserProxyOptions struct {
 	KernelStatus func() (running bool, port int)
 }
 
-// userProxyView 对外投影（Python _proxy_dict 同形；凭据一律掩码）。
 type userProxyView struct {
 	ID                  int64   `json:"id"`
 	Label               *string `json:"label"`
@@ -61,7 +55,6 @@ type userProxyView struct {
 	LastCheckedAt       *string `json:"lastCheckedAt"`
 }
 
-// RegisterUserProxyRoutes 装配用户代理四端点。
 func RegisterUserProxyRoutes(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, dataDir string, opts UserProxyOptions) {
 	h := &userProxyHTTP{db: db, gate: gate, dataDir: dataDir, kernelStatus: opts.KernelStatus}
 	mux.HandleFunc("POST /api/v1/proxies", h.add)
@@ -77,7 +70,6 @@ type userProxyHTTP struct {
 	kernelStatus func() (running bool, port int)
 }
 
-// proxyRow proxies 行读取（凭据保持库内密封形态）。
 type proxyRow struct {
 	ID                  int64
 	Label               sql.NullString
@@ -104,15 +96,14 @@ func (h *userProxyHTTP) loadProxy(ctx context.Context, id int64) (*proxyRow, err
 	return &p, err
 }
 
-// project _proxy_dict 投影（url 掩码：***@host:port）。
 func projectProxy(p *proxyRow) userProxyView {
 	view := userProxyView{
 		ID: p.ID, Scheme: p.Scheme, Host: p.Host, Port: p.Port,
-		HasAuth:              p.Username.Valid && p.Username.String != "",
-		URL:                  fmt.Sprintf("%s://%s:%d", p.Scheme, p.Host, p.Port),
-		Enabled:              p.Enabled,
-		Status:               p.Status,
-		ConsecutiveFailures:  p.ConsecutiveFailures,
+		HasAuth:             p.Username.Valid && p.Username.String != "",
+		URL:                 fmt.Sprintf("%s://%s:%d", p.Scheme, p.Host, p.Port),
+		Enabled:             p.Enabled,
+		Status:              p.Status,
+		ConsecutiveFailures: p.ConsecutiveFailures,
 	}
 	if view.HasAuth {
 		view.URL = fmt.Sprintf("%s://***@%s:%d", p.Scheme, p.Host, p.Port)
@@ -132,14 +123,7 @@ func projectProxy(p *proxyRow) userProxyView {
 	return view
 }
 
-// userProxyErr body 校验错误项（Pydantic 实测锚点形状）。
-type userProxyErr struct {
-	Type  string         `json:"type"`
-	Loc   []any          `json:"loc"`
-	Msg   string         `json:"msg"`
-	Input any            `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type userProxyErr = httpx.ValErr
 
 type proxyAddBody struct {
 	URL      *string `json:"-"`
@@ -151,7 +135,6 @@ type proxyAddBody struct {
 	Label    *string
 }
 
-// decodeProxyAdd 请求体校验：缺失/非对象/字段类型错误按 Pydantic 形状回 422。
 func decodeProxyAdd(w http.ResponseWriter, r *http.Request) (*proxyAddBody, bool) {
 	fail := func(errs []userProxyErr) (*proxyAddBody, bool) {
 		runResponse(w, http.StatusUnprocessableEntity, map[string]any{"detail": errs})
@@ -215,7 +198,6 @@ type laxErr struct {
 	msg     string
 }
 
-// laxInt Pydantic int 宽松强转（bool→0/1；整值浮点与可解析整串收下）。
 func laxInt(v any) (int64, *laxErr) {
 	switch x := v.(type) {
 	case bool:
@@ -245,7 +227,6 @@ func laxInt(v any) (int64, *laxErr) {
 	return 0, &laxErr{"int_parsing", "Input should be a valid integer, unable to parse string as an integer"}
 }
 
-// parsedProxy _parse_proxy_url 输出。
 type parsedProxy struct {
 	scheme, host string
 	port         int
@@ -253,8 +234,6 @@ type parsedProxy struct {
 	password     *string
 }
 
-// parseProxyURL _parse_proxy_url 同构：补 scheme、https 归一 http、
-// hostname 小写、端口必需。失败返回与 Python 逐字一致的 ValueError 文案。
 func parseProxyURL(raw string) (*parsedProxy, error) {
 	original := strings.TrimSpace(raw)
 	raw = original
@@ -297,7 +276,6 @@ func parseProxyURL(raw string) (*parsedProxy, error) {
 	return out, nil
 }
 
-// addProxy 单条入库：凭据密封 + INTERACTIVE 写（Python add_proxy 同构）。
 func (h *userProxyHTTP) addProxy(ctx context.Context, line string, scheme, host string, port int64,
 	username, password, label *string) (userProxyView, error) {
 	if line != "" {
@@ -305,7 +283,6 @@ func (h *userProxyHTTP) addProxy(ctx context.Context, line string, scheme, host 
 		if uerr != nil {
 			return userProxyView{}, uerr
 		}
-		// URL 模式完全以解析结果为准（Python: scheme..password = parsed 整体覆盖）
 		scheme, host, port = parsed.scheme, parsed.host, int64(parsed.port)
 		username, password = parsed.username, parsed.password
 	}
@@ -371,7 +348,6 @@ func (h *userProxyHTTP) add(w http.ResponseWriter, r *http.Request) {
 			if line == "" {
 				continue
 			}
-			// 批量行不带 label（Python add_proxy(line) 同径）
 			view, err := h.addProxy(ctx, line, "http", "", 0, nil, nil, nil)
 			if err != nil {
 				badRequest(err)
@@ -529,21 +505,18 @@ func (h *userProxyHTTP) remove(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// routeID 路径参数整数校验（Pydantic int_parsing 实测形状）。
 func routeID(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
 	if err != nil {
 		runResponse(w, http.StatusUnprocessableEntity, map[string]any{"detail": []userProxyErr{
 			{Type: "int_parsing", Loc: []any{"path", name},
-				Msg: "Input should be a valid integer, unable to parse string as an integer",
+				Msg:   "Input should be a valid integer, unable to parse string as an integer",
 				Input: r.PathValue(name)}}})
 		return 0, false
 	}
 	return id, true
 }
 
-// resolve GET /proxies/resolve：策略引擎补全（Python resolve_proxy_url 同构）。
-// RuntimeError 语义映射 200 {"proxyUrl":null,"message":...}。
 func (h *userProxyHTTP) resolve(w http.ResponseWriter, r *http.Request) {
 	proxyURL, runtimeErr, err := h.resolveProxyURL(r.Context())
 	switch {
@@ -556,23 +529,50 @@ func (h *userProxyHTTP) resolve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// resolveOut 策略解析响应（Python dict 键序同形）。
 type resolveOut struct {
 	ProxyURL *string `json:"proxyUrl"`
 	Message  *string `json:"message,omitempty"`
 }
 
-// resolveProxyURL 策略引擎：direct_only=系统代理；direct_first=直连；
-// proxy_first=内核端口 → 启用池节点加权随机 → 7897 兜底 → 直连；
-// 其余策略（proxy_only/未知）= 启用池节点加权随机，无节点即 RuntimeError。
+type StrategyResolveOptions struct {
+	KernelStatus            func() (running bool, port int)
+	PortListening           func(port int) bool
+	SystemProxy             func(context.Context) (string, error)
+	LocalFallback           func() int
+	IncludeKernelOnFallback bool
+	FailSoft                bool
+}
+
 func (h *userProxyHTTP) resolveProxyURL(ctx context.Context) (*string, *string, error) {
+	return h.resolveProxyURLWith(ctx, StrategyResolveOptions{KernelStatus: h.kernelStatus})
+}
+
+func (h *userProxyHTTP) resolveProxyURLWith(ctx context.Context, opts StrategyResolveOptions) (*string, *string, error) {
 	strategy := h.kvString(ctx, "proxy.strategy", "direct_only")
 	direct := func() (*string, error) {
-		proxyURL, err := netenv.ResolveSystemProxy(ctx)
+		resolve := opts.SystemProxy
+		if resolve == nil {
+			resolve = netenv.ResolveSystemProxy
+		}
+		proxyURL, err := resolve(ctx)
 		if err != nil || proxyURL == "" {
 			return nil, nil
 		}
 		return &proxyURL, nil
+	}
+	listening := opts.PortListening
+	if listening == nil {
+		listening = clashkernel.PortListening
+	}
+	kernelURL := func() (string, bool) {
+		if opts.KernelStatus == nil {
+			return "", false
+		}
+		running, port := opts.KernelStatus()
+		if running && port > 0 && listening(port) {
+			return fmt.Sprintf("http://127.0.0.1:%d", port), true
+		}
+		return "", false
 	}
 	pick := func() (*string, *string, error) {
 		enabled, err := h.enabledProxies(ctx)
@@ -580,6 +580,9 @@ func (h *userProxyHTTP) resolveProxyURL(ctx context.Context) (*string, *string, 
 			return nil, nil, err
 		}
 		if len(enabled) == 0 {
+			if opts.FailSoft {
+				return nil, nil, nil
+			}
 			message := fmt.Sprintf("策略 %s 需要至少一条启用的代理", strategy)
 			return nil, &message, nil
 		}
@@ -593,11 +596,8 @@ func (h *userProxyHTTP) resolveProxyURL(ctx context.Context) (*string, *string, 
 	case "direct_first":
 		return nil, nil, nil
 	case "proxy_first":
-		if h.kernelStatus != nil {
-			if running, port := h.kernelStatus(); running && port > 0 && clashkernel.PortListening(port) {
-				url := fmt.Sprintf("http://127.0.0.1:%d", port)
-				return &url, nil, nil
-			}
+		if url, ok := kernelURL(); ok {
+			return &url, nil, nil
 		}
 		enabled, err := h.enabledProxies(ctx)
 		if err != nil {
@@ -607,23 +607,33 @@ func (h *userProxyHTTP) resolveProxyURL(ctx context.Context) (*string, *string, 
 			chosen := weightedPick(ctx, enabled, h)
 			return &chosen, nil, nil
 		}
-		if fallback := localFallbackPort(); fallback > 0 {
+		fallbackFn := opts.LocalFallback
+		if fallbackFn == nil {
+			fallbackFn = localFallbackPort
+		}
+		if fallback := fallbackFn(); fallback > 0 {
 			url := fmt.Sprintf("http://127.0.0.1:%d", fallback)
 			return &url, nil, nil
 		}
 		return nil, nil, nil
 	default:
+		if opts.IncludeKernelOnFallback {
+			if url, ok := kernelURL(); ok {
+				return &url, nil, nil
+			}
+		}
 		return pick()
 	}
 }
 
-// ResolveStrategyProxy 策略引擎的程序化出站口（GET /proxies/resolve 同链）：
-// 账号/愿望单/成就等 Steam 出站装配与本端点共用一条解析链。返回 (proxyURL,
-// message, err)：proxyURL 为空即直连；message 非空为可读运行时说明；err 仅
-// 基础设施故障。调用方拿不到代理按直连处理（strategy_proxy_or_direct 语义）。
+// ResolveStrategyProxy 与解析端点共用策略链；失败或拿不到代理返回空串供直连。
 func ResolveStrategyProxy(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string, kernelStatus func() (running bool, port int)) (string, string, error) {
-	h := &userProxyHTTP{db: db, gate: gate, dataDir: dataDir, kernelStatus: kernelStatus}
-	proxyURL, message, err := h.resolveProxyURL(ctx)
+	return ResolveStrategyProxyWith(ctx, db, gate, dataDir, StrategyResolveOptions{KernelStatus: kernelStatus})
+}
+
+func ResolveStrategyProxyWith(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string, opts StrategyResolveOptions) (string, string, error) {
+	h := &userProxyHTTP{db: db, gate: gate, dataDir: dataDir, kernelStatus: opts.KernelStatus}
+	proxyURL, message, err := h.resolveProxyURLWith(ctx, opts)
 	if proxyURL == nil {
 		return "", derefString(message), err
 	}
@@ -674,7 +684,6 @@ func (h *userProxyHTTP) kvInt(ctx context.Context, key string, fallback int64) i
 	return fallback
 }
 
-// enabledProxies 启用池节点（Python list_proxies(enabled_only=True) 同径）。
 func (h *userProxyHTTP) enabledProxies(ctx context.Context) ([]proxyRow, error) {
 	rows, err := h.db.QueryContext(ctx, `SELECT id,label,scheme,host,port,username,password,enabled,status,
 		latency_ms,consecutive_failures,CAST(last_checked_at AS TEXT) FROM proxies WHERE enabled=1 ORDER BY id`)
@@ -694,7 +703,6 @@ func (h *userProxyHTTP) enabledProxies(ctx context.Context) ([]proxyRow, error) 
 	return out, rows.Err()
 }
 
-// speedScore 速度分（Python _speed 同构）。
 func speedScore(latency sql.NullInt64) float64 {
 	if !latency.Valid || latency.Int64 == 0 {
 		return untestedSpd
@@ -703,7 +711,6 @@ func speedScore(latency sql.NullInt64) float64 {
 	return speedFloor + (1.0-speedFloor)*(1.0-slow)
 }
 
-// healthScore 健康分（Python _health 同构）。
 func healthScore(fails int, status string) float64 {
 	if fails >= maxFails {
 		return 0
@@ -714,7 +721,6 @@ func healthScore(fails int, status string) float64 {
 	return math.Pow(2.0, -float64(max(fails, 1)))
 }
 
-// weightedPick 加权随机（Python _weighted_pick 同构）；权重全零退回顺序轮询。
 func weightedPick(ctx context.Context, enabled []proxyRow, h *userProxyHTTP) string {
 	scores := make([]float64, len(enabled))
 	total := 0.0
@@ -731,7 +737,7 @@ func weightedPick(ctx context.Context, enabled []proxyRow, h *userProxyHTTP) str
 		weights[i] = int64(math.Round(score * weightScale))
 		sum += weights[i]
 	}
-	target := rand.Int63n(sum)
+	target := rand.Int64N(sum)
 	for i, weight := range weights {
 		if target < weight {
 			return runtimeURL(h.dataDir, enabled[i])
@@ -741,7 +747,6 @@ func weightedPick(ctx context.Context, enabled []proxyRow, h *userProxyHTTP) str
 	return runtimeURL(h.dataDir, enabled[len(enabled)-1])
 }
 
-// roundRobin 顺序轮询兜底（rr_index 存 app_settings，Python _round_robin 同径）。
 func (h *userProxyHTTP) roundRobin(ctx context.Context, enabled []proxyRow) string {
 	idx := h.kvInt(ctx, "proxy.rr_index", 0)
 	chosen := enabled[idx%int64(len(enabled))]
@@ -752,7 +757,11 @@ func (h *userProxyHTTP) roundRobin(ctx context.Context, enabled []proxyRow) stri
 	return runtimeURL(h.dataDir, chosen)
 }
 
-// runtimeURL 库内行 → 出网 URL（唯一解密点；密钥不可用退化无认证 URL）。
+func quoteUserinfo(raw string) string {
+	return strings.ReplaceAll(url.QueryEscape(raw), "+", "%20")
+}
+
+// runtimeURL 构造出网代理 URL；凭据解密失败退化为无认证 URL。
 func runtimeURL(dataDir string, p proxyRow) string {
 	if !p.Username.Valid || p.Username.String == "" {
 		return fmt.Sprintf("%s://%s:%d", p.Scheme, p.Host, p.Port)
@@ -762,12 +771,10 @@ func runtimeURL(dataDir string, p proxyRow) string {
 	if user == "" {
 		return fmt.Sprintf("%s://%s:%d", p.Scheme, p.Host, p.Port)
 	}
-	auth := url.QueryEscape(user) + ":" + url.QueryEscape(secret) + "@"
+	auth := quoteUserinfo(user) + ":" + quoteUserinfo(secret) + "@"
 	return fmt.Sprintf("%s://%s%s:%d", p.Scheme, auth, p.Host, p.Port)
 }
 
-// localFallbackPort 外部本地兜底口：端口在听 + 经它真能出网（Python
-// _local_fallback_port 同构：_tcp_alive + local_channel_egress_ok）。
 func localFallbackPort() int {
 	for _, port := range localMixedPorts {
 		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
@@ -783,7 +790,6 @@ func localFallbackPort() int {
 	return 0
 }
 
-// localEgressOK 经借道口发一次 204 探测（Python local_channel_egress_ok 同构）。
 func localEgressOK(proxyURL string) bool {
 	parsed, err := url.Parse(proxyURL)
 	if err != nil {
@@ -805,9 +811,6 @@ func localEgressOK(proxyURL string) bool {
 	return resp.StatusCode < 400
 }
 
-// ─── 小件 ───────────────────────────────────────────────────────────────────
-
-// sealProxyCredential 凭据密封（purpose 与 rekey 解封对拍 proxy-credential）。
 func sealProxyCredential(dataDir, plain string) (string, error) {
 	if secretbox.IsEncrypted(plain) {
 		return plain, nil
@@ -815,7 +818,6 @@ func sealProxyCredential(dataDir, plain string) (string, error) {
 	return secretbox.EncryptSecretIn(dataDir, plain, secretbox.PurposeProxyCredential)
 }
 
-// openProxyCredential 凭据解密；任何失败按不可用降级（Python open_value 同径）。
 func openProxyCredential(dataDir, value string) string {
 	if !secretbox.IsEncrypted(value) {
 		return value

@@ -1,8 +1,5 @@
 package proxypool
 
-// L0 探测与共享纯函数的单测：桩控制器覆盖全部响应分档；冷却档位、_to_int
-// 语义、IP 提取、L2 目标 URL 形状逐一钉死。
-
 import (
 	"context"
 	"encoding/json"
@@ -118,7 +115,6 @@ func TestExtractIP(t *testing.T) {
 	}
 }
 
-// L2 目标 URL 的 golden 用 Python 真实 urlencode 产物钉死（换链接即测试红）。
 func TestBusinessProbeURLGolden(t *testing.T) {
 	want := "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/" +
 		`?input_json={"ids":%5B{"appid":220}%5D,"context":{"language":"english",` +
@@ -146,7 +142,6 @@ func TestValidateBusiness(t *testing.T) {
 		t.Fatalf("合法业务响应判定失败：%v %q %d", ok, reason, final)
 	}
 
-	// success 是布尔 true 属契约不符（True == 1 会蒙混过关，显式拒绝）
 	boolPayload := map[string]any{
 		"response": map[string]any{"store_items": []any{
 			map[string]any{"appid": int64(220), "success": true,

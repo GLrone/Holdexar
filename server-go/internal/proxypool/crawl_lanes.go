@@ -105,7 +105,6 @@ func currentCrawlSlots(ctx context.Context, db *sql.DB, dataDir string) ([]crawl
 	return selectCrawlSlots(nodes, materialized), nil
 }
 
-// CrawlLaneCount is the number of distinct qualified exits in the materialized pool.
 func CrawlLaneCount(ctx context.Context, db *sql.DB, dataDir string) (int, error) {
 	slots, err := currentCrawlSlots(ctx, db, dataDir)
 	return len(slots), err
@@ -115,7 +114,6 @@ func crawlLanePlanPath(dataDir string) string {
 	return filepath.Join(dataDir, "proxypool", crawlLanePlanFilename)
 }
 
-// InvalidateCrawlLanes withdraws the plan before any runtime configuration change.
 func InvalidateCrawlLanes(dataDir string) error {
 	err := os.Remove(crawlLanePlanPath(dataDir))
 	if errors.Is(err, os.ErrNotExist) {

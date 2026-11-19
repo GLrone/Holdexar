@@ -1,8 +1,5 @@
 package proxypool
 
-// 恢复探测单元测试：取批轮转、依赖归因、探测结论分桶、落账状态推进。
-// 真内核全链路在 deadprobe_live_test.go（无内核整组 skip）。
-
 import (
 	"context"
 	"database/sql"
@@ -39,17 +36,14 @@ func TestFreeProbePortScansSegment(t *testing.T) {
 		t.Cleanup(func() { l.Close() })
 		return l
 	}
-	// 空段：首口即返回
 	base := freeProbePort(24300)
 	if base != 24300 {
 		t.Fatalf("空段应返回首选口 24300，实际 %d", base)
 	}
-	// 首口被占：顺延
 	listen(t, 24300)
 	if got := freeProbePort(24300); got != 24301 {
 		t.Fatalf("首选口被占应顺延 24301，实际 %d", got)
 	}
-	// 整段（8 个）占满：返回 0
 	listen(t, 24301)
 	listen(t, 24302)
 	listen(t, 24303)
@@ -70,7 +64,6 @@ func TestDeadProbeBundlesAttribution(t *testing.T) {
 	target := RecoveredNode{NodeID: "fp-a", RuntimeName: "1|香港 01", OriginalName: "香港 01",
 		Config: sockConfig(), SubscriptionID: sql.NullInt64{Int64: 1, Valid: true}}
 
-	// 完整配置 → 就绪；依赖节点不进产物（只作连接依赖）
 	peer := target
 	peer.NodeID = "fp-peer"
 	peer.RuntimeName = "1|香港 02"
@@ -83,7 +76,6 @@ func TestDeadProbeBundlesAttribution(t *testing.T) {
 		t.Fatalf("产物应只有根节点一条，实际 %v", bundle.proxies)
 	}
 
-	// 缺 server / 缺 type → 依赖归因，非节点失败
 	broken := target
 	broken.NodeID = "fp-b"
 	broken.RuntimeName = "1|坏配置"
@@ -100,7 +92,6 @@ func TestDeadProbeBundlesAttribution(t *testing.T) {
 		t.Fatalf("依赖细节缺失：%q", rejected[0].Detail)
 	}
 
-	// dialer-proxy 指向不存在名字 → 渲染失败依赖归因；来源错误并入细节
 	dp := target
 	dp.NodeID = "fp-c"
 	dp.RuntimeName = "1|缺依赖"
@@ -136,7 +127,6 @@ func TestLoadRecoverableNodesRotation(t *testing.T) {
 	db, _, _ := deadTestDB(t)
 	ctx := context.Background()
 	now := time.Now()
-	// 无观测记录（NULL 最先）→ 最旧观测 → 次新观测；ACTIVE 不进批
 	seedNode(t, db, "无记录", NodeDead, 0, int64(1))
 	seedNode(t, db, "旧档", NodeDead, 0, int64(1))
 	seedNode(t, db, "新档", NodeRetired, 0, int64(1))
@@ -176,7 +166,6 @@ func TestLoadRecoverableNodesRotation(t *testing.T) {
 	if err != nil || len(limited) != 1 || limited[0].RuntimeName != "无记录" {
 		t.Fatalf("batch 应截断取批：%v %v", limited, err)
 	}
-	// 渲染输入：原名缺省回落运行名，配置解析后整数字段保持 int64
 	if nodes[0].OriginalName != "无记录" {
 		t.Fatalf("原名缺省应回落运行名：%q", nodes[0].OriginalName)
 	}
@@ -199,7 +188,6 @@ func TestRecoverDeadNodesSourcelessAttribution(t *testing.T) {
 	db, gate, dir := deadTestDB(t)
 	seedNode(t, db, "无主", NodeDead, 1, nil)
 	seedNode(t, db, "有主", NodeDead, 1, int64(1))
-	// 内核文件位占位（空文件）：走预检失败分支，验证无主节点归因与落账
 	exeDir := filepath.Join(dir, "clash")
 	if err := os.MkdirAll(exeDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -228,7 +216,6 @@ func TestRecoverDeadNodesSourcelessAttribution(t *testing.T) {
 	if owned.OK || owned.NodeFailure {
 		t.Fatalf("占位内核探测不得构成节点证据：%+v", owned)
 	}
-	// 无主节点：状态与失败计数不动，但观测行要留
 	var state string
 	var failures int64
 	if err := db.QueryRow(`SELECT state, consecutive_failures FROM proxy_nodes WHERE runtime_name = '无主'`).
@@ -247,7 +234,6 @@ func TestRecoverDeadNodesSourcelessAttribution(t *testing.T) {
 	if obsOK != 0 || detail.String != "节点来源不存在" || channel.String != DefaultScheduleChannel {
 		t.Fatalf("观测行形状不对：ok=%d detail=%q channel=%q", obsOK, detail.String, channel.String)
 	}
-	// 临时探测目录应清理
 	entries, _ := os.ReadDir(filepath.Join(dir, "proxypool", "_dead_probe"))
 	if len(entries) != 0 {
 		t.Fatalf("探测工作目录应清理，残留 %d 项", len(entries))
@@ -272,7 +258,6 @@ func TestCommitRecoveryAdvancesStates(t *testing.T) {
 	if err := runner.commitRecovery(context.Background(), outcomes, now, "http://target/204"); err != nil {
 		t.Fatal(err)
 	}
-	// 复活：DEAD → ACTIVE、失败计数清零、观测 detail 缺省恢复成功
 	var state string
 	var failures int64
 	var lastL2 sql.NullString
@@ -283,7 +268,6 @@ func TestCommitRecoveryAdvancesStates(t *testing.T) {
 	if state != NodeActive || failures != 0 || lastL2.String != pyTimeText(now) {
 		t.Fatalf("恢复成功应复活清零：%s %d %v", state, failures, lastL2)
 	}
-	// 再失败：STALE → DEAD、失败计数 +1（真实节点失败证据）
 	if err := db.QueryRow(`SELECT state, consecutive_failures FROM proxy_nodes WHERE runtime_name = '再失败的'`).
 		Scan(&state, &failures); err != nil {
 		t.Fatal(err)
@@ -291,7 +275,6 @@ func TestCommitRecoveryAdvancesStates(t *testing.T) {
 	if state != NodeDead || failures != 2 {
 		t.Fatalf("节点失败证据应计数推进：%s %d", state, failures)
 	}
-	// 没测到：状态与计数都不动，观测只记事实
 	if err := db.QueryRow(`SELECT state, consecutive_failures FROM proxy_nodes WHERE runtime_name = '没测到的'`).
 		Scan(&state, &failures); err != nil {
 		t.Fatal(err)
@@ -340,7 +323,6 @@ func TestRenderDeadProbeConfigShape(t *testing.T) {
 			t.Fatalf("配置缺 %q：\n%s", want, text)
 		}
 	}
-	// 端口保持整数形态（8443 不得渲染成 '8443' 或 8443.0）
 	if contains(text, "'23001'") || contains(text, "23001.0") {
 		t.Fatalf("端口不得渲染成非整数形态：\n%s", text)
 	}

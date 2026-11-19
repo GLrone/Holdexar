@@ -1,8 +1,5 @@
 package dbwriter
 
-// 价格决策纯函数（无 IO）：games 行归一化 + 免费态分类 + 差量门禁 /
-// 版本名回填 / 标准版选择。语义与 Python 侧同链路逐行对齐。
-
 import (
 	"math"
 	"regexp"
@@ -10,14 +7,11 @@ import (
 	"time"
 )
 
-// BatchEntry 一个抓取结果：一款游戏的元数据 + 其价格行（一个任务 =
-// 一个区 × 一批 appid，每 appid 一条 entry）。
 type BatchEntry struct {
 	Game   GameData
 	Prices []PriceRow
 }
 
-// GameData games 元数据（对齐调用方 build_game_data 的 dict 形状）。
 // 指针 nil = 键缺省/显式 None：带缺省的列落模型缺省值，其余落 NULL。
 type GameData struct {
 	AppID           int64
@@ -35,15 +29,13 @@ type GameData struct {
 	Developers      []any // JSON 列；nil 落 JSON null 字面量，空切片落 []
 	Publishers      []any
 	PositiveRate    *int64
-	PositiveReviews *int64 // nil 落缺省 0
-	ReviewCount     *int64 // nil 落缺省 0
+	PositiveReviews *int64
+	ReviewCount     *int64
 	CreatedAt       *time.Time
-	UpdatedAt       *time.Time // nil 取 Writer.Now()
+	UpdatedAt       *time.Time
 }
 
-// PriceRow 单区价格行（对齐调用方 prices_arr 的 dict 形状）。
-// 指针 nil = Python .get 缺省：RegionCode/Currency 落空串、DiscountPercent/
-// SubID 落 0、IsGold/IsBundle 落 false、PriceStatus 落 "ok"。
+// nil 取字段缺省值（RegionCode/Currency=""、数值/bool=0/false、PriceStatus="ok"）。
 type PriceRow struct {
 	AppID             int64
 	RegionCode        *string
@@ -68,8 +60,7 @@ type PriceRow struct {
 // 自身的官方命名，不算版本款；带附加词的礼包 SKU 不在此列。
 var plainStandardSuffixRe = regexp.MustCompile(`(?i)^standard( digital)? edition$`)
 
-// 测试入口命名（测试版/测试服/公测/Playtest 等）→ 不进监控池的判定词形。
-// 只认锚定的「测试入口」组合词——裸 beta/测试会误伤标题自带裸词的正经游戏。
+// 仅匹配锚定测试入口词形，防裸 beta/测试误伤正常标题。
 var testEntryRe = regexp.MustCompile(
 	`(?i)测试版|测试服|技术测试|封闭测试|公开测试|压力测试|内测|公测|封测|体验版` +
 		`|play[\t\n\f\r \v_-]?test|beta[\t\n\f\r \v_-]?test|closed[\t\n\f\r \v_-]?beta` +
@@ -86,11 +77,9 @@ func isTestEntry(name string) bool {
 	return name != "" && testEntryRe.MatchString(name)
 }
 
-// isOkPriceRow ok 行价格合法性：nil 才是坏数据（0 = 免费游戏，合法）。
 func isOkPriceRow(price *int64) bool { return price != nil }
 
-// computeCnyFen cny_fen = ROUND(price_cents * rate_to_cny)（银行家舍入，
-// 对齐 Python round）；0 = 免费游戏，合法值；无汇率 → NULL。
+// computeCnyFen 按银行家舍入折算人民币分；0 为免费合法值，无汇率返回 nil。
 func (w *Writer) computeCnyFen(priceCents int64, currency string) *int64 {
 	if priceCents == 0 {
 		fen := int64(0)
@@ -114,18 +103,16 @@ func (w *Writer) fxRate(currency string) (float64, bool) {
 	return 0, false
 }
 
-// ── games 行归一化 ──────────────────────────────────────────────
-
 type gameRowValues struct {
 	appid         int64
-	name, nameEn  any // string 或 nil
+	name, nameEn  any
 	typ           any
 	headerImage   any
 	storeURL      any
 	chineseSupp   any
 	familySharing int64
 	tradingCards  int64
-	isEpic        int64 // 模型缺省列：调用方不携带，落缺省 0
+	isEpic        int64
 	isHb          int64
 	hlFlag        int64
 	ppFlag        int64
@@ -140,10 +127,9 @@ type gameRowValues struct {
 	positiveRev   int64
 	reviewCount   int64
 	viewCount     int64
-	createdAt     any // string 或 nil
+	createdAt     any
 	updatedAt     string
-	// 免费态字段：hasFree=true 时随行携带（批量 upsert 以 excluded 引用
-	// 逐行落）；false 时两键不进语句——纯 locked/missing 响应绝不洗掉库内免费态
+	// hasFree=false 时不写入免费态两列，防纯 locked/missing 响应洗掉免费标记。
 	hasFree  bool
 	freeKind any
 	promoEnd any
@@ -157,7 +143,6 @@ func b2i(b bool) int64 {
 	return 0
 }
 
-// normalizeGame games 行归一化 + 免费态/测试入口分类。
 func (w *Writer) normalizeGame(g GameData, prices []PriceRow) gameRowValues {
 	now := w.Now()
 	if g.UpdatedAt != nil {
@@ -185,9 +170,7 @@ func (w *Writer) normalizeGame(g GameData, prices []PriceRow) gameRowValues {
 		updatedAt:     FormatNaive(now),
 		nowTime:       now,
 	}
-	// 测试入口优先于价格分类：Beta/测试页常挂正价（页面透传本体价），
-	// 价格分类判不出免费态，只有命名能定性；'beta' 与 f2p/promo 同走
-	// free_kind 非空脱池机制
+	// 测试入口命名判定优先于价格分类，确保挂正价的 Beta 页仍标 beta 脱池。
 	state := classifyFreeKind(prices)
 	if isTestEntry(derefStr(g.Name, "")) {
 		state = &freeState{kind: "beta"}
@@ -211,22 +194,14 @@ func timeOrNilStr(t *time.Time) any {
 	return FormatNaive(*t)
 }
 
-// ── 免费态分类 ──────────────────────────────────────────────────
-
 type freeState struct {
 	kind     string
 	promoEnd *int64
 }
 
-// classifyFreeKind 单区价格行 → (free_kind, promo_end_at)。
-//   - probe = CN ok 行（锚区）；CN 无 ok 行时回退任意区 ok 行。
-//   - probe price=0：original>0 → promo（限时赠送，结束时间取各行
-//     promo_end_ts 最大值）；original=0 → f2p（永久免费）。
-//   - probe price>0（付费）→ 显式清标记——仅当 CN 行在场：各区任务独立
-//     分类，区服促销不同步时非 CN 任务不得抹掉 CN 刚打的 promo 标；
-//     CN 行缺席且 probe 付费 → nil（无信号，调用方不动标记）。
-//   - 一条 ok 行都没有（纯 locked/missing 响应）→ nil：下架/断网不该
-//     抹掉免费态。
+// classifyFreeKind 优先以 CN ok 行作锚区（无 CN 回退首个 ok 行）判 free_kind：
+// price=0 按 original>0 区分 promo/f2p；仅 CN 在场且付费时才显式清标记（防非 CN 任务误清），
+// 无 ok 行返回 nil（保留原免费态）。
 func classifyFreeKind(prices []PriceRow) *freeState {
 	var okRows []*PriceRow
 	for i := range prices {
@@ -279,14 +254,11 @@ func classifyFreeKind(prices []PriceRow) *freeState {
 	return &freeState{kind: "promo", promoEnd: maxEnd}
 }
 
-// ── 基线（差量门禁 + 版本名回填） ────────────────────────────────
-
 type obsKey struct {
 	region string
 	sub    int64
 }
 
-// snapTuple 差量比较键：价三件套 + 版本后缀 + gold 标。
 type snapTuple struct {
 	price    int64
 	original *int64
@@ -296,11 +268,9 @@ type snapTuple struct {
 }
 
 type baseline struct {
-	known  map[int64]string     // sub_id → 同 sub 最新非空版本名
-	latest map[obsKey]snapTuple // (区, sub) → 最新快照
+	known  map[int64]string
+	latest map[obsKey]snapTuple
 }
-
-// ── 价格决策 ────────────────────────────────────────────────────
 
 // currentRow 现价行（degraded 仅作决策标记，不落库）。
 type currentRow struct {
@@ -321,7 +291,6 @@ type currentRow struct {
 	degraded       bool
 }
 
-// historyRow 历史切片行。
 type historyRow struct {
 	appid         int64
 	region        string
@@ -349,8 +318,6 @@ type stdCandidate struct {
 	degraded bool
 }
 
-// planPriceRows 价格决策：差量门禁 / 版本名回填 / 标准版选择。
-// 活动快照标签由调用方按批求值传入（同一观测时刻本就该是同一个 key）。
 func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, eventKey *string) (
 	current []currentRow, history []historyRow, okRegions, degradedRegions map[string]bool,
 ) {
@@ -366,8 +333,7 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		currency := derefStr(p.Currency, "")
 		isGold := derefBool(p.IsGold, false)
 		suffix := p.VersionSuffix
-		// 丢名行沿用同 sub_id 的历史名（known_suffix）——标准版判定 /
-		// 差量比较全部一致
+		// 缺省版本后缀沿用同 sub_id 历史名，保持标准版判定与差量比较一致。
 		if suffix == nil || *suffix == "" {
 			if s, ok := base.known[derefI64(p.SubID, 0)]; ok {
 				suffix = &s
@@ -375,8 +341,8 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		}
 		isBundle := derefBool(p.IsBundle, false)
 		status := derefStr(p.PriceStatus, "ok")
-		// 质量门禁：ok 但无价格 = 成功响应里的坏数据。行级降级记史不记现；
-		// 区级欠账结转只在「选中行自身被降级」时发生
+		// 质量门禁：ok 但无价格视为坏数据并降级为 missing，不写历史；
+		// 仅当选中行自身被降级时才记现价失败章并触发区级欠账结转。
 		rowDegraded := false
 		if status == "ok" && !isOkPriceRow(priceCents) {
 			status = "missing"
@@ -387,9 +353,7 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 			cnyFen = w.computeCnyFen(*priceCents, currency)
 		}
 
-		// 所有有价格的版本写入 history；永久免费 price=0 不进 history
-		//（无价格事件），限时赠送 price=0+original>0 是真实价格事件照写；
-		// 相对最新快照无变化的行不写（差量门禁）
+		// 仅 price>0 或限时赠送（price=0 且 original>0）写历史，相对最新快照无变化则跳过。
 		if status == "ok" && priceCents != nil && (*priceCents > 0 || derefI64(p.OriginalPrice, 0) > 0) {
 			prev, hasPrev := base.latest[obsKey{region, derefI64(p.SubID, 0)}]
 			same := hasPrev && prev == snapTuple{
@@ -424,8 +388,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 			}
 		}
 
-		// 标准版候选: 非 gold 且非捆绑包，且名字无版本后缀——显式命名的
-		// Standard Edition 归一化为标准版候选
 		isStandard := !isGold && !isBundle &&
 			(suffix == nil || *suffix == "" || isPlainStandardSuffix(suffix))
 		if isStandard {
@@ -452,8 +414,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		}
 	}
 
-	// 每个区域选标准版写入 current：优先有价（ok+price 有值）行——该区
-	// 任何版本有价就算有数；全部无价才落 missing 状态行
 	var currentBatch []currentRow
 	seenRegions := map[string]bool{}
 	for _, region := range candidateOrder {
@@ -479,9 +439,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		seenRegions[region] = true
 	}
 
-	// 无标准版候选的区域也写入 current：该区有价（非捆绑包）行里取
-	// sub_id 最小的确定性兜底——最老 SKU 即本体。全部无价才落状态行，
-	// 同区多行降级时以最后一条为准
 	fallbackRows := map[string][]*PriceRow{}
 	var fallbackOrder []string
 	for i := range prices {
@@ -514,7 +471,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		} else {
 			sel = rows[len(rows)-1]
 		}
-		// 门禁降级行的实时状态在主循环里已算过，重算保持独立
 		rawStatus := derefStr(sel.PriceStatus, "ok")
 		priceCents := sel.Price
 		rowDegraded := rawStatus == "ok" && !isOkPriceRow(priceCents)
@@ -544,7 +500,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		})
 	}
 
-	// 门禁降级按行不扩散：只对「选中行自身被门禁降级」的区欠账结转
 	degradedRegions = map[string]bool{}
 	for i := range currentBatch {
 		if currentBatch[i].degraded {
@@ -552,8 +507,7 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 		}
 	}
 
-	// 门禁降级是失败观察；明确答复含 locked / 无购买选项。导入和旧调用方
-	// 没有显式 answer 时按状态推导
+	// 降级行记 failed 并清 lastSuccessAt/steamAnswer；未传 steamAnswer 时按状态推导。
 	for i := range currentBatch {
 		row := &currentBatch[i]
 		if degradedRegions[row.region] {
@@ -589,8 +543,6 @@ func (w *Writer) planPriceRows(prices []PriceRow, base baseline, now time.Time, 
 	}
 	return currentBatch, historyBatch, okRegions, degradedRegions
 }
-
-// ── 取值辅助（对齐 Python .get 缺省语义） ────────────────────────
 
 func derefStr(p *string, def string) string {
 	if p == nil {

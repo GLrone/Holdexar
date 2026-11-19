@@ -1,6 +1,4 @@
-// 对象级价格新鲜度：单游戏各地区成功观察与更新状态（等价 Python
-// crawl/freshness.py appid_freshness）。新鲜度只来自成功观察（last_success_at），
-// 「没有数据」不是「数据很旧」——无观察时刻三值全空，不塞进 stale。
+// 对象级价格新鲜度：仅由 last_success_at 计算，无成功观察时三值全空。
 package crawl
 
 import (
@@ -11,27 +9,23 @@ import (
 	"time"
 )
 
-// 刷新网格步长与陈旧阈值（小时）：6h 起 lagging，12h 起 stale（边界归下一档）。
 const (
 	freshHours   = 6.0
 	laggingHours = 12.0
-	// freshChunk appid 分批宽度：避开 SQLite 变量上限。
-	freshChunk = 500
+	freshChunk   = 500
 )
 
 type freshPriceRow struct {
 	appid   int64
 	region  string
-	status  sql.NullString // price_status
-	outcome sql.NullString // attempt_outcome
-	answer  sql.NullString // steam_answer
-	success *time.Time     // last_success_at
-	attempt *time.Time     // updated_at
+	status  sql.NullString
+	outcome sql.NullString
+	answer  sql.NullString
+	success *time.Time
+	attempt *time.Time
 }
 
-// pendingUnitsSQL 失败/中断任务挂账中未观察目标单元（等价 crawl/service.py
-// _JOB_TARGET_UNITS_SQL）：targets（appids×regions 或 tasks 分桶）减去观察已
-// 推进（updated_at/last_success_at ≥ targetStartedAt）与 skipUnits 已跳过者。
+// pendingUnitsSQL 失败/中断任务中尚未被观察或 skipUnits 结算的挂账单元。
 const pendingUnitsSQL = `
 WITH target_jobs AS MATERIALIZED (
     SELECT id, json_extract(stats_json, '$.targets.appids') AS appids,
@@ -135,9 +129,7 @@ func (r *Runtime) AppIDFreshness(ctx context.Context, appids []int64) ([]map[str
 	return out, nil
 }
 
-// naiveWall 时刻 → 墙钟裸时刻（UTC 标签）：DB 时间串（无时区）经 readTime
-// 解析成 UTC 标签的墙钟值，年龄比较两侧必须同口径——等价 Python 对 naive
-// datetime 的直接相减。
+// naiveWall 将时刻转为 UTC 标签的裸墙钟，与 readTime 解析出的 DB 时刻同口径比较。
 func naiveWall(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
 }
@@ -147,7 +139,6 @@ type freshUnitKey struct {
 	region string
 }
 
-// enabledRegions 启用区 code（小写，按 sort 排；Python enabled_regions 同口径）。
 func (r *Runtime) enabledRegions(ctx context.Context) ([]string, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT code FROM crawl_regions WHERE enabled=1 ORDER BY sort, code`)
 	if err != nil {
@@ -188,8 +179,6 @@ func collectFreshRows(rows *sql.Rows, byAppid map[int64][]freshPriceRow) error {
 	return rows.Err()
 }
 
-// regionalFreshness 同一份价格行生成地区明细和对象新鲜度：regions 为启用区
-// （大写化后作明细键），空则按现有价格行 region_code 展开。
 func regionalFreshness(rows []freshPriceRow, regions []string, pending map[freshUnitKey]bool, appid int64, now time.Time) map[string]any {
 	indexed := map[string]freshPriceRow{}
 	for _, row := range rows {
@@ -208,7 +197,7 @@ func regionalFreshness(rows []freshPriceRow, regions []string, pending map[fresh
 	var successes []time.Time
 	for _, code := range codes {
 		upper := strings.ToUpper(code)
-		row, has := indexed[upper] // 明细键与查找同用大写（Python codes 先 upper 再 indexed.get）
+		row, has := indexed[upper]
 		outcome := "notAttempted"
 		if has {
 			outcome = row.outcome.String
@@ -271,7 +260,6 @@ func regionalFreshness(rows []freshPriceRow, regions []string, pending map[fresh
 	return item
 }
 
-// freshnessBucket 年龄 → 档位。边界归下一档：6h 起 lagging，12h 起 stale。
 func freshnessBucket(ageHours float64) string {
 	if ageHours < freshHours {
 		return "fresh"
@@ -282,8 +270,6 @@ func freshnessBucket(ageHours float64) string {
 	return "stale"
 }
 
-// freshnessOf 观察时刻 → {observedAt, ageHours, freshness}；无观察（nil）三值
-// 全空——「没有数据」不是「数据很旧」。
 func freshnessOf(observedAt *time.Time, now time.Time) map[string]any {
 	if observedAt == nil {
 		return map[string]any{"observedAt": nil, "ageHours": nil, "freshness": nil}

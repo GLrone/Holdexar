@@ -5,7 +5,7 @@ package clashcfg
 import (
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -180,7 +180,7 @@ func validateGeoFreeConfig(parsed map[string]any) error {
 		}
 	}
 	if len(configured) > 0 {
-		sort.Strings(configured)
+		slices.Sort(configured)
 		return fmt.Errorf("运行配置包含地理数据加载设置：%s", configured[0])
 	}
 	if truthy(parsed["rule-providers"]) {
@@ -324,7 +324,6 @@ func validateGroupAutonomy(parsed map[string]any) error {
 	return nil
 }
 
-// ValidateExecutionConfigDoc 最终运行配置准入（映射形态）。
 func ValidateExecutionConfigDoc(doc map[string]any) error {
 	if err := validateGeoFreeConfig(doc); err != nil {
 		return err
@@ -335,7 +334,6 @@ func ValidateExecutionConfigDoc(doc map[string]any) error {
 	return validateGroupAutonomy(doc)
 }
 
-// ValidateExecutionConfigText 最终运行配置准入（文本形态）。
 func ValidateExecutionConfigText(text string) error {
 	doc, err := parseConfigDoc(text)
 	if err != nil {

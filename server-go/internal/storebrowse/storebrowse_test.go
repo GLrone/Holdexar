@@ -294,7 +294,6 @@ func TestTagsFallbackRetainsOrder(t *testing.T) {
 	}
 }
 
-// B6：purchase_options → 捆绑包发现桩提取（原始选项读取，判据随形态分流）。
 func TestBundleDiscoveriesExtraction(t *testing.T) {
 	item := itemJSON(t, `{"success":1,"visible":true,"appid":440,"name":"Main Game",
 		"purchase_options":[

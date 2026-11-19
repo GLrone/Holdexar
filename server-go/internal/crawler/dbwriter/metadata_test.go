@@ -140,8 +140,6 @@ func TestMetadataReplaceTagsPresenceAndRollback(t *testing.T) {
 	}
 }
 
-// TestMarkComingSoonCreatesPlaceholderRow B5①：新 appid 落 type=COMING_SOON
-// 挂名行（updated_at 落值脱首爬候选池）。
 func TestMarkComingSoonCreatesPlaceholderRow(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -157,8 +155,6 @@ func TestMarkComingSoonCreatesPlaceholderRow(t *testing.T) {
 	}
 }
 
-// TestMarkComingSoonConflictKeepsNameAndClearsRemoved B5②：冲突只更
-// type/updated_at 并清复活痕迹，名字保持库内原值。
 func TestMarkComingSoonConflictKeepsNameAndClearsRemoved(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -183,8 +179,6 @@ func TestMarkComingSoonConflictKeepsNameAndClearsRemoved(t *testing.T) {
 	}
 }
 
-// TestRecordBundleDiscoveries B6 四案：空输入 0；已知包跳过；新包落桩
-// （updated_at NULL、app_ids 单种子）；冲突幂等。
 func TestRecordBundleDiscoveries(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow

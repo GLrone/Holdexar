@@ -1,6 +1,4 @@
-// 内核安装编排：随包资产优先（本地复制，瞬时完成），随包缺失才走网络下载。
-// 同步阻塞在请求 goroutine 里（与 Python install_kernel 同构），下载进度经
-// progressStore 供轮询端点上报——不要改成后台任务，否则「进页续挂」语义错位。
+// 内核安装与请求同步阻塞，不可改为后台异步，否则进页续挂进度错位。
 package clashservice
 
 import (
@@ -11,17 +9,15 @@ import (
 	"holdexar/server-go/internal/clashkernel"
 )
 
-// InstallResult POST /clash/install 返回形状（失败分支只有 ok/error 两个键）。
 type InstallResult struct {
 	OK      bool    `json:"ok"`
 	Path    *string `json:"path,omitempty"`
 	Source  *string `json:"source,omitempty"`
 	Via     *string `json:"via,omitempty"`
-	Version *string `json:"version,omitempty"` // http 层在 ok 时追加
+	Version *string `json:"version,omitempty"`
 	Error   *string `json:"error,omitempty"`
 }
 
-// InstallProgress 安装进度快照（全字段 camelCase；无记录 = 全零值形态）。
 type InstallProgress struct {
 	Running  bool     `json:"running"`
 	Phase    *string  `json:"phase"`
@@ -34,10 +30,7 @@ type InstallProgress struct {
 	OK       bool     `json:"ok"`
 }
 
-// progressStore 下载进度的原子快照（下载回调直写，轮询端点读）。
-// 下载器每帧是「替换」语义，这里做**合并**：非零字段覆盖、零值保留——
-// 对齐 Python dict.update 的「部分字段刷新」（终帧只带 ok/percent 时
-// phase/source/received 不丢）。
+// progressStore 合并非零进度字段（终帧只带 ok/percent 时保留 phase/source/received）。
 type progressStore struct {
 	mu   sync.Mutex
 	snap clashkernel.Progress
@@ -110,17 +103,14 @@ func (p *progressStore) snapshot() InstallProgress {
 	return out
 }
 
-// InstallProgress 当前/最近一次内核下载进度（无记录时 running=false）。
 func (s *Service) InstallProgress() InstallProgress {
 	return s.progress.snapshot()
 }
 
-// KernelVersion 就位内核的版本输出首行；失败返回空串（响应层映射成 null）。
 func (s *Service) KernelVersion(exePath string) string {
 	return s.kernelVersion(exePath)
 }
 
-// InstallKernel 安装内核：随包就位即返回 bundled 结果；否则走下载兜底。
 func (s *Service) InstallKernel(ctx context.Context) InstallResult {
 	if _, err := clashkernel.EnsureKernel(s.BundledDir, s.DataDir); err != nil {
 		s.logf("随包内核就位失败：%v", err)
@@ -136,9 +126,10 @@ func (s *Service) InstallKernel(ctx context.Context) InstallResult {
 func (s *Service) downloadKernel(ctx context.Context) InstallResult {
 	s.progress.reset()
 	result := clashkernel.DownloadKernel(ctx, s.DataDir, clashkernel.DownloadOptions{
-		Mirrors:   s.installMirrors(),
-		Log:       func(format string, args ...any) { s.logf(format, args...) },
-		Progress:  s.progress.record,
+		Mirrors:       s.installMirrors(),
+		ReleaseAPIURL: s.ReleaseAPIURL,
+		Log:           func(format string, args ...any) { s.logf(format, args...) },
+		Progress:      s.progress.record,
 	})
 	if result.OK {
 		return InstallResult{OK: true, Path: &result.Path, Source: &result.Source, Via: &result.Via}

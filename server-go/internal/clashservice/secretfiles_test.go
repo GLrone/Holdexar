@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-// secretTree 造 clash/proxypool 子树：可重建明文件、原文缓存与嵌套目录。
 func secretTree(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -23,13 +22,12 @@ func secretTree(t *testing.T) string {
 	write("clash/config.runtime.yaml", "runtime")
 	write("clash/scratch.tmp", "tmp")
 	write("clash/sub/nested.runtime.yaml", "nested")
-	write("clash/subscription-origin.yaml", "origin") // 原文：事实源，永不清理
+	write("clash/subscription-origin.yaml", "origin")
 	write("proxypool/pool.runtime.yaml", "runtime")
 	write("proxypool/keep.yaml", "origin")
 	return root
 }
 
-// 清扫删净 *.runtime.yaml 与 *.tmp，保留原文 .yaml。
 func TestSweepTransientRemovesRebuildableFiles(t *testing.T) {
 	root := secretTree(t)
 	removed := SweepTransient(root)
@@ -51,7 +49,6 @@ func TestSweepTransientRemovesRebuildableFiles(t *testing.T) {
 	}
 }
 
-// POSIX 权限收紧：文件 0600、目录 0700（Windows 跳过）。
 func TestTightenAllPOSIX(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX 权限语义仅 POSIX 生效")
@@ -76,7 +73,6 @@ func TestTightenAllPOSIX(t *testing.T) {
 	check("proxypool/keep.yaml", 0o600)
 }
 
-// Windows no-op：不在 POSIX 平台上验证（本平台编译守卫）。
 func TestTightenAllWindowsNoOp(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("no-op 语义仅 Windows 生效")
@@ -85,7 +81,6 @@ func TestTightenAllWindowsNoOp(t *testing.T) {
 	if count := TightenAll(root); count != 0 {
 		t.Fatalf("Windows 下应为 no-op，实际处理 %d 个", count)
 	}
-	// 权限未被动过（Windows 权限位仅只读位，收紧前后不变即可）
 	if _, err := os.Stat(filepath.Join(root, "clash/subscription-origin.yaml")); err != nil {
 		t.Fatal(err)
 	}

@@ -1,18 +1,13 @@
 package clashcfg
 
-// Clash 运行配置 YAML 发射器（块式、缩进无关序列，PyYAML safe_dump 同形布局）。
-// 键序语义无关（YAML 映射无序），序列保序；普通 map 发射时 name 键置首——
-// 轻量节点名扫描只认 `- name:` 首键形态。
-
 import (
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// Doc 保序映射：运行配置骨架用它构造，产出键序稳定。
 type Doc struct {
 	keys []string
 	m    map[string]any
@@ -49,7 +44,6 @@ func (d *Doc) Keys() []string { return append([]string(nil), d.keys...) }
 
 func (d *Doc) Len() int { return len(d.keys) }
 
-// DumpYAML 任意值 → 块式 YAML 文本（尾部带换行）。
 func DumpYAML(v any) string {
 	var b strings.Builder
 	dumpNode(&b, v, 0, true)
@@ -75,7 +69,6 @@ func dumpNode(b *strings.Builder, v any, indent int, atRoot bool) {
 	}
 }
 
-// dumpMapping 键序由调用方给定；普通 map 已排序且 name 置首。
 func dumpMapping(b *strings.Builder, keys []string, m map[string]any, indent int, atRoot bool) {
 	pad := strings.Repeat(" ", indent)
 	if len(keys) == 0 {
@@ -89,8 +82,6 @@ func dumpMapping(b *strings.Builder, keys []string, m map[string]any, indent int
 	_ = atRoot
 }
 
-// emitKeyValue 单个键值对（不含行首缩进）：标量同行，集合换行成子块。
-// 键行缩进为 keyIndent，序列项与键同列（PyYAML 缩进无关序列形态）。
 func emitKeyValue(b *strings.Builder, key string, val any, keyIndent int) {
 	keyText := formatKey(key)
 	switch v := val.(type) {
@@ -163,18 +154,21 @@ func dumpSequence(b *strings.Builder, items []any, indent int) {
 	}
 }
 
-// sortedMapKeys 普通 map 的确定性键序：name 置首，其余字典序。
+// sortedMapKeys 普通 map 将 name 置首（配合节点名首键扫描）。
 func sortedMapKeys(m map[string]any) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		pi, pj := keys[i] == "name", keys[j] == "name"
-		if pi != pj {
-			return pi
+	slices.SortFunc(keys, func(a, b string) int {
+		pa, pb := a == "name", b == "name"
+		if pa != pb {
+			if pa {
+				return -1
+			}
+			return 1
 		}
-		return keys[i] < keys[j]
+		return strings.Compare(a, b)
 	})
 	return keys
 }
@@ -183,7 +177,6 @@ func formatKey(key string) string {
 	return formatScalarString(key, true)
 }
 
-// formatScalar 标量 → YAML 文本片段。
 func formatScalar(v any) string {
 	switch val := v.(type) {
 	case nil:
@@ -223,7 +216,6 @@ func formatYAMLFloat(f float64) string {
 	return s
 }
 
-// formatScalarString 文本 → YAML 标量：安全即纯、可单引即单引、其余双引转义。
 func formatScalarString(s string, isKey bool) string {
 	if s == "" {
 		return "''"

@@ -13,10 +13,9 @@ import (
 	"holdexar/server-go/internal/occupancy"
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
-// maintainDerived 派生列日切换维护：系列覆盖表闸外装填后进入版本比对，
-// 命中日切换才开写闸全库重算；失败只记日志。
 func (r *Runtime) maintainDerived(ctx context.Context) {
 	overrides, order := derived.LoadSeriesOverrides(r.opts.DataDir)
 	if err := derived.MaintainDerived(ctx, r.db, r.gate, r.now(), overrides, order); err != nil {
@@ -31,7 +30,7 @@ func nextPriceGrid(now time.Time, hours int) time.Time {
 	if hours > 72 {
 		hours = 72
 	}
-	pacific, _ := time.LoadLocation("America/Los_Angeles")
+	pacific := timeutil.Pacific()
 	hour := 2
 	if now.In(pacific).IsDST() {
 		hour = 1
@@ -132,10 +131,8 @@ func (r *Runtime) RegisterSchedules(ctx context.Context, s *sched.Scheduler) err
 		if e = r.RunRepair(ctx, 4*time.Minute); e != nil && !errors.Is(e, ErrBusy) {
 			r.opts.Log("自动补抓未完成：%v", e)
 		}
-		// 派生列日切换维护：补抓拍点尾部全库重算（对齐 Python core/scheduler.py
-		// price_repair 尾的 maintain_derived）；版本一致零重算，失败不拖垮排程
 		r.maintainDerived(ctx)
-	}, sched.WithMisfireUnlimited())
+	})
 	if err == nil {
 		err = r.registerRechecks(ctx, s)
 	}
@@ -160,7 +157,7 @@ func (r *Runtime) SettingsChanged(ctx context.Context, keys, kicks []string) {
 			if e := scheduler.SetNext("price_refresh", next); e != nil {
 				r.opts.Log("价格更新排程尚未调整：%v", e)
 			} else {
-				r.opts.Log("价格更新间隔已生效 │ 下轮=%s", next.Format("2006-01-02 15:04:05"))
+				r.opts.Log("价格更新间隔已生效 │ 下轮=%s", timeutil.FormatSec(next))
 			}
 		}
 		if key == "crawl.auto_price" {

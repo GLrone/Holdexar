@@ -52,7 +52,7 @@ const subscriptionViewSQL = `SELECT id,kind,url,label,replace(created_at,' ','T'
 
 var (
 	subscriptionURLInText = regexp.MustCompile(`(?i)https?://[^\s<>"']+`)
-	errSubscriptionKind   = errors.New("当前仅支持管理 Clash 订阅")
+	errSubscriptionKind   = errors.New("未知订阅方式（仅支持 clash 或 plain）")
 )
 
 func parseSubscriptionURL(raw string) *url.URL {
@@ -127,12 +127,6 @@ func ListSubscriptionViews(ctx context.Context, db *sql.DB, dataDir, kind string
 	return items, rows.Err()
 }
 
-// SubscriptionRouteOptions 订阅管理路由装配选项。BeforeAdd = 保存前置钩子
-// （kind=clash 内核缺失自动安装，失败拒保存，错误文案进 400）；AfterAdd =
-// 保存成功后的即时生效链（fail-soft，返回追加进响应的额外键，如 warning /
-// kernelStarted）。两者 nil = 跳过。AfterDelete / RevertToDirect = 删除订阅
-// 的收尾链（clashservice 缓存产物清理 / 无出口回退直连）；Channels 与
-// KernelProxy = 明文导入的借道通道链与订阅内核混合口（均 serverd 注入）。
 type SubscriptionRouteOptions struct {
 	Refresh        func(context.Context, int64) (*SyncResult, error)
 	OnChanged      func()
@@ -142,6 +136,8 @@ type SubscriptionRouteOptions struct {
 	RevertToDirect func(ctx context.Context)
 	Channels       func(ctx context.Context) []Channel
 	KernelProxy    func(ctx context.Context) string
+	ReloadActive   func(ctx context.Context, subID int64) bool
+	PostSyncCheck  func(subID int64)
 }
 
 type subscriptionHTTP struct {
@@ -156,6 +152,8 @@ type subscriptionHTTP struct {
 	revertToDirect func(ctx context.Context)
 	channels       func(ctx context.Context) []Channel
 	kernelProxy    func(ctx context.Context) string
+	reloadActive   func(ctx context.Context, subID int64) bool
+	postSyncCheck  func(subID int64)
 }
 
 type subscriptionEdit struct {
@@ -169,7 +167,8 @@ func RegisterSubscriptionRoutes(mux *http.ServeMux, db *sql.DB, gate *store.Writ
 	opts SubscriptionRouteOptions) {
 	h := subscriptionHTTP{db: db, gate: gate, dataDir: dataDir, refresh: opts.Refresh, onChanged: opts.OnChanged,
 		beforeAdd: opts.BeforeAdd, afterAdd: opts.AfterAdd, afterDelete: opts.AfterDelete,
-		revertToDirect: opts.RevertToDirect, channels: opts.Channels, kernelProxy: opts.KernelProxy}
+		revertToDirect: opts.RevertToDirect, channels: opts.Channels, kernelProxy: opts.KernelProxy,
+		reloadActive: opts.ReloadActive, postSyncCheck: opts.PostSyncCheck}
 	const path = "/api/v1/proxies/subscriptions"
 	mux.HandleFunc("GET "+path, h.list)
 	mux.HandleFunc("GET "+path+"/{id}/url", h.reveal)
@@ -250,12 +249,12 @@ func (h subscriptionHTTP) add(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if req.Kind != "clash" {
+	if req.Kind != "clash" && req.Kind != "plain" {
 		subscriptionError(w, http.StatusBadRequest, errSubscriptionKind.Error())
 		return
 	}
 	ctx := r.Context()
-	if h.beforeAdd != nil {
+	if req.Kind == "clash" && h.beforeAdd != nil {
 		if err := h.beforeAdd(ctx, req.Kind); err != nil {
 			subscriptionError(w, http.StatusBadRequest, err.Error())
 			return
@@ -270,28 +269,34 @@ func (h subscriptionHTTP) add(w http.ResponseWriter, r *http.Request) {
 	if req.Label != nil && *req.Label != "" {
 		label, stats = *req.Label, `{"labelSource":"user"}`
 	}
+	admission := AdmissionActive
+	if req.Kind == "clash" {
+		admission = AdmissionCandidate
+	}
 	var id int64
 	err = h.gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		return conn.QueryRowContext(ctx, `INSERT INTO proxy_subscriptions(kind,url,label,created_at,last_stats,deprecated,admission_status,auto_refresh)
-			VALUES ('clash',?,?,?,?,0,?,1) RETURNING id`, sealed, label, pyTimeText(time.Now()), stats, AdmissionCandidate).Scan(&id)
+			VALUES (?,?,?,?,?,0,?,1) RETURNING id`, req.Kind, sealed, label, pyTimeText(time.Now()), stats, admission).Scan(&id)
 	})
 	if err != nil {
 		subscriptionError(w, http.StatusInternalServerError, "暂时无法保存订阅")
 		return
 	}
-	response := map[string]any{"id": id, "kind": "clash", "url": maskSubscriptionURL(*req.URL), "label": label}
+	response := map[string]any{"id": id, "kind": req.Kind, "url": maskSubscriptionURL(*req.URL), "label": label}
 	if label != nil {
 		response["label"] = safeSubscriptionText(label.(string))
 	}
-	if fields, ok := h.refreshFields(ctx, id); ok {
-		copyRefreshFields(response, fields)
-		response["cached"] = false
-	} else {
-		response["warning"] = "订阅已保存，本次下载未完成"
-	}
-	if h.afterAdd != nil {
-		for key, value := range h.afterAdd(ctx, id) {
-			response[key] = value
+	if req.Kind == "clash" {
+		if fields, ok := h.refreshFields(ctx, id, false); ok {
+			copyRefreshFields(response, fields)
+			response["cached"] = fields["usedCache"] == true
+		} else {
+			response["warning"] = "订阅已保存，本次下载未完成"
+		}
+		if h.afterAdd != nil {
+			for key, value := range h.afterAdd(ctx, id) {
+				response[key] = value
+			}
 		}
 	}
 	runResponse(w, http.StatusOK, response)
@@ -317,7 +322,7 @@ func (h subscriptionHTTP) update(w http.ResponseWriter, r *http.Request) {
 			FROM proxy_subscriptions WHERE id=?`, id).Scan(&kind, &sealed, &label, &rawStats, &automatic); err != nil {
 			return err
 		}
-		if kind != "clash" {
+		if kind != "clash" && kind != "plain" {
 			return errSubscriptionKind
 		}
 		var stats map[string]any
@@ -384,8 +389,8 @@ func (h subscriptionHTTP) update(w http.ResponseWriter, r *http.Request) {
 			h.onChanged()
 		}
 		response := map[string]any{"id": id, "kind": view.Kind, "url": view.URL, "label": view.Label, "autoRefresh": view.AutoRefresh, "synced": false}
-		if urlChanged || enabled {
-			if fields, ok := h.refreshFields(ctx, id); ok {
+		if view.Kind == "clash" && (urlChanged || enabled) {
+			if fields, ok := h.refreshFields(ctx, id, true); ok {
 				copyRefreshFields(response, fields)
 				response["synced"] = true
 			} else {
@@ -419,7 +424,8 @@ func resetSubscriptionURL(ctx context.Context, conn *sql.Conn, id int64, sealed 
 	if _, err := SettleNodesAfterSourceChange(ctx, conn, nodes, time.Now()); err != nil {
 		return err
 	}
-	_, err = conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET url=?,admission_status=?,
+	_, err = conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET url=?,
+		admission_status=CASE WHEN kind='clash' THEN ? ELSE admission_status END,
 		last_imported_at=NULL,last_fetch_at=NULL,last_fetch_status=NULL,last_success_at=NULL,last_error=NULL,
 		cache_url_identity=NULL,deprecated=0,deprecated_at=NULL,deprecated_reason=NULL WHERE id=?`, sealed, AdmissionCandidate, id)
 	return err
@@ -445,7 +451,7 @@ func (h subscriptionHTTP) refreshRoute(trafficOnly bool) http.HandlerFunc {
 			subscriptionError(w, http.StatusBadRequest, errSubscriptionKind.Error())
 			return
 		}
-		fields, ok := h.refreshFields(ctx, id)
+		fields, ok := h.refreshFields(ctx, id, !trafficOnly)
 		if !ok {
 			subscriptionError(w, http.StatusBadGateway, "本次订阅下载未完成")
 			return
@@ -461,7 +467,7 @@ func (h subscriptionHTTP) refreshRoute(trafficOnly bool) http.HandlerFunc {
 	}
 }
 
-func (h subscriptionHTTP) refreshFields(ctx context.Context, id int64) (map[string]any, bool) {
+func (h subscriptionHTTP) refreshFields(ctx context.Context, id int64, allowReload bool) (map[string]any, bool) {
 	if h.refresh == nil {
 		return nil, false
 	}
@@ -474,11 +480,19 @@ func (h subscriptionHTTP) refreshFields(ctx context.Context, id int64) (map[stri
 	if !ok || snapshot == nil {
 		return nil, false
 	}
+	usedCache := result.UsedCache != nil && result.UsedCache[id]
+	restarted := false
+	if allowReload && h.reloadActive != nil {
+		restarted = h.reloadActive(ctx, id)
+		if restarted && h.postSyncCheck != nil {
+			h.postSyncCheck(id)
+		}
+	}
 	view, err := scanSubscriptionView(h.db.QueryRowContext(ctx, subscriptionViewSQL+` WHERE id=?`, id), h.dataDir, time.Now())
 	if err != nil {
 		return nil, false
 	}
-	fields := map[string]any{"id": id, "label": view.Label, "nodes": count, "traffic": nil, "alive": 0, "total": 0, "usedCache": false, "restarted": false, "strategySwitched": result.StrategySwitched}
+	fields := map[string]any{"id": id, "label": view.Label, "nodes": count, "traffic": nil, "alive": 0, "total": 0, "usedCache": usedCache, "restarted": restarted, "strategySwitched": result.StrategySwitched}
 	if snapshot.Userinfo != "" {
 		fields["traffic"] = safeSubscriptionText(snapshot.Userinfo)
 	}
@@ -494,16 +508,13 @@ func (h subscriptionHTTP) refreshFields(ctx context.Context, id int64) (map[stri
 }
 
 func copyRefreshFields(response, fields map[string]any) {
-	for _, key := range []string{"label", "nodes", "traffic", "alive", "total", "restarted", "strategySwitched"} {
+	for _, key := range []string{"label", "nodes", "traffic", "alive", "total", "usedCache", "restarted", "strategySwitched"} {
 		if value, exists := fields[key]; exists {
 			response[key] = value
 		}
 	}
 }
 
-// deleteRoute DELETE /subscriptions/{id}：clash 订阅先退出生产池并随行删
-// 快照行，再删订阅行；事务外回收快照目录与内核缓存产物，最后无出口回退
-// 直连（Python delete_subscription 同构）。
 func (h subscriptionHTTP) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	id, ok := subscriptionRouteID(w, r)
 	if !ok {
@@ -552,7 +563,6 @@ func (h subscriptionHTTP) deleteRoute(w http.ResponseWriter, r *http.Request) {
 		subscriptionError(w, http.StatusInternalServerError, "暂时无法删除订阅")
 		return
 	}
-	// 行已删，快照原始字节按订阅目录整体回收（内容寻址，行没了字节即孤儿）
 	_ = os.RemoveAll(filepath.Join(snapshotDir(h.dataDir), strconv.FormatInt(id, 10)))
 	if h.afterDelete != nil {
 		h.afterDelete(ctx, id, kind)
@@ -563,11 +573,8 @@ func (h subscriptionHTTP) deleteRoute(w http.ResponseWriter, r *http.Request) {
 	runResponse(w, http.StatusOK, map[string]any{"removed": true})
 }
 
-// errSubscriptionGone 删除窗口内订阅行已消失（并发删除守卫）。
 var errSubscriptionGone = errors.New("订阅不存在")
 
-// importRoute POST /subscriptions/{id}/import：拉取明文代理订阅并导入节点池
-// （Python import_plain_subscription 同构；非 plain 一律 400 逐字文案）。
 func (h subscriptionHTTP) importRoute(w http.ResponseWriter, r *http.Request) {
 	id, ok := subscriptionRouteID(w, r)
 	if !ok {
@@ -601,9 +608,6 @@ func (h subscriptionHTTP) importRoute(w http.ResponseWriter, r *http.Request) {
 	runResponse(w, http.StatusOK, stats)
 }
 
-// parsePlainProxyLine 明文代理行解析（Python parse_plain_proxy_line 同构，
-// 四格式：scheme://user:pass@host:port | host:port | host:port:user:pass |
-// user:pass@host:port；注释行与空行回 nil）。
 func parsePlainProxyLine(line string) map[string]any {
 	raw := strings.TrimSpace(line)
 	if raw == "" || strings.HasPrefix(raw, "#") {
@@ -669,8 +673,6 @@ func isDigits(s string) bool {
 	return true
 }
 
-// parsePlainProxyContent 响应原文 → 明文代理行列表（FetchOptions.ResponseParser
-// 装配形态；解析失败的行跳过）。
 func parsePlainProxyContent(raw []byte, _ string) ([]map[string]any, error) {
 	parsed := []map[string]any{}
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -681,8 +683,6 @@ func parsePlainProxyContent(raw []byte, _ string) ([]map[string]any, error) {
 	return parsed, nil
 }
 
-// importPlain 拉取与入库主链：抓取 → 快照落账 → 凭据密封逐行导入（按
-// host:port:解密用户名去重）→ 新行体检 → mark_imported → 走线事件。
 func (h subscriptionHTTP) importPlain(ctx context.Context, id int64, subURL string) (map[string]any, error) {
 	now := time.Now()
 	channels := BuildChannels(h.kernelProxyOf(ctx), h.poolChannelsOf(ctx))
@@ -736,8 +736,6 @@ func (h subscriptionHTTP) importPlain(ctx context.Context, id int64, subURL stri
 	if err != nil {
 		return nil, err
 	}
-	// 入库即体检：只测本次新增行（存量沿用既有 status，重测留给 6h 体检）；
-	// 失败保留数据，连败计数自然处置。逐条串行（登记差异：Python 并发 gather）。
 	if len(newIDs) > 0 {
 		checker := &ManualHealth{DB: h.db, Gate: h.gate, DataDir: h.dataDir}
 		alive := 0
@@ -772,8 +770,6 @@ func alive(stats map[string]any) int {
 	return 0
 }
 
-// ingestPlainNodes 逐行去重导入（去重键 = host + port + 解密后用户名）；
-// 新增行密封凭据落库。返回（added, skipped, 新增行 id 列表）。
 func ingestPlainNodes(ctx context.Context, conn *sql.Conn, dataDir string, parsed []map[string]any,
 ) (int, int, []int64, error) {
 	existing := map[string]bool{}
@@ -858,7 +854,6 @@ func stringOrDeref(v *string) string {
 	return *v
 }
 
-// markImported last_imported_at + last_stats 记账（Python mark_imported 同径）。
 func (h subscriptionHTTP) markImported(ctx context.Context, id int64, stats map[string]any) error {
 	encoded, err := json.Marshal(stats)
 	if err != nil {
@@ -872,7 +867,6 @@ func (h subscriptionHTTP) markImported(ctx context.Context, id int64, stats map[
 	})
 }
 
-// recordEvent 走线事件记账（失败只留日志不拖垮导入链，Python record_event 同径）。
 func (h subscriptionHTTP) recordEvent(ctx context.Context, kind, target string, statusCode any, durationMS int, errMsg any) {
 	_ = h.gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx,
@@ -882,8 +876,6 @@ func (h subscriptionHTTP) recordEvent(ctx context.Context, kind, target string, 
 	})
 }
 
-// autoswitchOnSubscription 导入有效订阅后自动切代理优先（Python
-// maybe_autoswitch_on_subscription 同构：直连 + 未显式选过 + 有存活节点）。
 func (h subscriptionHTTP) autoswitchOnSubscription(ctx context.Context, nodes int) bool {
 	if nodes <= 0 {
 		return false
@@ -924,7 +916,6 @@ func (h subscriptionHTTP) poolChannelsOf(ctx context.Context) []Channel {
 	return h.channels(ctx)
 }
 
-// fetchEvidence 失败错误 → 通道尝试留痕（对齐 Python getattr(exc, "attempts", [])）。
 func fetchEvidence(err error) ([]FetchAttempt, int) {
 	var ffe *FetchFailedError
 	var ufe *UnsupportedFormatError
@@ -943,7 +934,6 @@ func fetchEvidence(err error) ([]FetchAttempt, int) {
 	return nil, 0
 }
 
-// lastHTTPStatus 逆序首个 HTTP 状态码（Python persist 失败行同径）。
 func lastHTTPStatus(attempts []FetchAttempt) any {
 	for i := len(attempts) - 1; i >= 0; i-- {
 		if attempts[i].HTTPStatus != nil {

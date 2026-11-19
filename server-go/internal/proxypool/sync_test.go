@@ -12,7 +12,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// newSyncer 带桩 Fetch 的编排器（桩记录并发峰值，可按 URL 定制结果）。
 func newSyncer(t *testing.T, db *sql.DB, gate *store.WriteGate, dataDir string, fetch func(url string) (*FetchResult, error)) (*Syncer, *concurrencyProbe) {
 	t.Helper()
 	probe := &concurrencyProbe{}
@@ -91,7 +90,6 @@ func TestSyncAppliesSubscription(t *testing.T) {
 	if len(res.Failures) != 0 || res.NodeCount[subID] != 1 {
 		t.Fatalf("同步账目不符：%+v", res)
 	}
-	// Registry 对齐
 	var nodeCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM proxy_nodes`).Scan(&nodeCount); err != nil {
 		t.Fatal(err)
@@ -99,7 +97,6 @@ func TestSyncAppliesSubscription(t *testing.T) {
 	if nodeCount != 1 {
 		t.Fatalf("Registry 应有 1 节点，got %d", nodeCount)
 	}
-	// 快照账本：OK 行 + 原始字节落盘
 	var status, rawPath string
 	var nodeCountSnap int
 	if err := db.QueryRow(
@@ -117,7 +114,6 @@ func TestSyncAppliesSubscription(t *testing.T) {
 	if string(raw) != validSubscriptionBody {
 		t.Fatalf("落盘字节应与下载内容一致")
 	}
-	// 订阅行投影
 	var fetchStatus string
 	var lastError sql.NullString
 	if err := db.QueryRow(
@@ -154,7 +150,6 @@ func TestSyncFailureKeepsLastGoodSnapshot(t *testing.T) {
 	if _, err := s.SyncSubscriptions(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// 成功快照不被失败覆盖：OK 行恰 1 条（sha 仍指向第一轮内容）
 	var okCount int
 	if err := db.QueryRow(
 		`SELECT COUNT(*) FROM subscription_snapshots WHERE subscription_id = ? AND status = 'OK'`,
@@ -164,7 +159,6 @@ func TestSyncFailureKeepsLastGoodSnapshot(t *testing.T) {
 	if okCount != 1 {
 		t.Fatalf("失败不得新增 OK 快照行，got %d", okCount)
 	}
-	// 失败留痕行在场
 	var failedCount int
 	if err := db.QueryRow(
 		`SELECT COUNT(*) FROM subscription_snapshots WHERE subscription_id = ? AND status = 'FAILED'`,
@@ -181,7 +175,6 @@ func TestSyncFailureKeepsLastGoodSnapshot(t *testing.T) {
 	if lastError == "" {
 		t.Fatal("订阅行应带失败原因")
 	}
-	// 失败不触碰 Registry
 	var nodeCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM proxy_nodes`).Scan(&nodeCount); err != nil {
 		t.Fatal(err)
@@ -196,7 +189,6 @@ func TestSyncURLChangedGuard(t *testing.T) {
 	ctx := context.Background()
 	subID := addSubscription(t, db, dataDir, "https://sub.example.com/a")
 	s, _ := newSyncer(t, db, gate, dataDir, func(url string) (*FetchResult, error) {
-		// 下载期间订阅换了地址（模拟另一会话改绑）：闸内现读应拦下
 		sealed, err := SealURL(dataDir, "https://sub.example.com/ROTATED")
 		if err != nil {
 			t.Fatal(err)
@@ -367,7 +359,6 @@ func TestSyncSnapshotRestoreRoundTrip(t *testing.T) {
 		if len(snap.Attempts) != 1 || !snap.Attempts[0].OK {
 			t.Fatalf("恢复尝试留痕不符：%+v", snap.Attempts)
 		}
-		// 换链接后旧快照不得被选中
 		none, err := RestoreLatestSnapshot(ctx, conn, dataDir, subID, "https://other.example.com/x")
 		if err != nil || none != nil {
 			t.Fatalf("异 URL 查询应返回空：%v %v", none, err)
@@ -401,7 +392,6 @@ func TestSyncDeletedSubscriptionDuringFetch(t *testing.T) {
 func TestUnreadableURLPath(t *testing.T) {
 	db, gate, dataDir := newSubscriptionSyncDB(t)
 	ctx := context.Background()
-	// 写入一段伪密文（IsEncrypted 命中但解密必败）
 	res, err := db.Exec(`INSERT INTO proxy_subscriptions (url) VALUES (?)`, "enc1:not-a-real-token")
 	if err != nil {
 		t.Fatal(err)
@@ -427,7 +417,6 @@ func TestUnreadableURLPath(t *testing.T) {
 }
 
 func TestSyncRawOrphanOnRollbackKeepsFileIdempotent(t *testing.T) {
-	// 内容寻址落盘幂等：同一内容二次写不重复落文件
 	dataDir := t.TempDir()
 	path, err := writeRaw(dataDir, 3, "abc", []byte("hello"))
 	if err != nil {

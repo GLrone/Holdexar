@@ -1,16 +1,27 @@
 package proxypool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func allowLocalDirectForTest(t *testing.T) {
+	t.Helper()
+	defaultDirectDialer = (&net.Dialer{Timeout: 8 * time.Second}).DialContext
+	t.Cleanup(func() { defaultDirectDialer = nil })
+}
 
 const validSubscriptionBody = "proxies:\n  - {name: 测试节点, type: ss, server: a.example.com, port: 443, cipher: aes-256-gcm, password: p}\n"
 
@@ -32,7 +43,6 @@ func slowBody(t *testing.T, delay time.Duration, body string, status int) http.H
 	}
 }
 
-// TestFetchHedgeWinner 双出口竞速：慢直连 + 快代理，快通道先返回有效内容获胜。
 func TestFetchHedgeWinner(t *testing.T) {
 	fast := muxServer(t, slowBody(t, 30*time.Millisecond, validSubscriptionBody, 200))
 	channels := []Channel{
@@ -56,7 +66,6 @@ func TestFetchHedgeWinner(t *testing.T) {
 	}
 }
 
-// TestFetchInvalidFastDoesNotWin 快通道返回无效内容：不获胜，慢通道的有效内容胜出。
 func TestFetchInvalidFastDoesNotWin(t *testing.T) {
 	slow := muxServer(t, slowBody(t, 120*time.Millisecond, validSubscriptionBody, 200))
 	fast := muxServer(t, slowBody(t, 20*time.Millisecond, "<html>劫持页</html>", 200))
@@ -73,13 +82,11 @@ func TestFetchInvalidFastDoesNotWin(t *testing.T) {
 	if res.Channel != ChannelKernel {
 		t.Fatalf("无效内容不得获胜，获胜应为慢的有效通道，got %s", res.Channel)
 	}
-	// 尝试留痕：快通道 unsupported + 慢通道成功，顺序按完成时间
 	if len(res.Attempts) != 2 || res.Attempts[0].OK || !res.Attempts[1].OK {
 		t.Fatalf("尝试留痕不符：%+v", res.Attempts)
 	}
 }
 
-// TestFetchParallelismCap 单订阅出口竞速并发上限（默认 2）。
 func TestFetchParallelismCap(t *testing.T) {
 	var inflight, peak atomic.Int64
 	release := make(chan struct{})
@@ -125,7 +132,6 @@ func TestFetchParallelismCap(t *testing.T) {
 	}
 }
 
-// TestFetchDeadline 所有出口挂起：整体 deadline 截停，留痕含 subscription_deadline。
 func TestFetchDeadline(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
@@ -162,13 +168,12 @@ func TestFetchDeadline(t *testing.T) {
 	}
 }
 
-// TestFetchValidationChain 内容校验链：非 200 / 空体 / 非 YAML / 编码坏。
 func TestFetchValidationChain(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
 		body   string
-		want   string // 期望错误类型
+		want   string
 	}{
 		{"非200", 503, validSubscriptionBody, "*proxypool.FetchFailedError"},
 		{"空体", 200, "", "*proxypool.EmptyNodeSetError"},
@@ -189,7 +194,6 @@ func TestFetchValidationChain(t *testing.T) {
 			t.Fatalf("%s：期望 %s，got %T %v", c.name, c.want, err, err)
 		}
 	}
-	// UA 必须带 clash 关键字（面板按 UA 分流订阅格式）
 	var gotUA string
 	srv := muxServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotUA = r.Header.Get("User-Agent")
@@ -205,7 +209,6 @@ func TestFetchValidationChain(t *testing.T) {
 	}
 }
 
-// TestEgressPreference 首选出口排序：preferred 优先启动。
 func TestEgressPreference(t *testing.T) {
 	var mu sync.Mutex
 	var order []string
@@ -217,7 +220,6 @@ func TestEgressPreference(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(validSubscriptionBody))
 	})
-	// 两个通道同一服务器，仅 egress id 不同；preferred 应先发车
 	channels := []Channel{
 		{Name: "x", Proxy: srv.URL, EgressID: "pool:1"},
 		{Name: "y", Proxy: srv.URL, EgressID: "runtime"},
@@ -230,5 +232,213 @@ func TestEgressPreference(t *testing.T) {
 	}
 	if len(order) < 1 {
 		t.Fatal("应至少发出一次请求")
+	}
+}
+
+func scriptedRedirectClient(responses []http.Response) func(Channel) (*http.Client, error) {
+	return func(Channel) (*http.Client, error) {
+		var idx atomic.Int32
+		return &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				i := int(idx.Add(1)) - 1
+				if i >= len(responses) {
+					i = len(responses) - 1
+				}
+				r := responses[i]
+				hdr := http.Header{}
+				for k, v := range r.Header {
+					hdr[k] = v
+				}
+				body := []byte(nil)
+				if r.Body != nil {
+					body, _ = io.ReadAll(r.Body)
+					r.Body = io.NopCloser(bytes.NewReader(body))
+				}
+				return &http.Response{
+					StatusCode: r.StatusCode,
+					Header:     hdr,
+					Body:       io.NopCloser(bytes.NewReader(body)),
+					Request:    req,
+				}, nil
+			}),
+		}, nil
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestFetchRedirectPolicyAndSSRFAndSizeLimit(t *testing.T) {
+	ch := []Channel{{Name: ChannelDirect, EgressID: ChannelDirect}}
+
+	res, err := FetchSubscription(context.Background(), "http://a.invalid/sub", ch, FetchOptions{
+		ClientFactory: scriptedRedirectClient([]http.Response{
+			{StatusCode: 302, Header: http.Header{"Location": {"http://b.invalid:8443/s2"}}},
+			{StatusCode: 302, Header: http.Header{"Location": {"https://c.invalid/s3"}}},
+			{StatusCode: 200, Body: io.NopCloser(strings.NewReader(validSubscriptionBody))},
+		}),
+	})
+	if err != nil || res.Fmt != FormatYAML {
+		t.Fatalf("<=3 hops should succeed: res=%v err=%v", res, err)
+	}
+
+	_, err = FetchSubscription(context.Background(), "http://a.invalid/sub", ch, FetchOptions{
+		ClientFactory: scriptedRedirectClient([]http.Response{
+			{StatusCode: 302, Header: http.Header{"Location": {"http://b.invalid/1"}}},
+			{StatusCode: 302, Header: http.Header{"Location": {"http://c.invalid/2"}}},
+			{StatusCode: 302, Header: http.Header{"Location": {"http://d.invalid/3"}}},
+			{StatusCode: 302, Header: http.Header{"Location": {"http://e.invalid/4"}}},
+			{StatusCode: 200, Body: io.NopCloser(strings.NewReader(validSubscriptionBody))},
+		}),
+	})
+	if err == nil || !strings.Contains(err.Error(), "订阅地址重定向过多") || !strings.Contains(err.Error(), "provider_redirect_blocked") {
+		t.Fatalf("4th hop should fail with redirect limit: %v", err)
+	}
+
+	called := false
+	_, err = FetchSubscription(context.Background(), "file:///etc/passwd", ch, FetchOptions{
+		ClientFactory: func(Channel) (*http.Client, error) {
+			called = true
+			return nil, errors.New("should not call")
+		},
+	})
+	if err == nil || called || !strings.Contains(err.Error(), "http/https") {
+		t.Fatalf("bad initial scheme failed check: called=%v err=%v", called, err)
+	}
+
+	for _, loc := range []string{"file:///C:/Windows/win.ini", "http://127.0.0.1:8080/internal", "http://169.254.169.254/latest/meta-data/"} {
+		_, err = FetchSubscription(context.Background(), "http://a.invalid/sub", ch, FetchOptions{
+			ClientFactory: scriptedRedirectClient([]http.Response{
+				{StatusCode: 302, Header: http.Header{"Location": {loc}}},
+				{StatusCode: 200, Body: io.NopCloser(strings.NewReader(validSubscriptionBody))},
+			}),
+		})
+		if err == nil || !strings.Contains(err.Error(), "provider_redirect_blocked") || strings.Contains(err.Error(), loc) {
+			t.Fatalf("unsafe redirect %q not blocked properly: %v", loc, err)
+		}
+	}
+
+	pad9M := validSubscriptionBody + strings.Repeat("# comment padding\n", 500000)
+	if len(pad9M) <= 8<<20 {
+		t.Fatalf("expected > 8MiB fixture, got %d", len(pad9M))
+	}
+	res, err = FetchSubscription(context.Background(), "http://a.invalid/9m", ch, FetchOptions{
+		ClientFactory: scriptedRedirectClient([]http.Response{
+			{StatusCode: 200, Body: io.NopCloser(strings.NewReader(pad9M))},
+		}),
+	})
+	if err != nil || len(res.ResolvedNodes) != 1 {
+		t.Fatalf("9MiB body should succeed under 20MiB limit: err=%v", err)
+	}
+	oversized := strings.Repeat("x", (20<<20)+1)
+	_, err = FetchSubscription(context.Background(), "http://a.invalid/huge", ch, FetchOptions{
+		ClientFactory: scriptedRedirectClient([]http.Response{
+			{StatusCode: 200, Body: io.NopCloser(strings.NewReader(oversized))},
+		}),
+	})
+	if err == nil || !strings.Contains(err.Error(), "provider_size_limit") || !strings.Contains(err.Error(), "订阅内容过大") {
+		t.Fatalf(">20MiB should fail with size limit: %v", err)
+	}
+}
+
+func TestFetchCancelExitsPromptlyWithoutSpin(t *testing.T) {
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+	})
+	var calls atomic.Int32
+	factory := func(Channel) (*http.Client, error) {
+		return &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					close(started)
+				}
+				<-req.Context().Done()
+				select {
+				case <-time.After(300 * time.Millisecond):
+				case <-unblock:
+				}
+				return nil, req.Context().Err()
+			}),
+		}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchSubscription(ctx, "http://sub.example.com/s", []Channel{
+			{Name: "a", EgressID: "a"},
+			{Name: "b", EgressID: "b"},
+		}, FetchOptions{
+			ClientFactory: factory,
+			TotalTimeout:  10,
+			HedgeDelay:    0.5,
+		})
+		done <- err
+	}()
+
+	<-started
+	canceledAt := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("取消后 FetchSubscription 应返回错误")
+		}
+		if elapsed := time.Since(canceledAt); elapsed > 120*time.Millisecond {
+			t.Fatalf("取消后未立即退出循环，耗时=%v", elapsed)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("取消后不应继续发射对冲通道，实际调用=%d", got)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("取消后 FetchSubscription 卡死或空转")
+	}
+}
+
+func TestDefaultClientFactoryBlocksDirectSSRFAndDNSFailure(t *testing.T) {
+	var hits atomic.Int32
+	localSrv := muxServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(validSubscriptionBody))
+	})
+
+	direct := []Channel{{Name: ChannelDirect, EgressID: ChannelDirect}}
+	for _, target := range []string{
+		localSrv.URL + "/sub",
+		"http://127.0.0.1:9/sub",
+		"http://[::1]:9/sub",
+		"http://169.254.169.254/latest/meta-data/",
+		"http://100.100.100.200/latest/meta-data/",
+		"http://198.18.0.1/sub",
+		"http://localhost:8080/sub",
+	} {
+		_, err := FetchSubscription(context.Background(), target, direct, FetchOptions{
+			RequestTimeout: 1,
+			TotalTimeout:   2,
+		})
+		if err == nil {
+			t.Fatalf("expected SSRF rejection for %s", target)
+		}
+		var ffe *FetchFailedError
+		if !errors.As(err, &ffe) || len(ffe.Attempts) == 0 || ffe.Attempts[0].Stage != "policy" {
+			t.Fatalf("target %s expected policy rejection attempt, got err=%v", target, err)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("local httptest server received %d direct SSRF hits, want 0", hits.Load())
+	}
+
+	u, _ := url.Parse("http://unresolvable-domain-for-ssrf-check.invalid/sub")
+	if err := checkRedirectTarget(context.Background(), u, false); err == nil {
+		t.Fatal("expected checkRedirectTarget to fail closed on DNS lookup error")
 	}
 }

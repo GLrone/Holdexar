@@ -1,16 +1,7 @@
 package proxypool
 
-// 出口账本落库（Python exitstats.py 对齐）：作业收尾把内存里的 (出口 × 端点)
-// 聚合写成 proxy_run_exits 行，并把生产结果回写节点健康账本（统一账本的第三条
-// 写入通道）。fail-soft 契约：观测绝不能变成生产依赖——写不进去返回错误交调用
-// 方降级，作业结果不受影响。
-//
-// 错误分类（与探测证据分桶，互不累加）：
-//   - 环境级失败：本作业所有出口都没拿到任何 Steam 响应——不构成任何节点证据；
-//   - 出口级失败：环境确认存活时，零响应出口的节点判 DEAD——DEAD 可自由复活，
-//     且不累加 consecutive_failures：退休判据只归健康探测，生产抖动永远无法把
-//     节点推向 RETIRED；
-//   - 成功：清零失败计数、清冷却并回 ACTIVE/STALE（可复活的最强证据）。
+// 错误分桶（互不累加）：全出口零响应视为环境失败不记证据；环境存活时零响应仅判 DEAD，不累加 consecutive_failures。
+// 生产成功清零失败计数与冷却并恢复 ACTIVE/STALE。
 
 import (
 	"context"
@@ -20,9 +11,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// ExitStatsRow 一条出口聚合行（对齐 Python ExitStatsCollector.rows() 的 stats
-// 形状：出口键 × 端点，请求按固定枚举分桶）。Uncertain / TunnelError 是探测
-// 路径可能附加的键（Python row.get() 短路语义），收集器行缺省为零值。
 type ExitStatsRow struct {
 	ExitIP       string
 	Endpoint     string
@@ -68,7 +56,6 @@ var exitSchemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS ix_proxy_run_exits_run_id ON proxy_run_exits (run_id)",
 }
 
-// EnsureExitStatsSchema 幂等建出口账本表与索引；ctx 由写闸租约的事务传入。
 func EnsureExitStatsSchema(ctx context.Context, exec interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }) error {
@@ -83,9 +70,6 @@ func EnsureExitStatsSchema(ctx context.Context, exec interface {
 	return nil
 }
 
-// RecordRunExits 插入本次作业的出口聚合行并回写生产证据，返回插入数。
-// runID=0（作业行没建起来）直接返回 0：没有作业身份的出口行无法归因。
-// 事务与提交归写闸；now 为 nil 用挂钟。
 func RecordRunExits(ctx context.Context, gate *store.WriteGate, runID int64,
 	rows []ExitStatsRow, nodeByExit map[string]string, now *time.Time) (int, error) {
 	if runID == 0 || len(rows) == 0 {
@@ -109,7 +93,6 @@ func RecordRunExits(ctx context.Context, gate *store.WriteGate, runID int64,
 			if endpoint == "" {
 				endpoint = "other"
 			}
-			// 未映射到节点的出口落 NULL（Python mapping.get 的缺省形态）
 			var nodeArg any
 			if name := nodeByExit[row.ExitIP]; name != "" {
 				nodeArg = name
@@ -134,8 +117,6 @@ func RecordRunExits(ctx context.Context, gate *store.WriteGate, runID int64,
 	return inserted, nil
 }
 
-// writebackProductionEvidence 生产结果回写节点健康账本。
-// lane 绑定提供运行名，节点指纹是另一种身份，不能拿运行名查 node_id。
 func writebackProductionEvidence(ctx context.Context, conn *sql.Conn,
 	rows []ExitStatsRow, nodeByExit map[string]string, stamp time.Time) error {
 	type exitAgg struct{ ok, noresp int64 }
@@ -161,8 +142,6 @@ func writebackProductionEvidence(ctx context.Context, conn *sql.Conn,
 	if len(byRuntime) == 0 {
 		return nil
 	}
-	// 环境存活按全部行判（含未映射到节点的出口）：任一出口拿到过 Steam 响应
-	// 即本机与上游链路可用，零响应出口才构成节点证据。
 	environmentAlive := false
 	for _, row := range rows {
 		if !row.Uncertain && exitRowOK(row) > 0 {
@@ -178,7 +157,6 @@ func writebackProductionEvidence(ctx context.Context, conn *sql.Conn,
 	if err != nil {
 		return err
 	}
-	// 仍归属订阅的节点才算「有来源」（归属是一对一的身份组成部分）。
 	sourced := map[string]bool{}
 	for _, row := range nodeRows {
 		if row.SubscriptionID.Valid {
@@ -220,9 +198,6 @@ func writebackProductionEvidence(ctx context.Context, conn *sql.Conn,
 	return nil
 }
 
-// LatestL0Delays 每个节点最近一次成功 L0 探测的延迟（node_id → ms）。
-// 出口槽排序的延迟事实源：缺条目 = 没测过或没成功过（排序按未测处理，
-// 不凭空造默认值）。延迟挂在节点行（L0 成功只更新 l0_delay_ms）。
 func LatestL0Delays(ctx context.Context, db *sql.DB) (map[string]int64, error) {
 	rows, err := db.QueryContext(ctx,
 		`SELECT node_id, l0_delay_ms FROM proxy_nodes WHERE l0_delay_ms IS NOT NULL`)

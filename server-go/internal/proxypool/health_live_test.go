@@ -1,12 +1,5 @@
 package proxypool
 
-// 真内核三层体检验收（核心门禁）：随包 holdexar-mihomo.exe 真实拉起（24 节点 + 20 探测
-// lane + 独立混合口），节点类型 http → 本桩 HTTP 代理 → 本桩目标，链路全程真实。
-// ①L0 经 lane 混合口与控制器 /delay 双路传输探测；②L1 经 lane 出口身份（回环
-// 拓扑下身份 = 回环地址，语义正确）；③L2 StoreBrowse 形状本地桩（成功晋升 /
-// 目标失败不罚 / 隧道失败判死）；④20 lane 并发两波不饥饿。
-// 内核不随仓库分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
-
 import (
 	"bufio"
 	"context"
@@ -46,7 +39,6 @@ const liveNodeCount = 24
 
 func liveNodeName(i int) string { return fmt.Sprintf("ProbeNode-%02d", i+1) }
 
-// liveProbeTarget 业务 / 回显 / 204 三合一目标；browseOK 可切失败档。
 type liveProbeTarget struct {
 	server   *httptest.Server
 	port     int
@@ -60,6 +52,7 @@ func newLiveProbeTarget(t *testing.T) *liveProbeTarget {
 	lt.browseOK.Store(true)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/generate_204", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2 * time.Millisecond) // 避免本机回环 <1ms 落入 mihomo delay=0 哨兵误报 503
 		lt.hits.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -76,8 +69,6 @@ func newLiveProbeTarget(t *testing.T) *liveProbeTarget {
 	mux.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("127.0.0.1"))
 	})
-	// 固定高位段监听：Windows 动态端口范围（本机 1024-15000）内的监听口
-	// 会被高频拨号的隐式源端口绑定撞上（WSAEADDRINUSE），测试目标一律避开。
 	listener, port := listenHighPort(t)
 	mux2 := mux
 	go func() { _ = http.Serve(listener, mux2) }()
@@ -88,7 +79,6 @@ func newLiveProbeTarget(t *testing.T) *liveProbeTarget {
 	return lt
 }
 
-// listenHighPort 在 ≥20000 段找一个空闲端口并监听。
 func listenHighPort(t *testing.T) (net.Listener, int) {
 	t.Helper()
 	for cand := 20400; cand < 20500; cand++ {
@@ -101,7 +91,6 @@ func listenHighPort(t *testing.T) (net.Listener, int) {
 	return nil, 0
 }
 
-// minimalSocks5Server 最小 SOCKS5 服务端（无认证，仅 CONNECT，IPv4/域名）。
 func minimalSocks5Server(t *testing.T) (port int) {
 	t.Helper()
 	listener, p := listenHighPort(t)
@@ -186,7 +175,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	target := newLiveProbeTarget(t)
 	targetURL := target.server.URL
 
-	// 24 节点配置 + 20 探测 lane + 独立混合口 / 控制器
 	mixedPort, err := clashcfg.FreeLocalPort()
 	if err != nil {
 		t.Fatal(err)
@@ -198,8 +186,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	var proxies strings.Builder
 	proxies.WriteString("proxies:\n")
 	for i := 0; i < liveNodeCount; i++ {
-		// 回环沙箱节点用 direct 出站：真实承载 lane listener → 组选择 →
-		// 适配器 → 目标的内核链路（http 节点适配器在本机回环有预拨号失败问题）
 		fmt.Fprintf(&proxies, "  - name: %s\n    type: direct\n", liveNodeName(i))
 	}
 	configText := fmt.Sprintf("mode: global\nlog-level: warning\nallow-lan: false\n"+
@@ -229,7 +215,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("冷启动应生成随机控制器密钥")
 	}
 
-	// 账本：临时库 + 24 节点行（runtime 名与内核配置一致）
 	db, gate, _ := newTestDB(t)
 	conn := mustConn(t, db)
 	if err := EnsureSchema(ctx, conn); err != nil {
@@ -253,7 +238,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("应读到 3 条在听探测 lane，实际 %d", len(lanes))
 	}
 
-	// ── ① L0：经各 lane 混合口对本地目标做传输探测，全部可达 ──────────────
 	for i, lane := range lanes[:3] {
 		node := liveNodeName(i)
 		if err := selectLiveGroup(t, runtime.ControllerURL, runtime.Secret, lane.Group, node); err != nil {
@@ -265,7 +249,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		}
 	}
 
-	// ── L0 整池（控制器 /delay，health.py 语义）：24 节点全通、延迟挂行 ────
 	started := time.Now()
 	outcomes, err := checker.L0CheckPool(ctx, names, ProbeOptions{URL: targetURL + "/generate_204", TimeoutMS: 3000})
 	if err != nil {
@@ -274,9 +257,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	if len(outcomes) != liveNodeCount {
 		t.Fatalf("L0 应有 %d 条结论，实际 %d", liveNodeCount, len(outcomes))
 	}
-	// 回环沙箱观测：mihomo 对回环 socks 链路的 /delay 有约 5-10% 的瞬态 503
-	// （失败探测 100% 到达目标并拿到 2xx，属内核回环 URLTest 瞬态，非节点不可
-	// 达）。验收对失败节点重走真池路径（重探同时自然补写延迟证据），上限 6 轮。
 	transient := 0
 	l0Opts := ProbeOptions{URL: targetURL + "/generate_204", TimeoutMS: 3000}
 	for round := 0; round < 12; round++ {
@@ -324,12 +304,10 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	if got := queryInt(t, db, `SELECT COUNT(*) FROM proxy_nodes WHERE l0_delay_ms IS NOT NULL`); got != liveNodeCount {
 		t.Fatalf("延迟应挂到全部节点行，实际 %d", got)
 	}
-	// L0 成功不落观测行；失败探次各留一行证据（含重试轮的瞬态失败）。
 	if n := countRows(t, db, `SELECT COUNT(*) FROM health_observations`); n != transient {
 		t.Fatalf("观测行应等于瞬态失败探次 %d，实际 %d", transient, n)
 	}
 
-	// ── ② L1：经 lane 出口身份；回环拓扑下身份 = 回环地址 ─────────────────
 	exitOutcomes, err := checker.ExitIPCheckPool(ctx, names, ExitProbeOptions{URL: targetURL + "/ip", Timeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +327,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("L1 观测应 %d 行，实际 %d", liveNodeCount, n)
 	}
 
-	// ── ③ L2 成功：本地 StoreBrowse 形状桩 → 业务准入晋升 ACTIVE ──────────
 	bizStart := time.Now()
 	bizOutcomes, err := checker.BusinessCheckPool(ctx, names,
 		BusinessProbeOptions{URL: targetURL + "/IStoreBrowseService/GetItems/v1/", Timeout: 15 * time.Second})
@@ -369,7 +346,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("L2 成功观测应 %d 行，实际 %d", liveNodeCount, n)
 	}
 
-	// ── ③ L2 目标失败：Steam 侧 500 归因 target → 不罚节点 ────────────────
 	target.browseOK.Store(false)
 	failOutcomes, err := checker.BusinessCheckPool(ctx, names,
 		BusinessProbeOptions{URL: targetURL + "/IStoreBrowseService/GetItems/v1/", Timeout: 15 * time.Second})
@@ -385,7 +361,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("目标服务故障不得罚节点，未保持 ACTIVE×0 失败的节点数=%d", got)
 	}
 
-	// ── ③ L2 隧道失败：目标整体失联 → 空体 502 → 归因节点 → fail-fast ─────
 	target.server.Close()
 	tunnelOutcomes, err := checker.BusinessCheckPool(ctx, names,
 		BusinessProbeOptions{URL: targetURL + "/IStoreBrowseService/GetItems/v1/", Timeout: 15 * time.Second})
@@ -401,7 +376,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("隧道失败应全部判死计 1 次，实际 %d", got)
 	}
 
-	// ── ④ 20 lane 并发不饥饿：两波探测在界内完成 ─────────────────────────
 	if bizElapsed > 60*time.Second {
 		t.Fatalf("L2 两波（20 lane 并发）耗时 %v，疑似饥饿", bizElapsed)
 	}
@@ -411,7 +385,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	}
 	t.Logf("实测耗时：L2 两波 %v，L0 全程 %v", bizElapsed, l0Elapsed)
 
-	// 冷却复位语义（真库验证）：DEAD 节点收到成功证据 → 复活清冷却
 	var ingest IngestionResult
 	alive := CheckRow{Name: names[0], Alive: true, ExitIP: "127.0.0.1", MS: 66, Probed: true}
 	if err := gate.WithWrite(ctx, store.PriorityBackground, func(c *sql.Conn) error {
@@ -429,8 +402,6 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 		t.Fatalf("复活后应为 ACTIVE，实际 %s", state.String)
 	}
 }
-
-// ── 实测辅助 ────────────────────────────────────────────────────────────────────────────
 
 func selectLiveGroup(t *testing.T, controllerURL, secret, group, node string) error {
 	t.Helper()

@@ -1,9 +1,5 @@
 package proxypool
 
-// 订阅快照账本（Python subscription.py 快照面）：一次成功抓取产出一份不可变
-// 记录，失败也留痕（不改变 Registry、不覆盖最近成功快照）。原始字节按 sha
-// 内容寻址落盘（订阅动辄数十 KB 不进库），行内只存路径。
-
 import (
 	"context"
 	"crypto/sha256"
@@ -21,13 +17,10 @@ import (
 	"holdexar/server-go/internal/secretbox"
 )
 
-// SecretPurposeSubscription 订阅链接静态加密用途串。
 const SecretPurposeSubscription = "proxy-subscription"
 
-// UnreadableMessage 链接解密失败的用户语言提示。
 const UnreadableMessage = "订阅链接无法在本机解密，请删除该订阅后重新添加"
 
-// SealURL 订阅链接落库前封装（空串原样返回）。
 func SealURL(dataDir, url string) (string, error) {
 	if url == "" {
 		return "", nil
@@ -35,7 +28,6 @@ func SealURL(dataDir, url string) (string, error) {
 	return secretbox.EncryptSecretIn(dataDir, url, SecretPurposeSubscription)
 }
 
-// OpenURL 密文 → 明文。存量明文原样返回；解密失败返回空串（密钥属主机绑定）。
 func OpenURL(dataDir, value string) string {
 	if value == "" || !secretbox.IsEncrypted(value) {
 		return value
@@ -47,12 +39,10 @@ func OpenURL(dataDir, value string) string {
 	return text
 }
 
-// URLMatches 快照 provenance 比对：存量值解密后与当前 URL 严格相等。
 func URLMatches(dataDir, stored, wanted string) bool {
 	return wanted != "" && OpenURL(dataDir, stored) == wanted
 }
 
-// FetchAttempt 一次通道尝试的留痕（失败报告的证物，事后改写即失去意义）。
 type FetchAttempt struct {
 	Channel    string
 	OK         bool
@@ -64,7 +54,6 @@ type FetchAttempt struct {
 	EgressID   string
 }
 
-// Snapshot 一次成功抓取的不可变产物（构造后调用方不得改写 Nodes）。
 type Snapshot struct {
 	SubscriptionID     int64
 	URL                string
@@ -88,7 +77,6 @@ type Snapshot struct {
 
 var egressIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,100}$`)
 
-// safeEgressID 非法形态一律按 NULL 处理。
 func safeEgressID(v string) any {
 	if v == "" || !egressIDPattern.MatchString(v) {
 		return nil
@@ -96,7 +84,6 @@ func safeEgressID(v string) any {
 	return v
 }
 
-// AttemptsJSON 通道尝试留痕落库文本（ensure_ascii=True 紧凑 JSON）。
 func AttemptsJSON(attempts []FetchAttempt) string {
 	items := make([]any, 0, len(attempts))
 	for _, a := range attempts {
@@ -119,14 +106,12 @@ func AttemptsJSON(attempts []FetchAttempt) string {
 			"error":       errorText,
 		})
 	}
-	// Python json.dumps 不 sort_keys：按字面量键序输出
 	text, _ := pyJSONEncodeOrderedASCII(items, []string{
 		"channel", "egress_id", "ok", "http_status", "format", "stage", "elapsed_ms", "error",
 	})
 	return text
 }
 
-// pyJSONEncodeOrderedASCII 按固定键序输出对象列表（对齐 Python dict 字面量序）。
 func pyJSONEncodeOrderedASCII(items []any, keyOrder []string) (string, error) {
 	var sb stringsBuilder
 	sb.WriteByte('[')
@@ -213,7 +198,6 @@ func pyEncodeOrderedValue(sb *stringsBuilder, v any, keyOrder []string) error {
 	return nil
 }
 
-// asciiEscapeLate ensure_ascii=True 后处理：非 ASCII 码点转 \uXXXX。
 func asciiEscapeLate(s string) string {
 	if isASCII(s) {
 		return s
@@ -263,12 +247,10 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// SnapshotDir 原始字节落盘目录。
 func snapshotDir(dataDir string) string {
 	return filepath.Join(dataDir, "proxypool", "snapshots")
 }
 
-// writeRaw 内容寻址落盘：相同内容只存一份；先 .tmp 再替换（避免半截文件）。
 func writeRaw(dataDir string, subscriptionID int64, sha string, raw []byte) (string, error) {
 	dir := filepath.Join(snapshotDir(dataDir), strconv.FormatInt(subscriptionID, 10))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -290,8 +272,6 @@ func writeRaw(dataDir string, subscriptionID int64, sha string, raw []byte) (str
 }
 
 // PersistSnapshot 快照落盘 + 写行。调用方负责事务边界：本函数不提交。
-// 落盘排在写入之前：文件是幂等的内容寻址写入，事务回滚后留孤儿文件远好过
-// 「事务提交了但原始字节没落盘」——后者会让恢复永远拿不回基线。
 func PersistSnapshot(ctx context.Context, conn *sql.Conn, dataDir string, snap *Snapshot) (int64, error) {
 	path, err := writeRaw(dataDir, snap.SubscriptionID, snap.Sha256, snap.RawContent)
 	if err != nil {
@@ -324,7 +304,6 @@ func PersistSnapshot(ctx context.Context, conn *sql.Conn, dataDir string, snap *
 	return res.LastInsertId()
 }
 
-// PersistFetchFailure 失败留痕行（不改变可恢复快照：sha256 为空、无 raw_path）。
 func PersistFetchFailure(ctx context.Context, conn *sql.Conn, in FailureRecord) error {
 	sealed, err := SealURL(in.DataDir, in.URL)
 	if err != nil {
@@ -352,7 +331,6 @@ func PersistFetchFailure(ctx context.Context, conn *sql.Conn, in FailureRecord) 
 	return err
 }
 
-// FailureRecord 失败留痕输入。
 type FailureRecord struct {
 	SubscriptionID int64
 	DataDir        string
@@ -370,7 +348,6 @@ func nilIfEmptyStr(s string) any {
 	return s
 }
 
-// pyDumpProviderJSON provider 节点元数据落库文本（默认分隔符 JSON）。
 func pyDumpProviderJSON(providerNodes map[string][]map[string]any) string {
 	names := make([]string, 0, len(providerNodes))
 	for name := range providerNodes {
@@ -399,8 +376,6 @@ func nodesToAny(nodes []map[string]any) []any {
 	return out
 }
 
-// RestoreLatestSnapshot 从最近一条成功快照行恢复 Snapshot（「上一份」唯一入口）。
-// url 非空时只认从该 URL 抓下来的成功快照（换链接后旧链接快照不算事实）。
 func RestoreLatestSnapshot(ctx context.Context, conn *sql.Conn, dataDir string, subscriptionID int64, url string) (*Snapshot, error) {
 	rows, err := conn.QueryContext(ctx, `SELECT id, sha256, format, raw_path, url, node_count,
 		http_status, content_type, source_channel, source_egress, profile_title,
@@ -446,7 +421,6 @@ func RestoreLatestSnapshot(ctx context.Context, conn *sql.Conn, dataDir string, 
 	return restoreSnapshotRow(dataDir, matched)
 }
 
-// snapshotRow 快照行的只读投影。
 type snapshotRow struct {
 	id                 int64
 	sha, format        sql.NullString
@@ -482,8 +456,7 @@ func restoreSnapshotRow(dataDir string, r *snapshotRow) (*Snapshot, error) {
 		}
 	}
 	if r.providerNodesJSON.Valid && r.providerNodesJSON.String != "" {
-		// provider 订阅的恢复依赖二级来源展开与 override 应用，未随本批迁移；
-		// 静默按 inline 解析会丢 provider 节点，fail-closed 报错。
+		// provider 订阅快照恢复暂不支持，fail-closed 报错以防丢失二级节点。
 		return nil, &SnapshotRecoveryError{Detail: "provider 订阅快照恢复暂不支持"}
 	}
 	fmt0 := r.format.String
@@ -524,15 +497,12 @@ func restoreSnapshotRow(dataDir string, r *snapshotRow) (*Snapshot, error) {
 	}, nil
 }
 
-// SnapshotRecoveryError 快照恢复失败（fail-closed：静默当成没有上一份会让
-// 来源对齐判空）。
 type SnapshotRecoveryError struct{ Detail string }
 
 func (e *SnapshotRecoveryError) Error() string {
 	return "订阅快照恢复失败：" + e.Detail
 }
 
-// parseStoredAttempts 恢复库内通道留痕（字段缺失/类型不符按缺省）。
 func parseStoredAttempts(payload string) []FetchAttempt {
 	if payload == "" {
 		return nil
@@ -570,7 +540,6 @@ func parseStoredAttempts(payload string) []FetchAttempt {
 	return out
 }
 
-// IsSnapshotRecovery 判定错误是否为快照恢复失败。
 func IsSnapshotRecovery(err error) bool {
 	var rec *SnapshotRecoveryError
 	return errors.As(err, &rec)

@@ -506,3 +506,58 @@ func TestFetchSettingsReanchorsRegisteredPriceTaskOnlyAfterCommit(t *testing.T) 
 		t.Fatalf("failed write changed runtime: interval=%d events=%v", interval, changes)
 	}
 }
+
+func TestPriceRepairMisfireRespectsDefaultGraceWhilePriceRefreshCatchesUp(t *testing.T) {
+	db, gate := runtimeFixture(t)
+	ctx := context.Background()
+	if _, err := db.Exec(`INSERT INTO app_settings(key,value_json) VALUES('crawl.auto_price','false') ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 6, 10, 0, 0, 0, beijing)
+	r := New(db, gate, events.NewBus(), Options{Now: func() time.Time { return now }})
+	var fired, missed []string
+	var mu sync.Mutex
+	scheduler := sched.NewScheduler(sched.WithOnEvent(func(e sched.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch e.Kind {
+		case sched.EventFire:
+			fired = append(fired, e.JobID)
+		case sched.EventMissed:
+			missed = append(missed, e.JobID)
+		}
+	}))
+	if err := r.RegisterSchedules(ctx, scheduler); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.StartSim(now)
+	if err := scheduler.SetNext("price_refresh", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := scheduler.SetNext("price_repair", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	scheduler.SimJump(now.Add(90 * time.Second))
+	scheduler.RunSim(now.Add(90 * time.Second))
+	scheduler.Stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	var refreshCount, repairFire, repairMissed int
+	for _, id := range fired {
+		switch id {
+		case "price_refresh":
+			refreshCount++
+		case "price_repair":
+			repairFire++
+		}
+	}
+	for _, id := range missed {
+		if id == "price_repair" {
+			repairMissed++
+		}
+	}
+	if refreshCount != 1 || repairFire != 0 || repairMissed == 0 {
+		t.Fatalf("expected price_refresh=1 price_repair=0 missed>0, got fired=%v missed=%v", fired, missed)
+	}
+}

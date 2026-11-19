@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// 测试全程用本地 httptest 桩或关死端口作探测目标，不触真实网络。
-
 type eventLog struct {
 	mu     sync.Mutex
 	events []string
@@ -30,7 +28,6 @@ func (l *eventLog) all() []string {
 	return append([]string(nil), l.events...)
 }
 
-// fastChecker 测试参数：阈值 2、单轮探测、零间隔，事件入 log。
 func fastChecker(log *eventLog) *Checker {
 	return &Checker{
 		Threshold:    2,
@@ -48,16 +45,16 @@ func deadURL(t *testing.T) string {
 		t.Fatalf("占位监听失败：%v", err)
 	}
 	url := "http://" + ln.Addr().String()
-	_ = ln.Close() // 关死端口：探测必然连接拒绝
+	_ = ln.Close()
 	return url
 }
 
 func TestSuccessResetsConsecutiveFailures(t *testing.T) {
 	c := fastChecker(&eventLog{})
-	c.PingURLs = []string{deadURL(t)} // 探测必败：计数只能靠成功请求清零
+	c.PingURLs = []string{deadURL(t)}
 
 	c.ReportFailure()
-	c.ReportSuccess() // 怀疑计数清零
+	c.ReportSuccess()
 	c.ReportFailure()
 	if c.IsOffline() {
 		t.Fatalf("成功清零后再失败一次不应到线确认断网")
@@ -75,12 +72,11 @@ func TestSuccessResetsConsecutiveFailures(t *testing.T) {
 func TestLiveProbeVetoesOffline(t *testing.T) {
 	log := &eventLog{}
 	c := fastChecker(log)
-	// 探测目标返回 503：状态码无关紧要，拿到响应即证明链路通
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
-	c.PingURLs = []string{deadURL(t), srv.URL} // 首目标死、次目标活
+	c.PingURLs = []string{deadURL(t), srv.URL}
 
 	for range 3 {
 		c.ReportFailure()
@@ -103,7 +99,6 @@ func TestConfirmOfflineWhenProbeFails(t *testing.T) {
 	if !c.IsOffline() {
 		t.Fatalf("到线且探测全败应确认断网")
 	}
-	// 断网期间不再累计：继续上报不改变状态，也不触发新核实
 	for range 5 {
 		c.ReportFailure()
 	}
@@ -125,7 +120,7 @@ func TestWaitUntilOnlineRecovers(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
 	defer srv.Close()
-	c.PingURLs = []string{dead, srv.URL} // 恢复后探测可通
+	c.PingURLs = []string{dead, srv.URL}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if !c.WaitUntilOnline(ctx) {

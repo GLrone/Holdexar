@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +22,7 @@ import (
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/store"
 	"holdexar/server-go/internal/storebrowse"
+	"holdexar/server-go/internal/timeutil"
 )
 
 var ErrBusy = errors.New("价格更新正在进行")
@@ -41,7 +42,7 @@ type Options struct {
 	ProxyLanes     func(context.Context) ([]proxypool.CrawlLane, error)
 	NetworkBlocked func(context.Context) bool
 	StoreBrowseURL string
-	// DataDir 数据目录（系列覆盖文件 series_overrides.json 装填源；空 = 无覆盖）。
+	// DataDir series_overrides.json 所在目录。
 	DataDir string
 }
 
@@ -63,9 +64,7 @@ type Runtime struct {
 	jobID, cycleID int64
 	scheduler      *sched.Scheduler
 
-	// ImportAppids 目录导入分类出口（serverd 注入 games.ImportAppids；nil =
-	// 端点按未装配 503 拒绝）。经注入而非直调 games 包：crawl→games→wishlist
-	// 的生产依赖边会让 wishlist 测试面成环。
+	// ImportAppids 注入目录导入处理（避免 crawl→games→wishlist 测试依赖成环；nil 返回 503）。
 	ImportAppids func(ctx context.Context, appids []any) (map[string]any, error)
 }
 
@@ -83,9 +82,9 @@ func New(db *sql.DB, gate *store.WriteGate, bus *events.Bus, opts Options) *Runt
 }
 
 func (r *Runtime) now() time.Time  { return r.opts.Now().In(beijing) }
-func timestamp(t time.Time) string { return t.Format("2006-01-02 15:04:05.000000") }
+func timestamp(t time.Time) string { return timeutil.FormatMicro(t) }
 
-var beijing = func() *time.Location { loc, _ := time.LoadLocation("Asia/Shanghai"); return loc }()
+var beijing = timeutil.Beijing
 
 func (r *Runtime) begin(parent context.Context) (context.Context, func(), error) {
 	if err := parent.Err(); err != nil {
@@ -620,9 +619,7 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 				resultMu.Unlock()
 				continue
 			}
-			// 即将推出且该区无购买答复（未开放预购）→ COMING_SOON 暂缓：
-			// 无价格付费游戏不入库，重探通道按 type=COMING_SOON 选候选，
-			// 开放预购/上线后正常入库转正（Python browse_store 判定序）
+			// 即将推出且无购买选项时标 COMING_SOON 暂缓并清 missing，待后续复查转正。
 			if (state == "missing" || state == "locked") && storebrowse.ComingSoon(item) {
 				if e := writer.MarkComingSoon(workCtx, id); e != nil {
 					r.opts.Log("标记即将推出暂缓失败：%v", e)
@@ -634,10 +631,7 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 				continue
 			}
 			if state == "missing" {
-				// 库内已知行未发售（release_date 在未来）：跳过落账只清账，
-				// 不走 COMING_SOON——那会把 import 分类覆写成暂缓；日期过后
-				// 自然恢复定价，误标的 missing 陈欠行一并清除（否则补抓每拍
-				// 重拾、永不收敛）
+				// 库内已知未发售行仅清误标 missing 跳过落账，防覆写 import 分类或每拍空转。
 				if releaseInFuture(game.ReleaseDate, r.now()) {
 					clearMissing = append(clearMissing, dbwriter.RegionPair{AppID: id, RegionCode: task.Region})
 					resultMu.Lock()
@@ -667,15 +661,12 @@ func (r *Runtime) runJob(ctx context.Context, cycleID int64, kind, scope, trigge
 				resultMu.Unlock()
 				continue
 			}
-			// 仅价格保存成功的条目收集捆绑包发现；按批去重（bundle_id）
 			for _, d := range storebrowse.BundleDiscoveries(items[entries[i].Game.AppID]) {
 				if _, dup := discoveries[d.BundleID]; !dup {
 					discoveries[d.BundleID] = d
 				}
 			}
 		}
-		// 捆绑包发现桩落库：游戏条目 purchase_options 白送的数据，失败仅记
-		// 日志不拖垮价格链路（发现渠道只负责把新包带进门，无价桩不随轮刷新）
 		if len(discoveries) > 0 {
 			list := make([]dbwriter.BundleDiscovery, 0, len(discoveries))
 			for _, d := range discoveries {
@@ -742,12 +733,10 @@ func uniqueStrings(s []string) []string {
 	for v := range set {
 		out = append(out, v)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
-// releaseInFuture 库内 release_date（YYYY-MM-DD）落在本日之后（未发售判据）；
-// 无法解析 = 不在未来（对齐 Python _release_in_future）。
 func releaseInFuture(releaseDate *string, now time.Time) bool {
 	if releaseDate == nil || *releaseDate == "" {
 		return false

@@ -1,7 +1,5 @@
 package proxypool
 
-// 池构建与重建钩子测试：合格集门禁、签名敏感性、构建三门禁、变化检测钩子。
-
 import (
 	"context"
 	"database/sql"
@@ -14,7 +12,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// poolTestDB 在既有夹具上补齐节点表与准入判定所需列。
 func poolTestDB(t *testing.T) (*sql.DB, *store.WriteGate, string) {
 	t.Helper()
 	db, gate, dir := newTestDB(t)
@@ -63,7 +60,6 @@ func TestEligibleNodesGates(t *testing.T) {
 	seedPoolSubscription(t, db, 1, AdmissionActive, "")
 	seedPoolSubscription(t, db, 2, AdmissionCandidate, "")
 	seedPoolSubscription(t, db, 3, nil, "")
-	// 订阅 4：流量已用尽（resource_block_reason）
 	seedPoolSubscription(t, db, 4, AdmissionActive, `{"traffic": "upload=90;download=10;total=100"}`)
 	seedPoolSubscription(t, db, 5, AdmissionActive, "")
 	seedPoolSubscription(t, db, 6, AdmissionActive, "")
@@ -76,13 +72,9 @@ func TestEligibleNodesGates(t *testing.T) {
 	seedPoolNode(t, db, "no-sub", NodeActive, nil, goodConfig("no-sub"))
 	seedPoolNode(t, db, "candidate-sub", NodeActive, int64(2), goodConfig("candidate-sub"))
 	seedPoolNode(t, db, "blocked-sub", NodeActive, int64(4), goodConfig("blocked-sub"))
-	// 配置不完整（缺 server）
 	seedPoolNode(t, db, "incomplete", NodeActive, int64(1), `{"type": "ss", "port": 1}`)
-	// 信息占位节点
 	seedPoolNode(t, db, "剩余流量：10GB", NodeActive, int64(5), goodConfig("x"))
-	// 订阅行不存在
 	seedPoolNode(t, db, "orphan-sub", NodeActive, int64(99), goodConfig("orphan-sub"))
-	// 订阅 6：admission NULL 按遗留语义仍算 ACTIVE（IsAdmitted 同口径）
 	seedPoolNode(t, db, "legacy-sub", NodeActive, int64(3), goodConfig("legacy-sub"))
 
 	nodes, err := EligibleNodes(ctx, conn, now)
@@ -120,19 +112,16 @@ func TestPoolSignatureSensitive(t *testing.T) {
 	if len(sig1) != 2 {
 		t.Fatalf("两节点应两条签名，实际 %v", sig1)
 	}
-	// 稳定：重复计算一致
 	sig1b, _ := PoolSignature(ctx, conn, t.TempDir(), now)
 	if PoolSignatureChanged(sig1, sig1b) {
 		t.Fatalf("重复计算签名应一致：%v vs %v", sig1, sig1b)
 	}
-	// 首条签名 = runtime_name:sha256(完整参数 JSON)；独立复核哈希输入
 	blob := `{"name":"n1","port":8443,"server":"s.example.com","type":"ss"}`
 	want := "n1:" + sha256Hex([]byte(blob))
 	if sig1[0] != want {
 		t.Fatalf("节点签名应 %s，实际 %s", want, sig1[0])
 	}
 
-	// 配置变化 → 签名变
 	if _, err := db.Exec(`UPDATE proxy_nodes SET normalized_config = ? WHERE runtime_name = 'n1'`,
 		`{"name": "n1", "type": "ss", "server": "s.example.com", "port": 8444}`); err != nil {
 		t.Fatal(err)
@@ -142,7 +131,6 @@ func TestPoolSignatureSensitive(t *testing.T) {
 		t.Fatalf("配置变化应改变签名")
 	}
 
-	// 数量相同但节点不同 → 签名变（比集合不比数量）
 	if _, err := db.Exec(`DELETE FROM proxy_nodes WHERE runtime_name = 'n2'`); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +140,6 @@ func TestPoolSignatureSensitive(t *testing.T) {
 		t.Fatalf("换节点应改变签名")
 	}
 
-	// 池文件读数：文件缺席返回空
 	if got := PoolFileNames(t.TempDir()); len(got) != 0 {
 		t.Fatalf("无池文件应返回空，实际 %v", got)
 	}
@@ -193,7 +180,6 @@ func TestBuildPoolWritesAndReplays(t *testing.T) {
 }
 
 func TestRenderPoolDuplicateRejected(t *testing.T) {
-	// 重名即拒绝不依赖数据库唯一约束兜底（renderPoolNodes 纯函数直测）。
 	nodes := []poolNodeRow{
 		{RuntimeName: "dup", Config: map[string]any{"type": "ss", "server": "s", "port": int64(1)}},
 		{RuntimeName: "dup", Config: map[string]any{"type": "ss", "server": "s", "port": int64(2)}},
@@ -212,10 +198,8 @@ func TestBuildPoolFailurePreservesOldPool(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	seedPoolSubscription(t, db, 1, AdmissionActive, "")
-	// dialer-proxy 指向同订阅不存在的名字 → 渲染在写盘前失败
 	seedPoolNode(t, db, "with-dp", NodeActive, int64(1),
 		`{"name": "with-dp", "type": "ss", "server": "s", "port": 1, "dialer-proxy": "缺失依赖"}`)
-	// 先放一个旧池，验证失败不破坏旧池
 	oldText := "proxies:\n  - name: old\n    type: direct\n"
 	if err := os.MkdirAll(filepath.Join(dir, "proxypool"), 0o755); err != nil {
 		t.Fatal(err)

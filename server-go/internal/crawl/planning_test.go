@@ -190,8 +190,6 @@ func TestPlanningFrozenEmptyScopeSurvivesJSON(t *testing.T) {
 	}
 }
 
-// B3 空区行即拾即清：missing 过冷却、blocked 过 7 天老化窗的空区行删除；
-// 新鲜行保留、非空区行不动、结果集不含空区。
 func TestMissingClearsStaleEmptyRegionRows(t *testing.T) {
 	p := plannerFixture(t)
 	ctx := context.Background()

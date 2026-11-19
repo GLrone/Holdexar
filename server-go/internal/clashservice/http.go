@@ -1,21 +1,17 @@
-// http.go clash 订阅内核控制面 9 条端点（对齐 Python domains/proxies/router.py
-// :207-392 的 /proxies/clash/* 面）：状态/安装/进度/启动/切换/点选/测速/测速
-// 进度/停止。错误映射：*StatusError 直接映射状态码与 detail，其余 500。
 package clashservice
 
 import (
 	"encoding/json"
 	"errors"
 	"net/http"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func reply(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 
-// replyService 统一服务调用应答：*StatusError → 对应状态码+detail，其余 500。
 func (s *Service) replyService(w http.ResponseWriter, r *http.Request, call func() (any, error)) {
 	result, err := call()
 	if err != nil {
@@ -30,8 +26,7 @@ func (s *Service) replyService(w http.ResponseWriter, r *http.Request, call func
 	reply(w, 200, result)
 }
 
-// readSubID 解析 {"subscriptionId": int}：required=false 时缺省/0 → nil（缺省
-// 用最近点选）；required=true 时缺失/非法 → FastAPI 422 形状（loc body）。
+// readSubID 解析 {"subscriptionId": int}；required=false 允许缺省/<=0 返回 nil，required=true 返回 422。
 func readSubID(w http.ResponseWriter, r *http.Request, required bool) (*int64, bool) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
 	var body struct {
@@ -51,8 +46,6 @@ func readSubID(w http.ResponseWriter, r *http.Request, required bool) (*int64, b
 	return body.SubscriptionID, true
 }
 
-// Register 装配 9 条控制面端点。固定字面量路径先注册，动态段歧义由 Go 1.22
-// ServeMux 精确字面量优先解决（Python router.py:203-204 的顺序要求不受影响）。
 func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/proxies/clash", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, s.StatusPayload(r.Context()))

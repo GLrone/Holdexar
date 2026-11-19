@@ -10,36 +10,29 @@ import (
 
 	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
-// 社区历史源观测合流：来源侧只产出观测，身份/币种/时间范围校验与统一写入
-// 全部在核心执行；INSERT OR IGNORE 语义保证社区点永不覆盖本地官方观测，
-// 卸载数据源不丢任何已合流历史。
+// 社区历史观测合流：核心统一校验落库，ON CONFLICT DO NOTHING 不覆盖官方观测。
 
-// CommunityObservation 单条社区历史观测（appid × region 级回填批次的成员）。
 type CommunityObservation struct {
 	SnapshotAt     time.Time // 裸北京时间（与官方观测同一把钟）
 	SubID          *int64    // 商品身份未知序列必须为 nil
-	PriceMinor     *int64    // 本币最小单位；缺失=无价点
+	PriceMinor     *int64
 	IsGold         bool
-	Currency       string // 本币币种（有价必填）
+	Currency       string
 	ProductUnknown bool   // 商品身份未知 → 独立序列，永不并入标准版
 	CnyFen         *int64 // 来源侧可自带折算；缺失时读路径按历史汇率回填
-	Source         string // 来源标注（行级 source 列），缺省 community
+	Source         string
 }
 
-// mergeBatchLimit 单批上限：超限拒绝，防一次性巨批长期占用写闸。
 const mergeBatchLimit = 5000
 
-// mergeChunk 每条 INSERT 语句的行数分块（只为语句规模；原子性由单事务保证）。
 const mergeChunk = 400
 
-// beijingFixedZone 裸北京时间（观测时间戳的规范位置，与官方观测同一把钟）。
-var beijingFixedZone = time.FixedZone("UTC+8", 8*3600)
+var beijingFixedZone = timeutil.ZoneUTC8
 
-// MergeCommunityHistory 校验并合流一批社区历史观测（BACKGROUND 写闸，单事务
-// 覆盖去重读、写入与派生重算）。返回新增行数。校验失败整批拒绝（错误带
-// 用户语言原因，由回填执行者记入同步状态），绝不落半批。
+// MergeCommunityHistory 在单次 BACKGROUND 写闸事务内校验、去重并合流观测，校验失败整批拒绝。
 func (w *Writer) MergeCommunityHistory(ctx context.Context, appid int64, region string, obs []CommunityObservation) (int, error) {
 	regionUpper := strings.ToUpper(strings.TrimSpace(region))
 	if regionUpper == "" {
@@ -59,7 +52,6 @@ func (w *Writer) MergeCommunityHistory(ctx context.Context, appid int64, region 
 
 	var inserted int64
 	err := w.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
-		// 身份核验：游戏必须存在——未知身份的观测不落库。
 		var exists int
 		if e := conn.QueryRowContext(ctx, `SELECT 1 FROM games WHERE appid=?`, appid).Scan(&exists); e != nil {
 			if errors.Is(e, sql.ErrNoRows) {
@@ -70,8 +62,7 @@ func (w *Writer) MergeCommunityHistory(ctx context.Context, appid int64, region 
 		if len(rows) == 0 {
 			return nil
 		}
-		// 佐证去重：与本地已识别行（官方观测/包通道）同日同价的点视为
-		// 同一观测的重复表达，直接跳过不落。
+		// 跳过与库内已识别行同日同价的观测，避免重复落库。
 		seen, e := identifiedDayPrices(ctx, conn, appid, regionUpper, rows)
 		if e != nil {
 			return e
@@ -169,7 +160,6 @@ func (w *Writer) validateCommunityRow(obs CommunityObservation) (communityRow, e
 	return row, nil
 }
 
-// identifiedDayPrices 收集窗口内已识别行（官方观测/包通道）的（日，价）集合。
 func identifiedDayPrices(ctx context.Context, conn *sql.Conn, appid int64, regionUpper string, rows []communityRow) (map[dayPriceKey]struct{}, error) {
 	lo, hi := rows[0].snapshotAt, rows[0].snapshotAt
 	for _, row := range rows {
@@ -202,8 +192,7 @@ func identifiedDayPrices(ctx context.Context, conn *sql.Conn, appid int64, regio
 	return seen, cursor.Err()
 }
 
-// communityInsertSQL 与官方 upsert 同一六段唯一键；社区行冲突即放弃
-//（DO NOTHING）——绝不覆盖官方观测的任何列。
+// 与 historyUpsertSQL 共用六段唯一键，冲突 DO NOTHING 不覆盖官方观测。
 const communityInsertSQL = `INSERT INTO game_price_history
 (appid, region_code, currency, price, original_price, discount_percent, sub_id,
 is_gold, version_suffix, is_bundle, price_status, cny_fen, discount_end_ts,
@@ -224,8 +213,6 @@ func (w *Writer) insertCommunityRows(ctx context.Context, conn *sql.Conn, appid 
 			end = len(rows)
 		}
 		for _, row := range rows[start:end] {
-			// original_price/discount_percent 等促销详情是官方观测的职责，
-			// 社区点一律 NULL/0；冲突放弃语义同时保证不覆盖官方值。
 			result, e := stmt.ExecContext(ctx,
 				appid, regionUpper, row.currency, row.price, nil, 0, row.subID,
 				row.isGold, nil, 0, priceStatusOf(row.price), row.cnyFen, nil,

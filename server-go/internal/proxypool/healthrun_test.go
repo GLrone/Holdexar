@@ -1,7 +1,5 @@
 package proxypool
 
-// 体检运行行编排测试：建轮即提交、收尾汇总、scheduled 读点、进度事件发布。
-
 import (
 	"context"
 	"database/sql"
@@ -33,7 +31,6 @@ func TestStartHealthRunCommitsImmediately(t *testing.T) {
 	if runID == 0 {
 		t.Fatal("应返回运行行 id")
 	}
-	// 建轮即提交：闸外读可见（探测的网络段在闸外进行时，台账已在）
 	var channel string
 	var startedAt sql.NullString
 	var totals [4]int64
@@ -89,7 +86,6 @@ func TestCurrentMaintenanceRunReadPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 无运行行 → nil
 	view, err := CurrentMaintenanceRun(ctx, db, dir)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +100,6 @@ func TestCurrentMaintenanceRunReadPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedNode(t, db, "n1", NodeActive, 0, int64(1))
-	// 观测行：L1×1 成功、L2×2（一成功一失败）
 	mustInsertObservation(t, db, "fp-n1", ProbeLevelL1, true, runID)
 	mustInsertObservation(t, db, "fp-n1", ProbeLevelL2, true, runID)
 	mustInsertObservation(t, db, "fp-n1", ProbeLevelL2, false, runID)
@@ -122,16 +117,13 @@ func TestCurrentMaintenanceRunReadPoint(t *testing.T) {
 	if view.ProbedL1 != 1 || view.ProbedL2 != 2 {
 		t.Fatalf("逐层计数应 l1=1 l2=2，实际 %+v", view)
 	}
-	// totals 来自池文件读数（无池文件 = 0）
 	if view.TotalL1 != 0 || view.TotalL2 != 0 {
 		t.Fatalf("无池文件 totals 应为 0，实际 %+v", view)
 	}
-	// startedAt 是 isoformat 形态
 	if want := pyIsoFormat(pyTimeText(started)); view.StartedAt != want {
 		t.Fatalf("startedAt 应 %s，实际 %s", want, view.StartedAt)
 	}
 
-	// manual 通道运行行不被本读点负责
 	manualID, err := StartHealthRun(ctx, gate, "manual", nil, started)
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +133,6 @@ func TestCurrentMaintenanceRunReadPoint(t *testing.T) {
 		t.Fatalf("manual 运行不得顶替 scheduled 读点：%+v", view2)
 	}
 
-	// 已收尾 → nil
 	if err := FinishHealthRun(ctx, gate, runID, HealthRunSummary{Total: 2}, time.Now(), 100); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +159,6 @@ func TestPublishProbeProgressGated(t *testing.T) {
 	sub := bus.Subscribe()
 	defer bus.Unsubscribe(sub)
 
-	// 预约位缺省关：不发布
 	total := 10
 	PublishProbeProgress(bus, ProbeLevelL1, 3, &total)
 	if _, err := sub.Get(testCtx(150 * time.Millisecond)); err == nil {
@@ -198,7 +188,6 @@ func TestPublishProbeProgressGated(t *testing.T) {
 		t.Fatalf("进度数值不对：%v", got)
 	}
 
-	// total 缺席：不下发 total 键
 	PublishProbeProgress(bus, ProbeLevelL2, 5, nil)
 	ev2, err := sub.Get(testCtx(200 * time.Millisecond))
 	if err != nil {
@@ -210,11 +199,9 @@ func TestPublishProbeProgressGated(t *testing.T) {
 		}
 	}
 
-	// bus 为 nil：静默
 	PublishProbeProgress(nil, ProbeLevelL1, 1, &total)
 }
 
-// testCtx 测试用短超时上下文（到期即释放，避免 vet lostcancel）。
 func testCtx(d time.Duration) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	go func() {

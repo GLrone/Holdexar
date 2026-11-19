@@ -1,17 +1,4 @@
-// Package sched：进程内周期任务调度内核。
-//
-// 语义约定：
-//   - 触发器只回答「严格晚于某时刻的下一次触发」：interval 网格锚定注册时刻不漂移，
-//     每日任务为单时区日粒度；
-//   - 错过多拍默认合并为一拍补跑（取最新原定时刻），可改逐拍补跑（WithCoalesce(false)）；
-//   - 迟到宽限默认 1s，超宽限放弃该拍并出 missed 事件；需迟到必补的任务（价格主轮）
-//     用 WithMisfireUnlimited 无限宽限；
-//   - 单实例互斥默认开启：上轮未完成时到点即跳拍并出 skip 事件；
-//   - 运行体内 SetNext 重锚下次触发，后到生效并覆盖触发器默认续排，续排仅作兜底；
-//   - Stop 停机不等在跑任务：已排触发作废、立即返回，在跑数量记录在 stop 事件。
-//
-// 时区：包内嵌 tzdata，Windows 无系统时区库时 DefaultLoc 仍可用。
-// 测试：StartSim/RunSim/SimJump 提供离散事件模拟驱动，确定性验证语义，不睡真实时间。
+// Package sched 进程内周期任务调度器（默认合并漏拍、1s 宽限、单实例互斥；interval 网格锚定 Start）。
 package sched
 
 import (
@@ -21,18 +8,16 @@ import (
 	"time"
 )
 
-// 事件类别。
 const (
-	EventFire    = "fire"    // 到点执行
-	EventSkip    = "skip"    // 上轮未完成，跳拍
-	EventMissed  = "missed"  // 迟到超宽限，放弃该拍
-	EventSetNext = "setnext" // 重锚生效
-	EventStop    = "stop"    // 停机
-	EventPanic   = "panic"   // 运行体崩溃，已 recover
+	EventFire    = "fire"
+	EventSkip    = "skip"
+	EventMissed  = "missed"
+	EventSetNext = "setnext"
+	EventStop    = "stop"
+	EventPanic   = "panic"
 )
 
-// Event：调度事件（运行账挂点）。At 为实际处理时刻，Scheduled 为原定触发时刻
-// （setnext 事件中 Scheduled 携带新目标时刻）。
+// Event 调度事件；setnext 事件中 Scheduled 携带新目标时刻。
 type Event struct {
 	Kind      string
 	JobID     string
@@ -42,29 +27,25 @@ type Event struct {
 	Note      string
 }
 
-// RunCtx：任务运行体句柄。
 type RunCtx struct {
 	JobID     string
 	Label     string
-	Scheduled time.Time // 原定触发时刻
+	Scheduled time.Time
 
 	s *Scheduler
 	j *job
 }
 
-// Now：调度器当前时刻（模拟模式为模拟时钟）。
 func (rc *RunCtx) Now() time.Time { return rc.s.now() }
 
-// BusyFor：模拟模式登记运行体将持续占用 d（供单实例互斥判定）；
-// 真实模式占用以运行体实际返回为准，此调用无效果。
+// BusyFor 仅在模拟模式下登记占用时长，供单实例互斥判定。
 func (rc *RunCtx) BusyFor(d time.Duration) {
 	if rc.s.sim {
 		rc.j.busyUntil = rc.s.simNow.Add(d)
 	}
 }
 
-// SetNext：运行中重锚下次触发，后到生效并覆盖触发器默认续排；
-// 零值取消已排触发；过去时刻按普通迟到拍处理（受宽限政策约束）。
+// SetNext 覆盖默认续排并重锚下次触发；零值取消触发，过去时刻进入常规到期/宽限判定。
 func (rc *RunCtx) SetNext(t time.Time) {
 	if rc.s.sim {
 		rc.s.applySetNextLocked(rc.j, t)
@@ -100,19 +81,15 @@ type job struct {
 
 	next      time.Time
 	running   int
-	busyUntil time.Time // 模拟模式占用截止
+	busyUntil time.Time
 }
 
-// JobOption：任务注册选项。
 type JobOption func(*job)
 
-// WithLabel：任务标签（运行账展示名，随事件下发）。
 func WithLabel(label string) JobOption { return func(j *job) { j.label = label } }
 
-// WithCoalesce：错过多拍是否合并为一拍（默认开；关闭则逐拍补跑）。
 func WithCoalesce(on bool) JobOption { return func(j *job) { j.coalesce = on } }
 
-// WithMaxInstances：并发实例上限（默认 1；非正值保持默认）。
 func WithMaxInstances(n int) JobOption {
 	return func(j *job) {
 		if n > 0 {
@@ -121,23 +98,17 @@ func WithMaxInstances(n int) JobOption {
 	}
 }
 
-// WithMisfireUnlimited：无限宽限——迟到多久都补跑最新一拍（价格主轮）。
 func WithMisfireUnlimited() JobOption { return func(j *job) { j.grace = nil } }
 
-// WithMisfireGrace：迟到超过宽限即放弃该拍（出 missed 事件）。
 func WithMisfireGrace(d time.Duration) JobOption { return func(j *job) { g := d; j.grace = &g } }
 
-// defaultMisfireGrace：全局迟到宽限默认 1s。
 func defaultMisfireGrace() *time.Duration { g := time.Second; return &g }
 
-// SchedulerOption：调度器构造选项。
 type SchedulerOption func(*Scheduler)
 
-// WithOnEvent：事件回调（运行账挂点）。回调在调度器内部锁外执行，可安全调用
-// Scheduler 方法；真实模式下并发事件到达顺序以 At 为准。
+// WithOnEvent 回调在内部锁外执行，可安全重入 Scheduler；并发事件时序以 At 为准。
 func WithOnEvent(fn func(Event)) SchedulerOption { return func(s *Scheduler) { s.onEvent = fn } }
 
-// Scheduler：周期任务调度器。零值不可用，经 NewScheduler 构造。
 type Scheduler struct {
 	mu      sync.Mutex
 	jobs    map[string]*job
@@ -154,7 +125,6 @@ type Scheduler struct {
 	wake    chan struct{}
 }
 
-// NewScheduler：构造调度器。
 func NewScheduler(opts ...SchedulerOption) *Scheduler {
 	s := &Scheduler{
 		jobs:   map[string]*job{},
@@ -173,8 +143,6 @@ func (s *Scheduler) Running() bool {
 	return s.started && !s.stopped
 }
 
-// Register：注册任务。重复 ID、空 ID、空运行体、调度器已停止均报错；
-// 调度器已启动时注册即时初锚并唤醒驱动。
 func (s *Scheduler) Register(id string, trig Trigger, body func(*RunCtx), opts ...JobOption) error {
 	if id == "" {
 		return errors.New("任务 ID 为空")
@@ -210,7 +178,6 @@ func (s *Scheduler) Register(id string, trig Trigger, body func(*RunCtx), opts .
 	return nil
 }
 
-// RegisterInterval：注册锚点 + 周期网格任务；当前时刻早于 start 时首拍即 start。
 func (s *Scheduler) RegisterInterval(id string, start time.Time, period time.Duration, body func(*RunCtx), opts ...JobOption) error {
 	if period <= 0 {
 		return errors.New("周期必须为正数")
@@ -218,7 +185,6 @@ func (s *Scheduler) RegisterInterval(id string, start time.Time, period time.Dur
 	return s.Register(id, IntervalTrigger{Start: start, Period: period}, body, opts...)
 }
 
-// RegisterDaily：注册每日固定时刻任务（DefaultLoc 时区）。
 func (s *Scheduler) RegisterDaily(id string, hour, minute int, body func(*RunCtx), opts ...JobOption) error {
 	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
 		return fmt.Errorf("每日时刻 %d:%02d 越界", hour, minute)
@@ -226,7 +192,6 @@ func (s *Scheduler) RegisterDaily(id string, hour, minute int, body func(*RunCtx
 	return s.Register(id, DailyTrigger{Hour: hour, Minute: minute}, body, opts...)
 }
 
-// SetNext：重锚指定任务的下次触发，后到生效并覆盖触发器默认续排。
 func (s *Scheduler) SetNext(id string, t time.Time) error {
 	s.mu.Lock()
 	j, ok := s.jobs[id]
@@ -243,7 +208,6 @@ func (s *Scheduler) SetNext(id string, t time.Time) error {
 	return nil
 }
 
-// Start：启动真实时钟驱动（非阻塞；停机用 Stop，不等在跑任务）。
 func (s *Scheduler) Start() {
 	s.mu.Lock()
 	if s.started || s.stopped {
@@ -260,7 +224,6 @@ func (s *Scheduler) Start() {
 	go s.runReal()
 }
 
-// StartSim：进入模拟模式并置当前时刻；未初锚任务按当前时刻推算首拍。
 func (s *Scheduler) StartSim(t time.Time) {
 	s.mu.Lock()
 	s.started = true
@@ -274,7 +237,6 @@ func (s *Scheduler) StartSim(t time.Time) {
 	s.mu.Unlock()
 }
 
-// RunSim：模拟驱动——处理当前时刻全部到期拍，再跳至最早下次触发，直至 end 或停机。
 func (s *Scheduler) RunSim(end time.Time) {
 	s.mu.Lock()
 	if !s.sim {
@@ -293,7 +255,6 @@ func (s *Scheduler) RunSim(end time.Time) {
 	s.flush()
 }
 
-// SimJump：模拟时钟直接跳到 t；期间到点的拍按错过拍处理。
 func (s *Scheduler) SimJump(t time.Time) {
 	s.mu.Lock()
 	s.simNow = t
@@ -339,12 +300,10 @@ func (s *Scheduler) poke() {
 	}
 }
 
-// emitLocked：持锁路径暂存事件，派发统一走 flush。
 func (s *Scheduler) emitLocked(e Event) {
 	s.pending = append(s.pending, e)
 }
 
-// emit：无锁调用方（真实模式运行体）路径。
 func (s *Scheduler) emit(e Event) {
 	s.mu.Lock()
 	s.emitLocked(e)
@@ -352,7 +311,6 @@ func (s *Scheduler) emit(e Event) {
 	s.flush()
 }
 
-// flush：锁外派发暂存事件；回调内产生的新事件继续排空。
 func (s *Scheduler) flush() {
 	for {
 		s.mu.Lock()
@@ -371,7 +329,6 @@ func (s *Scheduler) flush() {
 	}
 }
 
-// runReal：真实时钟驱动——定时器到点处理到期拍；注册/重锚经 wake 通道即时重排。
 func (s *Scheduler) runReal() {
 	for {
 		s.mu.Lock()
@@ -444,8 +401,6 @@ func (s *Scheduler) processAllDueLocked(now time.Time) {
 	}
 }
 
-// processDueLocked：单拍到点处理——错过拍合并、宽限判定、单实例互斥、
-// 默认续排先行落位作兜底，再执行运行体（运行体重锚后到生效）。
 func (s *Scheduler) processDueLocked(j *job, now time.Time) {
 	slot := j.next
 	if j.coalesce {
@@ -472,8 +427,7 @@ func (s *Scheduler) processDueLocked(j *job, now time.Time) {
 		return
 	}
 	j.running++
-	// 默认续排在运行体之前生效；运行体内 SetNext 随后覆盖——
-	// 重锚主导，触发器续排仅作重锚失败时的兜底。
+	// 默认续排先落位作兜底，运行体内调用 SetNext 时覆盖。
 	j.next = j.trig.Next(slot)
 	s.emitLocked(Event{Kind: EventFire, JobID: j.id, Label: j.label, Scheduled: slot, At: now})
 	rc := &RunCtx{JobID: j.id, Label: j.label, Scheduled: slot, s: s, j: j}
@@ -510,13 +464,11 @@ func (s *Scheduler) runBody(j *job, rc *RunCtx, at time.Time) {
 	j.body(rc)
 }
 
-// applySetNextLocked：模拟模式运行体路径（调用方已持锁，直接写入）。
 func (s *Scheduler) applySetNextLocked(j *job, t time.Time) {
 	j.next = t
 	s.emitLocked(Event{Kind: EventSetNext, JobID: j.id, Label: j.label, Scheduled: t, At: s.nowLocked()})
 }
 
-// setNextExternal：外部与真实模式运行体路径——取锁写入、派发事件并唤醒驱动重算定时。
 func (s *Scheduler) setNextExternal(j *job, t time.Time) {
 	s.mu.Lock()
 	j.next = t

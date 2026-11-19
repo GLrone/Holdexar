@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// runFor：在守卫 goroutine 里跑 Run，带超时兜底（防挂死拖死测试）。
 func runFor(t *testing.T, s *Scheduler, initial []Task) (returned chan struct{}) {
 	t.Helper()
 	returned = make(chan struct{})
@@ -28,8 +27,6 @@ func mustReturn(t *testing.T, returned chan struct{}, what string) {
 		t.Fatalf("Run 未收敛：%s", what)
 	}
 }
-
-// ── 基本并发与计数 ───────────────────────────────────────────────
 
 func TestPoolBasic(t *testing.T) {
 	r := NewRouter()
@@ -107,7 +104,6 @@ func TestPoolDoneDedupByID(t *testing.T) {
 	var calls atomic.Int64
 	_ = r.Register("work", func(*Context) error { calls.Add(1); return nil })
 	s := NewScheduler(r, WithWorkers(2))
-	// 同一任务重复投递：逐次执行，完成数按 ID 去重为一份
 	initial := []Task{
 		{ID: "x", Type: "work"},
 		{ID: "x", Type: "work"},
@@ -155,8 +151,6 @@ func TestPoolDynamicEnqueue(t *testing.T) {
 	}
 }
 
-// ── 停止语义 ─────────────────────────────────────────────────────
-
 func TestPoolStopDrainsQueue(t *testing.T) {
 	r := NewRouter()
 	release := make(chan struct{})
@@ -175,7 +169,7 @@ func TestPoolStopDrainsQueue(t *testing.T) {
 	returned := runFor(t, s, initial)
 	waitFor(t, "两个 worker 各领一题", func() bool { return started.Load() == 2 })
 
-	s.Stop() // 停止信号：在跑的继续跑完计数，队里的排干不计数
+	s.Stop()
 	close(release)
 	mustReturn(t, returned, "停止后排干收敛")
 
@@ -203,8 +197,6 @@ func TestPoolStopBeforeRun(t *testing.T) {
 	}
 }
 
-// ── 进度先于完成 ─────────────────────────────────────────────────
-
 func TestProgressBeforeDoneMark(t *testing.T) {
 	r := NewRouter()
 	_ = r.Register("work", func(*Context) error { return nil })
@@ -227,8 +219,6 @@ func TestProgressBeforeDoneMark(t *testing.T) {
 	}
 	mustReturn(t, runFor(t, s, initial), "10 个任务带进度回调")
 
-	// Run 返回时末条进度（done=10）必然已同步送达：完成标记以进度回调
-	// 先返回为前缀，若顺序颠倒此处会偶发失败
 	if !seenAll.Load() {
 		t.Fatalf("Run 返回前末条进度未送达")
 	}
@@ -256,13 +246,10 @@ func TestProgressTotalFixed(t *testing.T) {
 		lastTotal.Store(int64(p.Total))
 	}))
 	mustReturn(t, runFor(t, s, []Task{{ID: "root", Type: "work"}}), "动态追加")
-	// Total 固定为初始任务量，不随动态追加波动
 	if lastTotal.Load() != 1 {
 		t.Fatalf("Total 应固定为初始任务量 1，实际 %d", lastTotal.Load())
 	}
 }
-
-// ── lane 租借与冷却 ──────────────────────────────────────────────
 
 func TestLaneRentalSkipsUnhealthy(t *testing.T) {
 	r := NewRouter()
@@ -287,7 +274,7 @@ func TestLaneRentalSkipsUnhealthy(t *testing.T) {
 		}),
 	)
 	s.materializeLanes()
-	lanes[0].MarkUnhealthy() // 预置：一条 lane 不健康
+	lanes[0].MarkUnhealthy()
 
 	initial := make([]Task, 8)
 	for i := range initial {
@@ -317,11 +304,11 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 	r := NewRouter()
 	var (
 		mu    sync.Mutex
-		order []int // 任务依次落在哪条 lane（按 Client 值）
+		order []int
 	)
 	_ = r.Register("work", func(ctx *Context) error {
 		if ctx.Task.ID == "heal" {
-			ctx.Lane.MarkHealthy() // 探测成功：客户端复位健康标记
+			ctx.Lane.MarkHealthy()
 		}
 		mu.Lock()
 		order = append(order, ctx.Lane.Client.(int))
@@ -338,7 +325,7 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 			return l
 		}),
 	)
-	s.laneWait = time.Millisecond // 测试缩短岗位等待轮询
+	s.laneWait = time.Millisecond
 
 	s.materializeLanes()
 	lanes[0].MarkUnhealthy()
@@ -349,8 +336,6 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 		{ID: "heal", Type: "work"},
 	})
 
-	// 两条 lane 都被初始清扫隔离后，逐个把冷却时刻拨到「已到期」，
-	// 驱动冷却到期 → 探路位 → 真任务验证 的流程
 	waitFor(t, "两条 lane 进冷却区", func() bool {
 		s.laneMu.Lock()
 		defer s.laneMu.Unlock()
@@ -374,15 +359,14 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 		})
 	}
 
-	expire(lanes[0])   // t1：lane0 冷却到期以探路位返回
-	waitForOrder(1, 2) // 探路失败，归还清扫回冷却区（lane0+lane1）
+	expire(lanes[0])
+	waitForOrder(1, 2)
 	mu.Lock()
 	first := order[0]
 	mu.Unlock()
 	if first != 0 {
 		t.Fatalf("t1 应落在探路位 lane0，实际 %v", orderSnapshot(&mu, &order))
 	}
-	// t1 验证失败仍不健康：归还清扫应带新的完整冷却期回冷却区
 	s.laneMu.Lock()
 	fresh := s.cooldownUntil[lanes[0]].Sub(s.clock.Now()) > LaneCooldown/2
 	s.laneMu.Unlock()
@@ -390,8 +374,8 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 		t.Fatalf("探路失败 lane 应在归还清扫时进冷却区并刷新到期时刻")
 	}
 
-	expire(lanes[1])   // t2：lane1 冷却到期以探路位返回
-	waitForOrder(2, 2) // 探路失败，归还清扫回冷却区
+	expire(lanes[1])
+	waitForOrder(2, 2)
 	mu.Lock()
 	second := order[1]
 	mu.Unlock()
@@ -399,8 +383,8 @@ func TestLaneCooldownProbeFlow(t *testing.T) {
 		t.Fatalf("t2 应落在探路位 lane1，实际 %v", orderSnapshot(&mu, &order))
 	}
 
-	expire(lanes[1])   // t3（heal）：探路成功复位，lane 留在岗位池
-	waitForOrder(3, 1) // 仅 lane0 留在冷却区
+	expire(lanes[1])
+	waitForOrder(3, 1)
 	mustReturn(t, returned, "探路位流程收敛")
 
 	mu.Lock()

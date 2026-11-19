@@ -6,9 +6,6 @@ import (
 	"testing"
 )
 
-// TestAppIDFreshnessBucketsAndPending 对象级新鲜度钉住：档位边界（6h/12h）、
-// 启用区过滤（非启用区不进明细也不进对象时钟）、pending 未观察目标
-// （失败任务挂账 / skipUnits 已跳过 / 取消轮排除）。
 func TestAppIDFreshnessBucketsAndPending(t *testing.T) {
 	r, db := readFixture(t)
 	ctx := context.Background()
@@ -23,36 +20,23 @@ func TestAppIDFreshnessBucketsAndPending(t *testing.T) {
 		exec(`INSERT INTO game_current_prices(appid,region_code,discount_percent,fail_count,price_status,attempt_outcome,steam_answer,last_success_at,updated_at)
 		      VALUES(?,?,0,0,?,?,?,?,?)`, appid, region, status, outcome, answer, success, updated)
 	}
-	// 10: cn 成功观察 2h → fresh；us 行在但非启用区，不得拖旧对象时钟
-	// （region_code 与生产同约定大写：units SQL 的 JOIN 与明细查找均按大写匹配）
 	price(10, "CN", "ok", "success", "ok", "2026-11-06 10:00:00", "2026-11-06 10:00:00")
 	price(10, "US", "ok", "success", "ok", "2026-11-05 20:00:00", "2026-11-05 20:00:00")
-	// 20: 无任何行 → notAttempted + 三值全空
-	// 30: 5h → fresh，但 outcome=failed 且未 blocked → pending
 	price(30, "CN", "missing", "failed", "", "2026-11-06 07:00:00", "2026-11-06 07:00:00")
-	// 40: 11h → lagging；50: 16h → stale
 	price(40, "CN", "ok", "success", "ok", "2026-11-06 01:00:00", "2026-11-06 01:00:00")
 	price(50, "CN", "ok", "success", "ok", "2026-11-05 20:00:00", "2026-11-05 20:00:00")
-	// 70: 成功观察但目标未结算（观察早于 targetStartedAt）→ pending
 	price(70, "CN", "ok", "success", "ok", "2026-11-06 09:00:00", "2026-11-06 09:00:00")
-	// 60: 有成功观察但早于挂账阈值；skipUnits 已结算 → 不 pending（缺行单元
-	// 无论挂账与否恒 pending——notAttempted 分支，故必须给行才能观察 skip）
 
 	exec(`INSERT INTO price_cycles(id,kind,status,scope,expected_json) VALUES(9,'scheduled','cancelled','pool','{}')`)
 	job := func(id int64, status, stats string) {
 		t.Helper()
 		exec(`INSERT INTO crawl_jobs(id,kind,status,mode,cycle_id,stats_json,started_at) VALUES(?,'manual',?,'app',NULL,?,'2026-11-06 08:00:00')`, id, status, stats)
 	}
-	// 60 被 job1 挂账、被 job2 skipUnits 覆盖 → 已结算不 pending（观察 07:00
-	// 早于阈值 08:00，价格侧不结算，只能靠 skip）
 	price(60, "CN", "ok", "success", "ok", "2026-11-06 07:00:00", "2026-11-06 07:00:00")
 	job(1, "failed", `{"targets":{"appids":[60],"regions":["CN"]},"targetStartedAt":"2026-11-06T08:00:00"}`)
 	job(2, "failed", `{"skipUnits":["60:CN"],"targetStartedAt":"2026-11-06T09:00:00"}`)
-	// 10 的挂账已被更新观察结算 → 不 pending
 	job(3, "failed", `{"targets":{"appids":[10],"regions":["CN"]},"targetStartedAt":"2026-11-06T09:00:00"}`)
-	// 70 挂账未结算（观察 09:00 早于阈值 10:00）→ pending
 	job(4, "failed", `{"targets":{"appids":[70],"regions":["CN"]},"targetStartedAt":"2026-11-06T10:00:00"}`)
-	// 80 挂在已取消轮上 → 排除不 pending（同样需给行：缺行单元恒 pending）
 	price(80, "CN", "ok", "success", "ok", "2026-11-06 07:00:00", "2026-11-06 07:00:00")
 	job(5, "failed", `{"targets":{"appids":[80],"regions":["CN"]},"targetStartedAt":"2026-11-06T10:00:00"}`)
 	exec(`UPDATE crawl_jobs SET cycle_id=9 WHERE id=5`)

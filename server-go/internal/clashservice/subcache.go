@@ -1,6 +1,3 @@
-// 每订阅缓存文件：原文缓存 clash-sub-{id}.yaml 与项目渲染的运行配置
-// clash-sub-{id}.runtime.yaml。命名与 Python clash_manager.py 逐字符对齐
-// （_subscription_id_of 反解依赖这份命名约定）。
 package clashservice
 
 import (
@@ -20,14 +17,11 @@ import (
 
 const runtimeSuffix = ".runtime.yaml"
 
-// SubscriptionConfigPath 每条订阅各存一份配置缓存（data/clash/clash-sub-{id}.yaml）。
-// 这份文件是原始订阅正文：来源证据与离线缓存，不直接交给内核。
 func SubscriptionConfigPath(dataDir string, subID int64) string {
 	return filepath.Join(clashkernel.KernelDir(dataDir), fmt.Sprintf("clash-sub-%d.yaml", subID))
 }
 
-// SubscriptionIDOf 从缓存路径反解订阅 id（clash-sub-{id}.yaml）；
-// 共享单文件与非法命名返回 false——没有订阅身份就没有归属对象。
+// SubscriptionIDOf 从 clash-sub-{id}.yaml 反解订阅 ID；其他命名返回 false。
 func SubscriptionIDOf(configPath string) (int64, bool) {
 	stem := strings.TrimSuffix(filepath.Base(configPath), filepath.Ext(configPath))
 	if !strings.HasPrefix(stem, "clash-sub-") {
@@ -40,10 +34,7 @@ func SubscriptionIDOf(configPath string) (int64, bool) {
 	return id, true
 }
 
-// MaterializeSubscriptionConfig 原始订阅缓存 → 内核实际加载的运行配置。
-// 原文保持不动（来源证据，同一份原文总渲染出同一份运行配置）；
-// 入参已是运行配置时优先从配对原文重新生成。渲染失败按 400 语义返回
-// （Python ValueError → switch 400 / 启动候选淘汰）。
+// MaterializeSubscriptionConfig 从原文缓存渲染运行配置（原文保持不动）；渲染失败返回 400。
 func MaterializeSubscriptionConfig(rawPath string) (string, error) {
 	out := rawPath
 	source := rawPath
@@ -70,8 +61,7 @@ func MaterializeSubscriptionConfig(rawPath string) (string, error) {
 	return out, nil
 }
 
-// FetchSubscriptionToCache 从库内最近一次成功快照恢复订阅缓存正文
-// （在线拉取失败/无需联网时的兜底）。含「订阅地址与缓存归属不一致」守卫。
+// FetchSubscriptionToCache 从最近成功快照恢复缓存，含订阅 URL 归属校验。
 func (s *Service) FetchSubscriptionToCache(ctx context.Context, subID int64, subURL string) (*SubscriptionFetch, error) {
 	var stored string
 	err := s.DB.QueryRowContext(ctx, `SELECT url FROM proxy_subscriptions WHERE id=?`, subID).Scan(&stored)
@@ -107,8 +97,6 @@ func (s *Service) writeCacheFromSnapshot(subID int64, subURL string, raw []byte,
 	return &SubscriptionFetch{Raw: raw, Title: title, Userinfo: userinfo, Nodes: nodes}, nil
 }
 
-// subscriptionAutoNameFromURL 无面板名时的取名兜底：URL 末段（去 query，percent
-// 解码）；末段是看不出含义的凭据时返回空串——「无名称」比假名字诚实。
 func subscriptionAutoNameFromURL(rawURL string) string {
 	path := rawURL
 	if idx := strings.Index(path, "?"); idx >= 0 {
@@ -160,8 +148,6 @@ func looksLikeOpaqueToken(text string) bool {
 	return opaqueTokenRe.MatchString(text)
 }
 
-// ─── 文件小工具 ──────────────────────────────────────────────
-
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
@@ -171,7 +157,6 @@ func toValidUTF8(raw []byte) string {
 	return strings.ToValidUTF8(string(raw), "")
 }
 
-// atomicWriteFile tmp + replace 原子落盘（权限收紧到属主，对齐 node_secret_files.tighten）。
 func atomicWriteFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {

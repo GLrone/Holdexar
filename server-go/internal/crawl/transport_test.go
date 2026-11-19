@@ -313,7 +313,7 @@ func TestNetworkTakeoverDefersRemainingCycleStagesOnly(t *testing.T) {
 	if _, err := r.StartJob(ctx, "appids", []int64{221}, nil, "manual", nil); err != nil {
 		t.Fatal(err)
 	}
-	<-idle // Cycle already completed.
+	<-idle
 	select {
 	case <-idle:
 	case <-ctx.Done():

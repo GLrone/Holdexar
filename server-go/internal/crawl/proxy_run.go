@@ -1,12 +1,13 @@
 package crawl
 
 import (
+	"cmp"
 	"context"
 	"crypto/x509"
 	"database/sql"
 	"errors"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -142,7 +143,7 @@ func (r *Runtime) finishProxyRun(ctx context.Context, id int64, trace *proxyRunT
 	for _, row := range trace.exits {
 		rows = append(rows, row)
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].ExitIP < rows[j].ExitIP })
+	slices.SortFunc(rows, func(a, b proxypool.ExitStatsRow) int { return cmp.Compare(a.ExitIP, b.ExitIP) })
 	if _, err = proxypool.RecordRunExits(ctx, r.gate, id, rows, trace.nodes, &now); err != nil {
 		r.opts.Log("代理作业 %d 的出口记录未能保存：%v", id, err)
 	}

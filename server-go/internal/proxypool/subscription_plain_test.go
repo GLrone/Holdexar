@@ -1,6 +1,3 @@
-// subscription_plain_test.go 批 2 订阅测试：DELETE 级联（节点行/快照行/磁盘
-// 产物/钩子）+ 明文导入（4 格式解析表测、非 plain 400 逐字、真拉取导入链、
-// 失败落 FAILED 账）。
 package proxypool
 
 import (
@@ -90,7 +87,6 @@ func seedPlainSub(t *testing.T, db *sql.DB, kind string) int64 {
 	return id
 }
 
-// TestParsePlainProxyLine 四格式表测（Python parse_plain_proxy_line 同径）。
 func TestParsePlainProxyLine(t *testing.T) {
 	cases := []struct {
 		line string
@@ -135,8 +131,6 @@ func TestParsePlainProxyLine(t *testing.T) {
 	}
 }
 
-// TestSubscriptionDeleteCascade clash 级联（退出生产池 + 快照行 + 目录 + 钩子）
-// 与 plain 直删；缺席 404。
 func TestSubscriptionDeleteCascade(t *testing.T) {
 	resetSubHooks()
 	db, _, dir, do := subPlainFixture(t)
@@ -172,13 +166,11 @@ func TestSubscriptionDeleteCascade(t *testing.T) {
 	if !revertedDirect {
 		t.Fatal("删除后应触发回退直连钩子")
 	}
-	// plain 删除：不触生产池语义，同样清行与目录
 	revertedDirect = false
 	rec = do("DELETE", "/api/v1/proxies/subscriptions/"+strconv.FormatInt(plainID, 10), "")
 	if rec.Code != 200 {
 		t.Fatalf("plain 删除应 200：%d %s", rec.Code, rec.Body.String())
 	}
-	// plain 删除只删订阅行（快照/节点级联是 clash 专属语义）
 	assertSubCounts(t, db, plainID, 0, 1, 1)
 	rec = do("DELETE", "/api/v1/proxies/subscriptions/"+strconv.FormatInt(plainID, 10), "")
 	if rec.Code != 404 || !strings.Contains(rec.Body.String(), "订阅不存在") {
@@ -221,8 +213,8 @@ func assertSubCounts(t *testing.T, db *sql.DB, id int64, subs, snapshots, nodes 
 	}
 }
 
-// TestImportPlainSubscription 非 plain 400 逐字 + 真拉取导入链 + 失败落账。
 func TestImportPlainSubscription(t *testing.T) {
+	allowLocalDirectForTest(t)
 	resetSubHooks()
 	db, gate, dir, do := subPlainFixture(t)
 	clashID := seedPlainSub(t, db, "clash")
@@ -234,7 +226,6 @@ func TestImportPlainSubscription(t *testing.T) {
 	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "订阅不存在") {
 		t.Fatalf("缺席应 400：%d %s", rec.Code, rec.Body.String())
 	}
-	// 真拉取导入：httptest 服务发明文行（四格式混排 + 注释 + 重复行）
 	plainID := seedPlainSub(t, db, "plain")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -286,7 +277,6 @@ func TestImportPlainSubscription(t *testing.T) {
 	if eventCount != 1 {
 		t.Fatalf("走线事件应 1 条：%d", eventCount)
 	}
-	// 重复导入：全部按去重跳过
 	rec = do("POST", "/api/v1/proxies/subscriptions/"+strconv.FormatInt(plainID, 10)+"/import", "")
 	if rec.Code != 200 {
 		t.Fatalf("重复导入应 200：%d %s", rec.Code, rec.Body.String())
@@ -295,7 +285,6 @@ func TestImportPlainSubscription(t *testing.T) {
 	if stats["added"] != float64(0) || stats["skipped"] != float64(5) {
 		t.Fatalf("重复导入应全跳过：%s", rec.Body.String())
 	}
-	// 失败落 FAILED 账：不可达端口
 	deadID := seedPlainSub(t, db, "plain")
 	if _, err := db.Exec(`UPDATE proxy_subscriptions SET url=? WHERE id=?`, sealSubURL(t, dir, "http://127.0.0.1:1/none"), deadID); err != nil {
 		t.Fatal(err)

@@ -6,8 +6,6 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------- 测试件：事件收集
-
 type evLog struct{ evs []Event }
 
 func (l *evLog) on(e Event) { l.evs = append(l.evs, e) }
@@ -44,8 +42,6 @@ func parseBJ(s string) time.Time {
 	return t
 }
 
-// ---------------------------------------------------------------- 测试件：价格网格（与价格主轮自续约同构，锚点随太平洋夏令时切换）
-
 var locPac = mustLoc("America/Los_Angeles")
 
 func anchorHour(now time.Time) int {
@@ -64,10 +60,7 @@ func gridNext(now time.Time, step time.Duration) time.Time {
 	return base
 }
 
-// priceBody：价格主轮运行体——按运行时刻重算网格并自续约。
 func priceBody(rc *RunCtx) { rc.SetNext(gridNext(rc.Now(), 6*time.Hour)) }
-
-// ---------------------------------------------------------------- 触发器语义
 
 func TestIntervalTriggerNext(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -76,9 +69,9 @@ func TestIntervalTriggerNext(t *testing.T) {
 		after time.Time
 		want  time.Time
 	}{
-		{start.Add(-time.Minute), start},                                 // 早于锚点 → 首拍即锚点
-		{start, start.Add(time.Hour)},                                    // 恰在锚点 → 严格晚一拍
-		{start.Add(2*time.Hour + time.Second), start.Add(3 * time.Hour)}, // 锚定步进不漂移
+		{start.Add(-time.Minute), start},
+		{start, start.Add(time.Hour)},
+		{start.Add(2*time.Hour + time.Second), start.Add(3 * time.Hour)},
 		{start.Add(47 * time.Hour), start.Add(48 * time.Hour)},
 	}
 	for _, c := range cases {
@@ -95,7 +88,7 @@ func TestDailyTriggerNext(t *testing.T) {
 		want  string
 	}{
 		{"2026-11-01 00:00", "2026-11-01 03:00"},
-		{"2026-11-01 03:00", "2026-11-02 03:00"}, // 恰在拍点 → 次日
+		{"2026-11-01 03:00", "2026-11-02 03:00"},
 		{"2026-11-01 23:59", "2026-11-02 03:00"},
 	}
 	for _, c := range cases {
@@ -108,11 +101,9 @@ func TestDailyTriggerNext(t *testing.T) {
 
 func TestGridAnchors(t *testing.T) {
 	step := 6 * time.Hour
-	// 夏令时（太平洋 10:00 PDT = 北京 01:00）
 	if got := gridNext(parseBJ("2026-10-31 17:00"), step); !got.Equal(parseBJ("2026-10-31 19:00")) {
 		t.Fatalf("PDT 网格下一拍 = %s, want 10-31 19:00", bj(got))
 	}
-	// 秋季回拨后（太平洋 10:00 PST = 北京 02:00）：19:00 触发重锚 → 当日 20:00 追赶拍
 	if got := gridNext(parseBJ("2026-11-01 19:00"), step); !got.Equal(parseBJ("2026-11-01 20:00")) {
 		t.Fatalf("PST 重锚下一拍 = %s, want 11-01 20:00", bj(got))
 	}
@@ -126,8 +117,6 @@ func TestGridAnchors(t *testing.T) {
 		t.Fatalf("回拨后锚点 = %d, want 2", h)
 	}
 }
-
-// ---------------------------------------------------------------- DST 网格追赶拍
 
 func TestGridDSTAutumn(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
@@ -189,7 +178,6 @@ func TestGridDSTSpring(t *testing.T) {
 			t.Fatalf("第 %d 拍原定 %s, want %s", i+1, bj(e.Scheduled), want[i])
 		}
 	}
-	// 春季方向：跨步拉长（02:00 锚点网格最后一拍 20:00 → 次日 01:00 新锚点网格，5h），无追赶拍
 	for i := 1; i < len(fires); i++ {
 		gap := fires[i].Scheduled.Sub(fires[i-1].Scheduled)
 		wantGap := 6 * time.Hour
@@ -201,8 +189,6 @@ func TestGridDSTSpring(t *testing.T) {
 		}
 	}
 }
-
-// ---------------------------------------------------------------- 执行超过周期：跳拍序列
 
 func TestBusySkipsTicks(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
@@ -239,8 +225,6 @@ func TestBusySkipsTicks(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 错过拍：补跑与放弃
-
 func TestMissedTicks(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
 	first := gridNext(start, 6*time.Hour)
@@ -254,10 +238,9 @@ func TestMissedTicks(t *testing.T) {
 	}
 	s.StartSim(start)
 	s.RunSim(parseBJ("2026-11-01 07:30"))
-	s.SimJump(parseBJ("2026-11-01 17:30")) // 冻结 10h，错过 13:00 拍
+	s.SimJump(parseBJ("2026-11-01 17:30"))
 	s.RunSim(parseBJ("2026-11-02 03:00"))
 
-	// 无限宽限：恢复瞬间补跑最新一拍，只补一拍
 	cu := log.of(EventFire, "catchup")
 	if len(cu) != 6 {
 		t.Fatalf("catchup 触发 %d 拍, want 6", len(cu))
@@ -268,7 +251,6 @@ func TestMissedTicks(t *testing.T) {
 	if !cu[4].Scheduled.Equal(parseBJ("2026-11-01 19:00")) {
 		t.Fatalf("catchup 恢复后下一拍 = %s, want 19:00", bj(cu[4].Scheduled))
 	}
-	// 有限宽限：错过拍超宽限放弃并出 missed 事件，网格按原样恢复
 	lim := log.of(EventFire, "limited")
 	miss := log.of(EventMissed, "limited")
 	if len(miss) != 1 || !miss[0].Scheduled.Equal(parseBJ("2026-11-01 13:00")) {
@@ -297,10 +279,9 @@ func TestCoalesce(t *testing.T) {
 	}
 	s.StartSim(start)
 	s.RunSim(parseBJ("2026-11-01 07:30"))
-	s.SimJump(parseBJ("2026-11-01 20:30")) // 冻结 13h，错过 13:00 与 19:00 两拍
+	s.SimJump(parseBJ("2026-11-01 20:30"))
 	s.RunSim(parseBJ("2026-11-02 03:00"))
 
-	// 合并：两拍并一拍，取最新原定时刻
 	m := log.of(EventFire, "merged")
 	var mAt []time.Time
 	for _, e := range m {
@@ -311,7 +292,6 @@ func TestCoalesce(t *testing.T) {
 	if len(mAt) != 1 || !mAt[0].Equal(parseBJ("2026-11-01 19:00")) {
 		t.Fatalf("merged 恢复瞬间触发 %d 次（原定 %v）, want 1 次且原定 19:00", len(mAt), mAt)
 	}
-	// 逐拍：两拍各补一次，同为恢复瞬间
 	ea := log.of(EventFire, "each")
 	var eaAt []time.Time
 	for _, e := range ea {
@@ -323,8 +303,6 @@ func TestCoalesce(t *testing.T) {
 		t.Fatalf("each 恢复瞬间触发 %d 次（原定 %v）, want 2 次且为 13:00/19:00", len(eaAt), eaAt)
 	}
 }
-
-// ---------------------------------------------------------------- SetNext 立即生效
 
 func TestSetNextImmediate(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
@@ -359,13 +337,12 @@ func TestSetNextExternal(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.StartSim(start)
-	s.RunSim(start.Add(65 * time.Minute)) // 首拍 +1h 已发生，默认续排 +2h
+	s.RunSim(start.Add(65 * time.Minute))
 	if err := s.SetNext("job", start.Add(80*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	s.RunSim(start.Add(3 * time.Hour))
 	fires := log.of(EventFire, "job")
-	// 重锚单次生效：下一拍被改写到 +80min（早于默认 +2h）；此后触发器网格恢复
 	want := []string{"2026-10-31 18:00", "2026-10-31 18:20", "2026-10-31 19:00", "2026-10-31 20:00"}
 	if len(fires) != len(want) {
 		t.Fatalf("外部重锚后触发 %d 拍, want %d", len(fires), len(want))
@@ -486,8 +463,6 @@ func TestZeroNextCancelsWithoutRefire(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- Stop 语义
-
 func TestStopNoWait(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
 	var log evLog
@@ -497,7 +472,7 @@ func TestStopNoWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.StartSim(start)
-	s.RunSim(start.Add(11 * time.Minute)) // 首拍进入 3h 占用
+	s.RunSim(start.Add(11 * time.Minute))
 	s.Stop()
 
 	stops := log.of(EventStop, "")
@@ -505,8 +480,8 @@ func TestStopNoWait(t *testing.T) {
 		t.Fatalf("stop 事件 = %v, want 1 条且登记在跑 1", stops)
 	}
 	before := len(log.evs)
-	s.RunSim(start.Add(20 * time.Hour)) // 停机后已排触发作废，零新事件
-	s.Stop()                            // 幂等
+	s.RunSim(start.Add(20 * time.Hour))
+	s.Stop()
 	if len(log.evs) != before {
 		t.Fatalf("停机后新增事件 %d 条, want 0", len(log.evs)-before)
 	}
@@ -518,8 +493,6 @@ func TestStopNoWait(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 运行体崩溃隔离
-
 func TestPanicRecovered(t *testing.T) {
 	start := parseBJ("2026-10-31 17:00")
 	var log evLog
@@ -529,7 +502,7 @@ func TestPanicRecovered(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.StartSim(start)
-	s.RunSim(start.Add(time.Hour)) // 两次到点均崩溃，调度不停转
+	s.RunSim(start.Add(time.Hour))
 	if n := len(log.of(EventFire, "boom")); n != 2 {
 		t.Fatalf("崩溃后仍应续排，触发 %d 拍, want 2", n)
 	}
@@ -537,8 +510,6 @@ func TestPanicRecovered(t *testing.T) {
 		t.Fatalf("panic 事件 %d 条, want 2", n)
 	}
 }
-
-// ---------------------------------------------------------------- 注册与参数校验
 
 func TestRegisterErrors(t *testing.T) {
 	s := NewScheduler()
@@ -564,7 +535,6 @@ func TestRegisterErrors(t *testing.T) {
 		t.Fatalf("重复 ID 应报错")
 	}
 
-	// 运行中注册即时初锚
 	var log evLog
 	s2 := NewScheduler(WithOnEvent(log.on))
 	t0 := parseBJ("2026-10-31 17:00")

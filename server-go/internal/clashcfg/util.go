@@ -1,15 +1,11 @@
 package clashcfg
 
-// 小工具：Python truthiness / 字符串化 / 深拷贝 / 列表互换。
-
 import (
 	"fmt"
 )
 
-// Truthy 对齐 Python 真值判断（导出给依赖包使用）。
 func Truthy(v any) bool { return truthy(v) }
 
-// truthy 对齐 Python 真值判断（None/False/0/""/[]/{} 为假）。
 func truthy(v any) bool {
 	switch val := v.(type) {
 	case nil:
@@ -35,7 +31,6 @@ func truthy(v any) bool {
 	}
 }
 
-// pyStr 对齐 str(v or "")：None/空串归空，其余按展示文本。
 func pyStr(v any) string {
 	if v == nil {
 		return ""
@@ -130,7 +125,6 @@ func providerKeys(providers map[string]map[string]any) []string {
 	for name := range providers {
 		out = append(out, name)
 	}
-	// Python dict 按插入序；Go map 无序，键序仅影响 use 展开顺序（语义无关面）
 	sortStrings(out)
 	return out
 }
@@ -143,7 +137,6 @@ func sortStrings(items []string) {
 	}
 }
 
-// docFromMap 普通 map → 保序文档（name 置首、其余字典序，键序确定性）。
 func docFromMap(m map[string]any) *Doc {
 	out := NewDoc()
 	for _, key := range sortedMapKeys(m) {
@@ -152,7 +145,6 @@ func docFromMap(m map[string]any) *Doc {
 	return out
 }
 
-// docToMap 把保序文档拍平为普通映射（校验与比较用，键序无关）。
 func docToMap(d *Doc) map[string]any {
 	out := make(map[string]any, d.Len())
 	for _, key := range d.Keys() {

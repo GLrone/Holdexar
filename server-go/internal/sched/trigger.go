@@ -5,7 +5,6 @@ import (
 	_ "time/tzdata" // Windows 无系统时区库，内嵌保证 DefaultLoc 可加载
 )
 
-// DefaultLoc：调度默认时区。
 var DefaultLoc = mustLoc("Asia/Shanghai")
 
 func mustLoc(name string) *time.Location {
@@ -21,7 +20,6 @@ type Trigger interface {
 	Next(after time.Time) time.Time
 }
 
-// IntervalTrigger：锚点 + 周期网格；步进锚定 Start，不随实际唤醒漂移。
 type IntervalTrigger struct {
 	Start  time.Time
 	Period time.Duration
@@ -38,7 +36,6 @@ func (it IntervalTrigger) Next(after time.Time) time.Time {
 	return it.Start.Add(time.Duration(k) * it.Period)
 }
 
-// DailyTrigger：每日固定时刻（单时区日粒度）；Loc 为空时用 DefaultLoc。
 type DailyTrigger struct {
 	Hour, Minute int
 	Loc          *time.Location

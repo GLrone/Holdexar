@@ -15,7 +15,6 @@ import (
 	"holdexar/server-go/internal/crawler"
 )
 
-// fakeClock：Sleep 只登记时长不真睡，供退避序列断言。
 type fakeClock struct {
 	mu     sync.Mutex
 	now    time.Time
@@ -44,7 +43,6 @@ func (c *fakeClock) recorded() []time.Duration {
 	return append([]time.Duration(nil), c.sleeps...)
 }
 
-// recorder：收集出口账本回调。
 type recorder struct {
 	mu      sync.Mutex
 	records []RequestRecord
@@ -66,14 +64,13 @@ func (r *recorder) outcomes() []string {
 	return out
 }
 
-// newTestClient：短退避 + 无抖动 + 模拟时钟 + 独立出口账本的测试客户端。
 func newTestClient(t *testing.T, mutate func(*Config)) (*Client, *recorder) {
 	t.Helper()
 	rec := &recorder{}
 	cfg := Config{
 		Backoff429Base:   5 * time.Millisecond,
 		BackoffOtherBase: 5 * time.Millisecond,
-		JitterMax:        -1, // 无抖动，退避序列可精确断言
+		JitterMax:        -1,
 		RateLimits:       crawler.NewExitRateLimits([]string{"exit-a"}, 200, 300*time.Second, nil),
 		Breakers:         crawler.NewExitBreakers([]string{"exit-a"}, nil),
 		OnRequest:        rec.add,
@@ -98,7 +95,6 @@ func sameStrings(a, b []string) bool {
 	return true
 }
 
-// jsonServer：命中计数 + 固定 JSON 响应。
 type jsonServer struct {
 	srv  *httptest.Server
 	mu   sync.Mutex
@@ -123,8 +119,6 @@ func (js *jsonServer) count() int {
 	defer js.mu.Unlock()
 	return js.hits
 }
-
-// ── 成功链 + 头部契约 + UA 轮换 ─────────────────────────────────
 
 func TestGetJSONSuccessAndHeaderContract(t *testing.T) {
 	var mu sync.Mutex
@@ -184,8 +178,6 @@ func TestGetJSONSuccessAndHeaderContract(t *testing.T) {
 	}
 }
 
-// ── 真 429：熔断 + 退避 + 成功复位 ──────────────────────────────
-
 func TestReal429BackoffThenSuccess(t *testing.T) {
 	js := &jsonServer{}
 	js.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -209,11 +201,9 @@ func TestReal429BackoffThenSuccess(t *testing.T) {
 	if err != nil || status != http.StatusOK || string(body) != `{"ok": true}` {
 		t.Fatalf("重试后应成功，实际 status=%d err=%v", status, err)
 	}
-	// 客户端侧真 429 退避一次（模拟时钟登记，无抖动）
 	if sleeps := fc.recorded(); len(sleeps) != 1 || sleeps[0] != 5*time.Millisecond {
 		t.Fatalf("真 429 应退避一次 5ms，实际 %v", fc.recorded())
 	}
-	// 熔断冷却真实等待了一个冷却期（爬侧冷却 5s 起步，crawler 内部时钟不可注入）
 	if elapsed := time.Since(start); elapsed < 4*time.Second {
 		t.Fatalf("第二次尝试应阻塞在熔断冷却等待，实际 %v", elapsed)
 	}
@@ -227,8 +217,6 @@ func TestReal429BackoffThenSuccess(t *testing.T) {
 		t.Fatalf("成功后熔断应复位")
 	}
 }
-
-// ── 幻觉 429 清洗 ───────────────────────────────────────────────
 
 func TestPhantom429Cleaned(t *testing.T) {
 	phantomBody := `{"730":{"success":true,"data":{"price_overview":{"final":1999}}}}`
@@ -272,7 +260,6 @@ func TestPhantom429BareShape(t *testing.T) {
 }
 
 func TestReal429Exhausted(t *testing.T) {
-	// StoreBrowse 形状两条分支都不匹配 → 真 429 照常熔断
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		fmt.Fprint(w, `{"response": {}}`)
@@ -295,8 +282,6 @@ func TestReal429Exhausted(t *testing.T) {
 		t.Fatalf("真 429 应触发本出口熔断")
 	}
 }
-
-// ── 403/404 不重试 ──────────────────────────────────────────────
 
 func Test403404NoRetry(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusNotFound} {
@@ -333,15 +318,13 @@ func Test403404NoRetry(t *testing.T) {
 	}
 }
 
-// ── 建连失败：计数 + 换出口回调 ─────────────────────────────────
-
 func TestConnectFailSwitchExit(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close() // 先起后关：拨号必被拒
+	ln.Close()
 
 	var mu sync.Mutex
 	var exhausted []string
@@ -372,7 +355,6 @@ func TestConnectFailSwitchExit(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// 成功复位计数：之后一次失败不重复触发回调
 	okSrv := newJSONServer(t, `{"ok": true}`)
 	if _, _, err := c.GetJSON(context.Background(), okSrv.srv.URL, "exit-a"); err != nil {
 		t.Fatal(err)
@@ -387,14 +369,12 @@ func TestConnectFailSwitchExit(t *testing.T) {
 	}
 }
 
-// ── 限流被真实消费 ──────────────────────────────────────────────
-
 func TestRateLimiterConsumed(t *testing.T) {
 	okSrv := newJSONServer(t, `{"ok": true}`)
 	c, _ := newTestClient(t, func(cfg *Config) {
 		cfg.RateLimits = crawler.NewExitRateLimits([]string{"exit-a"}, 1, 150*time.Millisecond, nil)
 	})
-	c.clock = systemClock{} // 真实时钟：窗口等待真实发生
+	c.clock = systemClock{}
 	start := time.Now()
 	for i := 0; i < 2; i++ {
 		if _, _, err := c.GetJSON(context.Background(), okSrv.srv.URL, "exit-a"); err != nil {
@@ -406,8 +386,6 @@ func TestRateLimiterConsumed(t *testing.T) {
 	}
 }
 
-// ── 熔断被真实消费（按出口分账） ────────────────────────────────
-
 func TestBreakerConsumedPerExit(t *testing.T) {
 	okSrv := newJSONServer(t, `{"ok": true}`)
 	fallbackLimiter := crawler.NewRateLimiter(200, 300*time.Second)
@@ -418,7 +396,6 @@ func TestBreakerConsumedPerExit(t *testing.T) {
 	})
 	c.cfg.Breakers.ForExit("exit-a").Trip()
 
-	// exit-a 在熔断冷却内被阻塞，取消后不发请求
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -437,7 +414,6 @@ func TestBreakerConsumedPerExit(t *testing.T) {
 	if okSrv.count() != 0 {
 		t.Fatalf("熔断等待期不应发出请求，实际 %d", okSrv.count())
 	}
-	// exit-b 不受 exit-a 熔断影响
 	status, _, err := c.GetJSON(context.Background(), okSrv.srv.URL, "exit-b")
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("exit-b 应不受影响正常发出，实际 status=%d err=%v", status, err)
@@ -446,8 +422,6 @@ func TestBreakerConsumedPerExit(t *testing.T) {
 		t.Fatalf("exit-b 应发出一发，实际 %d", okSrv.count())
 	}
 }
-
-// ── 传输层缓存与 TLS 分档 ───────────────────────────────────────
 
 func TestTransportCache(t *testing.T) {
 	c, _ := newTestClient(t, func(cfg *Config) { cfg.Timeout = time.Second })
@@ -486,7 +460,6 @@ func TestTLSVerifyTiering(t *testing.T) {
 	defer srv.Close()
 
 	c, rec := newTestClient(t, nil)
-	// 缺省校验档：自签证书被拒，属建连类失败不重试
 	status, _, err := c.GetJSON(context.Background(), srv.URL, "exit-a")
 	if err == nil || status != 0 {
 		t.Fatalf("缺省档应拒绝自签证书，实际 status=%d err=%v", status, err)
@@ -497,17 +470,13 @@ func TestTLSVerifyTiering(t *testing.T) {
 	if len(c.clock.(*fakeClock).recorded()) != 0 {
 		t.Fatalf("TLS 握手失败不应重试")
 	}
-	// 请求级放宽校验档：同参复用同一传输
 	status, body, err := c.GetJSON(context.Background(), srv.URL, "exit-a", WithInsecureTLS(true))
 	if err != nil || status != http.StatusOK || string(body) != `{"ok": true}` {
 		t.Fatalf("放宽档应成功，实际 status=%d err=%v", status, err)
 	}
 }
 
-// ── 502 隧道失败与普通 5xx ──────────────────────────────────────
-
 func Test502TunnelFail(t *testing.T) {
-	// 空 502 无 Content-Type：网关隧道失败，通道侧故障不重试
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
@@ -551,7 +520,6 @@ func Test502TunnelFail(t *testing.T) {
 }
 
 func Test502WithBodyRetries(t *testing.T) {
-	// 带 502（有响应体）：普通 5xx 可重试
 	js := &jsonServer{}
 	js.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		js.mu.Lock()
@@ -562,7 +530,7 @@ func Test502WithBodyRetries(t *testing.T) {
 	}))
 	defer js.srv.Close()
 
-	c, rec := newTestClient(t, nil) // MaxRetries=3
+	c, rec := newTestClient(t, nil)
 	status, _, err := c.GetJSON(context.Background(), js.srv.URL, "exit-a")
 	var se *StatusError
 	if !errors.As(err, &se) || se.Status != http.StatusBadGateway {
@@ -579,8 +547,6 @@ func Test502WithBodyRetries(t *testing.T) {
 		t.Fatalf("出口账本应记 e5xx×3，实际 %v", got)
 	}
 }
-
-// ── 读超时 ──────────────────────────────────────────────────────
 
 func TestTimeoutOutcome(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -602,8 +568,6 @@ func TestTimeoutOutcome(t *testing.T) {
 		t.Fatalf("读超时应记 timeout，实际 %v", got)
 	}
 }
-
-// ── 重定向 ──────────────────────────────────────────────────────
 
 func TestFollowRedirects(t *testing.T) {
 	mux := http.NewServeMux()
@@ -633,8 +597,6 @@ func TestFollowRedirects(t *testing.T) {
 	}
 }
 
-// ── 响应体上限 ──────────────────────────────────────────────────
-
 func TestBodyLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, strings.Repeat("a", 4096))
@@ -654,8 +616,6 @@ func TestBodyLimit(t *testing.T) {
 	}
 }
 
-// ── 缺省装配 ────────────────────────────────────────────────────
-
 func TestNewDefaults(t *testing.T) {
 	c := New(Config{})
 	if c.cfg.Timeout != DefaultTimeout || c.cfg.MaxRetries != DefaultMaxRetries ||
@@ -669,7 +629,6 @@ func TestNewDefaults(t *testing.T) {
 	if c.limiterFor("x") != crawler.DefaultRateLimiter || c.breakerFor("x") != crawler.DefaultBreaker {
 		t.Fatalf("未注入账本应回落进程级单例")
 	}
-	// 幻觉判定行为对齐 crawler.AppDetailsPhantom429
 	if _, ok := c.phantom([]byte(`{"success":true,"data":{}}`), ""); !ok {
 		t.Fatalf("裸形状应判定为幻觉 429")
 	}

@@ -14,7 +14,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// stubFetch 为各候选装配在线拉取行为（缺省候选 = 在线失败）。
 func stubFetch(svc *Service, byID map[int64]func() (*SubscriptionFetch, error)) {
 	svc.FetchOnline = func(ctx context.Context, id int64, url string) (*SubscriptionFetch, error) {
 		if fn, ok := byID[id]; ok {
@@ -32,13 +31,10 @@ func fetchFail() (*SubscriptionFetch, error) {
 	return nil, fmt.Errorf("下载订阅失败：所有通道均未成功")
 }
 
-// ─── 端口选项三态 ────────────────────────────────────────────
-
 func TestKernelPortOptionsThreeStates(t *testing.T) {
 	svc, kernel, _ := newFixture(t)
 	ctx := context.Background()
 
-	// ① 未运行 + 无存档 → 动态分配（并把归一化的 auto 写回 KV）
 	port, allocate, err := svc.KernelPortOptions(ctx)
 	if err != nil || allocate != true || port != 0 {
 		t.Fatalf("未运行缺省应动态分配：%d %v %v", port, allocate, err)
@@ -48,7 +44,6 @@ func TestKernelPortOptionsThreeStates(t *testing.T) {
 		t.Fatalf("归一化模式未写回：%v %q", err, mode)
 	}
 
-	// ② fixed 模式存档口
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		if err := settingsWrite(conn, portModeKey, "fixed"); err != nil {
 			return err
@@ -62,7 +57,6 @@ func TestKernelPortOptionsThreeStates(t *testing.T) {
 		t.Fatalf("fixed 模式应用存档口：%d %v %v", port, allocate, err)
 	}
 
-	// ③ auto + 在跑沿用现口
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		return settingsWrite(conn, portModeKey, "auto")
 	}); err != nil {
@@ -74,7 +68,6 @@ func TestKernelPortOptionsThreeStates(t *testing.T) {
 		t.Fatalf("在跑应沿用现口：%d %v %v", port, allocate, err)
 	}
 
-	// ④ fixed 存档口无效 → 回落 auto（写回）+ 未运行动态分配
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		if err := settingsWrite(conn, portModeKey, "fixed"); err != nil {
 			return err
@@ -98,8 +91,6 @@ func settingsWrite(conn *sql.Conn, key string, value any) error {
 	return settings.WriteValue(context.Background(), conn, key, value)
 }
 
-// ─── 候选链 ──────────────────────────────────────────────────
-
 func TestResolveOrderAndOnlineFirst(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "老订阅", "", false)
@@ -107,7 +98,6 @@ func TestResolveOrderAndOnlineFirst(t *testing.T) {
 	seedSubscription(t, svc, 3, "https://sub.example.com/c", "最新订阅", "", false)
 	stubFetch(svc, map[int64]func() (*SubscriptionFetch, error){2: func() (*SubscriptionFetch, error) { return fetchOK(subYAML) }})
 
-	// 无显式请求：候选序新→旧 [3,2,1]；3 在线失败被淘汰，2 在线成功即返回
 	picked, err := svc.ResolveStartableClash(context.Background(), nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -134,12 +124,10 @@ func TestResolveRequestedFirstAndCacheFallback(t *testing.T) {
 	url := "https://sub.example.com/a"
 	seedSubscription(t, svc, 1, url, "老订阅", "", false)
 	seedSubscription(t, svc, 2, "https://sub.example.com/b", "新订阅", "", false)
-	// 全部在线失败，但 1 有历史成功快照（缓存兜底）
 	seedSnapshot(t, svc, 1, url, []byte(subYAML), "缓存面板", "")
 	stubFetch(svc, nil)
 	ctx := context.Background()
 
-	// 显式请求 2：取不到配置且无缓存 → 淘汰后轮到 1（有缓存，显式请求时命中即用）
 	requested := int64(2)
 	picked, err := svc.ResolveStartableClash(ctx, &requested, false)
 	if err != nil {
@@ -155,7 +143,6 @@ func TestResolveRequestedFirstAndCacheFallback(t *testing.T) {
 		t.Fatalf("缓存路径标题应取快照面板名：%q", picked.Title)
 	}
 
-	// 无显式请求：候选序 [2,1]，2 失败淘汰、1 缓存命中但留作兜底继续找，最后兜底返回
 	picked, err = svc.ResolveStartableClash(ctx, nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +155,7 @@ func TestResolveRequestedFirstAndCacheFallback(t *testing.T) {
 func TestResolveAllDeadAggregates(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "甲", "", false)
-	seedSubscription(t, svc, 2, "", "乙", "", false) // 无明文 URL（解密失败）
+	seedSubscription(t, svc, 2, "", "乙", "", false)
 	stubFetch(svc, nil)
 
 	_, err := svc.ResolveStartableClash(context.Background(), nil, false)
@@ -183,9 +170,7 @@ func TestResolveAllDeadAggregates(t *testing.T) {
 
 func TestResolveNoUsableSubs(t *testing.T) {
 	svc, _, _ := newFixture(t)
-	// 全部废弃（deprecated 列命中）
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "甲", "", true)
-	// 资源封锁（expire 已过）→ 投影为废弃
 	seedSubscription(t, svc, 2, "https://sub.example.com/b", "乙", `{"traffic":"upload=0; download=0; total=100; expire=1000000000"}`, false)
 
 	_, err := svc.ResolveStartableClash(context.Background(), nil, false)
@@ -205,7 +190,6 @@ func TestResolveKVSelectedUsedAsRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// KV 选中的 1 在前；1 在线失败且无缓存被淘汰，2 在线成功返回
 	picked, err := svc.ResolveStartableClash(ctx, nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -215,20 +199,16 @@ func TestResolveKVSelectedUsedAsRequest(t *testing.T) {
 	}
 }
 
-// ─── 启动链 ──────────────────────────────────────────────────
-
 func TestStartClashBranches(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	ctx := context.Background()
 
-	// 未装内核
 	_, err := svc.StartClash(ctx, nil)
 	if se, detail := statusErrOf(t, err); se.Status != 400 || detail != "未找到内核，请先安装" {
 		t.Fatalf("未装内核文案不符：%s", detail)
 	}
 	writeExe(t, svc.DataDir)
 
-	// 无订阅
 	_, err = svc.StartClash(ctx, nil)
 	if se, detail := statusErrOf(t, err); se.Status != 400 || detail != "尚未保存 Clash 订阅链接，请先添加" {
 		t.Fatalf("无订阅文案不符：%s", detail)
@@ -236,14 +216,12 @@ func TestStartClashBranches(t *testing.T) {
 
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "甲", "", false)
 
-	// 指定不存在的订阅
 	missing := int64(9)
 	_, err = svc.StartClash(ctx, &missing)
 	if se, detail := statusErrOf(t, err); se.Status != 404 || detail != "指定的订阅不存在" {
 		t.Fatalf("订阅不存在应 404：%s", detail)
 	}
 
-	// 指定废弃订阅（文案含 deprecatedReason）
 	seedSubscription(t, svc, 2, "https://sub.example.com/b", "乙", "", false)
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET deprecated=1, deprecated_reason=? WHERE id=2`, "节点大量失效")
@@ -256,7 +234,6 @@ func TestStartClashBranches(t *testing.T) {
 	if se, detail := statusErrOf(t, err); se.Status != 400 || !strings.Contains(detail, "该订阅已废弃（节点大量失效）") || !strings.Contains(detail, "手动删除该订阅") {
 		t.Fatalf("废弃订阅文案不符：%s", detail)
 	}
-	// 无理由的废弃行回落固定文案
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET deprecated_reason=NULL WHERE id=2`)
 		return err
@@ -298,13 +275,11 @@ func TestStartClashSuccessChain(t *testing.T) {
 	if len(kernel.startOpts) != 1 {
 		t.Fatalf("未运行应走 Start：%+v", kernel.startOpts)
 	}
-	// 规格风险 5：订阅内核 Start 必须 InjectLanes=true（Python 缺省 true，Go 零值 false）
 	opts := kernel.startOpts[0]
 	if !opts.InjectLanes || opts.SubscriptionURL != "https://sub.example.com/a" {
 		t.Fatalf("Start 选项缺 lane 注入或订阅归属：%+v", opts)
 	}
 
-	// 收尾账目：selected KV / 走线日志 / 导入回填 / 名称链
 	if got := svc.SelectedSubID(ctx); got == nil || *got != 1 {
 		t.Fatalf("启动成功应落 selected KV：%v", got)
 	}
@@ -352,7 +327,6 @@ func TestStartClashFallbackFrom(t *testing.T) {
 	seedSubscription(t, svc, 2, "https://sub.example.com/b", "新订阅", "", false)
 	stubFetch(svc, map[int64]func() (*SubscriptionFetch, error){2: func() (*SubscriptionFetch, error) { return fetchOK(subYAML) }})
 
-	// 显式请求 1：1 在线失败且无缓存被淘汰，降级到 2 启动（fallbackFrom 指向 1）
 	requested := int64(1)
 	result, err := svc.StartClash(context.Background(), &requested)
 	if err != nil {
@@ -365,8 +339,6 @@ func TestStartClashFallbackFrom(t *testing.T) {
 		t.Fatalf("实际启动的订阅应为 2：%+v", result.Subscription)
 	}
 }
-
-// ─── 切换链 ──────────────────────────────────────────────────
 
 func TestSwitchClashNotRunning(t *testing.T) {
 	svc, _, _ := newFixture(t)
@@ -412,7 +384,6 @@ func TestSwitchClashSuccessHotReload(t *testing.T) {
 		firstChecks = append(firstChecks, subID)
 	}
 
-	// 缓存缺失：在线拉取补缓存
 	stubFetch(svc, map[int64]func() (*SubscriptionFetch, error){1: func() (*SubscriptionFetch, error) { return fetchOK(subYAML) }})
 	result, err := svc.SwitchClash(ctx, 1)
 	if err != nil {
@@ -441,7 +412,6 @@ func TestSwitchClashReloadRejected400(t *testing.T) {
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "甲", "", false)
 	kernel.st = runningStatus("")
 	kernel.runningSub = "https://sub.example.com/old"
-	// 预置缓存（跳过下载）
 	if err := os.WriteFile(SubscriptionConfigPath(svc.DataDir, 1), []byte(subYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +423,6 @@ func TestSwitchClashReloadRejected400(t *testing.T) {
 	if se, detail := statusErrOf(t, err); se.Status != 400 || !strings.Contains(detail, "内核拒绝新配置") {
 		t.Fatalf("拒载应 400：%+v", se)
 	}
-	// 运行态保留（拒载不清账）
 	if !kernel.Status().Running {
 		t.Fatalf("拒载不应停内核")
 	}
@@ -494,8 +463,6 @@ func TestSwitchClashDeprecatedAndMissing(t *testing.T) {
 	}
 }
 
-// ─── 点选 / 停止 ─────────────────────────────────────────────
-
 func TestSelectClashRoundtrip(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	seedSubscription(t, svc, 1, "https://sub.example.com/a", "甲", "", false)
@@ -527,13 +494,10 @@ func TestStopClashClearsRuntime(t *testing.T) {
 	if result.Running || result.Port != nil || result.SubscriptionURL != nil {
 		t.Fatalf("停止后运行态应清账：%+v", result)
 	}
-	// configPath 保留（对齐 Python stop 清账清单）
 	if result.ConfigPath == nil || *result.ConfigPath != "x" {
 		t.Fatalf("停止后 configPath 应保留：%+v", result)
 	}
 }
-
-// ─── 名称三档链 ──────────────────────────────────────────────
 
 func TestApplySubscriptionNameChain(t *testing.T) {
 	svc, _, _ := newFixture(t)
@@ -549,7 +513,6 @@ func TestApplySubscriptionNameChain(t *testing.T) {
 		t.Fatalf("panel 来源应跟随机场改名：%q", name)
 	}
 
-	// 用户命名锁死
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET label=?, last_stats=? WHERE id=1`, "我起的名", `{"labelSource":"user"}`)
 		return err
@@ -561,7 +524,6 @@ func TestApplySubscriptionNameChain(t *testing.T) {
 		t.Fatalf("用户命名不应被机场名覆盖：%q", name)
 	}
 
-	// 无标记 + 名字≠机场名 → 视为用户命名（老数据归位）锁死
 	if err := svc.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		_, err := conn.ExecContext(ctx, `UPDATE proxy_subscriptions SET label=?, last_stats=NULL WHERE id=1`, "旧自动名")
 		return err
@@ -573,7 +535,6 @@ func TestApplySubscriptionNameChain(t *testing.T) {
 		t.Fatalf("老数据不等机场名应视为用户命名锁死：%q", name)
 	}
 
-	// 名字==机场名 + 无标记 → 补 panel 标记
 	name, _ = svc.ApplySubscriptionNameChain(ctx, 1, "旧自动名")
 	if name != "旧自动名" {
 		t.Fatalf("同名应保持：%q", name)
@@ -584,20 +545,16 @@ func TestApplySubscriptionNameChain(t *testing.T) {
 	}
 }
 
-// ─── 在线拉取默认实现（SyncOne 真链路 + 归属守卫）────────────
-
 func TestFetchOnlineDefaultGuardAndFlow(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	url := "https://sub.example.com/a"
 	seedSubscription(t, svc, 1, url, "甲", "", false)
 	ctx := context.Background()
 
-	// 归属守卫：URL 与库内不一致 → 400
 	if _, err := svc.fetchOnlineDefault(ctx, 1, "https://sub.example.com/other"); err == nil || !strings.Contains(err.Error(), "订阅地址与缓存归属不一致") {
 		t.Fatalf("默认在线拉取缺归属守卫：%v", err)
 	}
 
-	// SyncOne 真链路：没有可达通道 → 失败（非 nil 错误）
 	if _, err := svc.fetchOnlineDefault(ctx, 1, url); err == nil {
 		t.Fatalf("无通道时应失败")
 	}

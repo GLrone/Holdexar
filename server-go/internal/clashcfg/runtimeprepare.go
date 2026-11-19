@@ -1,9 +1,5 @@
 package clashcfg
 
-// 池文件 → 内核运行配置生成：crawl-pool.yaml（只读产物）→ crawl-runtime.yaml
-// （内核实际启动文件）。lane = 一个 select 组（成员 = 池内全部节点）+ 一个
-// mixed listener；探测 lane 在池专属端口段注入；热重载通道钉住现役端点。
-
 import (
 	"fmt"
 	"os"
@@ -11,18 +7,15 @@ import (
 	"strings"
 )
 
-// RuntimeConfigError 运行配置不可用（如热重载缺现役端点）。
 type RuntimeConfigError struct{ Detail string }
 
 func (e *RuntimeConfigError) Error() string { return e.Detail }
 
-// PoolBuildError 池文件形态不可用。
 type PoolBuildError struct{ Detail string }
 
 func (e *PoolBuildError) Error() string { return e.Detail }
 
-// LaneCountFor 由池规模决定开几条 lane：一个节点最多占一条工位，上限 MaxLanes。
-// requested < 0 表示未指定（取池规模）。池为空返回 0。
+// LaneCountFor 按池规模算 lane 数，上限 MaxLanes；requested < 0 取池规模。
 func LaneCountFor(poolSize int, requested int) int {
 	if poolSize <= 0 {
 		return 0
@@ -47,7 +40,6 @@ func LaneCountFor(poolSize int, requested int) int {
 	return result
 }
 
-// PinnedEndpoints 现役运行配置里可被热重载沿用的端点。
 type PinnedEndpoints struct {
 	Controller     string
 	Secret         string
@@ -56,8 +48,7 @@ type PinnedEndpoints struct {
 	ProbeLanePorts []int
 }
 
-// PinnedRuntimeEndpoints 读现役运行配置文本里可沿用的端点；缺失或不可解析返回
-// nil（热重载没有可沿用的端点，调用方必须走冷通道）。
+// PinnedRuntimeEndpoints 提取现役端点；不可用返回 nil，调用方走冷通道。
 func PinnedRuntimeEndpoints(runtimeText string) *PinnedEndpoints {
 	doc, err := LoadYAML(runtimeText)
 	if err != nil {
@@ -140,11 +131,7 @@ func mapOrderedPorts(byIndex map[int]int) []int {
 	return out
 }
 
-// PrepareRuntimeConfig 由 crawl-pool.yaml 生成 crawl-runtime.yaml（写盘，tmp+replace）。
-// lanes < 0 = 未指定（按池规模，钳到 MaxLanes）；pinRunning 时 controller /
-// secret / mixed-port / 既有 lane 端口全部沿用现役运行配置——热重载后所有已交出
-// 的入口 URL 继续有效；现役配置缺失时抛错（热重载的前提不成立）。
-// 返回 (落盘路径, 最终文本, 错误)。
+// PrepareRuntimeConfig 生成运行配置；pinRunning 沿用现役端点且现役缺失即报错。
 func PrepareRuntimeConfig(dataDir string, lanes int, pinRunning bool) (string, string, error) {
 	var pinned *PinnedEndpoints
 	if pinRunning {

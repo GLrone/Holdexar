@@ -1,22 +1,20 @@
 package dbwriter
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/store"
 )
 
-// MarkComingSoon coming_soon 无包（未开放预购/未上线）暂缓语义：type=COMING_SOON
-// 挂名行（对齐 Python mark_coming_soon）。与 mark_non_game_type 的脱池机制相同
-// （updated_at 落值防反哺空转），但 type 单独成类——重探通道按 type=COMING_SOON
-// 选候选，开放预购/上线后正常入库覆盖此行。冲突只更 type/时间戳并一并清复活
-// 痕迹（正常入库路径覆盖过此行时 removed 可能被误标过）；名字保持挂名值。
+// MarkComingSoon 写/更新 type=COMING_SOON 占位行并落 updated_at 防反哺空转，
+// 冲突时保留原名并清 removed 标记，供后续复查转正。
 func (w *Writer) MarkComingSoon(ctx context.Context, appid int64) error {
 	return w.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		before, err := derived.CatalogInputs(ctx, conn, []int64{appid})
@@ -83,32 +81,27 @@ func (w *Writer) ClearMissingRegionsBatch(ctx context.Context, pairs []RegionPai
 		return err
 	})
 	if err != nil {
-		sort.Slice(clean, func(i, j int) bool {
-			if clean[i].AppID == clean[j].AppID {
-				return clean[i].RegionCode < clean[j].RegionCode
+		slices.SortFunc(clean, func(a, b RegionPair) int {
+			if c := cmp.Compare(a.AppID, b.AppID); c != 0 {
+				return c
 			}
-			return clean[i].AppID < clean[j].AppID
+			return strings.Compare(a.RegionCode, b.RegionCode)
 		})
 		return 0, &RegionStatusWriteError{Pairs: clean}
 	}
 	return int(count), nil
 }
 
-// BundleDiscovery 捆绑包发现桩（游戏条目 purchase_options 白送的数据）。
 type BundleDiscovery struct {
 	BundleID int64
 	Name     string
-	MPS      int64 // must_purchase_as_set
+	MPS      int64
 	ItemKind int64
 	AppIDs   []int64
 }
 
-// RecordBundleDiscoveries 捆绑包发现桩落库。只 INSERT 库内没有的包
-// （冲突 DO NOTHING）：既有完整主档不覆盖——发现渠道只负责「把新包带
-// 进门」，无价桩不随轮刷新，用户关注/导入该包时才整区抓取补价。
-// app_ids 只存本游戏一个 id 当种子，抓取时会被 included_appids 校正。
-// updated_at=NULL（发现桩：播种查询按 NULL 捞）。返回新插数（调用方做
-// 发现计数）。
+// RecordBundleDiscoveries 仅插入尚不存在的捆绑包发现桩（冲突 DO NOTHING，updated_at=NULL，
+// app_ids 存单游戏种子 id），返回新插行数。
 func (w *Writer) RecordBundleDiscoveries(ctx context.Context, discoveries []BundleDiscovery) (int, error) {
 	if len(discoveries) == 0 {
 		return 0, nil
@@ -189,7 +182,7 @@ func (w *Writer) MarkNonGameTypesBatch(ctx context.Context, types map[int64]stri
 	for id := range types {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	values := make([][2]any, 0, len(ids))
 	for _, id := range ids {
 		var typ any
@@ -232,7 +225,7 @@ func (w *Writer) UpsertTagsBatch(ctx context.Context, entries map[int64][][2]int
 	for id := range entries {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	values := [][3]int64{}
 	for _, id := range ids {
 		for _, tag := range entries[id] {

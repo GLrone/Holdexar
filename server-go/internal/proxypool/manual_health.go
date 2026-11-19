@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"holdexar/server-go/internal/events"
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/settings"
@@ -27,6 +28,73 @@ type ManualHealth struct {
 	Gate    *store.WriteGate
 	DataDir string
 	Target  string
+	// Bus 事件总线（nil=不广播 settings.changed）；RestartKernelForPort 内核
+	// 在跑时的端口切换重启（nil=按内核未运行处理，端口 KV 下次启动生效）。
+	Bus                  *events.Bus
+	RestartKernelForPort func(ctx context.Context, port int) error
+}
+
+// strategyKnown 路由策略白名单（与 Python STRATEGIES 同表）。
+func strategyKnown(name string) bool {
+	switch name {
+	case "proxy_first", "direct_only", "direct_first", "proxy_only":
+		return true
+	}
+	return false
+}
+
+// portError 端口参数类错误：以 400 形态回给调用方（与 Python ValueError→400 同径）。
+type portError string
+
+func (e portError) Error() string { return string(e) }
+
+// kvBool 读布尔 KV（缺省返回 def；值非布尔形态按 def 处理）。
+func kvBool(ctx context.Context, conn *sql.Conn, key string, def bool) (bool, error) {
+	var raw any
+	err := conn.QueryRowContext(ctx, `SELECT json_extract(value_json,'$') FROM app_settings WHERE key=?`, key).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return def, nil
+	}
+	if err != nil {
+		return def, err
+	}
+	if b, ok := raw.(bool); ok {
+		return b, nil
+	}
+	if f, ok := raw.(float64); ok {
+		return f != 0, nil
+	}
+	return def, nil
+}
+
+// kernelPortConfig 迁移自 Python kernel_port_config：模式缺省按有无存档端口判定，
+// 非法模式/端口自愈（自愈写回由调用方的写事务承载时落库）。
+func (s *ManualHealth) kernelPortConfig(ctx context.Context) (string, *int) {
+	var mode *string
+	var port *int
+	_ = s.DB.QueryRowContext(ctx, `SELECT json_extract(value_json,'$') FROM app_settings WHERE key='proxy.clash_port_mode'`).Scan(&mode)
+	_ = s.DB.QueryRowContext(ctx, `SELECT json_extract(value_json,'$') FROM app_settings WHERE key='proxy.clash_port'`).Scan(&port)
+	m := "auto"
+	if mode != nil && (*mode == "auto" || *mode == "fixed") {
+		m = *mode
+	} else if port != nil {
+		m = "fixed"
+	}
+	if port != nil && (*port < 1 || *port > 65535) {
+		port = nil
+	}
+	if m == "fixed" && port == nil {
+		m = "auto"
+	}
+	return m, port
+}
+
+// publishChanged 广播 settings.changed（键清单载荷，与设置面同形；无总线静默跳过）。
+func (s *ManualHealth) publishChanged(keys ...string) {
+	if s.Bus == nil || len(keys) == 0 {
+		return
+	}
+	s.Bus.Publish("settings.changed", events.KV{Key: "keys", Val: keys})
 }
 
 type manualProbe struct {
@@ -230,22 +298,121 @@ func (s *ManualHealth) Register(mux *http.ServeMux) {
 }
 
 func (s *ManualHealth) healthSetting(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		HealthAuto *bool `json:"healthAuto"`
+	var body struct {
+		Strategy      *string `json:"strategy"`
+		ClashPort     *int    `json:"clashPort"`
+		Autostart     *bool   `json:"autostart"`
+		HealthAuto    *bool   `json:"healthAuto"`
+		ClashPortMode *string `json:"clashPortMode"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&input); err != nil || input.HealthAuto == nil {
-		runResponse(w, http.StatusUnprocessableEntity, map[string]any{"detail": "此入口当前只支持修改自动节点体检"})
+	if err := dec.Decode(&body); err != nil {
+		runResponse(w, http.StatusUnprocessableEntity, map[string]any{"detail": "请求体无效"})
 		return
 	}
-	if err := s.Gate.WithWrite(r.Context(), store.PriorityInteractive, func(conn *sql.Conn) error {
-		return settings.WriteValue(r.Context(), conn, manualHealthSetting, *input.HealthAuto)
-	}); err != nil {
-		runPayload(w, "", err)
-		return
+	ctx := r.Context()
+
+	// ① 策略：白名单校验 + 用户显式标记（标记为真后订阅导入的自动切换不再覆盖）
+	if body.Strategy != nil {
+		if !strategyKnown(*body.Strategy) {
+			runResponse(w, http.StatusBadRequest, map[string]any{"detail": "未知策略: " + *body.Strategy})
+			return
+		}
+		if err := s.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			if err := settings.WriteValue(ctx, conn, "proxy.strategy", *body.Strategy); err != nil {
+				return err
+			}
+			explicit, err := kvBool(ctx, conn, "proxy.strategy_explicit", false)
+			if err != nil {
+				return err
+			}
+			if !explicit {
+				return settings.WriteValue(ctx, conn, "proxy.strategy_explicit", true)
+			}
+			return nil
+		}); err != nil {
+			runPayload(w, "", err)
+			return
+		}
+		s.publishChanged("proxy.strategy", "proxy.strategy_explicit")
 	}
-	value, err := proxyStrategy(r.Context(), s.DB)
+
+	// ② 端口模式/端口：fixed 校验端口并（内核在跑时）立即按新端口重启；auto 只改模式
+	if body.ClashPortMode != nil || body.ClashPort != nil {
+		oldMode, oldPort := s.kernelPortConfig(ctx)
+		targetMode := oldMode
+		if body.ClashPortMode != nil {
+			targetMode = *body.ClashPortMode
+		} else if body.ClashPort != nil {
+			targetMode = "fixed"
+		}
+		if targetMode != "auto" && targetMode != "fixed" {
+			runResponse(w, http.StatusBadRequest, map[string]any{"detail": "代理端口模式必须是 auto 或 fixed"})
+			return
+		}
+		changed := []string{}
+		if err := s.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			if targetMode == "fixed" {
+				targetPort := oldPort
+				if body.ClashPort != nil {
+					p := *body.ClashPort
+					targetPort = &p
+				}
+				if targetPort == nil || *targetPort < 1 || *targetPort > 65535 {
+					return portError("固定端口必须在 1 到 65535 之间")
+				}
+				if s.RestartKernelForPort != nil && (oldMode != "fixed" || oldPort == nil || *oldPort != *targetPort) {
+					if err := s.RestartKernelForPort(ctx, *targetPort); err != nil {
+						return fmt.Errorf("代理端口切换失败：%w", err)
+					}
+				}
+				if err := settings.WriteValue(ctx, conn, "proxy.clash_port", *targetPort); err != nil {
+					return err
+				}
+				if err := settings.WriteValue(ctx, conn, "proxy.clash_port_mode", "fixed"); err != nil {
+					return err
+				}
+				changed = append(changed, "proxy.clash_port", "proxy.clash_port_mode")
+				return nil
+			}
+			if err := settings.WriteValue(ctx, conn, "proxy.clash_port_mode", "auto"); err != nil {
+				return err
+			}
+			changed = append(changed, "proxy.clash_port_mode")
+			return nil
+		}); err != nil {
+			if pe, ok := err.(portError); ok {
+				runResponse(w, http.StatusBadRequest, map[string]any{"detail": string(pe)})
+				return
+			}
+			runPayload(w, "", err)
+			return
+		}
+		s.publishChanged(changed...)
+	}
+
+	// ③ 自启 / 体检开关
+	changed := []string{}
+	for _, pair := range []struct {
+		body *bool
+		key  string
+	}{{body.Autostart, "proxy.autostart"}, {body.HealthAuto, manualHealthSetting}} {
+		if pair.body == nil {
+			continue
+		}
+		if err := s.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			return settings.WriteValue(ctx, conn, pair.key, *pair.body)
+		}); err != nil {
+			runPayload(w, "", err)
+			return
+		}
+		changed = append(changed, pair.key)
+	}
+	if len(changed) > 0 {
+		s.publishChanged(changed...)
+	}
+
+	value, err := proxyStrategy(ctx, s.DB)
 	runPayload(w, value, err)
 }
 

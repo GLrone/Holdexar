@@ -1,5 +1,3 @@
-// 重建待办位与消费链单测：状态机语义、占用让路、消费在动手之前、
-// 占用释放触发钩子。真内核热重建走 live 测试。
 package proxypool
 
 import (
@@ -95,7 +93,6 @@ func TestRunPendingRebuildNoopCases(t *testing.T) {
 	rebuildPending.Store(false)
 
 	calls := 0
-	// 无待办：空手返回，回调不动。
 	ran, err := RunPendingRebuild(context.Background(), func(ctx context.Context) error {
 		calls++
 		return nil
@@ -103,7 +100,6 @@ func TestRunPendingRebuildNoopCases(t *testing.T) {
 	if err != nil || ran || calls != 0 {
 		t.Fatalf("无待办应空手：ran=%v err=%v calls=%d", ran, err, calls)
 	}
-	// 无回调（未接线）：消费但不执行。
 	RequestRebuild()
 	ran, err = RunPendingRebuild(context.Background(), nil)
 	if err != nil || ran {
@@ -118,7 +114,6 @@ func TestRunPendingRebuildConsumesBeforeAction(t *testing.T) {
 	defer rebuildPending.Store(false)
 	rebuildPending.Store(false)
 
-	// 重建中再次变脏：pending 属下一次重建，不被本次吞掉。
 	RequestRebuild()
 	ran, err := RunPendingRebuild(context.Background(), func(ctx context.Context) error {
 		RequestRebuild()
@@ -137,7 +132,6 @@ func TestEndCrawlKicksOnCrawlEnd(t *testing.T) {
 	prev := occupancy.OnCrawlEnd
 	defer func() { occupancy.OnCrawlEnd = prev }()
 
-	// 钩子在占用已释放后异步执行（Python create_task 同款）：触发时持有者应已清空。
 	fired := make(chan string, 1)
 	occupancy.OnCrawlEnd = func() {
 		fired <- occupancy.CurrentHolder()

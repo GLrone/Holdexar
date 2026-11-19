@@ -1,10 +1,5 @@
 package proxypool
 
-// L0 传输层探测（Python health.py L0 段对齐）：经控制器 /proxies/{name}/delay
-// 让内核经指定节点探一次目标。三层分工里 L0 只作诊断不作准入；响应区分
-// 200 {"delay":n}=成功，404=名字没定位到（不构成健康证据），其余非 200=探测失败。
-// valid=False 表示这一探没测到节点本身，不累加失败计数、不推进状态。
-
 import (
 	"context"
 	"encoding/json"
@@ -20,7 +15,6 @@ import (
 	"holdexar/server-go/internal/clashkernel"
 )
 
-// L0 探测目标：204、无响应体、请求最轻。
 const ProbeTargetURL = "http://www.gstatic.com/generate_204"
 
 const (
@@ -32,7 +26,6 @@ const (
 	detailControllerAuthFail = "控制器认证失败"
 )
 
-// ProbeResult 一次 L0 探测的原始结论。
 type ProbeResult struct {
 	RuntimeName string
 	OK          bool
@@ -41,14 +34,12 @@ type ProbeResult struct {
 	Valid       bool
 }
 
-// ProbeOptions L0 探测参数（零值 = 缺省目标与超时）。
 type ProbeOptions struct {
 	URL           string
 	TimeoutMS     int
 	ClientTimeout time.Duration
 }
 
-// probeHTTPClient 不走环境代理（Python trust_env=False 语义），TLS 校验保持默认。
 func probeHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
@@ -56,7 +47,6 @@ func probeHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
-// ProbeNode 让内核经指定节点探测目标 URL，返回最基础的一次 L0 观测。
 func ProbeNode(ctx context.Context, controllerURL, secret, runtimeName string, opts ProbeOptions) ProbeResult {
 	if opts.URL == "" {
 		opts.URL = ProbeTargetURL
@@ -111,8 +101,7 @@ func ProbeNode(ctx context.Context, controllerURL, secret, runtimeName string, o
 	return ProbeResult{RuntimeName: runtimeName, OK: true, DelayMS: delay, Valid: true}
 }
 
-// PoolProbeLanes 池运行时配置里的探测 lane；端口没在听的剔除——走死端口的探测
-// 会把「通道不通」误判成「节点不通」。解析失败 / 无 lane 返回空。
+// PoolProbeLanes 剔除未在听端口，防通道不通误判节点不通。
 func PoolProbeLanes(configText string) []clashcfg.ProbeLane {
 	lanes, err := clashcfg.ParseProbeLanes(configText)
 	if err != nil {
@@ -127,11 +116,8 @@ func PoolProbeLanes(configText string) []clashcfg.ProbeLane {
 	return out
 }
 
-// failCooldownMinutes 失败冷却档位（Python bridge 口径）：按连续失败次数取档，
-// 单位分钟；成功或收到任何 Steam 响应即清冷却。
 var failCooldownMinutes = []int{30, 60, 120, 240, 480, 1440}
 
-// CooldownMinutesFor 连续失败次数 → 冷却分钟数（第 1 次失败起 30 分钟，逐档翻倍封顶）。
 func CooldownMinutesFor(consecutiveFailures int64) int {
 	tier := consecutiveFailures
 	if tier < 1 {
@@ -143,8 +129,6 @@ func CooldownMinutesFor(consecutiveFailures int64) int {
 	return failCooldownMinutes[tier-1]
 }
 
-// pyToProbeInt Python _to_int 语义：None/空串 → 无值；字符串/数值按
-// int(float(v)) 截断；NaN/Inf 不可转换；bool 按数值 1/0。
 func pyToProbeInt(v any) (int64, bool) {
 	switch x := v.(type) {
 	case nil:
@@ -182,7 +166,6 @@ func pyToProbeIntFromFloat(s string) (int64, bool) {
 	return int64(f), true
 }
 
-// pyReprValue 数值观测值的 Python repr 形态（detail 文案对齐用）。
 func pyReprValue(v any) string {
 	switch x := v.(type) {
 	case nil:

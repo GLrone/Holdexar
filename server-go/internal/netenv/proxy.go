@@ -24,7 +24,6 @@ type resolver struct {
 
 var systemResolver = &resolver{environment: os.Environ, registry: readWindowsProxy, dial: (&net.Dialer{Timeout: time.Second}).DialContext, now: time.Now}
 
-// ResolveSystemProxy returns a reachable configured HTTP proxy, or an empty URL for direct access.
 func ResolveSystemProxy(ctx context.Context) (string, error) { return systemResolver.resolve(ctx) }
 
 func (r *resolver) resolve(ctx context.Context) (string, error) {

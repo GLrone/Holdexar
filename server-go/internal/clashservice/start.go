@@ -1,5 +1,4 @@
-// 启动候选链与启动/切换/点选/停止。候选淘汰仅当「下载不了且无缓存」——
-// 订阅链接失效不该连累内核起不来，节点好不好交给首检与废弃判定。
+// 订阅启动候选链：仅下载失败且无缓存时淘汰候选。
 package clashservice
 
 import (
@@ -22,7 +21,6 @@ const (
 	portKey     = "proxy.clash_port"
 )
 
-// ClashSubscription 订阅行投影（URL 为明文，库内专用不进响应体）。
 type ClashSubscription struct {
 	ID               int64
 	Kind             string
@@ -39,8 +37,6 @@ func (sub *ClashSubscription) deprecatedReasonOr() string {
 	return "不可用节点超过 95%"
 }
 
-// listClashSubscriptions kind=clash 的订阅清单（reveal 语义 + 废弃投影：
-// deprecated 列或资源封锁判定任一命中即废弃）。
 func (s *Service) listClashSubscriptions(ctx context.Context) ([]ClashSubscription, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT id, kind, url, label, CAST(last_stats AS TEXT),
 		COALESCE(deprecated,0), deprecated_reason FROM proxy_subscriptions WHERE kind='clash' ORDER BY id`)
@@ -86,8 +82,6 @@ func findSub(subs []ClashSubscription, id int64) *ClashSubscription {
 	return nil
 }
 
-// ─── 端口选项（fixed 存档口 / 在跑沿用现口 / 动态分配三态）────
-
 func (s *Service) writeKV(ctx context.Context, key string, value any) {
 	err := s.Gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
 		return settings.WriteValue(ctx, conn, key, value)
@@ -97,7 +91,6 @@ func (s *Service) writeKV(ctx context.Context, key string, value any) {
 	}
 }
 
-// kernelPortConfig 归一化端口模式（无效存档口回落 auto 并写回）。
 func (s *Service) kernelPortConfig(ctx context.Context) (mode string, savedPort int, portOK bool, err error) {
 	var modeRaw, portRaw sql.NullString
 	err = s.DB.QueryRowContext(ctx, `SELECT
@@ -133,8 +126,6 @@ func (s *Service) kernelPortConfig(ctx context.Context) (mode string, savedPort 
 	return mode, savedPort, portOK, nil
 }
 
-// KernelPortOptions 内核启动的端口选项：fixed 模式用存档口；在跑沿用现口；
-// 否则动态分配（allocate 只在未运行时出现，与 Python 调用面等价）。
 func (s *Service) KernelPortOptions(ctx context.Context) (mixedPort int, allocate bool, err error) {
 	mode, savedPort, portOK, err := s.kernelPortConfig(ctx)
 	if err != nil {
@@ -150,20 +141,16 @@ func (s *Service) KernelPortOptions(ctx context.Context) (mixedPort int, allocat
 	return 0, true, nil
 }
 
-// ─── 启动候选链 ──────────────────────────────────────────────
-
-// AttemptRecord 被淘汰候选的失败原因。
 type AttemptRecord struct {
 	ID    int64  `json:"id"`
 	Label string `json:"label"`
 	Error string `json:"error"`
 }
 
-// StartableClash 选出的「现在就能把内核拉起来」的候选。
 type StartableClash struct {
 	Subscription ClashSubscription
-	ConfigPath   string // 项目生成的运行配置（交给内核的）
-	RawPath      string // 原文缓存路径（来源证据）
+	ConfigPath   string
+	RawPath      string
 	Title        string
 	Userinfo     string
 	Nodes        int
@@ -171,10 +158,7 @@ type StartableClash struct {
 	Attempts     []AttemptRecord
 }
 
-// ResolveStartableClash 挑一条现在就能用的订阅。候选序：请求的那条在前，
-// 其余非废弃按新→旧倒序；无显式请求时吃落库的「最近一次显式选中」按请求对待。
-// 在线取到的配置优先于缓存回退（无指定订阅时缓存命中留作兜底继续找）；
-// 显式指定的订阅命中即返回（尊重用户选择）。
+// ResolveStartableClash 选可用订阅：请求或最近选中优先，在线优于缓存兜底。
 func (s *Service) ResolveStartableClash(ctx context.Context, requestedID *int64, snapshotOnly bool) (*StartableClash, error) {
 	subs, err := s.listClashSubscriptions(ctx)
 	if err != nil {
@@ -247,7 +231,6 @@ func (s *Service) ResolveStartableClash(ctx context.Context, requestedID *int64,
 	return nil, statusErr(400, "所有可用订阅都取不到配置（%s），请更换订阅链接后重试", strings.Join(detail, "；"))
 }
 
-// prepareCandidate 单候选取配置：在线下载优先、缓存兜底，再渲染运行配置。
 func (s *Service) prepareCandidate(ctx context.Context, sub ClashSubscription, snapshotOnly bool) (*StartableClash, error) {
 	cachePath := SubscriptionConfigPath(s.DataDir, sub.ID)
 	var fetch *SubscriptionFetch
@@ -255,7 +238,6 @@ func (s *Service) prepareCandidate(ctx context.Context, sub ClashSubscription, s
 	if snapshotOnly {
 		restored, rerr := s.FetchSubscriptionToCache(ctx, sub.ID, sub.URL)
 		if rerr != nil {
-			// 库内无成功快照：回落读缓存正文（snapshot_only 的本地文件分支）
 			raw, ferr := os.ReadFile(cachePath)
 			nodes, nerr := countSubscriptionNodes(raw)
 			if ferr != nil || nerr != nil {
@@ -281,8 +263,6 @@ func (s *Service) prepareCandidate(ctx context.Context, sub ClashSubscription, s
 	}, nil
 }
 
-// fetchToCache 在线拉取并写缓存正文；在线失败或本轮无新快照时回落库内成功快照。
-// 返回 cached=是否走的缓存兜底。
 func (s *Service) fetchToCache(ctx context.Context, sub ClashSubscription) (*SubscriptionFetch, bool, error) {
 	fetched, err := s.fetch(ctx, sub.ID, sub.URL)
 	if err == nil && fetched != nil {
@@ -297,7 +277,7 @@ func (s *Service) fetchToCache(ctx context.Context, sub ClashSubscription) (*Sub
 	restored, rerr := s.FetchSubscriptionToCache(ctx, sub.ID, sub.URL)
 	if rerr != nil {
 		if err != nil {
-			return nil, false, err // 在线失败原因优先（对齐 sync.failures 文案）
+			return nil, false, err
 		}
 		return nil, false, rerr
 	}
@@ -311,7 +291,6 @@ func (s *Service) fetch(ctx context.Context, subID int64, subURL string) (*Subsc
 	return s.fetchOnlineDefault(ctx, subID, subURL)
 }
 
-// fetchOnlineDefault 默认在线拉取：proxypool.Syncer.SyncOne（闸外并发抓取 + 闸内落库）。
 func (s *Service) fetchOnlineDefault(ctx context.Context, subID int64, subURL string) (*SubscriptionFetch, error) {
 	var stored string
 	err := s.DB.QueryRowContext(ctx, `SELECT url FROM proxy_subscriptions WHERE id=?`, subID).Scan(&stored)
@@ -331,7 +310,7 @@ func (s *Service) fetchOnlineDefault(ctx context.Context, subID int64, subURL st
 	}
 	snapshot := result.Snapshots[subID]
 	if snapshot == nil {
-		return nil, nil // 本轮没有产生新快照 → 调用方走缓存兜底
+		return nil, nil
 	}
 	return &SubscriptionFetch{
 		Raw: snapshot.RawContent, Title: snapshot.ProfileTitle,
@@ -351,12 +330,7 @@ func countSubscriptionNodes(raw []byte) (int, error) {
 	return len(nodes), nil
 }
 
-// ─── 启动 / 切换 / 点选 / 停止 ────────────────────────────────
-
-// ensureSubKernelRunning 确保订阅内核跑着指定配置（对齐 Python ensure_running 的
-// inject_lanes 缺省 True）：未运行经 Start 显式 InjectLanes=true（EnsureRunningOptions
-// 无该位、池路径零值即所需，订阅内核不能漏）；在跑走 EnsureRunning 热重载
-// （runningKernelText 恒注入 lane）。端口选项三态保证 allocate 只在未运行时出现。
+// ensureSubKernelRunning 未运行走 Start(InjectLanes=true)，在跑走热重载；仅未运行时允许分配端口。
 func (s *Service) ensureSubKernelRunning(exePath, configPath, subURL string, mixedPort int, allocate bool) (clashkernel.EnsureRunResult, error) {
 	if !s.Kernel.Status().Running {
 		status, err := s.Kernel.Start(exePath, configPath, clashkernel.StartOptions{
@@ -370,31 +344,26 @@ func (s *Service) ensureSubKernelRunning(exePath, configPath, subURL string, mix
 	})
 }
 
-// StartSubRef 启动响应里实际拉起内核的订阅。
 type StartSubRef struct {
 	ID    int64   `json:"id"`
 	Label *string `json:"label"`
 }
 
-// AttemptRef 非空 = 请求的订阅取不到配置，已降级到其他订阅启动。
 type AttemptRef struct {
 	ID    int64   `json:"id"`
 	Label *string `json:"label"`
 }
 
-// StartResult POST /clash/start 响应（status + started/reloaded + 启动扩展）。
 type StartResult struct {
 	BaseStatus
-	Started     bool        `json:"started"`
-	Reloaded    bool        `json:"reloaded"`
-	Nodes       *int        `json:"nodes"`
-	UsedCache   bool        `json:"usedCache"`
+	Started      bool        `json:"started"`
+	Reloaded     bool        `json:"reloaded"`
+	Nodes        *int        `json:"nodes"`
+	UsedCache    bool        `json:"usedCache"`
 	Subscription StartSubRef `json:"subscription"`
 	FallbackFrom *AttemptRef `json:"fallbackFrom"`
 }
 
-// StartClash 启动内核全链：候选链取配置 → 拉起/热重载 → 名称链/导入回填/
-// 选中落库/走线日志/首检挂点。
 func (s *Service) StartClash(ctx context.Context, requestedID *int64) (*StartResult, error) {
 	detect := s.DetectKernel()
 	if !detect.Found {
@@ -463,7 +432,6 @@ func (s *Service) StartClash(ctx context.Context, requestedID *int64) (*StartRes
 	return out, nil
 }
 
-// SwitchResult POST /clash/switch 响应。
 type SwitchResult struct {
 	BaseStatus
 	Switched bool `json:"switched"`
@@ -471,8 +439,7 @@ type SwitchResult struct {
 	Reloaded bool `json:"reloaded"`
 }
 
-// SwitchClash 切换运行中内核的订阅：有缓存直接热重载（秒级），无缓存先下载；
-// 热重载持检测串行锁——打断首检会对着新配置探测、整轮误判污染账本。
+// SwitchClash 切换订阅并持 TestLock 热重载，防止打断检测污染账本。
 func (s *Service) SwitchClash(ctx context.Context, subscriptionID int64) (*SwitchResult, error) {
 	status := s.Kernel.Status()
 	if !status.Running {
@@ -532,7 +499,6 @@ func (s *Service) SwitchClash(ctx context.Context, subscriptionID int64) (*Switc
 	}, nil
 }
 
-// SelectClash 内核未运行时记录订阅行点选（跨页面与重启保留，启动缺省用它）。
 func (s *Service) SelectClash(ctx context.Context, subscriptionID int64) (int64, error) {
 	subs, err := s.listClashSubscriptions(ctx)
 	if err != nil {
@@ -547,7 +513,6 @@ func (s *Service) SelectClash(ctx context.Context, subscriptionID int64) (int64,
 	return subscriptionID, nil
 }
 
-// StopClash 停止内核并清运行态账目（configPath 保留）。
 func (s *Service) StopClash() BaseStatus {
 	return baseStatus(s.Kernel.Stop())
 }

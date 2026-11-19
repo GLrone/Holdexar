@@ -10,9 +10,6 @@ import (
 	"testing"
 )
 
-// 同载荷对照验收（核心门禁）：节点身份哈希与订阅解析用真实 Python 参考实现
-// 直调对拍，逐字节一致。venv 缺失自动 skip（跨语言对照的既有先例）。
-
 const worktreeRoot = `E:\Holdexar-go-migration`
 
 func venvPython(t *testing.T) string {
@@ -24,8 +21,6 @@ func venvPython(t *testing.T) string {
 	return py
 }
 
-// runPythonRef 调真实参考实现：脚本含 ref_entry(payload) 定义与 main 驱动，
-// 读 inputs.json、写 outputs.json（sys.path 注入 worktree server 根）。
 func runPythonRef(t *testing.T, refBody string, inputs any, outputs any) {
 	t.Helper()
 	py := venvPython(t)
@@ -70,7 +65,6 @@ func runPythonRef(t *testing.T, refBody string, inputs any, outputs any) {
 	_ = io.Discard
 }
 
-// refIdentityScript 参考侧：真实 models.py 的三个身份函数。
 const refIdentityScript = `
 from app.domains.proxypool.models import node_fingerprint, subscription_tag, port_is_identity
 
@@ -84,8 +78,6 @@ def ref_entry(payload):
 `
 
 func TestCrossLangIdentityHash(t *testing.T) {
-	// 15 组输入：同链接异内容 / 同内容异链接 / 动态端口机场 / 本地代理链 /
-	// 域名边界 / 中文与嵌套 / 浮点布尔空值 / 键序打乱 / 未知键 / 控制字符
 	config := func(extra map[string]any) map[string]any {
 		base := map[string]any{
 			"name": "香港 01", "type": "ss", "server": "hk1.example.com",
@@ -188,7 +180,6 @@ func TestCrossLangIdentityHash(t *testing.T) {
 			t.Fatalf("case %d 指纹逐字节不一致：\nGo     %s\nPython %s", i, want, got.Fingerprints[i])
 		}
 	}
-	// 关键语义锚点（对拍背景下的行为断言）
 	fp0, _ := NodeFingerprint(fingerprintCases[0]["config"].(map[string]any), fingerprintCases[0]["tag"].(string))
 	fp3, _ := NodeFingerprint(fingerprintCases[3]["config"].(map[string]any), fingerprintCases[3]["tag"].(string))
 	if fp0 != fp3 {
@@ -221,7 +212,6 @@ func TestCrossLangIdentityHash(t *testing.T) {
 		len(got.Fingerprints), len(got.Tags), len(got.PortIdentity))
 }
 
-// refParseScript 参考侧：真实 subscription.py 的 parse_nodes + 逐节点指纹。
 const refParseScript = `
 import json
 from app.domains.proxypool.subscription import parse_nodes
@@ -259,7 +249,6 @@ func TestCrossLangParseNodes(t *testing.T) {
 		t.Fatalf("节点数不一致：Go %d Python %d", len(nodes), got.Count)
 	}
 	for i, node := range nodes {
-		// 树深度相等（数值按值比较，对齐 Python ==）
 		if !pyConfigEqual(node, got.Nodes[i].m) {
 			t.Fatalf("节点 %d 树不一致：\nGo     %v\nPython %v", i, node, got.Nodes[i].m)
 		}
@@ -274,7 +263,6 @@ func TestCrossLangParseNodes(t *testing.T) {
 	t.Logf("解析对照：%d 节点树逐值一致 + 指纹逐字节一致", got.Count)
 }
 
-// symmetricMap JSON 对象解码（UseNumber，数字形态保真）。
 type symmetricMap struct{ m map[string]any }
 
 func (s *symmetricMap) UnmarshalJSON(data []byte) error {

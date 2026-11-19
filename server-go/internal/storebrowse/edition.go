@@ -1,8 +1,9 @@
 package storebrowse
 
 import (
+	"cmp"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -19,7 +20,7 @@ var (
 )
 
 func init() {
-	sort.SliceStable(editionKeys, func(i, j int) bool { return len(editionKeys[i]) > len(editionKeys[j]) })
+	slices.SortStableFunc(editionKeys, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 }
 
 func IsGoldEdition(name string) bool {

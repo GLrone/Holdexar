@@ -1,9 +1,5 @@
 package clashservice
 
-// 检测链测试：会话语义（单飞/终态/failed）+ 账本语义（冷却阶梯/重置/退役/恢复/
-// 废弃判定）+ selector 自愈 + 冷却跳过计数。对照基线 Python tests/
-// test_clash_nodes_state.py；出网全走桩，绝不真出网。
-
 import (
 	"context"
 	"database/sql"
@@ -23,15 +19,12 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// ─── 检测链夹具 ──────────────────────────────────────────────
-
-// stubTestController 控制器桩：组选择/回读/模式全内存。
 type stubTestController struct {
 	mu      sync.Mutex
 	proxies map[string]map[string]any
 	putLog  []string
 	mode    string
-	reject  map[string]bool // 组名 → PUT 一律失败
+	reject  map[string]bool
 }
 
 func newStubController(groups []string) *stubTestController {
@@ -95,7 +88,6 @@ func (c *stubTestController) PatchMode(mode string) error {
 	return nil
 }
 
-// probeCount Steam 探针调用计数。
 type probeCount struct {
 	mu    sync.Mutex
 	ports map[int]int
@@ -122,7 +114,6 @@ func (p *probeCount) portsCount() int {
 	return total
 }
 
-// nodeFingerprintOf 运行配置里按名取节点身份（与 impl 同一计算链）。
 func nodeFingerprintOf(t *testing.T, configText, url, name string) string {
 	t.Helper()
 	format, err := proxypool.DetectFormat([]byte(configText))
@@ -146,9 +137,6 @@ func nodeFingerprintOf(t *testing.T, configText, url, name string) string {
 	return ""
 }
 
-// newTestFixture 检测链全套夹具：订阅 1 + 注入 lane 的运行配置 + 内核桩在跑 +
-// 每个节点的权威账本行（NodeNew 无冷却）。返回 svc、内核桩、控制器桩、探针
-// 计数器、订阅原文缓存路径、订阅原文与订阅 URL（节点身份一律按原文算）。
 func newTestFixture(t *testing.T, nodes ...string) (*Service, *stubRuntime, *stubTestController, *probeCount, string, string, string) {
 	t.Helper()
 	if len(nodes) == 0 {
@@ -179,7 +167,6 @@ func newTestFixture(t *testing.T, nodes ...string) (*Service, *stubRuntime, *stu
 	if len(lanes) < 2 {
 		t.Fatalf("夹具应注入至少 2 条 lane：%d", len(lanes))
 	}
-	// 内核桩：在跑 + 指向运行配置 + 订阅归属
 	kernel.mu.Lock()
 	kernel.st = clashkernel.Status{
 		Running: true, Port: 18347, EntryReady: true,
@@ -219,8 +206,6 @@ func mustRead(t *testing.T, path string) []byte {
 	return raw
 }
 
-// buildConfigWithNodes 按名单拼最小订阅配置（节点名进 proxies 段；server 逐节点
-// 递增——name 不参与节点身份，同连接参数的两个名字算同一节点，账本播种会互覆）。
 func buildConfigWithNodes(names []string) string {
 	var b strings.Builder
 	b.WriteString("mixed-port: 7890\nmode: rule\nrules:\n  - MATCH,DIRECT\nproxies:\n")
@@ -253,7 +238,6 @@ func ledgerExitIP(ip string) func(*ledgerSeed) {
 	return func(s *ledgerSeed) { s.exitIP = ip }
 }
 
-// seedLedgerNode 播种权威节点行（对齐 impl 的身份链；已存在则先删）。
 func seedLedgerNode(t *testing.T, svc *Service, configText, url, name string, state string, opts ...func(*ledgerSeed)) {
 	t.Helper()
 	seed := ledgerSeed{}
@@ -289,7 +273,6 @@ func seedLedgerNode(t *testing.T, svc *Service, configText, url, name string, st
 	}
 }
 
-// ledgerRow 读回权威节点行（按原名）。
 type ledgerRow struct {
 	State               string
 	ConsecutiveFailures int64
@@ -325,7 +308,6 @@ func fixedNow() time.Time {
 	return time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 }
 
-// failAllProbe 全灭探针形态：Steam 无响应（status=0）+ 无出口 IP = 传输失败。
 func failAllProbe(ctx context.Context, port int) (bool, int) { return false, 0 }
 
 func failAllExitIP(ctx context.Context, port int) string { return "" }
@@ -349,8 +331,6 @@ func waitSessionPhase(t *testing.T, svc *Service, phase string, timeout time.Dur
 	return nil
 }
 
-// ─── 会话语义 ────────────────────────────────────────────────
-
 func TestTestProgressIdleShape(t *testing.T) {
 	svc, _, _, _, _, _, _ := newTestFixture(t)
 	snap := svc.TestProgress(context.Background())
@@ -362,7 +342,6 @@ func TestTestProgressIdleShape(t *testing.T) {
 
 func TestTestStartSingleFlightReuse(t *testing.T) {
 	svc, _, _, _, _, _, _ := newTestFixture(t)
-	// 探针桩挂起：让任务停在探测中（running），验证第二次 start 复用不重开
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	svc.SteamProbe = func(ctx context.Context, port int) (bool, int) {
@@ -383,7 +362,7 @@ func TestTestStartSingleFlightReuse(t *testing.T) {
 	if !ok || firstSnap.Phase != "queued" {
 		t.Fatalf("首启应落 queued 会话并立即返回：%v", first)
 	}
-	<-entered // 任务已进入探测
+	<-entered
 
 	second := svc.TestStart(context.Background())
 	secondSnap, ok := second.(*testSessionSnapshot)
@@ -417,7 +396,6 @@ func TestTestStartAfterDoneRunsNewSession(t *testing.T) {
 
 func TestTestSessionQueuedVisibleDuringLockHold(t *testing.T) {
 	svc, _, _, _, _, _, _ := newTestFixture(t)
-	// 外部占住 TestLock：start 应落 queued 会话立即返回，探测任务等锁不进 impl
 	svc.TestLock.Lock()
 	svc.TestStart(context.Background())
 	svc.testMu.Lock()
@@ -447,7 +425,6 @@ func TestTestSessionFailedWithoutKernel(t *testing.T) {
 
 func TestTestSessionProgressSnapshotFields(t *testing.T) {
 	svc, _, _, _, _, _, _ := newTestFixture(t)
-	// 终态字段齐全断言（camelCase 契约）
 	svc.TestStart(context.Background())
 	snap := waitSessionPhase(t, svc, "done", 3*time.Second)
 	if snap.Total == nil || *snap.Total != 2 {
@@ -502,17 +479,14 @@ func TestTestSessionProgressSnapshotFields(t *testing.T) {
 	}
 }
 
-// ─── 冷却跳过（定时体检口径 probeAll=false）──────────────────
-
 func TestCooldownSkipCountsAndPayload(t *testing.T) {
 	svc, _, _, _, _, configText, url := newTestFixture(t)
 	now := fixedNow()
-	// 节点A 在冷却期内且有账本存活证据（体检缺省不探它）；节点B 无冷却
 	seedLedgerNode(t, svc, configText, url, "节点A", proxypool.NodeActive,
 		ledgerCooldown(now.Add(30*time.Minute)), ledgerLastL2(now))
 	seedLedgerNode(t, svc, configText, url, "节点B", proxypool.NodeNew)
 
-	result, err := svc.testClashNodes(context.Background(), nil, false) // 定时体检口径
+	result, err := svc.testClashNodes(context.Background(), nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +499,6 @@ func TestCooldownSkipCountsAndPayload(t *testing.T) {
 	if *snap.ToProbe != 1 || *snap.Total != 2 {
 		t.Fatalf("toProbe=1 total=2，实际 toProbe=%d total=%d", *snap.ToProbe, *snap.Total)
 	}
-	// 冷却跳过行：probed=false + cooling=true + 存活按账本口径（A 有 last_l2 → alive）
 	var cooling *testNodeRow
 	for i := range result.Nodes {
 		if result.Nodes[i].Cooling {
@@ -540,14 +513,11 @@ func TestCooldownSkipCountsAndPayload(t *testing.T) {
 	}
 }
 
-// ─── 账本语义（冷却阶梯 / 成功重置 / 退役 / 恢复）─────────────
-
 func TestLedgerCooldownLadderAndDeprecation(t *testing.T) {
 	svc, _, _, _, _, configText, url := newTestFixture(t)
 	svc.SteamProbe = failAllProbe
 	svc.ExitIPProbe = failAllExitIP
 	now := fixedNow()
-	// 冷却阶梯：30/60/120/240/480/1440 分钟，之后恒 1440（对齐 test_fail_cooldown_ladder）
 	ladder := []int{30, 60, 120, 240, 480, 1440, 1440, 1440}
 	for _, expectMinutes := range ladder {
 		if _, err := svc.testClashNodes(context.Background(), nil, true); err != nil {
@@ -565,7 +535,6 @@ func TestLedgerCooldownLadderAndDeprecation(t *testing.T) {
 		if delta != time.Duration(expectMinutes)*time.Minute {
 			t.Fatalf("连续失败 %d 次期望冷却 %dmin，实际 %v", row.ConsecutiveFailures, expectMinutes, delta)
 		}
-		// 全灭 → 订阅废弃（带「没有可用节点」原因）
 		deprecated, reason, _ := readSubRow(t, svc, 1)
 		if !deprecated || !strings.Contains(reason.String, "没有可用节点") {
 			t.Fatalf("全灭应废弃订阅带原因：%v %v", deprecated, reason)
@@ -589,7 +558,6 @@ func TestLedgerSuccessResetsCooldownAndRecoversSubscription(t *testing.T) {
 	if row.State != proxypool.NodeDead || row.ConsecutiveFailures != 2 {
 		t.Fatalf("两轮失败后应为 DEAD×2：%s %d", row.State, row.ConsecutiveFailures)
 	}
-	// 换回成功探针：一次成功证据复活节点并解除废弃（对齐 test_ok_resets_cooldown）
 	svc.SteamProbe = func(ctx context.Context, port int) (bool, int) { return true, 200 }
 	svc.ExitIPProbe = func(ctx context.Context, port int) string { return "2.2.2.2" }
 	if _, err := svc.testClashNodes(context.Background(), nil, true); err != nil {
@@ -638,7 +606,6 @@ func TestLedgerRetireAfterThreeFailuresAndRestore(t *testing.T) {
 func TestLedgerAliveStatsFromCooldownSkipped(t *testing.T) {
 	svc, _, _, _, _, configText, url := newTestFixture(t)
 	now := fixedNow()
-	// A 冷却中但账本有存活证据（含出口）；B 实探传输失败
 	seedLedgerNode(t, svc, configText, url, "节点A", proxypool.NodeActive,
 		ledgerCooldown(now.Add(30*time.Minute)), ledgerLastL2(now), ledgerExitIP("9.9.9.9"))
 	seedLedgerNode(t, svc, configText, url, "节点B", proxypool.NodeActive)
@@ -649,7 +616,6 @@ func TestLedgerAliveStatsFromCooldownSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// n(B) 实探失败、n(A) 冷却跳过按权威账本存活计入（对齐 test_cooldown_nodes_counted_by_registry）
 	if result.Alive != 1 {
 		t.Fatalf("冷却跳过按账本存活应计入：alive=%d", result.Alive)
 	}
@@ -658,14 +624,11 @@ func TestLedgerAliveStatsFromCooldownSkipped(t *testing.T) {
 	}
 }
 
-// ─── selector 自愈 ───────────────────────────────────────────
-
 func TestSelectorSelfHealSwitchesToFastestAlive(t *testing.T) {
 	svc, _, ctl, _, runtimePath, _, _ := newTestFixture(t)
 	configRaw, _ := os.ReadFile(runtimePath)
 	lanes, _ := clashcfg.ParseProbeLanes(string(configRaw))
 	portA := lanes[0].Port
-	// 当前选中 节点A（组 now=A）；A 死 B 活（按 lane 端口区分节点）
 	svc.SteamProbe = func(ctx context.Context, port int) (bool, int) {
 		if port == portA {
 			return false, 502
@@ -689,7 +652,6 @@ func TestSelectorSelfHealSwitchesToFastestAlive(t *testing.T) {
 
 func TestSelectorSelfHealNotTriggeredWhenCurrentAlive(t *testing.T) {
 	svc, _, ctl, _, _, _, _ := newTestFixture(t)
-	// 全活：组 now 已是节点A 且 A 活 → 不切换
 	result, err := svc.testClashNodes(context.Background(), nil, true)
 	if err != nil {
 		t.Fatal(err)
@@ -707,11 +669,8 @@ func TestSelectorSelfHealNotTriggeredWhenCurrentAlive(t *testing.T) {
 	}
 }
 
-// ─── 探测链行为 ──────────────────────────────────────────────
-
 func TestLaneProbeRejectedGroupProducesNoEvidence(t *testing.T) {
 	svc, _, ctl, counts, _, _, _ := newTestFixture(t)
-	// lane-1 的 PUT 被拒 → 选择没生效，按探不到处理（不产生该节点的健康证据）
 	ctl.mu.Lock()
 	ctl.reject["HlProbeLane-1"] = true
 	ctl.mu.Unlock()
@@ -740,7 +699,6 @@ func TestLaneProbeRejectedGroupProducesNoEvidence(t *testing.T) {
 
 func TestNoLanesAndEntryDownFailsWithUserMessage(t *testing.T) {
 	svc, kernel, _, _, _, _, _ := newTestFixture(t)
-	// lane 端口全没在听 + 入口没在听 → failed 带用户文案（不污染账本）
 	svc.PortListeningFn = func(int) bool { return false }
 	kernel.mu.Lock()
 	kernel.st.EntryReady = false
@@ -756,8 +714,6 @@ func TestNoLanesAndEntryDownFailsWithUserMessage(t *testing.T) {
 	}
 }
 
-// ─── 首检（5 分钟复用窗口）───────────────────────────────────
-
 func TestFirstCheckReuseWindow(t *testing.T) {
 	svc, _, _, _, _, configText, url := newTestFixture(t)
 	now := fixedNow()
@@ -770,7 +726,6 @@ func TestFirstCheckReuseWindow(t *testing.T) {
 	if svc.ClashNodesFresh(context.Background(), 2) {
 		t.Fatalf("无账本订阅应判定不 fresh")
 	}
-	// 窗口外（6 分钟前）→ 不 fresh，首检照跑
 	svc.Now = func() time.Time { return now.Add(6 * time.Minute) }
 	if svc.ClashNodesFresh(context.Background(), 1) {
 		t.Fatalf("窗口外应判定不 fresh")
@@ -784,7 +739,6 @@ func TestFirstCheckSkipsInsideWindowAndProbesOutside(t *testing.T) {
 	seedLedgerNode(t, svc, configText, url, "节点A", proxypool.NodeActive, ledgerLastL2(now))
 	seedLedgerNode(t, svc, configText, url, "节点B", proxypool.NodeActive, ledgerLastL2(now))
 
-	// 窗口内：沿用账本，不出网、不建会话
 	svc.SpawnFirstCheck(1, true)
 	time.Sleep(150 * time.Millisecond)
 	if counts.portsCount() != 0 {
@@ -794,7 +748,6 @@ func TestFirstCheckSkipsInsideWindowAndProbesOutside(t *testing.T) {
 		t.Fatalf("复用跳过不应建会话：%v", svc.TestProgress(context.Background()))
 	}
 
-	// 账本证据老化出窗 → 首检照跑（probeAll=true 全量）
 	svc.Now = func() time.Time { return now.Add(10 * time.Minute) }
 	svc.SpawnFirstCheck(1, true)
 	deadline := time.Now().Add(3 * time.Second)
@@ -807,11 +760,8 @@ func TestFirstCheckSkipsInsideWindowAndProbesOutside(t *testing.T) {
 	waitSessionPhase(t, svc, "done", 3*time.Second)
 }
 
-// ─── 检测串行锁（三源互斥：手动/首检/体检）───────────────────
-
 func TestTestLockSerializesConcurrentRuns(t *testing.T) {
 	svc, _, _, _, _, _, _ := newTestFixture(t)
-	// 手动检测持锁期间，第二个直调 testClashNodes 阻在门外不进 impl
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	svc.SteamProbe = func(ctx context.Context, port int) (bool, int) {

@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-// ── 注册与重名 ───────────────────────────────────────────────────
-
 func TestRouterRegisterDuplicate(t *testing.T) {
 	r := NewRouter()
 	if err := r.Register("app", func(*Context) error { return nil }); err != nil {
@@ -31,8 +29,6 @@ func TestRouterRegisterGuards(t *testing.T) {
 		t.Fatalf("空处理器注册应报错")
 	}
 }
-
-// ── 分发与跳过 ───────────────────────────────────────────────────
 
 func TestRouterDispatch(t *testing.T) {
 	r := NewRouter()
@@ -69,11 +65,9 @@ func TestRouterSkip(t *testing.T) {
 	var skips []string
 	r.OnSkip = func(task Task, reason string) { skips = append(skips, reason) }
 
-	// 缺类型
 	if err := r.Route(&Context{Task: Task{ID: "a"}}); err != nil {
 		t.Fatalf("缺类型应跳过而非报错: %v", err)
 	}
-	// 未知类型
 	if err := r.Route(&Context{Task: Task{ID: "b", Type: "ghost"}}); err != nil {
 		t.Fatalf("未知类型应跳过而非报错: %v", err)
 	}
@@ -84,8 +78,6 @@ func TestRouterSkip(t *testing.T) {
 		t.Fatalf("应记录两次跳过观察，实际 %d", len(skips))
 	}
 }
-
-// ── 队列收尾丢弃 ─────────────────────────────────────────────────
 
 func TestContextEnqueueAfterClose(t *testing.T) {
 	s := NewScheduler(NewRouter())

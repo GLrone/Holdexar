@@ -14,7 +14,6 @@ func communityFixture(t *testing.T) *Writer {
 		VALUES (872410, 'T', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`); e != nil {
 		t.Fatal(e)
 	}
-	// 官方观测：2026-01-01 10:00 价格 19900（standard，product_unknown=0）。
 	if _, e := w.DB.Exec(`INSERT INTO game_price_history
 		(appid, region_code, currency, price, discount_percent, sub_id, is_gold, version_suffix, is_bundle, price_status, cny_fen, snapshot_at, source, product_unknown)
 		VALUES (872410, 'CN', 'CNY', 19900, 30, NULL, 0, NULL, 0, 'ok', 1990, '2026-01-01 10:00:00', 'steam', 0)`); e != nil {
@@ -30,7 +29,7 @@ func TestMergeCommunityKeepsFullPluginSource(t *testing.T) {
 		t.Fatalf("valid plugin source rejected: %d %v", n, e)
 	}
 	var stored string
-	if e := w.DB.QueryRow(`SELECT source FROM game_price_history WHERE source=?`,source).Scan(&stored); e != nil || stored != source {
+	if e := w.DB.QueryRow(`SELECT source FROM game_price_history WHERE source=?`, source).Scan(&stored); e != nil || stored != source {
 		t.Fatalf("source=%q err=%v", stored, e)
 	}
 }
@@ -63,7 +62,6 @@ func TestMergeCommunityValidationRejectsWholeBatch(t *testing.T) {
 			t.Fatalf("%s: err=%v want~%s", tc.name, e, tc.want)
 		}
 	}
-	// 校验失败整批拒绝：合法成员也不得落库。
 	mixed := []CommunityObservation{
 		{SnapshotAt: beiTime("2026-01-02 08:00:00"), PriceMinor: int64p(100), Currency: "CNY"},
 		{SnapshotAt: beiTime("2026-01-02 08:00:00"), PriceMinor: int64p(0), Currency: "CNY"},
@@ -78,12 +76,10 @@ func TestMergeCommunityValidationRejectsWholeBatch(t *testing.T) {
 	if rows != 0 {
 		t.Fatalf("rejected batch leaked %d rows", rows)
 	}
-	// 未知身份的游戏不落库。
 	ok := []CommunityObservation{{SnapshotAt: beiTime("2026-01-02 08:00:00"), PriceMinor: int64p(100), Currency: "CNY", CnyFen: int64p(100)}}
 	if _, e := w.MergeCommunityHistory(ctx, 999999, "cn", ok); e == nil {
 		t.Fatal("unknown appid must fail")
 	}
-	// 巨批拒绝。
 	big := make([]CommunityObservation, mergeBatchLimit+1)
 	for i := range big {
 		big[i] = CommunityObservation{SnapshotAt: beiTime("2026-01-02 08:00:00"), PriceMinor: int64p(100), Currency: "CNY"}
@@ -96,7 +92,6 @@ func TestMergeCommunityValidationRejectsWholeBatch(t *testing.T) {
 func TestMergeCommunityNeverOverwritesOfficialObservation(t *testing.T) {
 	w := communityFixture(t)
 	ctx := context.Background()
-	// 与官方行六段键完全相同（snapshot_at/sub/price/is_gold 一致）→ 冲突放弃。
 	obs := []CommunityObservation{
 		{SnapshotAt: beiTime("2026-01-01 10:00:00"), PriceMinor: int64p(19900), Currency: "CNY", CnyFen: int64p(1)},
 		{SnapshotAt: beiTime("2026-01-01 08:00:00"), PriceMinor: int64p(19900), Currency: "CNY", CnyFen: int64p(1990)},
@@ -106,7 +101,6 @@ func TestMergeCommunityNeverOverwritesOfficialObservation(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	// 键冲突一行放弃 + 同日同价佐证一行跳过 + 新价一行入库。
 	if inserted != 1 {
 		t.Fatalf("inserted=%d", inserted)
 	}
@@ -131,12 +125,10 @@ func TestMergeCommunityNeverOverwritesOfficialObservation(t *testing.T) {
 	if community != 1 {
 		t.Fatalf("community rows=%d", community)
 	}
-	// 幂等：重复合流零新增。
 	inserted, e = w.MergeCommunityHistory(ctx, 872410, "cn", obs)
 	if e != nil || inserted != 0 {
 		t.Fatalf("replay inserted=%d err=%v", inserted, e)
 	}
-	// 促销详情保持官方职责：社区行不带折扣/原价/捆绑归属。
 	var nulls int
 	if e = w.DB.QueryRow(`SELECT count(*) FROM game_price_history WHERE source='community' AND (original_price IS NOT NULL OR discount_percent!=0 OR bundle_id IS NOT NULL)`).Scan(&nulls); e != nil {
 		t.Fatal(e)

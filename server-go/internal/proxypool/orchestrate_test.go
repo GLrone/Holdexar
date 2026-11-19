@@ -1,10 +1,5 @@
 package proxypool
 
-// 编排层测试：步骤顺序（签名读点 / 同步 / 重建的相对次序）、失败隔离（一步失败
-// 不拖垮其余）、准入晋升串联、出口聚合消费（fail-soft、无后续动作）；
-// live 一轮真内核维护（沙箱节点拓扑照 health_live_test.go：socks5 回环节点 +
-// 本地目标桩），覆盖同步 → 健康 → 签名变化 → 重建热重载全链。
-
 import (
 	"context"
 	"database/sql"
@@ -23,7 +18,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// newOrchestrateDB 全列订阅表 + 节点 / 快照 / 健康 / 出口账本 schema 的隔离测试库。
 func newOrchestrateDB(t *testing.T) (*sql.DB, *store.WriteGate, string) {
 	t.Helper()
 	db, gate, dir := newTestDB(t)
@@ -59,7 +53,6 @@ func newOrchestrateDB(t *testing.T) (*sql.DB, *store.WriteGate, string) {
 	return db, gate, dir
 }
 
-// deadOrchestrateDB 已关闭的隔离库（制造「数据库不可用」的失败夹具）。
 func deadOrchestrateDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "dead.db"))
@@ -72,7 +65,6 @@ func deadOrchestrateDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// eventLog 步骤事件序（跨注入点共享的调用顺序记录）。
 type eventLog struct {
 	mu    sync.Mutex
 	items []string
@@ -90,8 +82,6 @@ func (l *eventLog) joined() string {
 	return strings.Join(l.items, ",")
 }
 
-// signatureStub 池签名假读点：按调用次序返回预置序列（越界复读末值），可把每次
-// 读取记入事件序。
 type signatureStub struct {
 	values [][]string
 	calls  int
@@ -110,8 +100,6 @@ func (s *signatureStub) read(context.Context) ([]string, error) {
 	return s.values[i], nil
 }
 
-// stubSubBodyAt 逐节点独立桩端口：沙箱节点只有 type/server/port 三键，端口
-// 参与节点身份（PortIsIdentity），同口两节点会在 Registry 折叠成一行。
 func stubSubBodyAt(ports []int, names []string) string {
 	var b strings.Builder
 	b.WriteString("proxies:\n")
@@ -158,7 +146,6 @@ func stubFetchResult(body string) *FetchResult {
 	}
 }
 
-// seedOrchestrateSubscription 播种一条订阅（密文 URL，默认 CANDIDATE）。
 func seedOrchestrateSubscription(t *testing.T, db *sql.DB, dataDir, plainURL string) int64 {
 	t.Helper()
 	sealed, err := SealURL(dataDir, plainURL)
@@ -173,8 +160,6 @@ func seedOrchestrateSubscription(t *testing.T, db *sql.DB, dataDir, plainURL str
 	return id
 }
 
-// TestRunPoolMaintenanceStepOrder 步骤顺序：before 签名 → 同步 → 准入 → 健康跳过
-// → after 签名 → 签名变化触发重建。
 func TestRunPoolMaintenanceStepOrder(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
@@ -221,7 +206,6 @@ func TestRunPoolMaintenanceStepOrder(t *testing.T) {
 	}
 }
 
-// TestRunPoolMaintenanceAdmissionPromotes 体检有可用节点的候选订阅自动转正。
 func TestRunPoolMaintenanceAdmissionPromotes(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
@@ -256,11 +240,9 @@ func TestRunPoolMaintenanceAdmissionPromotes(t *testing.T) {
 	}
 }
 
-// TestRunPoolMaintenanceSyncFailureIsolation 同步失败不拖垮准入与重建判定。
 func TestRunPoolMaintenanceSyncFailureIsolation(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
-	// 订阅表缺失 → 同步的清单读取整体失败（比单订阅下载失败更深的顶层失败）
 	if _, err := db.Exec(`DROP TABLE proxy_subscriptions`); err != nil {
 		t.Fatal(err)
 	}
@@ -289,12 +271,9 @@ func TestRunPoolMaintenanceSyncFailureIsolation(t *testing.T) {
 	}
 }
 
-// TestRunPoolMaintenanceHealthWaveFailure 探针层失败只进收尾 end_reason，波次
-// 照常建行收尾，编排继续走到签名比对。
 func TestRunPoolMaintenanceHealthWaveFailure(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
-	// 池文件给一个节点名，让波次真的走进节点读取（读已关闭的库即失败）
 	if err := os.MkdirAll(filepath.Dir(PoolPath(dir)), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +306,6 @@ func TestRunPoolMaintenanceHealthWaveFailure(t *testing.T) {
 	}
 }
 
-// TestRunPoolMaintenanceSignatureUnreadable 签名读不了时跳过重建判定，不扰动内核。
 func TestRunPoolMaintenanceSignatureUnreadable(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
@@ -349,8 +327,6 @@ func TestRunPoolMaintenanceSignatureUnreadable(t *testing.T) {
 	}
 }
 
-// TestRunDeadProbeSweepOrder 恢复扫批：空批不炸；签名变化触发重建；runner 失败
-// 留痕不上抛。
 func TestRunDeadProbeSweepOrder(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
@@ -389,8 +365,6 @@ func TestRunDeadProbeSweepOrder(t *testing.T) {
 	}
 }
 
-// TestIngestCrawlExits 出口聚合消费：runID=0 拒收、正常落行、写失败 fail-soft、
-// 无重建后续动作（对齐 Python write_run_exits → record_run_exits）。
 func TestIngestCrawlExits(t *testing.T) {
 	db, gate, dir := newOrchestrateDB(t)
 	ctx := context.Background()
@@ -423,14 +397,10 @@ func TestIngestCrawlExits(t *testing.T) {
 	}
 }
 
-// ── live：真内核一轮维护编排 ─────────────────────────────────────────────────
-
 func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 	exe := liveKernelExe(t)
 	ctx := context.Background()
 	target := newLiveProbeTarget(t)
-	// 每节点独立桩端口：沙箱节点只有 type/server/port 三键，端口参与节点身份
-	// （PortIsIdentity），同口两节点会在 Registry 折叠成一行。
 	socksPorts := []int{minimalSocks5Server(t), minimalSocks5Server(t), minimalSocks5Server(t)}
 
 	db, gate, dataDir := newOrchestrateDB(t)
@@ -450,7 +420,6 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 			return stubFetchResult(subBody.Load().(string)), nil
 		}}
 
-	// bootstrap：同步 → 建池 → 冷启动内核（编排第一轮开始时内核已在跑）
 	if _, err := syncer.SyncSubscriptions(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +458,6 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 
 	pid0 := runtime.ProcessPid()
 
-	// 第一轮健康波次产生此前未知的出口，通道签名随即重建。
 	r1, err := RunPoolMaintenance(ctx, o)
 	if err != nil {
 		t.Fatal(err)
@@ -510,7 +478,6 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 		t.Fatalf("运行行应收尾：%v", finished)
 	}
 
-	// 第二轮：订阅带进新节点 → 签名变化 → 重建（真热重载：进程不动、池跟上）
 	subBody.Store(stubSubBodyAt(socksPorts, []string{"Live-01", "Live-02", "Live-03"}))
 	r2, err := RunPoolMaintenance(ctx, o)
 	if err != nil {
@@ -533,7 +500,6 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 		t.Fatalf("重建后内核应仍在跑且入口在听：%+v", runtime.Status())
 	}
 
-	// 恢复探测扫批（无待恢复节点空转）与出口聚合消费（真落账）
 	sweep, err := RunDeadProbeSweep(ctx, o, "")
 	if err != nil {
 		t.Fatal(err)
@@ -553,9 +519,6 @@ func TestLiveOrchestrationMaintenanceRound(t *testing.T) {
 	t.Logf("live 编排验收通过：一轮维护 + 签名变化热重载 + 扫批 + 出口聚合")
 }
 
-// TestLiveRebuildConsumeAfterCrawl 爬取释放消费点真内核验收：占用期间请求的
-// 重建在 EndCrawl 释放后立即热重建（进程不动、池跟上），维护预约在位时让路，
-// 释放后周期拍式消费收敛。
 func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 	exe := liveKernelExe(t)
 	ctx := context.Background()
@@ -599,8 +562,6 @@ func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 	}
 	t.Cleanup(func() { runtime.Stop() })
 
-	// 库内补第三个 ACTIVE 节点：池文件（2 节点）与合格集漂移，消费后应热重建跟上。
-	// 配置须内核可装载（ss 要 cipher/password），否则 -t 校验拒绝热重载回滚磁盘。
 	seedPoolNode(t, db, "Live-03", "ACTIVE", subID,
 		`{"name": "Live-03", "type": "ss", "server": "s.example.com", "port": 8443, "cipher": "aes-256-gcm", "password": "p3"}`)
 	if names := PoolFileNames(dataDir); len(names) != 2 {
@@ -608,11 +569,9 @@ func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 	}
 	pid0 := runtime.ProcessPid()
 
-	// 一键接线（serverd 同款形态）：释放钩子消费待重建。
 	restore := WireRebuildPipeline(db, gate, dataDir, exe, &runtime)
 	defer restore()
 
-	// 占用期间请求重建 → 释放即异步消费：池跟上合格集、进程不动、待办位清空。
 	RequestRebuild()
 	if err := occupancy.BeginCrawl("live-rebuild"); err != nil {
 		t.Fatal(err)
@@ -641,7 +600,6 @@ func TestLiveRebuildConsumeAfterCrawl(t *testing.T) {
 		t.Fatal("重建后内核应仍在跑")
 	}
 
-	// 维护预约在位时消费让路，待办位保留；释放预约后周期拍式消费收敛。
 	if err := occupancy.BeginMaintenance(occupancy.MaintenanceHealth); err != nil {
 		t.Fatal(err)
 	}

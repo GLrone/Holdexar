@@ -34,7 +34,6 @@ type CandidateReport struct {
 	Failures map[int64]string
 }
 
-// Check runs first checks for explicit candidates, or all auto-refresh candidates when ids is nil.
 func (c *CandidateCheck) Check(ctx context.Context, ids []int64) (CandidateReport, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -233,7 +232,7 @@ func (c *CandidateCheck) commitCandidate(ctx context.Context, id int64, automati
 func candidateBundle(id int64, snap *Snapshot) (clashcfg.Bundle, []string, map[string]string, error) {
 	var groups []map[string]any
 	if snap.Fmt == FormatYAML || snap.Fmt == FormatProviderYAML {
-		doc, err := clashYAMLLoad(string(snap.RawContent))
+		doc, err := clashcfg.LoadYAML(string(snap.RawContent))
 		if err != nil {
 			return clashcfg.Bundle{}, nil, nil, err
 		}

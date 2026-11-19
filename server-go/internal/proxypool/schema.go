@@ -1,7 +1,6 @@
 package proxypool
 
-// Registry 与订阅快照账本的建表 DDL：逐字对齐 Python 模型 create_all 产物
-// （列序/类型名/UNIQUE 表级约束/索引名），缺表即建、不迁移不抬结构版本。
+// Registry 与订阅快照账本的建表 DDL：缺表即建，不迁移不抬结构版本。
 
 import (
 	"context"
@@ -63,7 +62,6 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS ix_subscription_snapshots_subscription_id ON subscription_snapshots (subscription_id)",
 }
 
-// EnsureSchema 幂等建两表与索引；ctx 由写闸租约的事务传入。
 func EnsureSchema(ctx context.Context, exec interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }) error {

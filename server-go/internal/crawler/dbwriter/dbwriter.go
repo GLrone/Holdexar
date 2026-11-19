@@ -1,15 +1,13 @@
-// Package dbwriter：价格批量写层（games 元数据 / 现价 / 历史切片 / 区级欠账）。
-// 写语义对齐现网同链路：批量形状、失败观察保底、同观测重放合并、
-// 连续缺价穷尽转终态。所有库写必须经 WriteGate；闸内只做库写，
-// 禁止网络与文件 IO。
+// 所有库写必须经 WriteGate；闸内禁止网络与文件 IO。
 package dbwriter
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,38 +17,31 @@ import (
 )
 
 const (
-	batchWriteChunk   = 100  // 一段事务最多写入的款数：写者位按段交还，交互写可在段间插入
-	insertChunkRows   = 2000 // 批量参数列表分块，限制单段内存与驱动调用规模
-	missingMaxRetries = 5    // 连续「真实响应缺价」次数上限，穷尽转 blocked
-	baselineChunkSize = 400  // 基线查询按 appid 分块
+	batchWriteChunk   = 100 // 一段事务最多写入的款数：写者位按段交还，交互写可在段间插入
+	insertChunkRows   = 2000
+	missingMaxRetries = 5 // 连续「真实响应缺价」次数上限，穷尽转 blocked
+	baselineChunkSize = 400
 
-	// 写闸积压背压：后台等待超过阈值后，抓取提交按深度线性退避（事实流
-	// 只降速不丢弃）；写段中位等待不再随积压无界增长。阈值高于常态满载
-	// 深度，只在写侧真的跟不上时生效。
+	// 写闸积压背压：后台排队超阈值时按深度线性退避，降速不丢数据。
 	backpressureDepth = 32
 	backpressureStep  = 50 * time.Millisecond
 	backpressureCap   = 2 * time.Second
 )
 
-// backpressureActive 进/退场日志各一条的包级开关（atomic 只记一次）。
 var backpressureActive atomic.Bool
 
-// Writer 写入价格批次及其观察时刻对应的活动标签。
 type Writer struct {
 	DB       *sql.DB
 	Gate     *store.WriteGate
-	Now      func() time.Time                 // 北京挂钟；缺省 UTC+8 固定偏移
-	EventKey func(time.Time) *string          // 观测时刻所属活动窗口 key；nil = 无活动
-	FxRates  map[string]float64               // 汇率缓存；LoadFxRates 装载
-	Log      func(format string, args ...any) // 运行事件出口；缺省 stderr
-	// SeriesOverrides 系列覆盖表（数据目录文件在闸外由宿主装填；
-	// nil = 无覆盖）。派生链闸内零文件 IO。
+	Now      func() time.Time // 北京挂钟；缺省 UTC+8 固定偏移
+	EventKey func(time.Time) *string
+	FxRates  map[string]float64
+	Log      func(format string, args ...any)
+	// SeriesOverrides 由宿主在闸外装填，派生链闸内不做文件 IO。
 	SeriesOverrides map[string][]int64
-	// Diag 写闸诊断面注入（测试假闸；nil = Gate.Diagnostics）。
-	Diag func(context.Context) map[string]any
+	Diag            func(context.Context) map[string]any
 }
 
-// NewWriter 构造写层。
 func NewWriter(db *sql.DB, gate *store.WriteGate) *Writer {
 	return &Writer{
 		DB:   db,
@@ -60,8 +51,7 @@ func NewWriter(db *sql.DB, gate *store.WriteGate) *Writer {
 	}
 }
 
-// LoadFxRates 装载汇率缓存（对齐 connect() 语义）：失败清空缓存走兜底
-// 汇率（仅 CNY=1.0），不阻断写链路。
+// LoadFxRates 刷新汇率缓存（Query 失败清空缓存，缺汇率时仅 CNY=1.0 生效）。
 func (w *Writer) LoadFxRates(ctx context.Context) error {
 	rows, err := w.DB.QueryContext(ctx, "SELECT currency_code, rate_to_cny FROM fx_rates")
 	if err != nil {
@@ -85,10 +75,8 @@ func (w *Writer) LoadFxRates(ctx context.Context) error {
 	return nil
 }
 
-// UpsertTaskBatch 一区一批（≤300 款）写完：拆 ~100 款的段逐段过写闸提交。
-// 每段独立事务（基线一次 + 决策纯函数化 + 四条批量语句 games / 现价 /
-// 欠账结转 / history，段内含收尾保存点），段与段之间写者位空出；段前按
-// 写闸积压深度退避（背压）。段体失败 → 本段转逐款隔离写（writeChunkSlow）。
+// UpsertTaskBatch 按 batchWriteChunk 分段过写闸提交（段前按积压退避，段间交还写者位）；
+// 段体失败时本段回退 writeChunkSlow。
 func (w *Writer) UpsertTaskBatch(ctx context.Context, entries []BatchEntry) ([]bool, error) {
 	results := make([]bool, len(entries))
 	for start := 0; start < len(entries); start += batchWriteChunk {
@@ -100,8 +88,6 @@ func (w *Writer) UpsertTaskBatch(ctx context.Context, entries []BatchEntry) ([]b
 			return nil, err
 		}
 		if degraded {
-			// 段体失败：本段回退逐款隔离写（慢 ~10 倍，只兜坏段；慢路径
-			// 自带分段闸与完成日志，段间交还写者位）
 			slow, err := w.writeChunkSlow(ctx, chunk)
 			if err != nil {
 				return nil, err
@@ -114,7 +100,6 @@ func (w *Writer) UpsertTaskBatch(ctx context.Context, entries []BatchEntry) ([]b
 	return results, nil
 }
 
-// gateDiagnostics 写闸诊断快照（背压事实源；测试经 Diag 注入假闸）。
 func (w *Writer) gateDiagnostics(ctx context.Context) map[string]any {
 	if w.Diag != nil {
 		return w.Diag(ctx)
@@ -125,8 +110,6 @@ func (w *Writer) gateDiagnostics(ctx context.Context) map[string]any {
 	return w.Gate.Diagnostics(ctx)
 }
 
-// backpressurePace 段提交前的到达率闸：写闸后台积压过深时让抓取侧先睡
-// min((深度-阈值)*步长, 上限)；进/退场日志各一条（atomic 只记一次）。
 func (w *Writer) backpressurePace(ctx context.Context) {
 	depth := 0
 	switch v := w.gateDiagnostics(ctx)["waiting_background"].(type) {
@@ -155,8 +138,6 @@ func (w *Writer) backpressurePace(ctx context.Context) {
 	}
 }
 
-// writeChunk 单段写入（≤batchWriteChunk 款）一次事务写完（含收尾保存点）。
-// degraded=true = 段体失败整段回滚（调用方转逐款隔离回退）。
 func (w *Writer) writeChunk(ctx context.Context, entries []BatchEntry) ([]bool, bool, error) {
 	results := make([]bool, len(entries))
 	for i := range results {
@@ -165,11 +146,10 @@ func (w *Writer) writeChunk(ctx context.Context, entries []BatchEntry) ([]bool, 
 	var bodyErr error
 	err := w.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		bodyErr = w.writeChunkTx(ctx, conn, entries)
-		return bodyErr // 非空即回滚整段
+		return bodyErr
 	})
 	if err != nil {
 		if bodyErr != nil {
-			// 段体失败：整段作废不落半批，交由调用方逐款隔离回退
 			w.Log("价格批量写段失败，整段作废（%d 款）: %v", len(entries), bodyErr)
 			for i := range results {
 				results[i] = false
@@ -194,7 +174,6 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 		return fmt.Errorf("基线查询失败: %w", err)
 	}
 
-	// 派生目录输入快照（写入前旧值）：系列联动的变化判定输入
 	var catalogBefore map[int64]derived.CatalogRow
 	if len(okIDs) > 0 {
 		if catalogBefore, err = derived.CatalogInputs(ctx, conn, okIDs); err != nil {
@@ -202,7 +181,7 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 		}
 	}
 
-	// 归一化 + 免费态分组：免费态字段缺省的行保留已有标记，两组列形状不同
+	// 缺失免费态字段的行保留库内已有标记，按列形状分两组写入。
 	var freeRows, plainRows []gameRowValues
 	type entryPlan struct {
 		entry    *BatchEntry
@@ -229,7 +208,6 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 		plans[i] = entryPlan{entry: e, now: row.nowTime, eventKey: ek}
 	}
 
-	// games 元数据：免费态字段组先行（对齐 Python {True:…, False:…} 组序）
 	if len(freeRows) > 0 {
 		if err := upsertGames(ctx, conn, freeRows, true); err != nil {
 			return fmt.Errorf("游戏元数据写入失败: %w", err)
@@ -274,15 +252,13 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 		if err := upsertCurrentPrices(ctx, conn, allCurrent); err != nil {
 			return fmt.Errorf("现价写入失败: %w", err)
 		}
-		// 补抓成功结转清账：本批有 ok 价的区 fail_count 归零；按「区集合
-		// 相同的款」分组成 IN 更新，避免 appid × 区的笛卡尔积误清
+		// 按「ok 区集合相同的款」分组清零 fail_count，避免 appid×区笛卡尔积误清。
 		for _, key := range sortedKeys(okGroups) {
 			if err := clearFailCount(ctx, conn, okGroups[key], okRegionSets[key]); err != nil {
 				return fmt.Errorf("欠账清账失败: %w", err)
 			}
 		}
-		// 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）。
-		// 常规 upsert 不带 fail_count（避免误清），账本专门走 bump
+		// 降级行经 bump 递增 fail_count（常规 upsert 不带 fail_count 防误清）。
 		for _, key := range sortedKeys(degradedGroups) {
 			if err := bumpMissingLedger(ctx, conn, degradedGroups[key], degradedRegionSets[key]); err != nil {
 				return fmt.Errorf("欠账结转失败: %w", err)
@@ -296,8 +272,7 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 		}
 	}
 
-	// 收尾（复活清标）保存点：与主段同事务一次提交；失败只回滚保存点
-	// 不拖垮主段
+	// 复活清标包在 SAVEPOINT 中，失败仅回滚清标不拖垮主段。
 	if _, err := conn.ExecContext(ctx, "SAVEPOINT hx_clear_removed"); err != nil {
 		return fmt.Errorf("收尾保存点建立失败: %w", err)
 	}
@@ -309,8 +284,7 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 	} else if _, err := conn.ExecContext(ctx, "RELEASE SAVEPOINT hx_clear_removed"); err != nil {
 		return fmt.Errorf("收尾保存点释放失败: %w", err)
 	}
-	// 派生列维护（hl/史低标记/系列识别/智能评分）：与 Python 同一写事务
-	// 内、批写完成后执行；系列覆盖表由宿主闸外装填
+	// 派生列维护与批写同事务执行，SeriesOverrides 由宿主闸外装填。
 	if len(okIDs) > 0 {
 		derived.SetClock(w.Now)
 		if _, err := derived.UpdatePriceDerived(ctx, conn, okIDs, derived.Options{
@@ -325,15 +299,11 @@ func (w *Writer) writeChunkTx(ctx context.Context, conn *sql.Conn, entries []Bat
 	return nil
 }
 
-// ── 区级欠账批量记账 ────────────────────────────────────────────
-
-// RegionPair 一条 (appid, 区) 欠账。
 type RegionPair struct {
 	AppID      int64
 	RegionCode string
 }
 
-// RegionStatusWriteError 区级记账失败：携带去重排序后的成对清单。
 type RegionStatusWriteError struct {
 	Pairs []RegionPair
 }
@@ -342,10 +312,7 @@ func (e *RegionStatusWriteError) Error() string {
 	return fmt.Sprintf("地区数据未能保存：%d 项", len(e.Pairs))
 }
 
-// MarkRegionStatusMissingBatch 批量记 missing 欠账（一次闸一事务）：行形状
-// 与单款 missing 分支同口径（failed 章 + 保留 last good price）。传输类失败
-// 不消耗补抓预算（fail_count 不递增），(appid, 区) 去重防同批双章。
-// 返回写入行数。
+// MarkRegionStatusMissingBatch 批量记 missing 欠账：保留原价与 last_success_at，传输失败不递增 fail_count，同批按 (appid,区) 去重。
 func (w *Writer) MarkRegionStatusMissingBatch(ctx context.Context, pairs []RegionPair) (int, error) {
 	if len(pairs) == 0 {
 		return 0, nil
@@ -370,25 +337,23 @@ func (w *Writer) MarkRegionStatusMissingBatch(ctx context.Context, pairs []Regio
 		for _, k := range order {
 			sorted = append(sorted, RegionPair{AppID: k.appid, RegionCode: k.cc})
 		}
-		sort.Slice(sorted, func(i, j int) bool {
-			if sorted[i].AppID != sorted[j].AppID {
-				return sorted[i].AppID < sorted[j].AppID
+		slices.SortFunc(sorted, func(a, b RegionPair) int {
+			if c := cmp.Compare(a.AppID, b.AppID); c != 0 {
+				return c
 			}
-			return sorted[i].RegionCode < sorted[j].RegionCode
+			return strings.Compare(a.RegionCode, b.RegionCode)
 		})
 		return 0, &RegionStatusWriteError{Pairs: sorted}
 	}
 	return len(order), nil
 }
 
-// ── 小工具 ──────────────────────────────────────────────────────
-
 func regionSetKey(regions map[string]bool) string {
 	list := make([]string, 0, len(regions))
 	for r := range regions {
 		list = append(list, r)
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 	return strings.Join(list, ",")
 }
 
@@ -397,16 +362,14 @@ func sortedKeys(m map[string][]int64) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 
-// inPlaceholders 生成 n 个 "?" 占位符的逗号串。
 func inPlaceholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
-// rowPlaceholders 生成 n 个单值行的 VALUES 串：(?),(?),...
 func rowPlaceholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("(?),", n), ",")
 }

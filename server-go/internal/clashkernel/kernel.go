@@ -17,7 +17,6 @@ import (
 	"holdexar/server-go/internal/clashcfg"
 )
 
-// timeoutError 一次性内核命令超时（对齐 subprocess.TimeoutExpired 分支）。
 type timeoutError struct{ d time.Duration }
 
 func (e *timeoutError) Error() string { return fmt.Sprintf("内核命令超时（%s）", e.d) }
@@ -28,15 +27,12 @@ func execTimeoutContext(timeout time.Duration) (context.Context, context.CancelF
 
 func joinPath(parts ...string) string { return filepath.Join(parts...) }
 
-// OverridePrefixes 能覆盖配置、改写运行行为的环境变量前缀（大小写不敏感）。
 var overridePrefixes = []string{"CLASH_", "MIHOMO_"}
 
-// OverrideNames 额外剥离的内核侧环境开关（大小写不敏感）。
 var overrideNames = map[string]bool{
 	"SAFE_PATHS": true, "DISABLE_LOOPBACK_DETECTOR": true, "SKIP_SYSTEM_IPV6_CHECK": true,
 }
 
-// PrecheckKind 预检拒绝分类：准入拒绝、内核拒载、超时、无法执行、文件被替换。
 type PrecheckKind string
 
 const (
@@ -47,7 +43,6 @@ const (
 	PrecheckChanged      PrecheckKind = "changed"
 )
 
-// PrecheckError 内核启动前的拒绝。
 type PrecheckError struct {
 	Kind   PrecheckKind
 	Detail string
@@ -82,12 +77,9 @@ func KernelEnv(base []string) []string {
 	return out
 }
 
-// MIHOMOVersion 随包内核版本（与 Python kernel_release.MIHOMO_VERSION 对齐）。
 const MIHOMOVersion = "v1.19.32"
 
-// KernelFilename 内核可执行文件名（Windows 带 .exe）。
-// 带应用前缀，与用户机器上其他软件启动的 mihomo 内核进程隔离：
-// 按名查/杀进程、误杀防护都以这个名字为准。
+// KernelFilename 带应用前缀，用于与机器上其他内核进程隔离防误杀。
 func KernelFilename() string {
 	if isWindows() {
 		return "holdexar-mihomo.exe"
@@ -95,7 +87,6 @@ func KernelFilename() string {
 	return "holdexar-mihomo"
 }
 
-// legacyKernelFilename 改名前的内核文件名（迁移收编期兜底）。
 func legacyKernelFilename() string {
 	if isWindows() {
 		return "mihomo.exe"
@@ -107,7 +98,6 @@ func isWindows() bool { return os.PathSeparator == '\\' }
 
 var versionRe = regexp.MustCompile(`v(\d+(?:\.\d+)+)`)
 
-// ParseKernelVersion mihomo -v 输出 → 点分版本切片；无法识别返回 nil。
 func ParseKernelVersion(raw string) []int {
 	m := versionRe.FindStringSubmatch(raw)
 	if m == nil {
@@ -144,14 +134,12 @@ func versionAtLeast(current, target []int) bool {
 	return true
 }
 
-// RunResult 一次性内核命令输出。
 type RunResult struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
 }
 
-// RunKernelCLI 跑一次性内核命令（版本探测、配置预检）并捕获输出。
 func RunKernelCLI(exePath string, args []string, timeout time.Duration) (RunResult, error) {
 	ctx, cancel := execTimeoutContext(timeout)
 	defer cancel()
@@ -175,7 +163,6 @@ func RunKernelCLI(exePath string, args []string, timeout time.Duration) (RunResu
 	return res, nil
 }
 
-// KernelVersion 就位内核的版本输出首行；失败返回空串。
 func KernelVersion(exePath string) string {
 	res, err := RunKernelCLI(exePath, []string{"-v"}, 10*time.Second)
 	if err != nil {
@@ -194,22 +181,19 @@ func KernelVersion(exePath string) string {
 	return ""
 }
 
-// KernelExeVersion 就位内核的版本切片（-v 失败/超时/输出非 mihomo 格式 = nil）。
 func KernelExeVersion(exePath string) []int {
 	return ParseKernelVersion(KernelVersion(exePath))
 }
 
-// EnsureResult 随包内核就位结果。
 type EnsureResult struct {
 	KernelReady bool
 	Copied      []string
 	Missing     []string
 	Upgraded    string
-	Adopted     string // 改名收编：本次被改名为现名的旧文件名（未收编为空）
+	Adopted     string
 	BundleDir   string
 }
 
-// KernelDir 内核工作目录（config.yaml 所在处，也是 -d 的工作目录）。
 func KernelDir(dataDir string) string {
 	dir := joinPath(dataDir, "clash")
 	_ = os.MkdirAll(dir, 0o755)
@@ -218,9 +202,7 @@ func KernelDir(dataDir string) string {
 
 func KernelExe(dataDir string) string { return joinPath(KernelDir(dataDir), KernelFilename()) }
 
-// AdoptLegacyKernel 改名迁移：把改名前落位的旧名内核改名为现名，用户免重新下载。
-// 仅在新名缺失而旧名文件就位时执行；旧内核进程仍占着文件（运行中的 exe 不可
-// 改名）等 rename 失败场景静默跳过，留给下次启动。返回旧文件名（未收编返回空）。
+// AdoptLegacyKernel 仅在新名缺失时收编兼容名内核，占用无法改名时静默跳过。
 func AdoptLegacyKernel(kernelPath string) string {
 	legacy := legacyKernelFilename()
 	legacyPath := joinPath(kernelPath, legacy)
@@ -234,10 +216,6 @@ func AdoptLegacyKernel(kernelPath string) string {
 	return legacy
 }
 
-// EnsureKernel 随包内核就位（data_dir 版本）：把内核补进 data/clash/（同名不
-// 覆盖），随包版本高于就位版本时替换（升级不夺回）。改名前的旧名内核先收编
-// （免重新下载）。发行包缺内核时 KernelReady=false，由调用方决定回退下载还是
-// 提示用户。
 func EnsureKernel(bundledDir, dataDir string) (EnsureResult, error) {
 	adopted := AdoptLegacyKernel(KernelDir(dataDir))
 	result := EnsureKernelFiles(KernelDir(dataDir), bundledDir)
@@ -247,8 +225,6 @@ func EnsureKernel(bundledDir, dataDir string) (EnsureResult, error) {
 	return result, nil
 }
 
-// EnsureKernelFiles 内核目录补齐（内核目录本身版本）：可执行文件同名不覆盖，
-// 另按版本升级。
 func EnsureKernelFiles(kernelPath, bundledDir string) EnsureResult {
 	exeName := KernelFilename()
 	target := joinPath(kernelPath, exeName)
@@ -268,8 +244,7 @@ func EnsureKernelFiles(kernelPath, bundledDir string) EnsureResult {
 	return result
 }
 
-// maybeUpgradeKernel 版本感知的内核换装：随包版本高于就位版本才替换。
-// 就位 ≥ 随包、版本不可辨、内核进程在跑时一律保留（升级不夺回）。
+// maybeUpgradeKernel 仅在随包版本高于就位版本且内核未运行时替换（不降级不夺回）。
 func maybeUpgradeKernel(kernelDir, bundledDir string) string {
 	exeName := KernelFilename()
 	exe := joinPath(kernelDir, exeName)
@@ -311,8 +286,6 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-// ValidateConfig 启动前校验运行配置：先静态准入再跑内核 `-t`；任何失败都返回
-// PrecheckError。
 func ValidateConfig(exePath, configPath, workDir string) error {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
@@ -352,7 +325,6 @@ func ValidateConfig(exePath, configPath, workDir string) error {
 	return &PrecheckError{Kind: PrecheckRejected, Detail: "内核拒绝配置（-t 校验未通过）：" + shown}
 }
 
-// ValidateConfigText 校验最终内存态配置文本：写临时副本后走完整预检。
 func ValidateConfigText(exePath, text, workDir string) error {
 	if err := clashcfg.ValidateExecutionConfigText(text); err != nil {
 		return &PrecheckError{Kind: PrecheckAdmission, Detail: err.Error()}

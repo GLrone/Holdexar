@@ -1,11 +1,6 @@
 package proxypool
 
-// 订阅同步编排（Python bootstrap.sync_subscriptions 本批范围）：
-// 订阅 → 快照 → Registry。Runtime 层不参与，也拿不到订阅 URL。
-// 铁律：并发下载（纯网络）在写闸外完成；闸内只允许落库 I/O（含快照原始
-// 字节的内容寻址落盘，属本轮流库伴生）与收尾提交——网络等待进闸会横持
-// 写者位，饿死全体写。闸内先重读订阅状态再应用；提交在闸内完成，闸界与
-// SQLite 文件锁界对齐。
+// 并发下载在写闸外执行；闸内重读订阅状态、仅做落库 I/O 与内容寻址写盘并提交。
 
 import (
 	"context"
@@ -19,20 +14,16 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// MaxConcurrentSubscriptionFetches 跨订阅并发上限（有界并发下载，落库仍串行）。
 const MaxConcurrentSubscriptionFetches = 5
 
-// 订阅行 URL 在闸内变化时的拒因。
 const messageURLChanged = "订阅地址在刷新期间发生变化，本次结果未应用"
 
-// Subscription 同步所需的最小订阅行投影（URL 密文，开封在消费点）。
 type Subscription struct {
 	ID     int64
 	URL    string
 	Repull SubRepullInfo
 }
 
-// SyncResult 一轮同步的账目。
 type SyncResult struct {
 	StrategySwitched  bool
 	SubscriptionCount int
@@ -41,16 +32,15 @@ type SyncResult struct {
 	Failures          map[int64]string
 	SkippedCandidates []int64
 	Snapshots         map[int64]*Snapshot
+	UsedCache         map[int64]bool
 }
 
-// FetchedOutcome 单订阅的闸外抓取产物（URL = 下载时的明文地址）。
 type FetchedOutcome struct {
 	Result *FetchResult
 	Err    error
 	URL    string
 }
 
-// Syncer 编排器。
 type Syncer struct {
 	DB                *sql.DB
 	Gate              *store.WriteGate
@@ -63,12 +53,10 @@ type Syncer struct {
 
 var syncSlot = make(chan struct{}, 1)
 
-// ListSubscriptions 读订阅清单（闸外只读）。
 func (s *Syncer) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
 	return listSyncSources(ctx, s.DB, 0)
 }
 
-// SyncSubscriptions 全量同步：并发抓取（闸外）→ 闸内一次提交。
 func (s *Syncer) SyncSubscriptions(ctx context.Context) (*SyncResult, error) {
 	return s.syncSubscriptions(ctx, false, 0)
 }
@@ -127,6 +115,7 @@ func (s *Syncer) syncSubscriptions(ctx context.Context, automatic bool, onlyID i
 		NodeCount:         map[int64]int{},
 		Failures:          map[int64]string{},
 		Snapshots:         map[int64]*Snapshot{},
+		UsedCache:         map[int64]bool{},
 	}
 	if len(subs) == 0 {
 		return result, nil
@@ -148,7 +137,6 @@ func (s *Syncer) syncSubscriptions(ctx context.Context, automatic bool, onlyID i
 		}
 	}
 
-	// 有界并发下载（纯 I/O），落库仍串行（SQLite 单写者）
 	fetchSlots := make(chan struct{}, maxInt(s.MaxConcurrentSubs, 1))
 	fetched := map[int64]FetchedOutcome{}
 	var fetchedMu sync.Mutex
@@ -178,8 +166,6 @@ func (s *Syncer) syncSubscriptions(ctx context.Context, automatic bool, onlyID i
 		return result, err
 	}
 
-	// 落库段进闸：WithWrite 三合一（闸 + 单连接 + BEGIN IMMEDIATE/COMMIT），
-	// 回调内失败整体回滚；单订阅半截写入由 SAVEPOINT 隔离。
 	err = s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		if err := EnsureSchema(ctx, conn); err != nil {
 			return err
@@ -218,7 +204,6 @@ func (s *Syncer) syncSubscriptions(ctx context.Context, automatic bool, onlyID i
 	return result, nil
 }
 
-// applyOne 单订阅闸内应用：SAVEPOINT 隔离，本条半截写入只回滚自己。
 func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription, item FetchedOutcome, now time.Time, result *SyncResult,
 ) error {
 	if _, err := conn.ExecContext(ctx, "SAVEPOINT sp_subscription_apply"); err != nil {
@@ -229,7 +214,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		_, _ = conn.ExecContext(ctx, "RELEASE sp_subscription_apply")
 	}
 	subID := sub.ID
-	// subURL 是**下载时**的地址；闸内现值与它比较才是换址守卫
 	subURL := item.URL
 	liveURL := OpenURL(s.DataDir, sub.URL)
 	finishOK := func(sha string, count int, snap *Snapshot) error {
@@ -250,7 +234,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		}
 		return nil
 	}
-	// 只有下载异常带通道尝试留痕（对齐 Python：getattr(fetch_error, "attempts", [])）
 	failureEvidence := func() ([]FetchAttempt, int) {
 		if item.Err == nil {
 			return nil, 0
@@ -283,7 +266,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 				SubscriptionID: subID, DataDir: s.DataDir, URL: subURL,
 				Attempts: attempts, Error: message, DurationMS: durationMS, Now: now,
 			}); err != nil {
-				// 失败明细保存失败不阻断原始失败投影（对齐 Python：仅记日志继续）
 				_, _ = conn.ExecContext(ctx, "ROLLBACK TO sp_subscription_fail")
 			}
 		}
@@ -307,7 +289,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		_, _ = conn.ExecContext(ctx, "RELEASE sp_subscription_work")
 	}
 	if subURL == "" {
-		// 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
 		workRollback()
 		return fail(UnreadableMessage)
 	}
@@ -318,7 +299,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		return nil
 	}
 	if item.Result == nil && item.Err == nil {
-		// 预取缺失（不可达）：按失败记账，不静默丢
 		workRollback()
 		return fail("订阅下载未返回结果")
 	}
@@ -326,8 +306,6 @@ func (s *Syncer) applyOne(ctx context.Context, conn *sql.Conn, sub Subscription,
 		workRollback()
 		return fail(errMessage(item.Err))
 	}
-	// 应用前现读订阅行：抓取可能耗时几十秒，期间地址可能已换——旧链接的
-	// 下载结果不得应用到新地址名下（本分支只记账，不动订阅行）
 	res := item.Result
 	nodes := res.ResolvedNodes
 	if len(nodes) == 0 {
@@ -375,7 +353,6 @@ func (s *Syncer) fill() {
 	}
 }
 
-// ListSubscriptionsConn 事务内读订阅清单（闸内重读用）。
 func (s *Syncer) ListSubscriptionsConn(ctx context.Context, conn *sql.Conn) ([]Subscription, error) {
 	return listSyncSources(ctx, conn, 0)
 }
@@ -440,7 +417,6 @@ func projectAcceptedSubscription(ctx context.Context, conn *sql.Conn, id int64, 
 	return err
 }
 
-// BuildSnapshot 抓取产物 → 不可变快照。
 func BuildSnapshot(subscriptionID int64, url string, result *FetchResult, nodes []map[string]any, now time.Time) *Snapshot {
 	return &Snapshot{
 		SubscriptionID:     subscriptionID,

@@ -1,9 +1,8 @@
-// 订阅节点检测链：会话快照（手动检测/首检/定时体检同源）+ 探测 lane 逐节点探测 +
-// 池账本落账（冷却/退役/废弃）+ selector 自愈。全程持 TestLock 串行，会话读写走
-// testMu；出网（业务探针/出口 IP/控制器/lane 端口预检）全部可注入，测试绝不真出网。
+// 订阅节点检测与账本落账全程持 TestLock 串行，会话状态走 testMu。
 package clashservice
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -12,7 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +24,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// FirstCheckReuseMinutes 启动/切换触发的首检复用窗口：窗口内账本已有结论就沿用，不重测。
 const FirstCheckReuseMinutes = 5
 
 const testSteamTimeout = 12 * time.Second
@@ -34,9 +32,6 @@ const testCtlTimeout = 8 * time.Second
 
 var secretLineRe = regexp.MustCompile(`(?m)^secret\s*:\s*(\S+)\s*$`)
 
-// ─── 会话快照（进度怎么记、谁读）─────────────────────────────
-
-// testNodeRow 单节点检测行（camelCase，对齐 client.ts ClashNodeTestItem）。
 type testNodeRow struct {
 	Name        string  `json:"name"`
 	Alive       bool    `json:"alive"`
@@ -51,7 +46,6 @@ type testNodeRow struct {
 	PoolState   *string `json:"poolState,omitempty"`
 }
 
-// testSessionSnapshot 一次检测会话（phase=queued/running/done/failed；终态保留）。
 type testSessionSnapshot struct {
 	Phase           string        `json:"phase"`
 	Total           *int          `json:"total"`
@@ -88,7 +82,6 @@ func (s *Service) sessionNow() string {
 	return s.now().In(sched.DefaultLoc).Format("2006-01-02T15:04:05.000000")
 }
 
-// sessionMutate 会话字段更新（无会话时静默——调用方都可能发生在 reset 之前）。
 func (s *Service) sessionMutate(fn func(*testSessionSnapshot)) {
 	s.testMu.Lock()
 	defer s.testMu.Unlock()
@@ -107,7 +100,6 @@ func (s *Service) sessionAppendNode(row testNodeRow) {
 	})
 }
 
-// TestProgress 当前/最近一次检测会话快照；无会话 {"phase":"idle"}，终态保留。
 func (s *Service) TestProgress(_ context.Context) any {
 	s.testMu.Lock()
 	defer s.testMu.Unlock()
@@ -117,9 +109,6 @@ func (s *Service) TestProgress(_ context.Context) any {
 	return s.testSession.clone()
 }
 
-// TestStart 手动检测入口：已有进行中的会话（queued/running）复用直接返回快照
-// （手动/首检/体检同源单飞）；否则落 queued 会话并拉起后台任务，立即返回
-// 快照（不等探测，对齐 asyncio.create_task）。
 func (s *Service) TestStart(_ context.Context) any {
 	s.testMu.Lock()
 	if s.testSession != nil && (s.testSession.Phase == "queued" || s.testSession.Phase == "running") {
@@ -132,7 +121,6 @@ func (s *Service) TestStart(_ context.Context) any {
 	s.testMu.Unlock()
 
 	go func() {
-		// 手动检测 = 要全量结论；失败原因（用户语言）已落会话，由进度端点带回。
 		if _, err := s.testClashNodes(context.Background(), nil, true); err != nil {
 			if _, isStatus := err.(*StatusError); !isStatus {
 				s.logf("Clash 节点检测后台会话执行失败：%v", err)
@@ -142,9 +130,6 @@ func (s *Service) TestStart(_ context.Context) any {
 	return snap
 }
 
-// ─── 检测链入口 ──────────────────────────────────────────────
-
-// testResult impl 的返回面（wrapper 据此收口会话 done）。
 type testResult struct {
 	Total          int
 	Probed         int
@@ -156,10 +141,7 @@ type testResult struct {
 	Nodes          []testNodeRow
 }
 
-// testClashNodes 检测会话入口：探测实现在 impl，进度实时写会话快照，成功/失败
-// 都收口到会话（done/failed）。全程持 TestLock（手动/首检/体检三源互斥）。
 func (s *Service) testClashNodes(ctx context.Context, subID *int64, probeAll bool) (testResult, error) {
-	// 体检/首检直调路径：等锁期间即有 queued 可看。
 	s.testMu.Lock()
 	if s.testSession == nil {
 		s.testSession = newTestSession(s.sessionNow())
@@ -222,8 +204,6 @@ func (s *Service) readKernelConfig(configPath string) string {
 	return string(raw)
 }
 
-// testClashNodesImpl 检测主链：身份链 → 探测 → 账本 → 摘要 → 自愈。
-// 调用方必须已持 TestLock。
 func (s *Service) testClashNodesImpl(ctx context.Context, subID *int64, probeAll bool) (testResult, error) {
 	s.sessionMutate(func(snap *testSessionSnapshot) { *snap = *newTestSession(s.sessionNow()) })
 
@@ -270,8 +250,7 @@ func (s *Service) testClashNodesImpl(ctx context.Context, subID *int64, probeAll
 		snap.Selector = &selector
 	})
 
-	// 事实源是运行配置不是磁盘历史——lane listener 端口在听才可用，绑不上
-	// 端口的 lane 会把「通道不通」误判成「节点不通」，探测前先剔除。
+	// 探测前剔除未在听的 lane 端口，防止通道不通误判为节点不通。
 	parsedLanes, _ := clashcfg.ParseProbeLanes(runningText)
 	var lanes []clashcfg.ProbeLane
 	for _, lane := range parsedLanes {
@@ -283,8 +262,7 @@ func (s *Service) testClashNodesImpl(ctx context.Context, subID *int64, probeAll
 	if len(lanes) > 0 {
 		results = s.probeNodesViaLanes(ctx, ctl, lanes, toProbe)
 	} else {
-		// selector 回退路径的探测流量走混合端口：入口没在听时全部节点会误判
-		// 失败污染账本（并连带触发订阅误废弃），如实报错代替。
+		// 无探测 lane 且混合口不可用时直接报错，防止全部节点误判污染账本。
 		if !s.Kernel.Status().EntryReady {
 			return testResult{}, statusErr(400, "内核入口不可用（混合端口未监听）且探测 lane 缺席，无法检测；请重启内核后重试")
 		}
@@ -295,8 +273,8 @@ func (s *Service) testClashNodesImpl(ctx context.Context, subID *int64, probeAll
 	for i, name := range nodeNames {
 		order[name] = i
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		return order[results[i].Name] < order[results[j].Name]
+	slices.SortStableFunc(results, func(a, b testNodeRow) int {
+		return cmp.Compare(order[a.Name], order[b.Name])
 	})
 	markSameExit(results, order)
 
@@ -342,8 +320,6 @@ func (s *Service) testClashNodesImpl(ctx context.Context, subID *int64, probeAll
 	}, nil
 }
 
-// ─── 身份链（以运行正文及 URL 确定节点身份，缺少归属证据不猜订阅）──
-
 func (s *Service) runtimeCheckNodes(ctx context.Context, status clashkernel.Status, runningURL, runningText string, subID *int64) (int64, []string, map[string]string, map[string]*ledgerNode, error) {
 	runningID, hasRunningID := SubscriptionIDOf(status.ConfigPath)
 	if subID != nil && hasRunningID && *subID != runningID {
@@ -375,9 +351,7 @@ func (s *Service) runtimeCheckNodes(ctx context.Context, status clashkernel.Stat
 	}
 	resolved := matches[0]
 
-	// 节点身份从订阅原文缓存取（与同步期同一解析器、同一指纹来源）。运行配置
-	// 是渲染产物，节点段与原文一致——proxypool 的严格 YAML 解析器不认渲染产物
-	// 的顶层零缩进序列，原文是唯一稳定可解析的节点事实源。
+	// 节点身份从订阅原文缓存取，保证与同步期同一解析器和指纹来源。
 	rawText := s.readKernelConfig(SubscriptionConfigPath(s.DataDir, resolved))
 	if rawText == "" {
 		return 0, nil, nil, nil, statusErr(400, "订阅缓存不可读，节点身份不可确认；请刷新订阅后重试")
@@ -422,8 +396,6 @@ func (s *Service) runtimeCheckNodes(ctx context.Context, status clashkernel.Stat
 	return resolved, names, nodeIDs, registry, nil
 }
 
-// ─── 探测通道 ────────────────────────────────────────────────
-
 func (s *Service) portListening(port int) bool {
 	if s.PortListeningFn != nil {
 		return s.PortListeningFn(port)
@@ -445,9 +417,6 @@ func (s *Service) exitIPProbe(ctx context.Context, port int) string {
 	return s.exitIPProbeDefault(ctx, port)
 }
 
-// probeNodesViaLanes 经探测 lane 并发探测（并发上限 = lane 数，20）：每条 lane
-// 一个独立 listener + include-all select 组，组选择互不干扰。节点多于 lane 数
-// 分波：每波先切组再整波并发，波内即进度（逐行进会话）。
 func (s *Service) probeNodesViaLanes(ctx context.Context, ctl clashTestController, lanes []clashcfg.ProbeLane, names []string) []testNodeRow {
 	results := []testNodeRow{}
 	for start := 0; start < len(names); start += len(lanes) {
@@ -459,11 +428,9 @@ func (s *Service) probeNodesViaLanes(ctx context.Context, ctl clashTestControlle
 		rows := make([]testNodeRow, len(wave))
 		var wg sync.WaitGroup
 		for i, name := range wave {
-			wg.Add(1)
-			go func(i int, name string) {
-				defer wg.Done()
+			wg.Go(func() {
 				rows[i] = s.probeNodeViaLane(ctx, ctl, lanes[i], name)
-			}(i, name)
+			})
 		}
 		wg.Wait()
 		results = append(results, rows...)
@@ -474,9 +441,7 @@ func (s *Service) probeNodesViaLanes(ctx context.Context, ctl clashTestControlle
 	return results
 }
 
-// probeNodeViaLane 单节点经单条探测 lane：切本 lane 组 → 组选择回读核验
-// now==name → 并发跑 Steam 存活与出口 IP。回读不对齐（选择没生效）按探不到
-// 处理——不产生该节点的健康证据。
+// probeNodeViaLane 切组后必须回读核验 now==name，未生效不产生健康证据。
 func (s *Service) probeNodeViaLane(ctx context.Context, ctl clashTestController, lane clashcfg.ProbeLane, name string) testNodeRow {
 	blank := testNodeRow{Name: name}
 	if err := ctl.PutProxy(lane.Group, name); err != nil {
@@ -493,9 +458,8 @@ func (s *Service) probeNodeViaLane(ctx context.Context, ctl clashTestController,
 		steamStatus int
 		exitIP      string
 	)
-	wg.Add(2)
-	go func() { defer wg.Done(); steamOK, steamStatus = s.steamProbe(ctx, lane.Port) }()
-	go func() { defer wg.Done(); exitIP = s.exitIPProbe(ctx, lane.Port) }()
+	wg.Go(func() { steamOK, steamStatus = s.steamProbe(ctx, lane.Port) })
+	wg.Go(func() { exitIP = s.exitIPProbe(ctx, lane.Port) })
 	wg.Wait()
 	if ctx.Err() != nil {
 		return testNodeRow{Name: name, Probed: true}
@@ -507,16 +471,14 @@ func (s *Service) probeNodeViaLane(ctx context.Context, ctl clashTestController,
 	}
 }
 
-// probeNodesViaSelector 回退路径：内核配置无探测 lane 时逐节点切路由 selector
-// 经混合端口探测。selector 切换是全局状态，只能串行；rule 模式下流量按规则组
-// 走（不经过 GLOBAL），检测期间临时切 global 模式让 GLOBAL 成为总闸，测完恢复。
+// probeNodesViaSelector 串行切路由组，必要时临时切 global 模式并在测完恢复。
 func (s *Service) probeNodesViaSelector(ctx context.Context, ctl clashTestController, mixedPort int, names []string, selector string) []testNodeRow {
 	prevMode := ""
 	if mode, err := ctl.CurrentMode(); err == nil {
 		prevMode = mode
 		if prevMode != "" && prevMode != "global" {
 			if err := ctl.PatchMode("global"); err != nil {
-				prevMode = "" // 模式切换失败则按当前模式尽力检测
+				prevMode = ""
 			}
 		}
 	}
@@ -531,9 +493,8 @@ func (s *Service) probeNodesViaSelector(ctx context.Context, ctl clashTestContro
 				steamStatus int
 				exitIP      string
 			)
-			wg.Add(2)
-			go func() { defer wg.Done(); steamOK, steamStatus = s.steamProbe(ctx, mixedPort) }()
-			go func() { defer wg.Done(); exitIP = s.exitIPProbe(ctx, mixedPort) }()
+			wg.Go(func() { steamOK, steamStatus = s.steamProbe(ctx, mixedPort) })
+			wg.Go(func() { exitIP = s.exitIPProbe(ctx, mixedPort) })
 			wg.Wait()
 			if ctx.Err() == nil {
 				ms := time.Since(started).Milliseconds()
@@ -556,8 +517,6 @@ func (s *Service) probeNodesViaSelector(ctx context.Context, ctl clashTestContro
 	return results
 }
 
-// ─── 同出口去重（代表行择优，其余标 duplicate）─────────────────
-
 func sameExitKeyLess(a, b testNodeRow, order map[string]int) bool {
 	key := func(r testNodeRow) (int, bool, int64, int) {
 		ms := int64(-1)
@@ -576,7 +535,7 @@ func sameExitKeyLess(a, b testNodeRow, order map[string]int) bool {
 	}
 	if aMS != bMS {
 		if aMS < 0 || bMS < 0 {
-			return bMS < 0 // 无延迟排后（inf 语义）
+			return bMS < 0
 		}
 		return aMS < bMS
 	}
@@ -610,9 +569,6 @@ func markSameExit(results []testNodeRow, order map[string]int) {
 	}
 }
 
-// ─── 账本落账（健康、观测与冷却同一事务）──────────────────────
-
-// commitTestLedger 归属守卫 → 建体检运行行 → ingest 逐节点对齐 → 收口运行行，
 // 全部在一个写事务内（落账失败不能继续写一份冷却结果）。
 func (s *Service) commitTestLedger(ctx context.Context, subID int64, runningURL, runningText, runningConfigPath string, results []testNodeRow, nodeIDs map[string]string, now time.Time) (proxypool.IngestionResult, error) {
 	checkRows := make([]proxypool.CheckRow, 0, len(results))
@@ -684,9 +640,7 @@ func (s *Service) commitTestLedger(ctx context.Context, subID int64, runningURL,
 	return outcome, nil
 }
 
-// runtimeIdentityChanged 检测期间内核的订阅归属/配置正文是否漂移
-// （Python 逐项对照 process 身份；Go 进程身份经由 Status 的订阅 URL 与
-// 配置路径判定——Stop/切换都会清掉或换掉这两者）。
+// runtimeIdentityChanged 检测期间内核归属或配置文本是否变化。
 func (s *Service) runtimeIdentityChanged(runningURL, runningText, runningConfigPath string) bool {
 	cur := s.Kernel.Status()
 	if !cur.Running || cur.SubscriptionURL != runningURL || cur.ConfigPath != runningConfigPath {
@@ -695,9 +649,6 @@ func (s *Service) runtimeIdentityChanged(runningURL, runningText, runningConfigP
 	return s.readKernelConfig(cur.ConfigPath) != runningText
 }
 
-// ─── 摘要（存活统计 / 订阅废弃判定 / 走线日志）─────────────────
-
-// ledgerNode 检测链视角的权威节点行（proxy_nodes）。
 type ledgerNode struct {
 	ID                  int64
 	NodeID              string
@@ -758,8 +709,7 @@ func pyTextTime(t time.Time) string {
 	return t.Format("2006-01-02 15:04:05.000000")
 }
 
-// parsePyTime 库内时间文本（pyTimeText 的北京挂钟 naive）→ time.Time。
-// 按写入时区（DefaultLoc）还原时刻，保证与 s.now() 的时刻比较不受机器时区影响。
+// parsePyTime 按 DefaultLoc 还原无时区时间文本，保证时刻比较与机器时区无关。
 func parsePyTime(text string) (time.Time, bool) {
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.000000", "2006-01-02 15:04:05",
@@ -772,7 +722,6 @@ func parsePyTime(text string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// ledgerInCooldown 节点是否处于冷却期（冷却到点 = 该测了）。
 func ledgerInCooldown(node *ledgerNode, now time.Time) bool {
 	if node == nil || !node.CooldownUntil.Valid || node.CooldownUntil.String == "" {
 		return false
@@ -781,18 +730,14 @@ func ledgerInCooldown(node *ledgerNode, now time.Time) bool {
 	return ok && until.After(now)
 }
 
-// ledgerAliveByLedger 冷却跳过/自愈口径的账本存活：ACTIVE/STALE 且有体检证据。
 func ledgerAliveByLedger(node *ledgerNode) bool {
 	return node != nil && (node.State == proxypool.NodeActive || node.State == proxypool.NodeStale) &&
 		node.LastL2At.Valid && node.LastL2At.String != ""
 }
 
-// summarizeNodeResults 摘要消费账本健康，落订阅统计和走线日志。
-// 冷却跳过节点的存活口径读权威账本（与投影期 ok 判定同语义）。
 func (s *Service) summarizeNodeResults(ctx context.Context, subID int64, results []testNodeRow, nodeNames []string, now time.Time, registry map[string]*ledgerNode) (int, int, bool, error) {
 	statsJSON, subDeprecated, blockedByResources := s.readSubscriptionStats(ctx, subID)
 	if len(nodeNames) > 0 && !anyProbed(results) {
-		// 没有任何实探结论（全冷却跳过/全没探到）：沿用上次统计口径。
 		var stats map[string]any
 		_ = json.Unmarshal([]byte(statsJSON), &stats)
 		alive := minInt(pyIntOr(stats["alive"]), len(nodeNames))
@@ -904,7 +849,6 @@ func probedNames(results []testNodeRow) map[string]bool {
 	return out
 }
 
-// readSubscriptionStats 订阅行投影（last_stats 原文 / deprecated / 资源封锁判定）。
 func (s *Service) readSubscriptionStats(ctx context.Context, subID int64) (statsJSON string, deprecated bool, blocked bool) {
 	var raw sql.NullString
 	var dep bool
@@ -920,7 +864,6 @@ func (s *Service) readSubscriptionStats(ctx context.Context, subID int64) (stats
 	return statsJSON, deprecated, blocked
 }
 
-// evaluateSubscriptionDeprecation 资源失效或没有可用节点时停用，恢复后自动解除。
 func (s *Service) evaluateSubscriptionDeprecation(ctx context.Context, subID int64, aliveCount, total int) (bool, error) {
 	if total <= 0 {
 		return false, nil
@@ -959,7 +902,6 @@ func (s *Service) evaluateSubscriptionDeprecation(ctx context.Context, subID int
 	return false, nil
 }
 
-// mergeLastStats 订阅 last_stats 局部合并（不动其他键）；同值重算不落写。
 func (s *Service) mergeLastStats(ctx context.Context, subID int64, fields map[string]any) error {
 	return s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		var raw sql.NullString
@@ -972,7 +914,7 @@ func (s *Service) mergeLastStats(ctx context.Context, subID int64, fields map[st
 		for key, value := range fields {
 			if key == "traffic" {
 				if text, _ := value.(string); text == "" {
-					continue // 流量是单调量：本次没取到保留既有值
+					continue
 				}
 			}
 			stats[key] = value
@@ -990,7 +932,6 @@ func (s *Service) mergeLastStats(ctx context.Context, subID int64, fields map[st
 	})
 }
 
-// recordEventWithError 走线日志（检测链版本带 error 摘要）。
 func (s *Service) recordEventWithError(ctx context.Context, kind, target, proxyLabel, errText string) {
 	ts := pyTextTime(s.now().In(sched.DefaultLoc))
 	err := s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
@@ -1011,8 +952,7 @@ func nullStringArg(v string) any {
 	return v
 }
 
-// maybeRevertToDirect 无可用出口时回退默认直连：只回退依赖代理池的策略
-// （proxy_first/proxy_only），用户显式选过的策略不动。
+// maybeRevertToDirect 仅在无可用出口时将未显式选定的 proxy_first/proxy_only 回退直连。
 func (s *Service) maybeRevertToDirect(ctx context.Context) bool {
 	if s.kvBool(ctx, "proxy.strategy_explicit", false) {
 		return false
@@ -1064,8 +1004,6 @@ func (s *Service) kvBool(ctx context.Context, key string, fallback bool) bool {
 	return v
 }
 
-// ─── 冷却跳过行的结果载荷（读权威账本状态，标注 cooling）──────
-
 func cooldownNodesPayload(nodeNames []string, probed map[string]bool, registry map[string]*ledgerNode) []testNodeRow {
 	payload := []testNodeRow{}
 	for _, name := range nodeNames {
@@ -1083,8 +1021,6 @@ func cooldownNodesPayload(nodeNames []string, probed map[string]bool, registry m
 	return payload
 }
 
-// ─── selector 自愈（当前选中已死 → 切最快健康节点）────────────
-
 func (s *Service) selfHealSelector(ctx context.Context, ctl clashTestController, selector string, results []testNodeRow, registry map[string]*ledgerNode, allProxies map[string]any, now time.Time) {
 	healthy := make([]testNodeRow, 0, len(results))
 	for _, row := range results {
@@ -1092,7 +1028,7 @@ func (s *Service) selfHealSelector(ctx context.Context, ctl clashTestController,
 			healthy = append(healthy, row)
 		}
 	}
-	sort.SliceStable(healthy, func(i, j int) bool { return *healthy[i].MS < *healthy[j].MS })
+	slices.SortStableFunc(healthy, func(a, b testNodeRow) int { return cmp.Compare(*a.MS, *b.MS) })
 
 	current := ""
 	if info, ok := allProxiesInfo(allProxies, selector); ok {
@@ -1120,8 +1056,6 @@ func (s *Service) selfHealSelector(ctx context.Context, ctl clashTestController,
 	}
 	s.logf("选中节点 %s 已死，已切换到最快健康节点 %s │ 原节点=%s 新节点=%s", current, target, current, target)
 }
-
-// ─── 路由组选择（selector 自愈用；探测 lane 组是检测专用通道）──
 
 func allProxiesInfo(allProxies map[string]any, name string) (map[string]any, bool) {
 	proxies, _ := allProxies["proxies"].(map[string]any)
@@ -1158,16 +1092,13 @@ func pickRouteSelector(allProxies map[string]any) string {
 		}
 		return 99
 	}
-	sort.SliceStable(groups, func(i, j int) bool { return score(groups[i].name) < score(groups[j].name) })
+	slices.SortStableFunc(groups, func(a, b groupInfo) int { return cmp.Compare(score(a.name), score(b.name)) })
 	if len(groups) == 0 || groups[0].name == "" {
 		return "GLOBAL"
 	}
 	return groups[0].name
 }
 
-// ─── 控制器客户端（PUT/GET 组选择；不走系统代理）──────────────
-
-// clashTestController 检测链对内核 RESTful 控制器的操作面（测试注入桩）。
 type clashTestController interface {
 	AllProxies() (map[string]any, error)
 	PutProxy(group, name string) error
@@ -1186,7 +1117,6 @@ func (s *Service) clashTestCtl(baseURL, secret string) clashTestController {
 	}
 }
 
-// httpClashCtl 控制器 REST 客户端（Bearer 密钥鉴权，Transport 不读环境代理）。
 type httpClashCtl struct {
 	BaseURL string
 	Secret  string
@@ -1295,15 +1225,12 @@ func (c *httpClashCtl) PatchMode(mode string) error {
 	return nil
 }
 
-// controllerSecretOf 运行配置里的控制器密钥（启动文本与命令行同密钥）。
 func controllerSecretOf(configText string) string {
 	if m := secretLineRe.FindStringSubmatch(configText); m != nil {
 		return m[1]
 	}
 	return ""
 }
-
-// ─── 生产探针（经本地代理端口；测试桩覆盖注入面）──────────────
 
 func dialViaPort(port int, timeout time.Duration) *http.Client {
 	proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
@@ -1316,8 +1243,6 @@ func dialViaPort(port int, timeout time.Duration) *http.Client {
 	}
 }
 
-// steamProbeDefault 生产业务探针：GET StoreBrowse 最小负载；200 且 body 是
-// JSON 对象才算活（HTML 拦截页 / 空体 / 非 JSON 一律判否）。
 func (s *Service) steamProbeDefault(ctx context.Context, port int) (bool, int) {
 	client := dialViaPort(port, testSteamTimeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, proxypool.BusinessProbeURL(220, ""), nil)
@@ -1345,7 +1270,6 @@ func (s *Service) steamProbeDefault(ctx context.Context, port int) (bool, int) {
 	return json.Unmarshal(body, &payload) == nil && payload != nil, resp.StatusCode
 }
 
-// exitIPProbeDefault 出口 IP 探测：ip-api → ip.sb 依次尝试（仅用于去重）。
 func (s *Service) exitIPProbeDefault(ctx context.Context, port int) string {
 	client := dialViaPort(port, testExitIPTimeout)
 	for _, target := range []string{
@@ -1390,10 +1314,6 @@ func (s *Service) exitIPProbeDefault(ctx context.Context, port int) string {
 	return ""
 }
 
-// ─── 首检（启动/切换成功后的后台检测，复用窗口内跳过）─────────
-
-// ClashNodesFresh 该订阅的节点账本是否在复用窗口内有过检测（last_l2_at 最大值；
-// 跨重启有效，任何通道的业务证据都推进它）。账本为空或结论过期返回 False。
 func (s *Service) ClashNodesFresh(ctx context.Context, subID int64) bool {
 	var latest sql.NullString
 	if err := s.DB.QueryRowContext(ctx,
@@ -1409,9 +1329,7 @@ func (s *Service) ClashNodesFresh(ctx context.Context, subID int64) bool {
 	return elapsed < FirstCheckReuseMinutes*time.Minute
 }
 
-// SpawnFirstCheck 首检：订阅内容变化（启动/切换/重拉生效）后检测一次写账本
-// （订阅废弃判定/selector 自愈都在里面）；缺省全量探测。账本在复用窗口内已有
-// 全量结论时跳过（来回切换订阅不重复探测）。失败不影响内核已生效的事实。
+// SpawnFirstCheck 首检复用窗口内有近期结论则跳过；失败不影响内核生效。
 func (s *Service) SpawnFirstCheck(subID int64, probeAll bool) {
 	go func() {
 		ctx := context.Background()
@@ -1431,9 +1349,7 @@ func (s *Service) SpawnFirstCheck(subID int64, probeAll bool) {
 	}()
 }
 
-// autoPromoteAfterCheck 首检健康（可用节点 ≥ 1）即转正进池——与同步侧的自动
-// 准入同一把尺子（对齐 router._auto_promote_after_check）。快照尚未落库时晋升
-// 会失败：账本可用数已写好，下一拍同步落快照时自动转正，这里只记日志不重试。
+// autoPromoteAfterCheck 首检可用数 >= 1 即转正；未落快照时等同步重试。
 func (s *Service) autoPromoteAfterCheck(ctx context.Context, subID int64, alive int) {
 	if alive < 1 {
 		return
@@ -1455,11 +1371,8 @@ func (s *Service) autoPromoteAfterCheck(ctx context.Context, subID int64, alive 
 	}
 }
 
-// ─── 小工具 ──────────────────────────────────────────────────
-
 func intPtr(v int) *int { return &v }
 
-// intPtrNonZero 0 = 无 HTTP 响应 → null（对齐 Python steamStatus=None）。
 func intPtrNonZero(v int) *int {
 	if v == 0 {
 		return nil
@@ -1491,7 +1404,6 @@ func pyIntOr(v any) int {
 	return 0
 }
 
-// anyStr Python str() 投影的窄版：检测链只消费字符串字段。
 func anyStr(v any) string {
 	switch text := v.(type) {
 	case string:

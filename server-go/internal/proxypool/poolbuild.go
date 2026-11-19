@@ -1,12 +1,5 @@
 package proxypool
 
-// 池构建与重建钩子（Python pool.py / bootstrap.py 对齐）：
-// EligibleNodes 读当前合格集（只读不落盘）；renderPoolNodes 纯渲染（重名即拒绝）；
-// BuildPool 三门禁后原子落盘；PoolSignature 按完整节点参数与连接依赖组判定
-// 运行集变化——判定"池变了"用运行集签名而不是快照 SHA：快照整体变了但合格
-// 运行集没变时，重启内核毫无意义。合格集变化 → RequestPoolRebuild 请求重建。
-// 并发边界：只执行 SQL 不提交，事务归调用方（经写闸）。
-
 import (
 	"context"
 	"crypto/sha256"
@@ -16,7 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,44 +19,36 @@ import (
 
 const PoolFilename = "crawl-pool.yaml"
 
-// 内核能装载一条代理所需的最小键：缺任何一个都不该进池（写进去只会被内核
-// 拒绝，比不写更糟——那会变成「池里有它、内核里没有」的静默差额）。
+// poolRequiredConfigKeys 缺任一必选键即不入池，防产生内核拒载的静默差额。
 var poolRequiredConfigKeys = []string{"type", "server", "port"}
 
-// builtinProxyNames 内建代理名（Python BUILTIN_PROXY_NAMES 同表）：这些目标
-// 不需要跨订阅来源解释，不算「连接依赖来源不可用」。
 var builtinProxyNames = map[string]bool{
 	"DIRECT": true, "REJECT": true, "REJECT-DROP": true, "GLOBAL": true,
 	"COMPATIBLE": true, "PASS": true, "PASS-RULE": true,
 }
 
-// PoolPath 池文件落盘路径。
 func PoolPath(dataDir string) string {
 	return filepath.Join(dataDir, "proxypool", PoolFilename)
 }
 
-// PoolFileNames 池文件当前写入的节点名（没有文件返回空）。这是落盘产物的读数，
-// 与 EligibleNodes（合格集）区分：判断池文件有没有跟上合格集要比集合，比数量
-// 会在「换了一个节点但数量相同」时漏判。
 func PoolFileNames(dataDir string) []string {
 	raw, err := os.ReadFile(PoolPath(dataDir))
 	if err != nil {
 		return nil
 	}
-	doc, err := clashYAMLLoad(string(raw))
+	doc, err := clashcfg.LoadYAML(string(raw))
 	if err != nil {
 		return nil
 	}
 	return poolProxyNames(doc)
 }
 
-// PoolAuxiliaryNames 池产物中的连接依赖组名称。
 func PoolAuxiliaryNames(dataDir string) []string {
 	raw, err := os.ReadFile(PoolPath(dataDir))
 	if err != nil {
 		return nil
 	}
-	doc, err := clashYAMLLoad(string(raw))
+	doc, err := clashcfg.LoadYAML(string(raw))
 	if err != nil {
 		return nil
 	}
@@ -92,12 +77,10 @@ func poolProxyNames(doc map[string]any) []string {
 	return out
 }
 
-// PoolBuildError 门禁未通过。写盘前抛出，调用方可以确信旧池未被破坏。
 type PoolBuildError struct{ Detail string }
 
 func (e *PoolBuildError) Error() string { return e.Detail }
 
-// PoolBuildResult 一次池生成的账目（数量是门禁的观测值，供调用方记录/断言）。
 type PoolBuildResult struct {
 	Path           string
 	ExpectedCount  int
@@ -106,7 +89,6 @@ type PoolBuildResult struct {
 	AuxiliaryNames []string
 }
 
-// poolNodeRow 合格节点行投影（Config 为解析后的归一化配置）。
 type poolNodeRow struct {
 	ID             int64
 	NodeID         string
@@ -121,7 +103,6 @@ type poolNodeRow struct {
 	LastL2At       sql.NullString
 }
 
-// poolSubscriptionRow 准入判定所需的订阅行投影。
 type poolSubscriptionRow struct {
 	ID          int64
 	Admission   sql.NullString
@@ -129,9 +110,6 @@ type poolSubscriptionRow struct {
 	OriginalURL string
 }
 
-// SubscriptionBlockReason 资源封锁判定（Python ProxySubscription.resource_block_reason
-// 对齐）：last_stats.traffic 的 expire 已过 → 订阅已到期；total>0 且已用尽 →
-// 订阅流量已用尽。返回空串 = 不封锁。
 func SubscriptionBlockReason(lastStatsJSON string, now time.Time) string {
 	if lastStatsJSON == "" {
 		return ""
@@ -160,9 +138,6 @@ func SubscriptionBlockReason(lastStatsJSON string, now time.Time) string {
 	return ""
 }
 
-// EligibleNodes 当前合格节点（池的输入集）。只读、不落盘。
-// 合格 = 状态合格（NEW/ACTIVE/STALE）+ 配置完整 + 仍归属订阅 + 订阅在生产准入
-// 且未资源封锁；信息占位节点（机场公告位）永不合格。
 func EligibleNodes(ctx context.Context, conn *sql.Conn, now time.Time) ([]poolNodeRow, error) {
 	return eligibleNodes(ctx, conn, now)
 }
@@ -230,7 +205,6 @@ func eligibleNodes(ctx context.Context, conn queryable, now time.Time) ([]poolNo
 	return out, nodeRows.Err()
 }
 
-// poolConfigComplete 资格之外的「配置完整」：池里每一条都必须是内核装载得了的。
 func poolConfigComplete(config map[string]any) bool {
 	if len(config) == 0 {
 		return false
@@ -244,11 +218,7 @@ func poolConfigComplete(config map[string]any) bool {
 	return true
 }
 
-// normalizeJSONNumbers 节点配置树内数字形态归一（Python json.loads 语义）：
-// json.Number 整数字面量 → int64，带小数/指数 → float64，其余原样。渲染与
-// 指纹两侧共用：YAML dump 对 int64 原样输出，json.Number 会被按字符串加引号、
-// float64 整值会带 .0——两者真内核都拒载。超出 int64 的整数字面量按 float64
-// 近似（Python 任意精度整数在节点配置里不可达）。
+// 指纹与 YAML 共用：整数归一化为 int64（超范围回退 float64），防加引号或 .0 拒载。
 func normalizeJSONNumbers(v any) any {
 	switch x := v.(type) {
 	case map[string]any:
@@ -277,8 +247,6 @@ func normalizeJSONNumbers(v any) any {
 	}
 }
 
-// loadPoolSourceDocuments 只为无法由同订阅节点解释的连接目标读取快照原文。
-// 格式不是 YAML / provider YAML 的快照按空文档处理；读取失败记入 errors。
 func loadPoolSourceDocuments(ctx context.Context, conn *sql.Conn, dataDir string, nodes []poolNodeRow, errors map[int64]string) map[int64]map[string]any {
 	originals := map[int64]map[string]bool{}
 	needs := map[int64]bool{}
@@ -318,8 +286,6 @@ func loadPoolSourceDocuments(ctx context.Context, conn *sql.Conn, dataDir string
 	return docs
 }
 
-// loadSubscriptionProxyGroups 读该订阅当前 URL 最近一次成功快照的 proxy-groups。
-// 没有可恢复快照按空文档（调用方以 errors 区分「读了但空」与「读失败」）。
 func loadSubscriptionProxyGroups(ctx context.Context, conn *sql.Conn, dataDir string, sid int64) (map[string]any, error) {
 	var sealed sql.NullString
 	if err := conn.QueryRowContext(ctx,
@@ -340,15 +306,13 @@ func loadSubscriptionProxyGroups(ctx context.Context, conn *sql.Conn, dataDir st
 	if snap.Fmt != FormatYAML && snap.Fmt != FormatProviderYAML {
 		return map[string]any{}, nil
 	}
-	doc, err := clashYAMLLoad(string(snap.RawContent))
+	doc, err := clashcfg.LoadYAML(string(snap.RawContent))
 	if err != nil {
 		return nil, fmt.Errorf("订阅快照不是合法 YAML：%s", err.Error())
 	}
 	return doc, nil
 }
 
-// renderPoolNodes 纯渲染层：不碰数据库、不碰磁盘，只做重复名门禁并产出 YAML 文本。
-// 单独暴露是为了让「重名即拒绝」这条规则不依赖数据库唯一约束兜底也测得到。
 func renderPoolNodes(nodes []poolNodeRow, sourceDocuments map[int64]map[string]any) (string, []string, error) {
 	names := make([]string, len(nodes))
 	seen := map[string]bool{}
@@ -369,7 +333,7 @@ func renderPoolNodes(nodes []poolNodeRow, sourceDocuments map[int64]map[string]a
 		for d := range uniq {
 			shown = append(shown, d)
 		}
-		sort.Strings(shown)
+		slices.Sort(shown)
 		shownList := make([]string, len(shown))
 		for i, s := range shown {
 			shownList[i] = pyReprValue(s)
@@ -379,7 +343,7 @@ func renderPoolNodes(nodes []poolNodeRow, sourceDocuments map[int64]map[string]a
 			"["+strings.Join(shownList, ", ")+"]")}
 	}
 
-	grouped := map[int64][]int{} // 订阅 → 节点下标（保序）
+	grouped := map[int64][]int{}
 	var order []int64
 	for i, node := range nodes {
 		sid := node.SubscriptionID.Int64
@@ -449,7 +413,6 @@ func renderPoolNodes(nodes []poolNodeRow, sourceDocuments map[int64]map[string]a
 	return clashcfg.DumpYAML(doc), names, nil
 }
 
-// PoolSignature 按完整节点参数、生产出口槽和必要连接依赖组判定运行集变化。
 func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time.Time) ([]string, error) {
 	nodes, err := EligibleNodes(ctx, conn, now)
 	if err != nil {
@@ -480,7 +443,7 @@ func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time
 	if renderErr != nil {
 		dependencies = map[string]any{"invalid": renderErr.Error()}
 	} else {
-		parsed, err := clashYAMLLoad(text)
+		parsed, err := clashcfg.LoadYAML(text)
 		if err != nil {
 			dependencies = map[string]any{"invalid": err.Error()}
 		} else {
@@ -488,8 +451,7 @@ func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time
 		}
 	}
 	groups, _ := dependencies.([]any)
-	// Python 真值语义：依赖组列表非空，或渲染失败落下的 {"invalid": ...} 标记
-	// （dict 恒真值），都算「依赖集有内容」；nil（无依赖组）才算空。
+	// len(groups)>0 或非 nil 失败标记视为有依赖，nil 才算空。
 	hasDependencies := len(groups) > 0 || (dependencies != nil && groups == nil)
 	if hasDependencies || len(sourceErrors) > 0 {
 		errMap := map[string]any{}
@@ -506,7 +468,6 @@ func PoolSignature(ctx context.Context, conn *sql.Conn, dataDir string, now time
 	return signatures, nil
 }
 
-// PoolSignatureChanged 两个运行集签名是否不同（顺序敏感：签名按节点主键有序）。
 func PoolSignatureChanged(before, after []string) bool {
 	if len(before) != len(after) {
 		return true
@@ -519,22 +480,14 @@ func PoolSignatureChanged(before, after []string) bool {
 	return false
 }
 
-// RequestPoolRebuild 合格集变化 → 请求重建的注入点。默认 RequestRebuild 置
-// 待办位（Python request_rebuild 同款可合并信号）；消费由重建接线装配
-// （占用释放钩子 / 周期拍）。调用方一律经 MaybeRequestPoolRebuild，不再直调
-// 本变量。
 var RequestPoolRebuild = RequestRebuild
 
-// MaybeRequestPoolRebuild 签名变化时请求重建（幂等：连续置位只算一次的语义
-// 由待办位持有方保证）。
 func MaybeRequestPoolRebuild(before, after []string) {
 	if PoolSignatureChanged(before, after) {
 		RequestPoolRebuild()
 	}
 }
 
-// BuildPool 读 Registry → 渲染 → 三门禁 → 落盘 → 复读。事务与提交归调用方
-// （经写闸）；任何门禁失败时旧池保持原样（不靠回滚补）。
 func BuildPool(ctx context.Context, conn *sql.Conn, dataDir string, now time.Time) (PoolBuildResult, error) {
 	eligible, err := EligibleNodes(ctx, conn, now)
 	if err != nil {
@@ -546,8 +499,7 @@ func BuildPool(ctx context.Context, conn *sql.Conn, dataDir string, now time.Tim
 	if err != nil {
 		return PoolBuildResult{}, err
 	}
-	// 门禁一/二：生成的文本自己必须解析得回来，且条目数不能缩水。
-	parsed, err := clashYAMLLoad(text)
+	parsed, err := clashcfg.LoadYAML(text)
 	if err != nil {
 		return PoolBuildResult{}, &PoolBuildError{Detail: "生成的池不是 {proxies: [...]} 形态：" + err.Error()}
 	}
@@ -573,13 +525,11 @@ func BuildPool(ctx context.Context, conn *sql.Conn, dataDir string, now time.Tim
 		return PoolBuildResult{}, err
 	}
 
-	// 门禁三：写完复读，磁盘上的名字集合必须与预期一致（名字是池与内核之间
-	// 唯一的对账钥匙）。
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return PoolBuildResult{}, err
 	}
-	replayed, err := clashYAMLLoad(string(raw))
+	replayed, err := clashcfg.LoadYAML(string(raw))
 	if err != nil {
 		return PoolBuildResult{}, &PoolBuildError{Detail: "磁盘复读的名字集合与预期不一致：" + err.Error()}
 	}

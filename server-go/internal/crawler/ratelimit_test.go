@@ -9,9 +9,6 @@ import (
 	"time"
 )
 
-// ── 测试时钟 ─────────────────────────────────────────────────────
-
-// advancingClock：Sleep 直接推进时钟，用于单 goroutine 的窗口/冷却序列测试。
 type advancingClock struct {
 	mu     sync.Mutex
 	now    time.Time
@@ -40,15 +37,12 @@ func (c *advancingClock) sleepCount() int {
 	return len(c.sleeps)
 }
 
-// manualClock：Sleep 阻塞到时钟到达等待截止时刻，用于并发等待观测。
-// 每次进入 Sleep 登记进入计数与截止时刻，推进方用 AdvanceTo 精确推到
-// 截止点，避免「推进早于等待者读起点」的竞态。
 type manualClock struct {
 	mu     sync.Mutex
 	now    time.Time
 	wake   chan struct{}
-	pend   time.Time    // 最近一次 Sleep 的截止时刻（观测口）
-	sleeps atomic.Int64 // Sleep 进入次数（观测口）
+	pend   time.Time
+	sleeps atomic.Int64
 }
 
 func newManualClock() *manualClock {
@@ -83,17 +77,14 @@ func (c *manualClock) Sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// SleepCount：Sleep 累计进入次数。
 func (c *manualClock) SleepCount() int64 { return c.sleeps.Load() }
 
-// PendingDeadline：最近一次进入 Sleep 的截止时刻。
 func (c *manualClock) PendingDeadline() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.pend
 }
 
-// AdvanceTo：时钟前进到 t（只进不退），唤醒全部等待者重新判定。
 func (c *manualClock) AdvanceTo(t time.Time) {
 	c.mu.Lock()
 	if t.After(c.now) {
@@ -105,7 +96,6 @@ func (c *manualClock) AdvanceTo(t time.Time) {
 	close(ch)
 }
 
-// errSleepClock：Now 正常，Sleep 返回注入错误（fail-open 观测）。
 type errSleepClock struct {
 	advancingClock
 	err error
@@ -113,7 +103,6 @@ type errSleepClock struct {
 
 func (c *errSleepClock) Sleep(_ context.Context, _ time.Duration) error { return c.err }
 
-// waitFor：轮询条件成立，超时判失败（避免真实长等待）。
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -125,8 +114,6 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("等待超时：%s", what)
 }
-
-// ── 滑窗限流 ─────────────────────────────────────────────────────
 
 func TestRateLimiterUnderWindow(t *testing.T) {
 	clk := newAdvancingClock()
@@ -148,7 +135,6 @@ func TestRateLimiterWindowBoundary(t *testing.T) {
 	lim.clock = clk
 	_ = lim.Acquire(context.Background())
 	_ = lim.Acquire(context.Background())
-	// 时刻恰好到窗：最旧时间戳等于出窗界，应被清理并直接放行
 	clk.mu.Lock()
 	clk.now = clk.now.Add(time.Second)
 	clk.mu.Unlock()
@@ -184,26 +170,23 @@ func TestRateLimiterWaitingCountedOnce(t *testing.T) {
 	lim := NewRateLimiter(1, time.Second)
 	lim.clock = clk
 	ctx := context.Background()
-	_ = lim.Acquire(ctx) // 占满窗口
+	_ = lim.Acquire(ctx)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			errs[i] = lim.Acquire(ctx)
-		}(i)
+		})
 	}
 	waitFor(t, "两个等待者进入排队", func() bool {
 		return clk.SleepCount() == 2 && lim.Waiting() == 2
 	})
-	clk.AdvanceTo(clk.PendingDeadline()) // 推到 1s：一人得名额，另一人进入第二轮等待
-	// 第二轮等待不重复计数：仍在排队的只有一人
+	clk.AdvanceTo(clk.PendingDeadline())
 	waitFor(t, "第二轮等待只计一人", func() bool {
 		return clk.SleepCount() == 3 && lim.Waiting() == 1
 	})
-	clk.AdvanceTo(clk.PendingDeadline()) // 推到 2s：第二轮等待者得名额
+	clk.AdvanceTo(clk.PendingDeadline())
 	wg.Wait()
 	for i, err := range errs {
 		if err != nil {
@@ -219,8 +202,7 @@ func TestRateLimiterFailOpen(t *testing.T) {
 	clk := &errSleepClock{err: errors.New("时钟故障")}
 	lim := NewRateLimiter(1, time.Second)
 	lim.clock = clk
-	_ = lim.Acquire(context.Background()) // 占满窗口
-	// 内部故障：放行且不占名额、不排队
+	_ = lim.Acquire(context.Background())
 	if err := lim.Acquire(context.Background()); err != nil {
 		t.Fatalf("内部故障应放行而非报错: %v", err)
 	}
@@ -234,7 +216,6 @@ func TestRateLimiterFailOpen(t *testing.T) {
 		t.Fatalf("放行路径不应记录名额，实际 %d 条", n)
 	}
 
-	// 调用方取消：原样上抛
 	clk2 := newManualClock()
 	lim2 := NewRateLimiter(1, time.Second)
 	lim2.clock = clk2
@@ -245,8 +226,6 @@ func TestRateLimiterFailOpen(t *testing.T) {
 		t.Fatalf("取消应上抛，实际 %v", err)
 	}
 }
-
-// ── 按出口分账 ───────────────────────────────────────────────────
 
 func TestExitRateLimitsIsolation(t *testing.T) {
 	fallback := NewRateLimiter(1, time.Second)
@@ -261,7 +240,6 @@ func TestExitRateLimitsIsolation(t *testing.T) {
 	a := exits.ForExit("a")
 	_ = a.Acquire(ctx)
 	_ = a.Acquire(ctx)
-	// 出口 a 预算占满：同键继续等，出口 b 不受影响
 	aCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	if err := a.Acquire(aCtx); !errors.Is(err, context.DeadlineExceeded) {
@@ -281,12 +259,10 @@ func TestExitRateLimitsFallback(t *testing.T) {
 	if exits.ForExit("") != fallback || exits.ForExit("x") != fallback {
 		t.Fatalf("空账本应全部回落共享实例")
 	}
-	// 空键不建账：显式传入的空串被跳过
 	exits2 := NewExitRateLimits([]string{"", ""}, 5, time.Second, fallback)
 	if exits2.ExitCount() != 0 {
 		t.Fatalf("空串出口键不应建账，实际 %d", exits2.ExitCount())
 	}
-	// 未知键回落
 	exits3 := NewExitRateLimits([]string{"a"}, 5, time.Second, fallback)
 	if exits3.ForExit("unknown") != fallback {
 		t.Fatalf("未知出口键应回落共享实例")

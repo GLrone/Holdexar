@@ -1,8 +1,5 @@
 package dbwriter
 
-// B1 逐款隔离回退 + B2 段前背压的单元测试。
-// 注入面：表触发器（RAISE 定向失败）、Writer.Diag（假写闸诊断）。
-
 import (
 	"context"
 	"database/sql"
@@ -14,8 +11,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// TestSlowPathFinishingSavepointFailureKeepsChunk B1②：收尾保存点失败只回滚
-// 保存点不拖垮主段——ok 款照常提交，第二次调用（注入解除）复活清标生效。
 func TestSlowPathFinishingSavepointFailureKeepsChunk(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -67,8 +62,6 @@ func TestSlowPathFinishingSavepointFailureKeepsChunk(t *testing.T) {
 	}
 }
 
-// TestSlowPathSegmentFailureOnlyVoidOwnChunk B1③：段级异常只作废本段——
-// 触发器 RAISE(ROLLBACK) 连根回滚外层事务，本段整段作废，后续段照常落库。
 func TestSlowPathSegmentFailureOnlyVoidOwnChunk(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -112,8 +105,6 @@ func TestSlowPathSegmentFailureOnlyVoidOwnChunk(t *testing.T) {
 	}
 }
 
-// TestSlowPathHandsWriterSlotBetweenChunks B1④：段间交还写者位——交互写
-// 在段间可插入（慢路径两段之间，交互写完整跑完且不被饿死）。
 func TestSlowPathHandsWriterSlotBetweenChunks(t *testing.T) {
 	w, db := newTestWriter(t)
 	w.Now = testNow
@@ -131,7 +122,6 @@ func TestSlowPathHandsWriterSlotBetweenChunks(t *testing.T) {
 	w.Diag = func(ctx context.Context) map[string]any {
 		paced++
 		if paced == 2 && interactiveDone != nil {
-			// 第二段起闸前：写者位已交还——交互写在此窗口完整执行
 			go func() {
 				interactiveDone <- w.Gate.WithWrite(context.Background(), store.PriorityInteractive, func(conn *sql.Conn) error {
 					_, err := conn.ExecContext(context.Background(), "INSERT INTO probe_slots (tag) VALUES ('interactive')")
@@ -167,7 +157,6 @@ func TestSlowPathHandsWriterSlotBetweenChunks(t *testing.T) {
 	}
 }
 
-// TestBackpressurePaceSleepsOnDeepQueue B2：积压超阈值按深度线性退避。
 func TestBackpressurePaceSleepsOnDeepQueue(t *testing.T) {
 	w := &Writer{Log: func(string, ...any) {}}
 	w.Diag = func(context.Context) map[string]any {
@@ -182,7 +171,6 @@ func TestBackpressurePaceSleepsOnDeepQueue(t *testing.T) {
 	}
 }
 
-// TestBackpressurePaceIdleUnderThreshold B2：深度≤阈值零退避。
 func TestBackpressurePaceIdleUnderThreshold(t *testing.T) {
 	w := &Writer{Log: func(string, ...any) {}}
 	w.Diag = func(context.Context) map[string]any {
@@ -196,7 +184,6 @@ func TestBackpressurePaceIdleUnderThreshold(t *testing.T) {
 	}
 }
 
-// TestBackpressurePaceLogsEntryAndExitOnce B2：进/退场日志各一条（atomic 去重）。
 func TestBackpressurePaceLogsEntryAndExitOnce(t *testing.T) {
 	logs := []string{}
 	w := &Writer{Log: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }}

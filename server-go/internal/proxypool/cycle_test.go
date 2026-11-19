@@ -3,6 +3,8 @@ package proxypool
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -219,5 +221,16 @@ func TestCycleMaintenanceFinishesFailedRunAndReleasesWriteGateForNetwork(t *test
 	}
 	if result, err := c.RunMaintenance(ctx, checker); err != nil || result["health_ok"] != int64(2) {
 		t.Fatalf("retry after failed run = %v, %v", result, err)
+	}
+}
+
+func TestCycleWarnRoutesThroughLogAndRedacts(t *testing.T) {
+	var lines []string
+	c := &Cycle{Log: func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}}
+	c.warn("保存代理体检签名失败", errors.New("https://example.test/sub?token=supersecret123"))
+	if len(lines) != 1 || strings.Contains(lines[0], "supersecret123") || !strings.Contains(lines[0], "token=***") {
+		t.Fatalf("logged = %v", lines)
 	}
 }

@@ -4,7 +4,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,9 +22,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// ─── 夹具 ────────────────────────────────────────────────────
-
-// subYAML 可渲染的最小订阅原文（RenderSubscriptionConfig / ParseNodes 双消费）。
 const subYAML = `mixed-port: 7890
 mode: rule
 tun:
@@ -63,7 +63,6 @@ func newFixture(t *testing.T) (*Service, *stubRuntime, string) {
 	return svc, kernel, dir
 }
 
-// seedSubscription 播种一条 clash 订阅行（stats 传空串 = NULL）。
 func seedSubscription(t *testing.T, svc *Service, id int64, url, label, stats string, deprecated bool) {
 	t.Helper()
 	sealed, err := proxypool.SealURL(svc.DataDir, url)
@@ -83,7 +82,6 @@ func seedSubscription(t *testing.T, svc *Service, id int64, url, label, stats st
 	}
 }
 
-// seedSnapshot 播种一条成功快照（经真实 PersistSnapshot，raw 落盘 + sha 校验齐全）。
 func seedSnapshot(t *testing.T, svc *Service, subID int64, url string, raw []byte, title, userinfo string) {
 	t.Helper()
 	nodes, err := proxypool.ParseNodes(raw, proxypool.FormatYAML)
@@ -121,7 +119,6 @@ func writeExe(t *testing.T, dir string) string {
 	return exe
 }
 
-// statusErrOf 断言错误是带 HTTP 语义的 StatusError 并返回其状态码与文案。
 func statusErrOf(t *testing.T, err error) (*StatusError, string) {
 	t.Helper()
 	if err == nil {
@@ -133,8 +130,6 @@ func statusErrOf(t *testing.T, err error) (*StatusError, string) {
 	}
 	return se, se.Detail
 }
-
-// ─── 内核桩 ──────────────────────────────────────────────────
 
 type stubRuntime struct {
 	mu         sync.Mutex
@@ -201,8 +196,6 @@ func (r *stubRuntime) RunningSubscriptionIs(subURL string) bool {
 	return r.st.Running && r.runningSub != "" && r.runningSub == subURL
 }
 
-// ─── 状态面 ──────────────────────────────────────────────────
-
 func TestStatusPayloadDetectAndSelected(t *testing.T) {
 	svc, _, dir := newFixture(t)
 	ctx := context.Background()
@@ -253,8 +246,6 @@ func TestSelectedSubIDRejectsBadValue(t *testing.T) {
 	}
 }
 
-// ─── 安装面 ──────────────────────────────────────────────────
-
 func buildZip(t *testing.T, name, data string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
@@ -296,7 +287,6 @@ func TestInstallBundledFirst(t *testing.T) {
 
 func TestInstallProgressStates(t *testing.T) {
 	progress := &progressStore{}
-	// 无记录 = 全零值
 	zero := progress.snapshot()
 	if zero.Running || zero.OK || zero.Phase != nil || zero.Percent != nil || zero.Received != 0 ||
 		zero.Total != nil || zero.Source != nil || zero.Via != nil || zero.Error != nil {
@@ -310,14 +300,12 @@ func TestInstallProgressStates(t *testing.T) {
 		mid.Percent == nil || *mid.Percent != 50 || mid.Source == nil || *mid.Source != "github" || mid.Via == nil || *mid.Via != "直连" {
 		t.Fatalf("下载中快照不符：%+v", mid)
 	}
-	// 完成：终帧只带 ok/percent，合并语义保留 phase/received 等字段
 	progress.record(clashkernel.Progress{OK: true, Percent: 100})
 	done := progress.snapshot()
 	if done.Running || !done.OK || done.Percent == nil || *done.Percent != 100 ||
 		done.Phase == nil || *done.Phase != "下载内核" || done.Received != 100 {
 		t.Fatalf("完成快照不符：%+v", done)
 	}
-	// 失败：error 落账，running 归 false，其余字段保留
 	progress.record(clashkernel.Progress{Error: "所有下载源均失败，可手动放置内核到 data/clash/"})
 	failed := progress.snapshot()
 	if failed.Running || failed.OK || failed.Error == nil || *failed.Error != "所有下载源均失败，可手动放置内核到 data/clash/" ||
@@ -326,12 +314,28 @@ func TestInstallProgressStates(t *testing.T) {
 	}
 }
 
+func serveReleaseDigest(t *testing.T, zipBytes []byte) string {
+	t.Helper()
+	sum := sha256.Sum256(zipBytes)
+	asset, _ := clashkernel.MihomoAsset()
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"assets": []map[string]any{{"name": asset, "digest": digest}},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
 func TestInstallDownloadViaMirror(t *testing.T) {
 	svc, _, dir := newFixture(t)
+	zipBytes := buildZip(t, "mihomo.exe", "kernel-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(buildZip(t, "mihomo.exe", "kernel-bytes"))
+		_, _ = w.Write(zipBytes)
 	}))
 	defer srv.Close()
+	svc.ReleaseAPIURL = serveReleaseDigest(t, zipBytes)
 	svc.InstallMirrors = []string{srv.URL + "/"}
 
 	result := svc.InstallKernel(context.Background())
@@ -350,10 +354,12 @@ func TestInstallDownloadViaMirror(t *testing.T) {
 
 func TestInstallAllMirrorsFailed(t *testing.T) {
 	svc, _, _ := newFixture(t)
+	zipBytes := buildZip(t, "mihomo.exe", "kernel-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
+	svc.ReleaseAPIURL = serveReleaseDigest(t, zipBytes)
 	svc.InstallMirrors = []string{srv.URL + "/"}
 
 	result := svc.InstallKernel(context.Background())
@@ -367,7 +373,20 @@ func TestInstallAllMirrorsFailed(t *testing.T) {
 	}
 }
 
-// ─── subcache 面 ─────────────────────────────────────────────
+func TestInstallRejectsDigestMismatch(t *testing.T) {
+	svc, _, _ := newFixture(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(buildZip(t, "mihomo.exe", "tampered-bytes"))
+	}))
+	defer srv.Close()
+	svc.ReleaseAPIURL = serveReleaseDigest(t, buildZip(t, "mihomo.exe", "expected-bytes"))
+	svc.InstallMirrors = []string{srv.URL + "/"}
+
+	result := svc.InstallKernel(context.Background())
+	if result.OK || result.Error == nil || *result.Error == "" {
+		t.Fatalf("摘要不匹配应失败阻断：%+v", result)
+	}
+}
 
 func TestSubscriptionConfigPathNaming(t *testing.T) {
 	dir := t.TempDir()
@@ -410,7 +429,6 @@ func TestMaterializeSubscriptionConfig(t *testing.T) {
 	if bytes.Contains(raw, []byte("tun:")) || bytes.Contains(raw, []byte("MATCH,DIRECT")) {
 		t.Fatalf("规则/接管段不应进运行配置：%s", text)
 	}
-	// 原文缓存保持不动
 	original, _ := os.ReadFile(rawPath)
 	if !bytes.Contains(original, []byte("MATCH,DIRECT")) {
 		t.Fatalf("原文缓存被改写")
@@ -467,10 +485,10 @@ func TestFetchSubscriptionToCacheRestoresSnapshot(t *testing.T) {
 
 func TestSubscriptionAutoNameFromURL(t *testing.T) {
 	cases := map[string]string{
-		"https://panel.example.com/api/v1/client/subscribe?token=abcdef": "subscribe",
-		"https://panel.example.com/dl/my-airport-sub":                    "my-airport-sub",
-		"https://panel.example.com/" + "abcdef0123456789abcdef0123456789": "", // 凭据末段不当名字
-		"https://panel.example.com/":                                      "", // 根路径无名字
+		"https://panel.example.com/api/v1/client/subscribe?token=abcdef":  "subscribe",
+		"https://panel.example.com/dl/my-airport-sub":                     "my-airport-sub",
+		"https://panel.example.com/" + "abcdef0123456789abcdef0123456789": "",
+		"https://panel.example.com/":                                      "",
 	}
 	for input, want := range cases {
 		if got := subscriptionAutoNameFromURL(input); got != want {

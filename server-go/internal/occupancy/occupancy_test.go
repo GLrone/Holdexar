@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// resetState 全局状态清场：包内测试直接复位，测试间互不残留。
 func resetState() {
 	mu.Lock()
 	holder = ""
@@ -18,7 +17,6 @@ func resetState() {
 	mu.Unlock()
 }
 
-// expectBusy 断言被拒、可哨兵判别且拒因一致。
 func expectBusy(t *testing.T, err error, want string) {
 	t.Helper()
 	var be *BusyError
@@ -33,8 +31,6 @@ func expectBusy(t *testing.T, err error, want string) {
 	}
 }
 
-// ── 互斥矩阵：爬取 ↔ 维护互拒，正常释放后可再入 ──────────────────
-
 func TestCrawlMaintenanceMutex(t *testing.T) {
 	resetState()
 	defer resetState()
@@ -45,14 +41,12 @@ func TestCrawlMaintenanceMutex(t *testing.T) {
 	if !CrawlerBusy() || CurrentHolder() != "job-1" {
 		t.Fatalf("爬取占用应在位，holder=%q", CurrentHolder())
 	}
-	// 爬取在位：维护拒绝、异 tag 拒绝、同 tag 幂等
 	expectBusy(t, BeginMaintenance(MaintenanceHealth), "已有爬取任务在执行（job-1）")
 	expectBusy(t, BeginCrawl("job-2"), "已有爬取任务在执行（job-1）")
 	if err := BeginCrawl("job-1"); err != nil {
 		t.Fatalf("同 tag 重入应幂等: %v", err)
 	}
 
-	// 释放后维护可入；维护在位：双向拒绝
 	EndCrawl()
 	if CrawlerBusy() {
 		t.Fatalf("释放后不应为忙")
@@ -64,19 +58,16 @@ func TestCrawlMaintenanceMutex(t *testing.T) {
 		MaintenanceReason() != "代理体检进行中" {
 		t.Fatalf("体检预约应在位，kind=%q reason=%q", MaintenanceKind(), MaintenanceReason())
 	}
-	// 预约不幂等：同种类重入同样拒
 	expectBusy(t, BeginMaintenance(MaintenanceHealth), "代理体检进行中")
 	expectBusy(t, BeginCrawl("job-3"), "代理体检进行中")
 	expectBusy(t, BeginMaintenance(MaintenanceRebuild), "代理体检进行中")
 
-	// 清预约后换种类，拒因随之切换
 	EndMaintenance()
 	if err := BeginMaintenance(MaintenanceRebuild); err != nil {
 		t.Fatalf("清理后取得重建预约失败: %v", err)
 	}
 	expectBusy(t, BeginCrawl("job-4"), "代理通道正在重建")
 
-	// 全部释放后爬取可再入，拒因读点归零
 	EndMaintenance()
 	if err := BeginCrawl("job-5"); err != nil {
 		t.Fatalf("维护清理后取得爬取占用失败: %v", err)
@@ -100,9 +91,6 @@ func TestEndWithoutBeginIdempotent(t *testing.T) {
 	}
 }
 
-// ── 异常路径不泄漏：调用方 defer 配对释放 ────────────────────────
-
-// holdThenError 占用后以业务错误返回，释放靠调用方 defer。
 func holdThenError() error {
 	if err := BeginCrawl("leaky"); err != nil {
 		return err
@@ -156,8 +144,6 @@ func TestBusyErrorSentinelOnly(t *testing.T) {
 	}
 }
 
-// ── 并发压测：多 goroutine 竞争，无死锁无双持 ────────────────────
-
 func TestConcurrentContention(t *testing.T) {
 	resetState()
 	defer resetState()
@@ -180,7 +166,6 @@ func TestConcurrentContention(t *testing.T) {
 			go func(id int) {
 				defer wg.Done()
 				tag := fmt.Sprintf("crawl-%d", id)
-				// 计数窗口须嵌在持位区间内：减计先于释放，释放间隙不算在位
 				for i := 0; i < iterations; i++ {
 					if i%2 == 0 {
 						if err := BeginCrawl(tag); err == nil {

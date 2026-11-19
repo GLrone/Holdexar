@@ -1,8 +1,5 @@
 package clashcfg
 
-// 内核配置文本操作：混合口钉定、tun 剥除、控制器端点解析、探测 lane 注入、
-// 订阅内容比较视图。全部以 YAML 文本为出入，不可解析时保守返回原文。
-
 import (
 	"crypto/rand"
 	"encoding/base64"
@@ -12,8 +9,6 @@ import (
 	"strings"
 )
 
-// 探测 lane 常量：与池内核 lane 同形态（select 组 + mixed listener），组用
-// include-all 随内核当前节点集自动变化，配置比较时剥掉即可。
 const (
 	ProbeLaneCount     = 20
 	ProbeLanePortBase  = 20000
@@ -33,7 +28,6 @@ const (
 	RuntimeConfigFilename = "crawl-runtime.yaml"
 )
 
-// FreeLocalPort 让系统分配一个空闲的本机 TCP 端口（不做端口租约）。
 func FreeLocalPort() (int, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -47,7 +41,6 @@ func FreeLocalPort() (int, error) {
 	return addr.Port, nil
 }
 
-// PortFreeBind 端口空闲探测（bind 判定）。
 func PortFreeBind(port int) bool {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -57,7 +50,6 @@ func PortFreeBind(port int) bool {
 	return true
 }
 
-// NewControllerSecret 随机控制密钥（token_urlsafe(32) 同形）。
 func NewControllerSecret() string {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -73,7 +65,6 @@ var controllerPortTailRe = regexp.MustCompile(`:(\d+)\s*$`)
 var secretLineRe = regexp.MustCompile(`(?m)^secret\s*:.*$`)
 var hasSecretRe = regexp.MustCompile(`(?m)^secret\s*:`)
 
-// ParseMixedPort 读配置里的混合监听口（无则 0）。
 func ParseMixedPort(configText string) int {
 	if m := mixedPortRe.FindStringSubmatch(configText); m != nil {
 		return atoiSafe(m[1])
@@ -118,7 +109,6 @@ func PinMixedPort(configText string, port int) string {
 	return DumpYAML(docFromMap(merged))
 }
 
-// StripTunSection 剥掉订阅自带的虚拟网卡段（tun），幂等；不可解析原文返回。
 func StripTunSection(configText string) string {
 	doc, err := LoadYAML(configText)
 	if err != nil {
@@ -137,7 +127,6 @@ func StripTunSection(configText string) string {
 	return DumpYAML(docFromMap(merged))
 }
 
-// WithControllerSecret 写入控制密钥：已有 secret 行原位替换，否则文末追加。
 func WithControllerSecret(configText string, secret string) string {
 	line := "secret: " + secret
 	if hasSecretRe.MatchString(configText) {
@@ -168,13 +157,11 @@ func ResolveController(configText string) (string, string) {
 	return fmt.Sprintf("http://127.0.0.1:%d", port), secret
 }
 
-// ProbeLane 探测 lane（组名, listener 端口）。
 type ProbeLane struct {
 	Group string
 	Port  int
 }
 
-// ProbeLaneOptions InjectProbeLanes 的可调参数；零值 = 旧链路默认段。
 type ProbeLaneOptions struct {
 	PortBase  int
 	PortSpan  int
@@ -183,10 +170,7 @@ type ProbeLaneOptions struct {
 	LaneCount int
 }
 
-// InjectProbeLanes 把探测 lane 注入内核配置（幂等）：剔除本前缀旧条目后追加
-// LaneCount 组 select(include-all) + 同数 mixed listener。端口避让本配置自己的
-// 混合口与控制器口；PinPorts 钉住沿用（热重载通道，绕过空闲检查）。不可解析的
-// 配置原样返回；一个端口都分不到时不动配置。
+// InjectProbeLanes 幂等注入探测 lane，避让混合/控制器口；PinPorts 绕过空闲检查。
 func InjectProbeLanes(configText string, opts ProbeLaneOptions) string {
 	portBase, portSpan := opts.PortBase, opts.PortSpan
 	if portBase == 0 {
@@ -277,7 +261,6 @@ func InjectProbeLanes(configText string, opts ProbeLaneOptions) string {
 	return DumpYAML(docFromMap(merged))
 }
 
-// ParseProbeLanes 从内核配置读出探测 lane（组名, listener 端口），按组名升序。
 func ParseProbeLanes(configText string) ([]ProbeLane, error) {
 	doc, err := LoadYAML(configText)
 	if err != nil {
@@ -313,8 +296,6 @@ func sortProbes(lanes []ProbeLane) {
 	}
 }
 
-// ParseNodeNames 从配置的 proxies 段解析节点名列表（轻量扫描，不做完整解析）。
-// 只认块式 `- name: xx` 与行内 `- { name: xx, ... }` 首键形态。
 func ParseNodeNames(configText string) []string {
 	var names []string
 	inProxies := false
@@ -348,9 +329,7 @@ func ParseNodeNames(configText string) []string {
 
 var nameItemRe = regexp.MustCompile(`-\s*(?:\{\s*)?name\s*:\s*(?:'([^']*)'|"([^"]*)"|([^,}]+))`)
 
-// SubscriptionView 配置的订阅内容视图：剥掉探测 lane、混合口与控制密钥后的
-// yaml 结构。mixed-port 一并剥掉：监听口归程序管，不属于订阅内容——端口漂移
-// 不触发重启的语义由这里兑现。不可解析返回 nil。
+// SubscriptionView 剥掉探测 lane、mixed-port 与 secret，避免端口漂移触发重启。
 func SubscriptionView(configText string) map[string]any {
 	doc, err := LoadYAML(configText)
 	if err != nil {
@@ -384,8 +363,6 @@ func SubscriptionView(configText string) map[string]any {
 	return view
 }
 
-// ConfigUnchanged 内核启动文本与磁盘配置是否等价（比较对象是订阅内容视图）。
-// 语义是「订阅内容真的变了才重启」：格式变化与端口漂移都不触发重启。
 func ConfigUnchanged(startupText, diskText string) bool {
 	if startupText == diskText {
 		return true

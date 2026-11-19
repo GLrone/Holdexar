@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/logredact"
 	"holdexar/server-go/internal/occupancy"
 	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
@@ -28,13 +29,13 @@ const (
 	globalSelectTimeout     = 10 * time.Second
 )
 
-// Cycle runs the health phases around the caller's pending runtime rebuild.
 type Cycle struct {
 	DB      *sql.DB
 	Gate    *store.WriteGate
 	DataDir string
 	Now     func() time.Time
 	Bus     *events.Bus
+	Log     func(string, ...any)
 
 	ProbeL0URL string
 	ProbeL1URL string
@@ -47,6 +48,15 @@ func (c *Cycle) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func (c *Cycle) warn(msg string, err error) {
+	text := logredact.Redact(err.Error())
+	if c.Log != nil {
+		c.Log("%s: %s", msg, text)
+		return
+	}
+	slog.Warn(msg, "error", text)
 }
 
 // RunL0 can run during a crawl. Recovery uses a separate temporary kernel.
@@ -84,7 +94,6 @@ func (c *Cycle) RunL0(ctx context.Context, checker *HealthChecker) (map[string]a
 	}, errors.Join(beforeErr, l0Err, recoveryErr, afterErr)
 }
 
-// RunMaintenance checks the saved throttle and reserves the live runtime before probing.
 func (c *Cycle) RunMaintenance(ctx context.Context, checker *HealthChecker) (map[string]any, error) {
 	if occupancy.CrawlerBusy() {
 		return map[string]any{"busy": true, "maintenance": "busy"}, nil
@@ -94,7 +103,7 @@ func (c *Cycle) RunMaintenance(ctx context.Context, checker *HealthChecker) (map
 	}
 	started := c.now()
 	if due, err := c.maintenanceDue(ctx, started); err != nil {
-		slog.Warn("读取代理体检间隔失败，本轮执行体检", "error", err)
+		c.warn("读取代理体检间隔失败，本轮执行体检", err)
 	} else if !due {
 		return map[string]any{"maintenance": "throttled"}, nil
 	}
@@ -188,7 +197,7 @@ func (c *Cycle) RunMaintenance(ctx context.Context, checker *HealthChecker) (map
 	}
 	if finishErr == nil && readErr == nil && restoreErr == nil {
 		if err := settings.SetValues(cleanupCtx, c.Gate, settings.Options{Bus: c.Bus}, map[string]any{maintenanceSignatureKey: after.signature()}); err != nil {
-			slog.Warn("保存代理体检签名失败", "error", err)
+			c.warn("保存代理体检签名失败", err)
 		}
 	}
 	return result, errors.Join(l1Err, l2Err, finishErr, readErr, restoreErr, ctx.Err())

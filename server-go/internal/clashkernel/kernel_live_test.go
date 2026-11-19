@@ -1,10 +1,5 @@
 package clashkernel
 
-// 真内核行为验收（核心门禁）：用 worktree 随包 holdexar-mihomo.exe 真实跑通
-// 预检 → spawn → 混合口归属 → 控制器 → 热重载 → 停止 → 孤儿清理。
-// 内核不随仓库分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
-// 孤儿清理测试只用改名副本内核，绝不匹配真映像名。
-
 import (
 	"fmt"
 	"net/http"
@@ -29,7 +24,6 @@ func liveKernelAsset(t *testing.T) string {
 	return exe
 }
 
-// poolFixture 生成 n 个假 ss 节点的池文件（127.0.0.1 占位服务，内核可解析即可）。
 func poolFixture(n int) string {
 	var b strings.Builder
 	b.WriteString("proxies:\n")
@@ -52,13 +46,10 @@ func writePool(t *testing.T, dataDir string, n int) {
 	}
 }
 
-// TestLiveKernelFullCycle 七步行为验收：就位 → 预检 → 启动 → 混合口归属 →
-// 控制器 → 热重载 → 停止。
 func TestLiveKernelFullCycle(t *testing.T) {
 	assetExe := liveKernelAsset(t)
 	dataDir := t.TempDir()
 
-	// ① 内核就位（复制）
 	res, err := EnsureKernel(filepath.Dir(assetExe), dataDir)
 	if err != nil {
 		t.Fatalf("内核就位失败：%v", err)
@@ -68,7 +59,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 	}
 	exePath := KernelExe(dataDir)
 
-	// ② 生成含 3 条 lane 的运行配置并预检
 	writePool(t, dataDir, 3)
 	configPath, _, err := clashcfg.PrepareRuntimeConfig(dataDir, 3, false)
 	if err != nil {
@@ -79,7 +69,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 		t.Fatalf("预检应通过：%v", err)
 	}
 
-	// ③ 启动 + 混合口就绪且归属进程正确
 	runtime := &Runtime{}
 	status, err := runtime.Start(exePath, configPath, StartOptions{InjectLanes: false})
 	if err != nil {
@@ -106,7 +95,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 		}
 	}
 
-	// ④ 控制器 /version 与 /proxies 可查
 	controller := NewController(status.ControllerURL, runtime.Secret)
 	if err := controller.Version(); err != nil {
 		t.Fatalf("控制器 /version 不可用：%v", err)
@@ -121,7 +109,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 		}
 	}
 
-	// ⑤ 热重载：池加一个节点，钉住端点生成新配置 → PUT /configs?force=true
 	writePool(t, dataDir, 4)
 	newConfigPath, newText, err := clashcfg.PrepareRuntimeConfig(dataDir, 3, true)
 	if err != nil {
@@ -145,7 +132,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 		t.Fatalf("热重载后混合口漂移：%d → %d", status.Port, runtime.Status().Port)
 	}
 
-	// ⑥ 停止：进程消失、端口释放
 	oldPID := runtime.Process.Pid()
 	runtime.Stop()
 	if runtime.Process != nil && runtime.Process.Running() {
@@ -168,7 +154,6 @@ func TestLiveKernelFullCycle(t *testing.T) {
 		t.Log("停止后新配置混合口释放略慢，属内核异步退出窗口")
 	}
 
-	// ⑦ 重启能力：停止后可再次启动（三段停止不留脏状态）
 	status2, err := runtime.Start(exePath, configPath, StartOptions{InjectLanes: false})
 	if err != nil {
 		t.Fatalf("停止后重启失败：%v", err)
@@ -203,7 +188,6 @@ func newConfigPathMixedPort(t *testing.T, path string) int {
 	return clashcfg.ParseMixedPort(readFile(t, path))
 }
 
-// TestLiveKernelBadConfigRejected 预检坏配置必须拒绝（真内核 -t）。
 func TestLiveKernelBadConfigRejected(t *testing.T) {
 	assetExe := liveKernelAsset(t)
 	dataDir := t.TempDir()
@@ -226,8 +210,6 @@ func TestLiveKernelBadConfigRejected(t *testing.T) {
 	}
 }
 
-// TestLiveKernelSpawnImmediateStopRace spawn 后立刻 stop 的竞态：三段停止对
-// 「刚拉起就停」与「起好再停」都必须收敛，且随后还能再启动。
 func TestLiveKernelSpawnImmediateStopRace(t *testing.T) {
 	assetExe := liveKernelAsset(t)
 	dataDir := t.TempDir()
@@ -253,7 +235,6 @@ func TestLiveKernelSpawnImmediateStopRace(t *testing.T) {
 			t.Fatalf("第 %d 次竞态停止后进程仍在", i)
 		}
 	}
-	// 竞态之后内核仍可正常起一次完整生命周期
 	runtime := &Runtime{}
 	if _, err := runtime.Start(exePath, configPath, StartOptions{InjectLanes: false}); err != nil {
 		t.Fatalf("竞态后正常启动失败：%v", err)
@@ -261,8 +242,6 @@ func TestLiveKernelSpawnImmediateStopRace(t *testing.T) {
 	runtime.Stop()
 }
 
-// TestLiveOrphanCleanupWithRenamedCopy 孤儿清理：改名副本内核 + 命令行匹配。
-// 绝不匹配真 mihomo.exe 映像名。
 func TestLiveOrphanCleanupWithRenamedCopy(t *testing.T) {
 	assetExe := liveKernelAsset(t)
 	dataDir := t.TempDir()
@@ -310,7 +289,6 @@ func TestLiveOrphanCleanupWithRenamedCopy(t *testing.T) {
 		t.Fatal("Toolhelp32 枚举应含孤儿副本进程号")
 	}
 
-	// 配置路径不匹配 → 不动它（命令行守卫）
 	killed, err := KillOrphanKernels("mihomo-hltest-orphan.exe", "E:\\definitely-other-config.yaml")
 	if err != nil {
 		t.Fatalf("孤儿查询失败：%v", err)
@@ -322,7 +300,6 @@ func TestLiveOrphanCleanupWithRenamedCopy(t *testing.T) {
 		t.Fatal("守卫不匹配误杀了孤儿副本")
 	}
 
-	// 配置路径匹配 → 清掉
 	killed, err = KillOrphanKernels("mihomo-hltest-orphan.exe", configPath)
 	if err != nil {
 		t.Fatalf("孤儿清理失败：%v", err)

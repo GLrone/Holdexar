@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-// ── 熔断退避序列 ─────────────────────────────────────────────────
-
 func TestBreakerBackoffSequence(t *testing.T) {
 	b := NewBreaker429()
 	b.clock = newAdvancingClock()
@@ -49,11 +47,9 @@ func TestBreakerWaitTrippedCooldown(t *testing.T) {
 	clk := newAdvancingClock()
 	b := NewBreaker429()
 	b.clock = clk
-	// 未熔断：即取即发
 	if err := b.WaitTripped(context.Background()); err != nil {
 		t.Fatalf("未熔断不应等待: %v", err)
 	}
-	// 已冷却 2s 后进入等待：只等剩余 3s
 	b.Trip()
 	clk.mu.Lock()
 	clk.now = clk.now.Add(2 * time.Second)
@@ -64,18 +60,15 @@ func TestBreakerWaitTrippedCooldown(t *testing.T) {
 	if clk.sleepCount() != 1 || clk.sleeps[0] != 3*time.Second {
 		t.Fatalf("应只等剩余冷却 3s，实际 %v", clk.sleeps)
 	}
-	// 到期放行试探：不自动复位
 	if !b.Tripped() {
 		t.Fatalf("冷却到期放行试探，不应自动复位")
 	}
-	// 已过冷却：不再等待
 	if err := b.WaitTripped(context.Background()); err != nil {
 		t.Fatalf("过冷却期等待失败: %v", err)
 	}
 	if clk.sleepCount() != 1 {
 		t.Fatalf("过冷却期不应再等待")
 	}
-	// 试探再失败：连续次数继续累加，冷却翻倍
 	b.Trip()
 	if b.Cooldown() != 10*time.Second {
 		t.Fatalf("试探失败后冷却应翻倍到 10s，实际 %v", b.Cooldown())
@@ -90,7 +83,6 @@ func TestBreakerWaitCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.WaitTripped(ctx) }()
-	// 等待者应停在冷却等待里（冷却未到不返回）
 	select {
 	case err := <-done:
 		t.Fatalf("冷却未到不应返回，实际 %v", err)
@@ -101,8 +93,6 @@ func TestBreakerWaitCancel(t *testing.T) {
 		t.Fatalf("冷却等待应可被取消，实际 %v", err)
 	}
 }
-
-// ── 按出口分账 ───────────────────────────────────────────────────
 
 func TestExitBreakersIsolation(t *testing.T) {
 	fallback := NewBreaker429()
@@ -125,8 +115,6 @@ func TestExitBreakersIsolation(t *testing.T) {
 		t.Fatalf("空账本应全部回落共享实例")
 	}
 }
-
-// ── 幻觉 429 形状判定 ────────────────────────────────────────────
 
 func TestAppDetailsPhantom429(t *testing.T) {
 	cases := []struct {

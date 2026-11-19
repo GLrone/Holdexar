@@ -25,6 +25,28 @@ func NetworkTakenOver(ctx context.Context) bool {
 	return takeover.takenOver(ctx)
 }
 
+func ResetTakeoverForTest(lookup func(context.Context, string, string) ([]netip.Addr, error)) func() {
+	takeover.mu.Lock()
+	origLookup := takeover.lookup
+	origAt := takeover.at
+	origValue := takeover.value
+	if lookup != nil {
+		takeover.lookup = lookup
+	} else {
+		takeover.lookup = net.DefaultResolver.LookupNetIP
+	}
+	takeover.at = time.Time{}
+	takeover.value = false
+	takeover.mu.Unlock()
+	return func() {
+		takeover.mu.Lock()
+		takeover.lookup = origLookup
+		takeover.at = origAt
+		takeover.value = origValue
+		takeover.mu.Unlock()
+	}
+}
+
 func (p *takeoverProbe) takenOver(ctx context.Context) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()

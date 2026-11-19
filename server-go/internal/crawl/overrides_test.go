@@ -14,7 +14,6 @@ import (
 	"holdexar/server-go/internal/storebrowse"
 )
 
-// overridesItem 构造单品批量响应（带一个标准版购买选项）。
 func overridesItem(appid int64, name string) storebrowse.Item {
 	return storebrowse.Item{"appid": appid, "success": 1, "visible": true, "type": 0, "name": name,
 		"purchase_options": []any{map[string]any{
@@ -23,8 +22,6 @@ func overridesItem(appid int64, name string) storebrowse.Item {
 		}}}
 }
 
-// TestRuntimeWriterLoadsSeriesOverrides B7：爬取期建 Writer 装填数据目录的
-// series_overrides.json——写批引发系列联动时覆盖表生效（新占位行按覆盖表落位）。
 func TestRuntimeWriterLoadsSeriesOverrides(t *testing.T) {
 	db, gate := runtimeFixture(t)
 	dataDir := t.TempDir()
@@ -55,8 +52,6 @@ func TestRuntimeWriterLoadsSeriesOverrides(t *testing.T) {
 	}
 }
 
-// B5④ 端到端：coming_soon 且该区无购买答复 → COMING_SOON 暂缓行落库，
-// 复查轮（comingsoon_retry）冷却期满后能选到该行。
 func TestRuntimeComingSoonDefersAndRecheckPicksIt(t *testing.T) {
 	db, gate := runtimeFixture(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -88,7 +83,6 @@ func TestRuntimeComingSoonDefersAndRecheckPicksIt(t *testing.T) {
 	if missingRows != 0 {
 		t.Fatalf("暂缓分支应清账不落欠账: %d", missingRows)
 	}
-	// 复查轮选取：冷却期满（updated_at 回拨 15 天）后能选到该行
 	if _, err := db.Exec(`UPDATE games SET updated_at=? WHERE appid=220`, timestamp(r.now().AddDate(0, 0, -15))); err != nil {
 		t.Fatal(err)
 	}
@@ -98,8 +92,6 @@ func TestRuntimeComingSoonDefersAndRecheckPicksIt(t *testing.T) {
 	}
 }
 
-// B5③ 库内已知行未发售（release_date 在未来）且判定 missing：只清账不标记、
-// 不落欠账。
 func TestRuntimeFutureReleaseOnlyClearsLedger(t *testing.T) {
 	db, gate := runtimeFixture(t)
 	kind := "GAME"
@@ -119,7 +111,6 @@ func TestRuntimeFutureReleaseOnlyClearsLedger(t *testing.T) {
 	r := New(db, gate, nil, Options{Fetch: func(ctx context.Context, ids []int64, cc, lang string, extras bool) (map[int64]storebrowse.Item, error) {
 		out := map[int64]storebrowse.Item{}
 		for _, id := range ids {
-			// 赠送态但响应里拿不到 0 价赠送选项 → 判定 missing
 			out[id] = storebrowse.Item{"appid": id, "success": 1, "visible": true, "type": 0, "name": name, "is_free_temporarily": true}
 		}
 		return out, nil
@@ -143,7 +134,6 @@ func TestRuntimeFutureReleaseOnlyClearsLedger(t *testing.T) {
 	}
 }
 
-// B6 端到端：价格保存成功的批次白送的捆绑包发现落库（无价桩 + 单种子）。
 func TestRuntimeRecordsBundleDiscoveries(t *testing.T) {
 	db, gate := runtimeFixture(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

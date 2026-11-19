@@ -80,7 +80,6 @@ func TestInjectProbeLanesDeterministicPorts(t *testing.T) {
 			t.Fatalf("listener 形态不对：%#v", em)
 		}
 	}
-	// 占用一个基址段端口时确定性避让
 	text = InjectProbeLanes(base, ProbeLaneOptions{PortFree: func(p int) bool { return p != 20000 }})
 	doc = mustLoad(t, text)
 	listeners, _ = doc["listeners"].([]any)
@@ -99,7 +98,6 @@ func TestInjectProbeLanesIdempotent(t *testing.T) {
 	if once != twice {
 		t.Fatalf("注入不幂等：\n一次：%s\n两次：%s", once, twice)
 	}
-	// 钉住端口：全部沿用，不再分配
 	pinned := make([]int, ProbeLaneCount)
 	for i := range pinned {
 		pinned[i] = 30000 + i
@@ -224,7 +222,6 @@ func TestValidateRejects(t *testing.T) {
 			t.Fatalf("%s：应拒绝（含 %q），实际 %v", c.name, c.want, err)
 		}
 	}
-	// 探针 lane 的 include-all 是唯一放行形态
 	probe := node + "proxy-groups:\n- name: " + ProbeLaneGroupPrefix + "-1\n  type: select\n  include-all: true\n"
 	if err := ValidateExecutionConfigText(probe); err != nil {
 		t.Fatalf("探针 include-all 应放行：%v", err)
@@ -270,18 +267,15 @@ func TestRenderNodeBundleErrors(t *testing.T) {
 	if _, err := RenderNodeBundle([]map[string]any{node("a")}, nil, BundleOptions{}); err != nil {
 		t.Fatalf("普通节点应渲染成功：%v", err)
 	}
-	// 缺失依赖
 	broken := node("a")
 	broken["dialer-proxy"] = "不存在"
 	if _, err := RenderNodeBundle([]map[string]any{broken}, nil, BundleOptions{}); err == nil {
 		t.Fatal("缺失依赖应拒绝")
 	}
-	// 组没有可用成员（include-all 空池）
 	emptyGroup := map[string]any{"name": "g", "type": "select", "include-all": true}
 	if _, err := RenderNodeBundle(nil, nil, BundleOptions{Groups: []map[string]any{emptyGroup}, RootsSet: true, Roots: []string{"g"}}); err == nil {
 		t.Fatal("空组应拒绝")
 	}
-	// 循环依赖
 	loop := node("a")
 	loop["dialer-proxy"] = "b"
 	loop2 := node("b")
@@ -314,5 +308,47 @@ func TestPinnedRuntimeEndpoints(t *testing.T) {
 	}
 	if PinnedRuntimeEndpoints("mode: global\n") != nil {
 		t.Fatal("缺控制器时必须视为无现役端点")
+	}
+}
+
+func TestYAMLAnchorsMergesMultiDocAndScalars(t *testing.T) {
+	src := "---\n" +
+		"b1: &b1 {cipher: aes-256-gcm, udp: true, port: 0700}\n" +
+		"b2: &b2 {cipher: chacha20, obfs: tls}\n" +
+		"node:\n" +
+		"  name: n\n" +
+		"  <<: [*b1, *b2]\n" +
+		"  udp: off\n" +
+		"scalars:\n" +
+		"  shortY: y\n" +
+		"  shortN: n\n" +
+		"  flagOn: on\n" +
+		"  badOctal: 0899\n" +
+		"  sexa: 1:30\n" +
+		"  date: 2026-12-31\n" +
+		"  tilde: ~\n" +
+		"  quotedBool: \"yes\"\n" +
+		"  literal: |-\n" +
+		"    0700\n" +
+		"...\n"
+	doc := mustLoad(t, src)
+	node := doc["node"].(map[string]any)
+	if node["cipher"] != "aes-256-gcm" || node["obfs"] != "tls" || node["udp"] != false || node["port"] != int64(448) {
+		t.Fatalf("merge/anchor 展开异常：%#v", node)
+	}
+	sc := doc["scalars"].(map[string]any)
+	if sc["shortY"] != "y" || sc["shortN"] != "n" || sc["flagOn"] != true || sc["badOctal"] != "0899" ||
+		sc["sexa"] != int64(90) || sc["date"] != "2026-12-31" || sc["tilde"] != nil ||
+		sc["quotedBool"] != "yes" || sc["literal"] != "0700" {
+		t.Fatalf("YAML 1.1 标量契约异常：%#v", sc)
+	}
+	for _, bad := range []string{
+		"a: 1\n---\nb: 2\n",
+		"a: &self\n  - *self\n",
+		"a: &self\n  <<: *self\n",
+	} {
+		if _, err := LoadYAML(bad); err == nil {
+			t.Fatalf("应拒绝非法或多文档输入：%q", bad)
+		}
 	}
 }

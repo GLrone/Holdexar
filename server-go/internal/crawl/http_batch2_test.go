@@ -12,7 +12,6 @@ import (
 	"holdexar/server-go/internal/games"
 )
 
-// serve 批 2 HTTP 装配测试通道：真 mux + Runtime.Register 全量路由。
 func serve(t *testing.T, r *Runtime) (*httptest.ResponseRecorder, func(method, path, body string) *httptest.ResponseRecorder) {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -27,7 +26,6 @@ func serve(t *testing.T, r *Runtime) (*httptest.ResponseRecorder, func(method, p
 	return nil, do
 }
 
-// decodeJSON 响应体解码（httptest 缓冲读法：先取原文再解码）。
 func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var out map[string]any
@@ -56,7 +54,6 @@ func joinAppids(ids []string) string {
 	return out
 }
 
-// TestFreshnessHTTPGuards 空参 400 / 非整 422 / 201 上限 400（Pydantic 实测形状）。
 func TestFreshnessHTTPGuards(t *testing.T) {
 	r, _ := readFixture(t)
 	_, do := serve(t, r)
@@ -89,8 +86,6 @@ func TestFreshnessHTTPGuards(t *testing.T) {
 	}
 }
 
-// TestFreshnessHTTPDedupOrder 重复查询参数去重保序；入库 appid 返回形状
-// （observedAt/freshness/regions 三键与 D8 内部件同源）。
 func TestFreshnessHTTPDedupOrder(t *testing.T) {
 	r, db := readFixture(t)
 	readExec(t, db, `INSERT INTO game_current_prices(appid,region_code,discount_percent,fail_count,price_status,attempt_outcome,steam_answer,last_success_at,updated_at)
@@ -118,7 +113,6 @@ func TestFreshnessHTTPDedupOrder(t *testing.T) {
 	}
 }
 
-// TestImportHTTPValidation 1-100 边界与元素校验（Pydantic venv 实测锚点）。
 func TestImportHTTPValidation(t *testing.T) {
 	r, _ := readFixture(t)
 	_, do := serve(t, r)
@@ -168,9 +162,6 @@ func joinStrings(parts []string, sep string) string {
 	return out
 }
 
-// TestImportHTTPClassification 只分类不落库：fail 保留原值回显、ok/own 计数。
-// ImportAppids 是注入出口（games.ImportAppids 经 serverd 装配），这里注入
-// 真实现以验证 HTTP 层形状。
 func TestImportHTTPClassification(t *testing.T) {
 	r, db := readFixture(t)
 	r.ImportAppids = func(ctx context.Context, appids []any) (map[string]any, error) {
@@ -193,7 +184,6 @@ func TestImportHTTPClassification(t *testing.T) {
 	if first["appid"] != float64(0) || first["status"] != "fail" {
 		t.Fatal(first)
 	}
-	// 布尔与可解析整串同样过校验（Pydantic lax int）
 	rec = do("POST", "/api/v1/crawl/import", `{"appids": [true, " 7 "]}`)
 	if rec.Code != 200 {
 		t.Fatalf("宽松强转应 200：%d %s", rec.Code, rec.Body.String())

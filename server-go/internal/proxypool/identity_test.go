@@ -32,7 +32,6 @@ func TestNodeFingerprintKeyOrderIndependent(t *testing.T) {
 }
 
 func TestNodeFingerprintAirportIgnoresPort(t *testing.T) {
-	// 机场节点带 password → 端口不进身份：动态端口换号仍是同一节点
 	a := airportConfig("n")
 	b := airportConfig("n")
 	b["port"] = int64(9999)
@@ -41,21 +40,18 @@ func TestNodeFingerprintAirportIgnoresPort(t *testing.T) {
 	if fa != fb {
 		t.Fatal("机场节点换端口不应换指纹")
 	}
-	// 换凭据 = 另一个节点
 	c := airportConfig("n")
 	c["password"] = "other"
 	fc, _ := NodeFingerprint(c, "tag")
 	if fa == fc {
 		t.Fatal("换凭据应换指纹")
 	}
-	// 未知键参与身份（宁可重登记，不可并成一条台账）
 	d := airportConfig("n")
 	d["new-opt"] = "x"
 	fd, _ := NodeFingerprint(d, "tag")
 	if fa == fd {
 		t.Fatal("新增未知键应换指纹")
 	}
-	// 忽略键不参与身份（name/udp/开关族）
 	e := airportConfig("renamed")
 	e["tfo"] = true
 	e["smux"] = map[string]any{"enabled": true}
@@ -66,7 +62,6 @@ func TestNodeFingerprintAirportIgnoresPort(t *testing.T) {
 }
 
 func TestNodeFingerprintLocalChainPortIsIdentity(t *testing.T) {
-	// 本地代理链形态：只有 type/server/port（+忽略键）→ 端口参与身份
 	local := func(port int64) map[string]any {
 		return map[string]any{"type": "http", "server": "127.0.0.1", "port": port}
 	}
@@ -75,7 +70,6 @@ func TestNodeFingerprintLocalChainPortIsIdentity(t *testing.T) {
 	if fa == fb {
 		t.Fatal("端口是唯一区分依据时应换指纹")
 	}
-	// 加了实质字段（password）后端口退场
 	withAuth := local(7890)
 	withAuth["username"] = "u"
 	withAuth["password"] = "p"
@@ -110,12 +104,12 @@ func TestSubscriptionTag(t *testing.T) {
 		wantLabel string
 	}{
 		{"https://sub.example.com/token", "example.com"},
-		{"https://a.b.c.example.com/token", "example.com"},          // 后两段
-		{"http://EXAMPLE.com/x", "example.com"},                     // 主机小写化
-		{"https://user:pass@sub.example.com:8443/p", "example.com"}, // userinfo/端口剥离
-		{"https://localhost/x", "localhost"},                        // 单段域名 → 标签即主机名
-		{"", ""},                                                    // 空 → 仅 digest
-		{"   ", ""},                                                 // 空白 strip 后为空
+		{"https://a.b.c.example.com/token", "example.com"},
+		{"http://EXAMPLE.com/x", "example.com"},
+		{"https://user:pass@sub.example.com:8443/p", "example.com"},
+		{"https://localhost/x", "localhost"},
+		{"", ""},
+		{"   ", ""},
 	}
 	for _, c := range cases {
 		tag := SubscriptionTag(c.url)
@@ -133,7 +127,6 @@ func TestSubscriptionTag(t *testing.T) {
 			t.Fatalf("%q → %q, want %q", c.url, tag, digestPart+"."+c.wantLabel)
 		}
 	}
-	// 同链接同 tag；异链接异 tag（digest 必异）
 	if SubscriptionTag("https://a.com/x") != SubscriptionTag(" https://a.com/x ") {
 		t.Fatal("strip 后同链接应同 tag")
 	}
@@ -167,7 +160,6 @@ func TestIsInfoPlaceholder(t *testing.T) {
 		}
 	}
 	normal := []string{"香港 01", "US-Premium", "重置优先级", "剩余旅程"}
-	// 「重置优先级」含「重置」是占位——注意词面是子串匹配，这里验证行为而非意图
 	for _, n := range []string{"香港 01", "US-Premium"} {
 		if IsInfoPlaceholder(n) {
 			t.Fatalf("%q 不应判为占位节点", n)
@@ -189,7 +181,6 @@ func TestPyFloatFormat(t *testing.T) {
 			t.Fatalf("formatPyFloat(%v) = %q, want %q", c.in, got, c.want)
 		}
 	}
-	// 负零：常量表达式无负零，用 Copysign 构造
 	if got := formatPyFloat(math.Copysign(0, -1)); got != "-0.0" {
 		t.Fatalf("formatPyFloat(-0) = %q, want -0.0", got)
 	}
@@ -208,7 +199,6 @@ func TestPyJSONEncodeBasics(t *testing.T) {
 	if got != want {
 		t.Fatalf("pyJSONEncode:\n got %s\nwant %s", got, want)
 	}
-	// 控制字符与引号反斜杠转义（0x01 → \u0001）
 	escaped, _ := pyJSONEncode(map[string]any{"k": "a\"b\\c\nd\x01"})
 	if escaped != `{"k":"a\"b\\c\nd\u0001"}` {
 		t.Fatalf("转义形态不符：%s", escaped)

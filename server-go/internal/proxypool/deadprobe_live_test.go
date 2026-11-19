@@ -1,10 +1,5 @@
 package proxypool
 
-// 真内核恢复探测与池构建验收（核心门禁）：DeadProbeRunner 拉起真内核对沙箱
-// SOCKS5 节点做整链恢复探测（无主节点归因、DEAD 复活落账、工作目录清理）；
-// BuildPool 产物经真内核预检、拉起、控制器逐名对账并实测可达。内核不随仓库
-// 分发：assets/clash/holdexar-mihomo.exe 缺失时整组 skip，不伪装通过。
-
 import (
 	"context"
 	"database/sql"
@@ -22,7 +17,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// deadProbeKernelCopy 把真内核复制进隔离数据目录（DeadProbeRunner 的定位路径）。
 func deadProbeKernelCopy(t *testing.T, dataDir string) {
 	t.Helper()
 	exe := liveKernelExe(t)
@@ -45,7 +39,6 @@ func deadProbeKernelCopy(t *testing.T, dataDir string) {
 	}
 }
 
-// deadSandboxNode 插一个沙箱 SOCKS5 节点行（原名与运行名按注册表形态对齐）。
 func deadSandboxNode(t *testing.T, db *sql.DB, name string, state string, failures int64, subID any, socksPort int) {
 	t.Helper()
 	config := map[string]any{"name": name, "type": "socks5",
@@ -75,12 +68,9 @@ func TestLiveDeadProbeRecovery(t *testing.T) {
 
 	deadSandboxNode(t, db, "Dead-01", NodeDead, 2, int64(1), socksPort)
 	deadSandboxNode(t, db, "Dead-02", NodeDead, 1, int64(1), socksPort)
-	// 无归属节点：来源不存在 → 依赖归因，不构成节点证据
 	deadSandboxNode(t, db, "无主", NodeDead, 0, nil, socksPort)
 
 	runner := &DeadProbeRunner{DB: db, Gate: gate, DataDir: dataDir}
-	// 回环 /delay 有约 5-10% 瞬态失败（G4 第八批实测）：对失败节点整轮重探，
-	// 上限 6 轮；每轮重探同时补写观测，落账以最终轮为准。
 	var outcomes []DeadProbeOutcome
 	for round := 0; ; round++ {
 		got, err := runner.RecoverDeadNodes(ctx, probeURL, 24)
@@ -112,13 +102,11 @@ func TestLiveDeadProbeRecovery(t *testing.T) {
 	for _, o := range outcomes {
 		byName[o.RuntimeName] = o
 	}
-	// 无主节点：依赖归因
 	sourceless := byName["1|无主"]
 	if sourceless.NodeID != "fp-无主" || sourceless.OK || sourceless.NodeFailure ||
 		sourceless.Cause != CauseDependency || sourceless.Detail != "节点来源不存在" {
 		t.Fatalf("无主节点应依赖归因：%+v", sourceless)
 	}
-	// 沙箱节点：真内核全链路恢复成功
 	for _, name := range []string{"1|Dead-01", "1|Dead-02"} {
 		o := byName[name]
 		if !o.OK || o.DelayMS <= 0 || !o.NodeFailure || o.Cause != CauseNode {
@@ -126,7 +114,6 @@ func TestLiveDeadProbeRecovery(t *testing.T) {
 		}
 	}
 
-	// 落账：复活 ACTIVE、失败计数清零、last_l2_at 挂账、观测行形状
 	for _, name := range []string{"1|Dead-01", "1|Dead-02"} {
 		var state string
 		var failures int64
@@ -151,7 +138,6 @@ func TestLiveDeadProbeRecovery(t *testing.T) {
 				name, detail.String, channel.String, runID)
 		}
 	}
-	// 无主节点状态不动、留观测行
 	var state string
 	if err := db.QueryRow(`SELECT state FROM proxy_nodes WHERE runtime_name = '1|无主'`).Scan(&state); err != nil {
 		t.Fatal(err)
@@ -162,7 +148,6 @@ func TestLiveDeadProbeRecovery(t *testing.T) {
 	if got := queryInt(t, db, `SELECT COUNT(*) FROM health_observations WHERE node_id = 'fp-无主'`); got < 1 {
 		t.Fatalf("无主节点应留观测行，实际 %d", got)
 	}
-	// 临时探测目录清理
 	entries, _ := os.ReadDir(filepath.Join(dataDir, "proxypool", "_dead_probe"))
 	if len(entries) != 0 {
 		t.Fatalf("探测工作目录应清理，残留 %d 项", len(entries))
@@ -182,7 +167,6 @@ func TestLiveBuildPoolKernelLoads(t *testing.T) {
 	for _, name := range []string{"Pool-01", "Pool-02", "Pool-03"} {
 		deadSandboxNode(t, db, name, NodeActive, 0, int64(1), socksPort)
 	}
-	// 不合格样本：DEAD 与信息占位都不得进池
 	deadSandboxNode(t, db, "Dead-Pool", NodeDead, 1, int64(1), socksPort)
 	deadSandboxNode(t, db, "剩余流量：10GB", NodeActive, 0, int64(1), socksPort)
 
@@ -212,12 +196,11 @@ func TestLiveBuildPoolKernelLoads(t *testing.T) {
 		t.Fatalf("池文件读数应 3 个，实际 %v", names)
 	}
 
-	// 真内核验收：池文件内容装配成运行配置 → 预检 → 拉起 → 控制器逐名对账
 	raw, err := os.ReadFile(result.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := clashYAMLLoad(string(raw))
+	parsed, err := clashcfg.LoadYAML(string(raw))
 	if err != nil {
 		t.Fatalf("池文件应能被包内解析器回读：%v", err)
 	}
@@ -268,13 +251,11 @@ func TestLiveBuildPoolKernelLoads(t *testing.T) {
 			t.Fatalf("不合格节点 %s 不得进池", absent)
 		}
 	}
-	// 沙箱节点经内核混合口实测可达：池内容不只是装载得了，还得真的通
 	code, perr := getViaProxy(mixedProbePort(mixedPort), target.server.URL+"/generate_204", 8*time.Second)
 	if perr != nil || code != http.StatusNoContent {
 		t.Fatalf("池节点经真内核不可达：code=%d err=%v", code, perr)
 	}
 
-	// 合格集变化 → 运行集签名变化 → 重建钩子触发
 	if _, err := db.Exec(`UPDATE proxy_nodes SET normalized_config = json_set(normalized_config, '$.port', 1)
 		WHERE runtime_name = '1|Pool-02'`); err != nil {
 		t.Fatal(err)
@@ -296,7 +277,6 @@ func TestLiveBuildPoolKernelLoads(t *testing.T) {
 	}
 }
 
-// controllerProxyNames 读控制器 /proxies 的在册节点名集合。
 func controllerProxyNames(t *testing.T, controllerURL, secret string) map[string]bool {
 	t.Helper()
 	client := probeHTTPClient(8 * time.Second)

@@ -1,10 +1,7 @@
 package dbwriter
 
-// 逐款隔离写（回退路径）：对齐 Python _upsert_task_batch_slow——批量快路径
-// 的段级异常退到这里，按 batchWriteChunk 分段，每段一闸一事务；段内一整批
-// 基线一次 + 单款 SAVEPOINT，单款失败记日志后回滚该款不拖垮整段；段间交还
-// 写者位（兜底路径慢 ~10 倍，整批持闸会把交互写饿到超时）。段级异常只作废
-// 本段，其余段照常。
+// 逐款隔离回退路径：按 batchWriteChunk 分段过写闸，段内单款包 SAVEPOINT 隔离，
+// 段间交还写者位防饿死交互写；段级异常仅作废本段。
 
 import (
 	"context"
@@ -16,8 +13,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// writeChunkSlow 逐款隔离写。entries 可为任意长度（快路径回退传单段，
-// 直调时内部分段）；返回逐款写入结果。
 func (w *Writer) writeChunkSlow(ctx context.Context, entries []BatchEntry) ([]bool, error) {
 	results := make([]bool, len(entries))
 	if len(entries) == 0 {
@@ -46,13 +41,10 @@ func (w *Writer) writeChunkSlow(ctx context.Context, entries []BatchEntry) ([]bo
 					baseline{known: known[aid], latest: latest[aid]}, i)
 				results[idx] = ok
 				if fatal != nil {
-					// 外层事务已被连根回滚（保存点消失）：余款不再尝试，
-					// 段级失败只作废本段
 					return fatal
 				}
 			}
-			// 收尾保存点：本段 ok 款复活清标与主段同事务提交；失败只回滚
-			// 保存点不拖垮本段
+			// 复活清标包在 SAVEPOINT 中，失败仅回滚清标不拖垮本段。
 			chunkOK := make([]int64, 0, len(chunk))
 			for i := range chunk {
 				if results[start+i] && chunk[i].Game.AppID != 0 {
@@ -74,7 +66,6 @@ func (w *Writer) writeChunkSlow(ctx context.Context, entries []BatchEntry) ([]bo
 			return nil
 		})
 		if err != nil {
-			// 段级失败只作废本段（其余段照常），与快路径段语义对齐
 			for i := start; i < end; i++ {
 				results[i] = false
 			}
@@ -85,10 +76,8 @@ func (w *Writer) writeChunkSlow(ctx context.Context, entries []BatchEntry) ([]bo
 	return results, nil
 }
 
-// writeEntrySavepoint 单款写入包在显式 SAVEPOINT 里：成功释放保存点返回
-// (true, nil)；普通单款失败记日志、回滚该款、返回 (false, nil)——不拖垮整段；
-// 保存点消失（外层事务被 RAISE(ROLLBACK) 等连根回滚）返回 (false, fatal)，
-// 调用方按段级失败处理。
+// writeEntrySavepoint 单款写入包在 SAVEPOINT 中：普通错误回滚本款并返回 (false, nil)；
+// 保存点失效（外层事务已回滚）返回错误由调用方作废整段。
 func (w *Writer) writeEntrySavepoint(ctx context.Context, conn *sql.Conn, entry *BatchEntry, base baseline, i int) (bool, error) {
 	name := fmt.Sprintf("hx_entry_%d", i)
 	if _, err := conn.ExecContext(ctx, "SAVEPOINT "+name); err != nil {
@@ -112,9 +101,6 @@ func (w *Writer) writeEntrySavepoint(ctx context.Context, conn *sql.Conn, entry 
 	return false, nil
 }
 
-// upsertEntryTx 单款写事务体（对齐 Python upsert_game_and_prices commit=False
-// 的闸内段）：games 元数据 + 现价 + 欠账清账/结转 + 历史切片 + 派生列，
-// 全部在调用方事务连接上执行，不提交。
 func (w *Writer) upsertEntryTx(ctx context.Context, conn *sql.Conn, entry *BatchEntry, base baseline) error {
 	aid := entry.Game.AppID
 	row := w.normalizeGame(entry.Game, entry.Prices)
@@ -141,13 +127,11 @@ func (w *Writer) upsertEntryTx(ctx context.Context, conn *sql.Conn, entry *Batch
 			if err := upsertCurrentPrices(ctx, conn, cur); err != nil {
 				return fmt.Errorf("现价写入失败: %w", err)
 			}
-			// 补抓成功结转清账：本款有 ok 价的区 fail_count 归零
 			if len(okRegions) > 0 && aid != 0 {
 				if err := clearFailCount(ctx, conn, []int64{aid}, okRegions); err != nil {
 					return fmt.Errorf("欠账清账失败: %w", err)
 				}
 			}
-			// 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）
 			if len(degradedRegions) > 0 && aid != 0 {
 				if err := bumpMissingLedger(ctx, conn, []int64{aid}, degradedRegions); err != nil {
 					return fmt.Errorf("欠账结转失败: %w", err)

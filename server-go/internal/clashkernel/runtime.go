@@ -1,8 +1,5 @@
 package clashkernel
 
-// 本地内核进程的启动 / 停止 / 状态与热重载编排。
-// 写盘→spawn→混合口归属核验→控制器就绪；配置更新走热重载，被拒即回滚磁盘。
-
 import (
 	"fmt"
 	"os"
@@ -13,7 +10,6 @@ import (
 	"holdexar/server-go/internal/clashcfg"
 )
 
-// Status 内核运行状态。
 type Status struct {
 	Running         bool
 	Port            int
@@ -23,7 +19,6 @@ type Status struct {
 	SubscriptionURL string
 }
 
-// Runtime 本地内核进程的生命周期持有者（每套内核一个实例，互不相干）。
 type Runtime struct {
 	Process         *KernelProcess
 	Port            int
@@ -36,7 +31,6 @@ type Runtime struct {
 	EntryReady      bool
 }
 
-// Status 当前状态快照。
 func (r *Runtime) Status() Status {
 	running := r.Process != nil && r.Process.Running()
 	return Status{
@@ -70,7 +64,6 @@ func (r *Runtime) subscriptionIf(running bool) string {
 	return r.SubscriptionURL
 }
 
-// EntryListening 混合入口必须由当前存活的内核进程监听。
 func (r *Runtime) EntryListening() bool {
 	if r.Process == nil || !r.Process.Running() || r.Port <= 0 {
 		return false
@@ -78,7 +71,6 @@ func (r *Runtime) EntryListening() bool {
 	return PortListening(r.Port) && PortOwnedByProcess(r.Port, uint32(r.Process.Pid()))
 }
 
-// WaitMixedPort 启动后等混合端口真的在听（控制器就绪 ≠ 入口就绪）。
 func (r *Runtime) WaitMixedPort(timeout time.Duration) bool {
 	if r.Port <= 0 {
 		return false
@@ -99,7 +91,6 @@ func (r *Runtime) WaitMixedPort(timeout time.Duration) bool {
 	return false
 }
 
-// StartOptions Start 的可选参数（对齐 Python start() 关键字面）。
 type StartOptions struct {
 	RestartIfChanged  bool
 	ForceRestart      bool
@@ -110,7 +101,6 @@ type StartOptions struct {
 	BundledDir        string
 }
 
-// readConfigFile 读配置文本；不存在返回空串。
 func readConfigFile(path string) string {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -119,7 +109,6 @@ func readConfigFile(path string) string {
 	return string(raw)
 }
 
-// writeConfigFile tmp + replace 原子落盘。
 func writeConfigFile(path, text string) error {
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, []byte(text), 0o644); err != nil {
@@ -132,8 +121,7 @@ func writeConfigFile(path, text string) error {
 	return nil
 }
 
-// Start 启动内核。已在跑时按 restart/force 语义幂等返回；新文本经完整预检后
-// 才落盘拉起，混合入口必须由新进程持有，否则视为启动失败（动态端口自动重试）。
+// Start 预检通过后才落盘拉起，混合口必须由新进程持有（动态端口自动重试）。
 func (r *Runtime) Start(exePath, configPath string, opts StartOptions) (Status, error) {
 	return r.start(exePath, configPath, opts, 0)
 }
@@ -183,7 +171,6 @@ func (r *Runtime) start(exePath, configPath string, opts StartOptions, retry int
 	if err := ValidateConfigText(exePath, text, workDir); err != nil {
 		return Status{}, err
 	}
-	// 随包内核资产补齐失败不阻断启动（调用方未给随包目录时跳过）
 	if opts.BundledDir != "" {
 		EnsureKernelFiles(workDir, opts.BundledDir)
 	}
@@ -191,7 +178,6 @@ func (r *Runtime) start(exePath, configPath string, opts StartOptions, retry int
 		r.Stop()
 	}
 	if _, err := KillOrphanKernelsExclude(KernelFilename(), configPath, uint32(r.ProcessPid())); err != nil {
-		// 清理失败不阻断启动
 	}
 	if err := writeConfigFile(configPath, text); err != nil {
 		return Status{}, err
@@ -233,7 +219,6 @@ func (r *Runtime) start(exePath, configPath string, opts StartOptions, retry int
 	return r.Status(), nil
 }
 
-// ProcessPid 现役子进程号（无则 0）。
 func (r *Runtime) ProcessPid() int {
 	if r.Process == nil {
 		return 0
@@ -241,14 +226,12 @@ func (r *Runtime) ProcessPid() int {
 	return r.Process.Pid()
 }
 
-// RunningSubscriptionIs 内核当前跑的是否该订阅（按启动时登记的订阅 URL 判定）。
 func (r *Runtime) RunningSubscriptionIs(subURL string) bool {
 	target := strings.TrimSpace(subURL)
 	return r.Status().Running && r.SubscriptionURL != "" && target != "" &&
 		r.SubscriptionURL == target
 }
 
-// Stop 停止内核并清空运行态账目。
 func (r *Runtime) Stop() Status {
 	if r.Process != nil {
 		r.Process.Stop()
@@ -263,9 +246,7 @@ func (r *Runtime) Stop() Status {
 	return r.Status()
 }
 
-// runningKernelText 给运行中内核热重载用的配置文本：合法性预检（YAML 可解析 +
-// 有节点段），不合法返回 ReloadRejected。返回（注入 lane 后文本, 写盘前文件原
-// 内容）——拒载回滚恢复的是这个文件自己被覆盖前的内容。
+// runningKernelText 预检热重载配置并返回写盘前原文件内容供拒载回滚。
 func (r *Runtime) runningKernelText(configPath string, mixedPort int, exePath string) (string, string, error) {
 	prevFileText := ""
 	if raw, err := os.ReadFile(configPath); err == nil {
@@ -302,7 +283,6 @@ func (r *Runtime) runningKernelText(configPath string, mixedPort int, exePath st
 	return text, prevFileText, nil
 }
 
-// EnsureRunningOptions EnsureRunning 的可选参数。
 type EnsureRunningOptions struct {
 	SubscriptionURL   string
 	MixedPort         int
@@ -310,16 +290,13 @@ type EnsureRunningOptions struct {
 	ForceRestart      bool
 }
 
-// EnsureRunResult EnsureRunning 的返回：状态 + started/reloaded 两个标记。
 type EnsureRunResult struct {
 	Status   Status
 	Started  bool
 	Reloaded bool
 }
 
-// EnsureRunning 确保内核跑着指定配置：没跑就启动；在跑时热重载生效（控制器
-// PUT /configs，内核进程不动）；配置被内核拒绝时回滚磁盘、保留运行态；控制器
-// 通路故障才回退进程重启。
+// EnsureRunning 在跑时走热重载，被拒回滚磁盘并保留运行态，通路/校验故障才重启。
 func (r *Runtime) EnsureRunning(exePath, configPath string, opts EnsureRunningOptions) (EnsureRunResult, error) {
 	subURL := strings.TrimSpace(opts.SubscriptionURL)
 	running := r.Process != nil && r.Process.Running()
@@ -365,15 +342,12 @@ func (r *Runtime) EnsureRunning(exePath, configPath string, opts EnsureRunningOp
 	wrote := false
 	injected, prevFileText, prepErr := r.runningKernelText(configPath, opts.MixedPort, exePath)
 	if prepErr != nil {
-		if _, isRejected := prepErr.(*ReloadRejectedError); isRejected {
-			return EnsureRunResult{}, fmt.Errorf("%s", prepErr.Error())
-		}
 		return EnsureRunResult{}, prepErr
 	}
 	wrote = true
 	if err := ConfirmConfigText(configPath, injected); err != nil {
 		r.rollbackConfig(configPath, prevFileText, wrote)
-		return EnsureRunResult{}, fmt.Errorf("%s", err.Error())
+		return EnsureRunResult{}, fmt.Errorf("%w", &ReloadRejectedError{Detail: err.Error()})
 	}
 	controller := NewController(r.ControllerURL, r.Secret)
 	if err := controller.PutConfigsForce(configPath); err != nil {
@@ -381,7 +355,6 @@ func (r *Runtime) EnsureRunning(exePath, configPath string, opts EnsureRunningOp
 			r.rollbackConfig(configPath, prevFileText, wrote)
 			return EnsureRunResult{}, err
 		}
-		// 通路故障才回退进程重启
 		r.Stop()
 		status, startErr := r.Start(exePath, configPath, StartOptions{
 			SubscriptionURL: subURL, MixedPort: opts.MixedPort,
@@ -390,7 +363,6 @@ func (r *Runtime) EnsureRunning(exePath, configPath string, opts EnsureRunningOp
 		return EnsureRunResult{Status: status, Started: startErr == nil}, startErr
 	}
 	if err := VerifyReloaded(controller, injected, r.Process.Pid()); err != nil {
-		// 校验不过：配置文本已写盘且内核可能已部分加载——回退进程重启收敛
 		r.Stop()
 		status, startErr := r.Start(exePath, configPath, StartOptions{
 			SubscriptionURL: subURL, MixedPort: opts.MixedPort,
@@ -410,8 +382,7 @@ func (r *Runtime) EnsureRunning(exePath, configPath string, opts EnsureRunningOp
 	return EnsureRunResult{Status: r.Status(), Reloaded: true}, nil
 }
 
-// rollbackConfig 拒载回滚：目标文件恢复到本进程写入前的内容（本次新建则删除），
-// 内核继续跑旧配置。
+// rollbackConfig 恢复写入前原配置（新建则删除），保持运行中内核不变。
 func (r *Runtime) rollbackConfig(configPath, prevFileText string, wrote bool) {
 	if !wrote {
 		return

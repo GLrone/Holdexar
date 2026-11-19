@@ -1,7 +1,5 @@
 package clashkernel
 
-// 控制器 REST 客户端与热重载生效性校验。
-
 import (
 	"encoding/json"
 	"fmt"
@@ -13,21 +11,18 @@ import (
 	"holdexar/server-go/internal/clashcfg"
 )
 
-// ReloadRejectedError 内核明确拒载新配置（HTTP 4xx）或新配置本身不合法。
-// 与「热重载通路故障」不同档：配置被拒时内核还好好跑着旧配置，正确动作是
-// 回滚磁盘、保留运行实例。
+// ReloadRejectedError 内核拒载新配置（非 2xx）；调用方应回滚磁盘并保留现役内核。
 type ReloadRejectedError struct{ Detail string }
 
 func (e *ReloadRejectedError) Error() string { return e.Detail }
 
-// Controller 内核 RESTful 控制器客户端（Bearer 密钥鉴权，不走系统代理）。
+// Controller 内核 RESTful 控制器客户端（Bearer 鉴权）。
 type Controller struct {
 	BaseURL string
 	Secret  string
 	HTTP    *http.Client
 }
 
-// NewController 构造控制器客户端（默认 8s 超时）。
 func NewController(baseURL, secret string) *Controller {
 	return &Controller{
 		BaseURL: baseURL,
@@ -63,7 +58,6 @@ func (c *Controller) do(method, path string, body io.Reader, timeout time.Durati
 	return resp.StatusCode, raw, nil
 }
 
-// Version 控制器 /version 是否可用（200 才算）。
 func (c *Controller) Version() error {
 	status, _, err := c.do(http.MethodGet, "/version", nil, 8*time.Second)
 	if err != nil {
@@ -75,7 +69,6 @@ func (c *Controller) Version() error {
 	return nil
 }
 
-// Proxies GET /proxies 的完整返回体。
 func (c *Controller) Proxies() (map[string]any, error) {
 	status, raw, err := c.do(http.MethodGet, "/proxies", nil, 8*time.Second)
 	if err != nil {
@@ -91,7 +84,6 @@ func (c *Controller) Proxies() (map[string]any, error) {
 	return body, nil
 }
 
-// ProxyNames /proxies 里内核当前装载的全部代理名。
 func (c *Controller) ProxyNames() (map[string]bool, error) {
 	body, err := c.Proxies()
 	if err != nil {
@@ -105,8 +97,6 @@ func (c *Controller) ProxyNames() (map[string]bool, error) {
 	return names, nil
 }
 
-// PutConfigsForce 让在跑的内核加载指定路径的新配置（进程不动）。
-// 非 2xx 视为内核拒绝这份配置。
 func (c *Controller) PutConfigsForce(configPath string) error {
 	payload := fmt.Sprintf(`{"path":%q}`, configPath)
 	status, _, err := c.do(http.MethodPut, "/configs?force=true",
@@ -120,8 +110,7 @@ func (c *Controller) PutConfigsForce(configPath string) error {
 	return nil
 }
 
-// VerifyReloaded 热重载生效性校验：控制器活着 + 新配置的节点真的出现在内核里 +
-// 探测 lane 端口在听 + 混合口归属当前进程。任一不满足返回错误，调用方回退。
+// VerifyReloaded 校验重载生效：控制器、新节点、探测 lane 与混合口归属均需通过。
 func VerifyReloaded(controller *Controller, injectedText string, pid int) error {
 	if err := controller.Version(); err != nil {
 		return fmt.Errorf("重载后控制器不可用：%w", err)

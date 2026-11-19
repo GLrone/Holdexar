@@ -1,6 +1,5 @@
 package proxypool
 
-// 订阅抓取：有限竞速，返回第一份格式和节点内容都有效的订阅。
 // 网络请求全部发生在写闸之外；任何失败都保留最后一次成功快照。
 
 import (
@@ -10,15 +9,17 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"holdexar/server-go/internal/clashcfg"
 )
 
-// SUB_USER_AGENT 必须与内核拉取 provider 时同款：面板按 UA 分流订阅格式，
-// 不含 clash 关键字会回落 base64 节点表，个别机场对非 clash UA 直接 404。
-// 版本对齐 kernel_release.MIHOMO_VERSION 单一来源。
+// SUB_USER_AGENT 必须含 clash 关键字且版本对齐内核，防机场回退或 404。
 const SUB_USER_AGENT = "clash.meta/1.19.32"
 
 const (
@@ -47,21 +48,16 @@ const (
 	ChannelLocal  = "local"
 )
 
-// Channel 一条抓取通道。Proxy 为空即直连。
 type Channel struct {
 	Name     string
 	Proxy    string
 	EgressID string
 }
 
-// ── 错误类型（稳定、可断言）──────────────────────────────────────
-
-// SnapshotError 订阅快照失败基类语义：不改 Registry、不覆盖旧快照。
 type SnapshotError struct{ msg string }
 
 func (e *SnapshotError) Error() string { return e.msg }
 
-// FetchFailedError 所有通道都没拿到可判定内容。
 type FetchFailedError struct {
 	URL        string
 	Attempts   []FetchAttempt
@@ -80,7 +76,6 @@ func (e *FetchFailedError) Error() string {
 	return fmt.Sprintf("订阅抓取失败（%d 通道）：%s", len(e.Attempts), strings.Join(shown, "、"))
 }
 
-// UnsupportedFormatError 内容拿到了但格式不归本模块处理。
 type UnsupportedFormatError struct {
 	Format     string
 	Attempts   []FetchAttempt
@@ -97,11 +92,38 @@ func (e *UnsupportedFormatError) Error() string {
 		return "订阅节点来源要求直连，但当前没有直连通道"
 	case "provider_proxy_rejected":
 		return "订阅节点来源的代理设置拒绝连接"
+	case "provider_redirect_blocked":
+		return "订阅节点来源重定向过多"
+	case "provider_size_limit":
+		return "订阅内容过大"
 	}
 	return fmt.Sprintf("不支持的订阅格式：%s", e.Format)
 }
 
-// EmptyNodeSetError 格式合法但解析出 0 个节点——按失败处理。
+type RedirectPolicyError struct {
+	Reason   string
+	Attempts []FetchAttempt
+}
+
+func (e *RedirectPolicyError) Error() string {
+	switch e.Reason {
+	case "bad_scheme":
+		return "订阅地址不支持（仅 http/https）"
+	case "too_many_redirects":
+		return "订阅地址重定向过多"
+	case "private_ip":
+		return "订阅地址重定向目标受限"
+	default:
+		return "订阅地址策略受限"
+	}
+}
+
+type SubscriptionTooLargeError struct {
+	Attempts []FetchAttempt
+}
+
+func (e *SubscriptionTooLargeError) Error() string { return "订阅内容过大" }
+
 type EmptyNodeSetError struct {
 	Format     string
 	Attempts   []FetchAttempt
@@ -112,7 +134,6 @@ func (e *EmptyNodeSetError) Error() string {
 	return fmt.Sprintf("订阅解析出 0 个节点（%s），按失败处理", e.Format)
 }
 
-// InvalidEncodingError 正文解不出 UTF-8（劫持页/非 UTF-8），不洗白。
 type InvalidEncodingError struct {
 	Attempts   []FetchAttempt
 	DurationMS int
@@ -126,8 +147,7 @@ func (e *InvalidEncodingError) Error() string {
 	return "订阅内容不是合法 UTF-8"
 }
 
-// ParseNodes inline YAML → 节点列表；其余格式一律不支持（与 detect_format
-// 同一套严格解码，解析入口不得成为非法字节洗白的第二条路）。
+// ParseNodes 仅支持严格 UTF-8 + YAML，其余格式一律拒绝。
 func ParseNodes(raw []byte, fmtStr string) ([]map[string]any, error) {
 	if fmtStr != FormatYAML {
 		return nil, &UnsupportedFormatError{Format: fmtStr}
@@ -136,7 +156,7 @@ func ParseNodes(raw []byte, fmtStr string) ([]map[string]any, error) {
 	if err != nil {
 		return nil, &InvalidEncodingError{}
 	}
-	doc, err := clashYAMLLoad(text)
+	doc, err := clashcfg.LoadYAML(text)
 	if err != nil {
 		return nil, err
 	}
@@ -167,8 +187,6 @@ func ParseNodes(raw []byte, fmtStr string) ([]map[string]any, error) {
 	return nodes, nil
 }
 
-// ── 格式判定 ──────────────────────────────────────────────────────
-
 var (
 	reProvidersKey = regexp.MustCompile(`(?m)^proxy-providers[\t\n\v\f\r \x1c-\x1f\x85\xa0\p{Zs}]*:`)
 	reProxiesKey   = regexp.MustCompile(`(?m)^proxies[\t\n\v\f\r \x1c-\x1f\x85\xa0\p{Zs}]*:`)
@@ -176,7 +194,6 @@ var (
 	reBase64Body   = regexp.MustCompile(`^[A-Za-z0-9+/=]+$`)
 )
 
-// DetectFormat 判定订阅正文格式。只判定不解析；非合法 UTF-8 报错。
 func DetectFormat(raw []byte) (string, error) {
 	if len(raw) == 0 {
 		return FormatEmpty, nil
@@ -232,6 +249,23 @@ func DetectFormat(raw []byte) (string, error) {
 	return FormatUnknown, nil
 }
 
+func decodeUTF8Strict(raw []byte) (string, error) {
+	if !utf8.Valid(raw) {
+		return "", &InvalidEncodingError{}
+	}
+	return string(raw), nil
+}
+
+func pySplitLines(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		switch r {
+		case '\n', '\r', '\v', '\f', 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029:
+			return true
+		}
+		return false
+	})
+}
+
 func pyLStrip(s string) string {
 	return strings.TrimLeftFunc(s, pythonStripRunes)
 }
@@ -245,12 +279,60 @@ func isPySpace(r rune) bool {
 	return r >= 0x2000 && r <= 0x200a
 }
 
-// ── 出口竞速 ──────────────────────────────────────────────────────
-
-// ClientFactory 按通道产出 HTTP 客户端（生产：带通道代理的 Transport；测试：httptest）。
 type ClientFactory func(channel Channel) (*http.Client, error)
 
-// DefaultClientFactory 生产默认：按通道的 proxy 建客户端（连接 5 秒上限）。
+// defaultDirectDialer 仅供单测注入本地 httptest 直连拨号，生产运行恒为 nil。
+var defaultDirectDialer func(ctx context.Context, network, address string) (net.Conn, error)
+
+// SetDirectDialerForTest 供跨包集成测试临时注入直连拨号器并返回复位函数。
+func SetDirectDialerForTest(dialer func(ctx context.Context, network, address string) (net.Conn, error)) func() {
+	prev := defaultDirectDialer
+	defaultDirectDialer = dialer
+	return func() { defaultDirectDialer = prev }
+}
+
+func safeDirectDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, &RedirectPolicyError{Reason: "private_ip"}
+	}
+	lower := strings.ToLower(strings.TrimSpace(host))
+	if lower == "" || strings.HasSuffix(lower, ".") || lower == "localhost" ||
+		strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") ||
+		strings.HasSuffix(lower, ".internal") {
+		return nil, &RedirectPolicyError{Reason: "private_ip"}
+	}
+	if ip, parseErr := netip.ParseAddr(lower); parseErr == nil {
+		if !isPublicRedirectIP(ip) {
+			return nil, &RedirectPolicyError{Reason: "private_ip"}
+		}
+		dialer := &net.Dialer{Timeout: 8 * time.Second}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("订阅主机解析失败")
+	}
+	for _, ip := range ips {
+		if !isPublicRedirectIP(ip) {
+			return nil, &RedirectPolicyError{Reason: "private_ip"}
+		}
+	}
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("订阅主机连接失败")
+}
+
 func DefaultClientFactory(channel Channel, timeout float64) (*http.Client, error) {
 	transport := &http.Transport{
 		Proxy:               nil,
@@ -264,14 +346,20 @@ func DefaultClientFactory(channel Channel, timeout float64) (*http.Client, error
 			return nil, fmt.Errorf("订阅通道代理地址无效：%s", channel.Proxy)
 		}
 		transport.Proxy = http.ProxyURL(u)
+	} else if defaultDirectDialer != nil {
+		transport.DialContext = defaultDirectDialer
+	} else {
+		transport.DialContext = safeDirectDialContext
 	}
 	return &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(timeout * float64(time.Second)),
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}, nil
 }
 
-// FetchOptions 竞速参数（缺省即生产标定）。
 type FetchOptions struct {
 	ClientFactory       func(channel Channel) (*http.Client, error)
 	RequestTimeout      float64
@@ -280,13 +368,14 @@ type FetchOptions struct {
 	MaxParallelChannels int
 	PreferredEgress     string
 	EgressScores        map[string]float64
-	// ResponseParser 明文代理行解析器（Python response_parser 同位）：内容
-	// 判为 uri/unknown 格式时交由它解析，解析出非空行集即视为有效订阅。
-	ResponseParser func(raw []byte, fmtStr string) ([]map[string]any, error)
+	ResponseParser      func(raw []byte, fmtStr string) ([]map[string]any, error)
+	customClient        bool
 }
 
 func (o *FetchOptions) fill() {
-	if o.ClientFactory == nil {
+	if o.ClientFactory != nil {
+		o.customClient = true
+	} else {
 		o.ClientFactory = func(c Channel) (*http.Client, error) {
 			return DefaultClientFactory(c, coalesceF(o.RequestTimeout, DefaultFetchTimeout))
 		}
@@ -312,7 +401,6 @@ func coalesceF(v, def float64) float64 {
 	return v
 }
 
-// FetchResult 获胜通道的产物（校验通过才产生）。
 type FetchResult struct {
 	Raw                []byte
 	HTTPStatus         int
@@ -331,16 +419,90 @@ type FetchResult struct {
 type channelOutcome struct {
 	result  *FetchResult
 	attempt FetchAttempt
-	issue   string // ""=成功；否则失败归类键
+	issue   string
 }
 
-// FetchSubscription 有限竞速抓取订阅，第一份校验通过的内容即获胜。
+const maxRedirectHops = 3
+
+var blockedRedirectPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2001::/32"),
+}
+
+func isPublicRedirectIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.Zone() != "" {
+		return false
+	}
+	for _, prefix := range blockedRedirectPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func assertHTTPURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, &RedirectPolicyError{Reason: "bad_scheme"}
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || parsed.Hostname() == "" {
+		return nil, &RedirectPolicyError{Reason: "bad_scheme"}
+	}
+	return parsed, nil
+}
+
+func checkRedirectTarget(ctx context.Context, target *url.URL, viaProxy bool) error {
+	scheme := strings.ToLower(target.Scheme)
+	if (scheme != "http" && scheme != "https") || target.Hostname() == "" {
+		return &RedirectPolicyError{Reason: "bad_scheme"}
+	}
+	host := strings.ToLower(target.Hostname())
+	if strings.HasSuffix(host, ".") || host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return &RedirectPolicyError{Reason: "private_ip"}
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !isPublicRedirectIP(ip) {
+			return &RedirectPolicyError{Reason: "private_ip"}
+		}
+		return nil
+	}
+	if !viaProxy && defaultDirectDialer == nil {
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if err != nil || len(ips) == 0 {
+			return &RedirectPolicyError{Reason: "dns_error"}
+		}
+		for _, ip := range ips {
+			if !isPublicRedirectIP(ip) {
+				return &RedirectPolicyError{Reason: "private_ip"}
+			}
+		}
+	}
+	return nil
+}
+
 func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, opts FetchOptions) (*FetchResult, error) {
+	if _, err := assertHTTPURL(urlStr); err != nil {
+		return nil, err
+	}
 	opts.fill()
 	ordered := make([]Channel, len(channels))
 	copy(ordered, channels)
 	if opts.PreferredEgress != "" || len(opts.EgressScores) > 0 {
-		// 稳定排序：首选出口优先，其余按历史成功率降序
 		for i := 1; i < len(ordered); i++ {
 			for j := i; j > 0 && channelLess(ordered[j], ordered[j-1], opts); j-- {
 				ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
@@ -378,12 +540,10 @@ func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, o
 		}()
 	}
 
-	defer cancel()
-
 	launch()
 	for len(active) > 0 {
 		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if remaining <= 0 || fetchCtx.Err() != nil {
 			break
 		}
 		wait := remaining
@@ -398,7 +558,6 @@ func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, o
 		select {
 		case f := <-completed:
 			batch = append(batch, f)
-			// 排空同一波完成的其余通道（Python FIRST_COMPLETED 的 done 集合）
 			for drained := true; drained; {
 				drained = false
 				select {
@@ -423,12 +582,14 @@ func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, o
 		}
 		timer.Stop()
 		if len(batch) == 0 {
+			if fetchCtx.Err() != nil {
+				break
+			}
 			if hedged && nextIndex < len(ordered) && len(active) < opts.MaxParallelChannels && time.Until(deadline) > 0 {
 				launch()
 			}
 			continue
 		}
-		// 完成批内第一份有效内容即获胜（Python 同：winner 按完成时间取首个非空结果）
 		winner := (*FetchResult)(nil)
 		for _, f := range batch {
 			delete(active, f)
@@ -452,13 +613,11 @@ func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, o
 			winner.Attempts = attempts
 			return winner, nil
 		}
-		// 全败：立即补位（有别于 hedge 等待）
-		for nextIndex < len(ordered) && len(active) < opts.MaxParallelChannels {
+		for fetchCtx.Err() == nil && nextIndex < len(ordered) && len(active) < opts.MaxParallelChannels {
 			launch()
 		}
 	}
 
-	// deadline 到：在飞通道记 subscription_deadline 留痕
 	if time.Now().After(deadline) || time.Until(deadline) <= 0 {
 		for f := range active {
 			a := FetchAttempt{
@@ -468,6 +627,15 @@ func FetchSubscription(ctx context.Context, urlStr string, channels []Channel, o
 				Stage:   "overall_timeout",
 			}
 			attempts = append(attempts, a)
+		}
+	} else if fetchCtx.Err() != nil {
+		for f := range active {
+			attempts = append(attempts, FetchAttempt{
+				Channel: f.channel.Name,
+				Fmt:     FormatUnknown,
+				Error:   "context_canceled",
+				Stage:   "canceled",
+			})
 		}
 	}
 	durationMS := int(time.Since(started) / time.Millisecond)
@@ -501,7 +669,6 @@ func egressKeyOf(c Channel) string {
 	return c.Name
 }
 
-// fetchOne 单通道：下载 → 内容校验（网络等待全部在该函数内，调用方闸外）。
 func fetchOne(ctx context.Context, urlStr string, channel Channel, opts FetchOptions) channelOutcome {
 	channelStarted := time.Now()
 	egressID := channel.EgressID
@@ -523,27 +690,64 @@ func fetchOne(ctx context.Context, urlStr string, channel Channel, opts FetchOpt
 	if err != nil {
 		return fail(nil, FormatUnknown, "transport_error", "transport")
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, urlStr, nil)
-	if err != nil {
-		return fail(nil, FormatUnknown, "transport_error", "transport")
+	manualClient := *client
+	manualClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
-	req.Header.Set("User-Agent", SUB_USER_AGENT)
-	resp, err := client.Do(req)
-	if err != nil {
-		var netErr net.Error
-		switch {
-		case errors.As(err, &netErr) && netErr.Timeout():
-			return fail(nil, FormatUnknown, "request_timeout", "timeout")
-		case isProxyError(err):
-			return fail(nil, FormatUnknown, "ProxyError", "proxy")
-		case isConnectError(err):
-			return fail(nil, FormatUnknown, "ConnectError", "connect")
+
+	target := urlStr
+	var resp *http.Response
+	for hops := 0; ; {
+		req, reqErr := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
+		if reqErr != nil {
+			return fail(nil, FormatUnknown, "transport_error", "transport")
 		}
-		return fail(nil, FormatUnknown, "transport_error", "transport")
+		req.Header.Set("User-Agent", SUB_USER_AGENT)
+		resp, err = manualClient.Do(req)
+		if err != nil {
+			var polErr *RedirectPolicyError
+			var netErr net.Error
+			switch {
+			case errors.As(err, &polErr):
+				return fail(nil, FormatUnknown, "provider_redirect_blocked: "+polErr.Error(), "policy")
+			case errors.As(err, &netErr) && netErr.Timeout():
+				return fail(nil, FormatUnknown, "request_timeout", "timeout")
+			case isProxyError(err):
+				return fail(nil, FormatUnknown, "ProxyError", "proxy")
+			case isConnectError(err):
+				return fail(nil, FormatUnknown, "ConnectError", "connect")
+			}
+			return fail(nil, FormatUnknown, "transport_error", "transport")
+		}
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			loc := strings.TrimSpace(resp.Header.Get("Location"))
+			resp.Body.Close()
+			if loc == "" {
+				return fail(nil, FormatUnknown, "provider_redirect_blocked", "policy")
+			}
+			if hops >= maxRedirectHops {
+				return fail(nil, FormatUnknown, "provider_redirect_blocked: 订阅地址重定向过多", "policy")
+			}
+			nextURL, parseErr := req.URL.Parse(loc)
+			if parseErr != nil {
+				return fail(nil, FormatUnknown, "provider_redirect_blocked: 订阅地址不支持（仅 http/https）", "policy")
+			}
+			if polErr := checkRedirectTarget(reqCtx, nextURL, opts.customClient || channel.Proxy != ""); polErr != nil {
+				return fail(nil, FormatUnknown, "provider_redirect_blocked: "+polErr.Error(), "policy")
+			}
+			hops++
+			target = nextURL.String()
+			continue
+		}
+		break
 	}
 	defer resp.Body.Close()
 	raw, readErr := readBody(resp)
 	if readErr != nil {
+		var tooLarge *SubscriptionTooLargeError
+		if errors.As(readErr, &tooLarge) {
+			return fail(nil, FormatUnknown, "provider_size_limit: "+tooLarge.Error(), "policy")
+		}
 		var netErr net.Error
 		if errors.As(readErr, &netErr) && netErr.Timeout() {
 			return fail(nil, FormatUnknown, "request_timeout", "timeout")
@@ -561,14 +765,14 @@ func fetchOne(ctx context.Context, urlStr string, channel Channel, opts FetchOpt
 }
 
 func readBody(resp *http.Response) ([]byte, error) {
-	const maxSubscriptionBytes = 8 << 20
+	const maxSubscriptionBytes = 20 << 20
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 8192)
 	for {
 		n, err := resp.Body.Read(chunk)
 		if n > 0 {
 			if len(buf)+n > maxSubscriptionBytes {
-				return nil, errors.New("订阅正文超过大小上限")
+				return nil, &SubscriptionTooLargeError{}
 			}
 			buf = append(buf, chunk[:n]...)
 		}
@@ -595,8 +799,6 @@ func isConnectError(err error) bool {
 	return false
 }
 
-// validateFetchResponse 内容校验链（对齐 Python _validate_fetch_response
-// 的生产主链：仅 inline YAML 有效；provider_yaml 解析随后续批次迁移）。
 func validateFetchResponse(statusCode int, contentType string, raw []byte,
 	userinfo, profileTitle, contentDisposition string,
 	channel Channel, elapsedMS int, egressID string,
@@ -682,8 +884,6 @@ func issueOr(current, def string) string {
 	return def
 }
 
-// BuildChannels 直连 → 内核 → 池 lane → 本机混合端口（kernel/池/本机通道
-// 的供给面随内核批次接线，本批调用方显式传通道）。
 func BuildChannels(kernelProxy string, poolChannels []Channel) []Channel {
 	channels := []Channel{{Name: ChannelDirect, EgressID: ChannelDirect}}
 	if kernelProxy != "" {

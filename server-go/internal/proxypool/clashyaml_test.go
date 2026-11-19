@@ -2,7 +2,6 @@ package proxypool
 
 import "testing"
 
-// 样例订阅：块式 + 流式 + 中文 + 嵌套结构 + 信息占位节点 + 换行注释。
 const sampleSubscription = `# Clash 订阅样例
 port: 7890
 mode: rule
@@ -80,7 +79,6 @@ func TestParseNodesSample(t *testing.T) {
 	if third["name"] != "改名 #7" {
 		t.Fatalf("引号内版本后缀不应剥离：%v", third["name"])
 	}
-	// name 以数字开头仍是字符串标量（0 号节点）
 	if nodes[3]["name"] != "0 号节点" {
 		t.Fatalf("0 前缀名称应是字符串：%v %T", nodes[3]["name"], nodes[3]["name"])
 	}
@@ -94,7 +92,6 @@ func TestParseNodesScalarSemantics(t *testing.T) {
 	}
 	n := nodes[0]
 	if v, ok := n["port"].(int64); !ok || v != int64(448) {
-		// 0700 按 YAML 1.1 八进制 = 448；0888 越界不成八进制 → 字符串（见 tag）
 		t.Fatalf("0700 应按 YAML 1.1 八进制解析为 448，got %T %v", n["port"], n["port"])
 	}
 	if n["alterId"] != int64(0) {
@@ -113,7 +110,6 @@ func TestParseNodesScalarSemantics(t *testing.T) {
 		t.Fatalf(".5 应为浮点 0.5，got %T %v", n["ratio"], n["ratio"])
 	}
 	if n["tag"] != "0899" {
-		// 0899 不构成八进制（8/9 越界）→ 字符串
 		t.Fatalf("0899 应为字符串，got %T %v", n["tag"], n["tag"])
 	}
 }
@@ -127,20 +123,21 @@ func TestParseNodesFailures(t *testing.T) {
 	if _, err := ParseNodes([]byte("proxies:\n  - name: a\n"), FormatBase64); err == nil {
 		t.Fatal("非 yaml 格式应报不支持")
 	}
-	// 只有 proxy-providers 无 inline proxies → provider 格式不支持
 	providerOnly := "proxy-providers:\n  sub:\n    type: http\n    url: https://x/y\n"
 	if _, err := ParseNodes([]byte(providerOnly), FormatYAML); err == nil {
 		t.Fatal("仅 provider 的订阅应报 provider_yaml 不支持")
 	}
-	// 全部是信息占位节点 → 空集
 	placeholder := "proxies:\n  - {name: \"到期时间：2026-12-31\", type: ss, server: a, port: 1, cipher: x, password: y}\n"
 	if _, err := ParseNodes([]byte(placeholder), FormatYAML); err == nil {
 		t.Fatal("占位节点全剔除后应报空集")
 	}
-	// 锚点不支持 → fail-closed
 	anchor := "base: &b {cipher: x}\nproxies:\n  - {name: a, type: ss, server: s, port: 1, <<: *b}\n"
-	if _, err := ParseNodes([]byte(anchor), FormatYAML); err == nil {
-		t.Fatal("锚点/merge 键应显式报错而非近似解析")
+	nodes, err := ParseNodes([]byte(anchor), FormatYAML)
+	if err != nil || len(nodes) != 1 || nodes[0]["cipher"] != "x" {
+		t.Fatalf("锚点/merge 键应正常展开，got nodes=%v err=%v", nodes, err)
+	}
+	if _, err := ParseNodes([]byte("proxies:\n  - name: a\n---\nproxies:\n  - name: b\n"), FormatYAML); err == nil {
+		t.Fatal("多文档订阅应报错")
 	}
 }
 
@@ -154,8 +151,8 @@ func TestDetectFormat(t *testing.T) {
 		{"proxy-providers:\n  a:\n    type: http\n", FormatProviderYAML},
 		{"{a: 1}", FormatJSON},
 		{"<html><body>x</body></html>", FormatHTML},
-		{"dm1lc3M6Ly9hYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODlF", FormatBase64}, // >40 字符纯 base64 字面
-		{"ss://abcdef@host:443#n1\nss://uvwxyz@host2:443#n2", FormatURI},               // 每行 URI
+		{"dm1lc3M6Ly9hYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODlF", FormatBase64},
+		{"ss://abcdef@host:443#n1\nss://uvwxyz@host2:443#n2", FormatURI},
 		{"-----BEGIN AGE ENCRYPTED FILE-----\nxyz", FormatAge},
 		{"just some text that is neither yaml nor anything else!!", FormatUnknown},
 	}

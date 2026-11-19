@@ -1,7 +1,5 @@
 package clashcfg
 
-// YAML 1.1 标量 resolver（对齐 PyYAML safe_load 的隐式类型判定）。
-
 import (
 	"math"
 	"regexp"
@@ -9,160 +7,143 @@ import (
 	"strings"
 )
 
-var boolLiterals = map[string]bool{
-	"yes": true, "no": true, "true": true, "false": true,
-	"on": true, "off": true,
-}
-
 var (
-	intRe   = regexp.MustCompile(`^[-+]?[0-9][0-9_]*$`)
-	octRe   = regexp.MustCompile(`^[-+]?0[0-7_]+$`)
-	hexRe   = regexp.MustCompile(`^[-+]?0x[0-9a-fA-F_]+$`)
-	binRe   = regexp.MustCompile(`^[-+]?0b[0-1_]+$`)
-	sexaRe  = regexp.MustCompile(`^[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+$`)
-	floatRe = regexp.MustCompile(`^[-+]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9_]*)?)([eE][-+]?[0-9]+)?$`)
-	fsexaRe = regexp.MustCompile(`^[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+\.[0-9_]*$`)
-	infRe   = regexp.MustCompile(`^[-+]?(\.inf|\.Inf|\.INF)$`)
-	nanRe   = regexp.MustCompile(`^\.[nN]a[nN]$`)
+	reYAMLBool    = regexp.MustCompile(`^(?:yes|Yes|YES|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF)$`)
+	reYAMLNull    = regexp.MustCompile(`^(?:~|null|Null|NULL|)$`)
+	reYAMLInt     = regexp.MustCompile(`^(?:[-+]?0b[0-1_]+|[-+]?0[0-7_]+|[-+]?(?:0|[1-9][0-9_]*)|[-+]?0x[0-9a-fA-F_]+|[-+]?[1-9][0-9_]*(:[0-5]?[0-9])+)$`)
+	reYAMLFloat   = regexp.MustCompile(`^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+][0-9]+)?|\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?|[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+\.[0-9_]*|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$`)
+	reSexagesimal = regexp.MustCompile(`^[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+(\.[0-9_]*)?$`)
 )
 
-// resolveScalarText 纯文本 → YAML 1.1 隐式类型（PyYAML 同判据）。
 func resolveScalarText(s string) any {
-	switch s {
-	case "", "~", "null", "Null", "NULL":
+	if reYAMLNull.MatchString(s) {
 		return nil
 	}
-	lower := strings.ToLower(s)
-	if boolLiterals[lower] {
-		return lower == "yes" || lower == "true" || lower == "on"
+	if reYAMLBool.MatchString(s) {
+		switch strings.ToLower(s) {
+		case "yes", "true", "on":
+			return true
+		}
+		return false
 	}
-	if infRe.MatchString(s) || nanRe.MatchString(s) {
-		return parseYAMLFloatLower(s)
+	if reYAMLInt.MatchString(s) {
+		if v, ok := parseYAMLInt(s); ok {
+			return v
+		}
+		return s
 	}
-	if v, ok := parseYAMLInt(s); ok {
-		return v
-	}
-	if v, ok := parseYAMLFloat(s); ok {
-		return v
+	if reYAMLFloat.MatchString(s) {
+		if v, ok := parseYAMLFloat(s); ok {
+			return v
+		}
+		return s
 	}
 	return s
 }
 
 func parseYAMLInt(s string) (int64, bool) {
-	clean := strings.ReplaceAll(s, "_", "")
-	if m := hexRe.FindString(clean); m != "" {
-		neg := strings.HasPrefix(clean, "-")
-		body := strings.TrimPrefix(strings.TrimPrefix(clean, "-"), "+")
-		v, err := strconv.ParseInt(body[2:], 16, 64)
+	neg := false
+	body := s
+	if strings.HasPrefix(body, "-") {
+		neg = true
+		body = body[1:]
+	} else if strings.HasPrefix(body, "+") {
+		body = body[1:]
+	}
+	clean := strings.ReplaceAll(body, "_", "")
+	var v int64
+	switch {
+	case strings.HasPrefix(clean, "0b"):
+		n, err := strconv.ParseInt(clean[2:], 2, 64)
 		if err != nil {
 			return 0, false
 		}
-		if neg {
-			v = -v
-		}
-		return v, true
-	}
-	if binRe.MatchString(clean) {
-		neg := strings.HasPrefix(clean, "-")
-		body := strings.TrimPrefix(strings.TrimPrefix(clean, "-"), "+")
-		v, err := strconv.ParseInt(body[2:], 2, 64)
+		v = n
+	case strings.HasPrefix(clean, "0x"):
+		n, err := strconv.ParseInt(clean[2:], 16, 64)
 		if err != nil {
 			return 0, false
 		}
-		if neg {
-			v = -v
-		}
-		return v, true
-	}
-	if octRe.MatchString(clean) {
-		neg := strings.HasPrefix(clean, "-")
-		body := strings.TrimPrefix(strings.TrimPrefix(clean, "-"), "+")
-		v, err := strconv.ParseInt(body[1:], 8, 64)
+		v = n
+	case len(clean) > 1 && clean[0] == '0':
+		n, err := strconv.ParseInt(clean[1:], 8, 64)
 		if err != nil {
 			return 0, false
 		}
-		if neg {
-			v = -v
+		v = n
+	case strings.Contains(clean, ":"):
+		n, ok := parseSexagesimalInt(clean)
+		if !ok {
+			return 0, false
 		}
-		return v, true
-	}
-	if sexaRe.MatchString(clean) {
-		return parseSexagesimal(clean)
-	}
-	if intRe.MatchString(clean) {
-		v, err := strconv.ParseInt(clean, 10, 64)
+		v = n
+	default:
+		n, err := strconv.ParseInt(clean, 10, 64)
 		if err != nil {
 			return 0, false
 		}
-		return v, true
-	}
-	return 0, false
-}
-
-// parseSexagesimal YAML 1.1 六十进制整数：1:30 → 90。
-func parseSexagesimal(s string) (int64, bool) {
-	neg := strings.HasPrefix(s, "-")
-	body := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
-	parts := strings.Split(body, ":")
-	var total int64
-	for _, part := range parts {
-		part = strings.ReplaceAll(part, "_", "")
-		v, err := strconv.ParseInt(part, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		total = total*60 + v
+		v = n
 	}
 	if neg {
-		total = -total
+		v = -v
+	}
+	return v, true
+}
+
+func parseSexagesimalInt(s string) (int64, bool) {
+	parts := strings.Split(s, ":")
+	total, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	for _, p := range parts[1:] {
+		n, err := strconv.ParseInt(p, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		total = total*60 + n
 	}
 	return total, true
 }
 
 func parseYAMLFloat(s string) (float64, bool) {
-	clean := strings.ReplaceAll(s, "_", "")
-	if fsexaRe.MatchString(clean) {
-		neg := strings.HasPrefix(clean, "-")
-		intPart, frac, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(clean, "-"), "+"), ".")
-		total := 0.0
-		for _, part := range strings.Split(intPart, ":") {
-			v, err := strconv.ParseFloat(part, 64)
-			if err != nil {
-				return 0, false
-			}
-			total = total*60 + v
+	lower := strings.ToLower(s)
+	if strings.Contains(lower, "inf") {
+		if strings.HasPrefix(s, "-") {
+			return math.Inf(-1), true
 		}
-		if frac != "" {
-			v, err := strconv.ParseFloat("0."+frac, 64)
-			if err != nil {
-				return 0, false
-			}
-			total += v / 60
-		}
-		if neg {
-			total = -total
-		}
-		return total, true
+		return math.Inf(1), true
 	}
-	if floatRe.MatchString(clean) {
-		v, err := strconv.ParseFloat(clean, 64)
-		if err != nil {
+	if strings.Contains(lower, "nan") {
+		return math.NaN(), true
+	}
+	if strings.Contains(s, ":") {
+		if !reSexagesimal.MatchString(s) {
 			return 0, false
 		}
-		return v, true
-	}
-	return 0, false
-}
-
-func parseYAMLFloatLower(s string) float64 {
-	neg := strings.HasPrefix(s, "-")
-	switch {
-	case strings.Contains(strings.ToLower(s), "inf"):
-		if neg {
-			return math.Inf(-1)
+		neg := strings.HasPrefix(s, "-")
+		body := strings.TrimLeft(s, "+-")
+		intPart, frac, hasDot := strings.Cut(body, ".")
+		total, ok := parseSexagesimalInt(strings.ReplaceAll(intPart, "_", ""))
+		if !ok {
+			return 0, false
 		}
-		return math.Inf(1)
-	default:
-		return math.NaN()
+		f := float64(total)
+		if hasDot && frac != "" {
+			fv, err := strconv.ParseFloat("0."+strings.ReplaceAll(frac, "_", ""), 64)
+			if err != nil {
+				return 0, false
+			}
+			f += fv
+		}
+		if neg {
+			f = -f
+		}
+		return f, true
 	}
+	f, err := strconv.ParseFloat(strings.ReplaceAll(s, "_", ""), 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
 }

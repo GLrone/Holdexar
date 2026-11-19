@@ -8,8 +8,6 @@ import (
 	"holdexar/server-go/internal/clashkernel"
 )
 
-// TestResolveOutboundProxy 策略引擎钉住：direct_only 系统代理 / direct_first
-// 恒直连 / proxy_first·proxy_only 内核混合端口优先、失败回直连不抛错。
 func TestResolveOutboundProxy(t *testing.T) {
 	ctx := context.Background()
 	runningKernel := func(kernel *stubRuntime) {
@@ -73,16 +71,25 @@ func TestResolveOutboundProxy(t *testing.T) {
 		if url, ok := svc.ResolveOutboundProxy(ctx); !ok || url != "http://127.0.0.1:18347" {
 			t.Fatalf("内核端口可用应返回：%q %v", url, ok)
 		}
-		// 端口没在听：直连（Python 的池加权轮询与 7897 兜底口未移植，登记差异）
 		svc.PortListeningFn = func(int) bool { return false }
+		svc.LocalFallback = func() int { return 0 }
 		if url, ok := svc.ResolveOutboundProxy(ctx); ok || url != "" {
 			t.Fatalf("端口未听应直连：%q %v", url, ok)
 		}
-		// 内核未运行：直连
 		stoppedKernel(kernel)
 		svc.PortListeningFn = func(int) bool { return true }
 		if url, ok := svc.ResolveOutboundProxy(ctx); ok || url != "" {
 			t.Fatalf("内核未运行应直连：%q %v", url, ok)
+		}
+		svc.LocalFallback = func() int { return 7897 }
+		if url, ok := svc.ResolveOutboundProxy(ctx); !ok || url != "http://127.0.0.1:7897" {
+			t.Fatalf("应回落 7897 兜底口：%q %v", url, ok)
+		}
+		if _, err := svc.DB.Exec(`INSERT INTO proxies(scheme,host,port,enabled,status,consecutive_failures) VALUES('http','10.1.2.3',8888,1,'ok',0)`); err != nil {
+			t.Fatal(err)
+		}
+		if url, ok := svc.ResolveOutboundProxy(ctx); !ok || url != "http://10.1.2.3:8888" {
+			t.Fatalf("proxy_first 无内核时应优先取池节点：%q %v", url, ok)
 		}
 	})
 

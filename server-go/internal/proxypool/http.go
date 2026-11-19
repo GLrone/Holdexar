@@ -1,6 +1,7 @@
 package proxypool
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 const runPayloadSQL = `json_object(
@@ -29,6 +32,30 @@ const runExitsSQL = `SELECT json_group_array(json_object(
 	'other',other,'durationMs',duration_ms))
 	FROM (SELECT * FROM proxy_run_exits WHERE run_id=? ORDER BY exit_ip,endpoint)`
 
+func QueryJobRunsJSON(ctx context.Context, db *sql.DB, limit, offset int64) (string, error) {
+	now := time.Now()
+	day := now.Format(time.DateOnly)
+	next := now.AddDate(0, 0, 1).Format(time.DateOnly)
+	const statement = `WITH today AS (
+		SELECT * FROM proxy_job_runs WHERE started_at>=? AND started_at<?
+	), page AS (
+		SELECT ` + runPayloadSQL + ` AS payload FROM proxy_job_runs ORDER BY id DESC LIMIT ? OFFSET ?
+	)
+	SELECT json_object(
+		'summary', json((SELECT json_object(
+			'day',?,'runs',COUNT(*),'success',COUNT(*) FILTER(WHERE status='success'),
+			'partial',COUNT(*) FILTER(WHERE status='partial'),'failed',COUNT(*) FILTER(WHERE status='failed'),
+			'interrupted',COUNT(*) FILTER(WHERE status='interrupted'),'running',COUNT(*) FILTER(WHERE status='running'),
+			'avgDurationMs',CAST(round(AVG(duration_ms)) AS INTEGER),
+			'poolExitIpCount',(SELECT pool_exit_ip_count FROM today WHERE pool_exit_ip_count IS NOT NULL ORDER BY id DESC LIMIT 1))
+		FROM today)),
+		'total',(SELECT COUNT(*) FROM proxy_job_runs),
+		'items',json((SELECT json_group_array(json(payload)) FROM page)))`
+	var payload string
+	err := db.QueryRowContext(ctx, statement, day, next, limit, offset, day).Scan(&payload)
+	return payload, err
+}
+
 func RegisterRuns(mux *http.ServeMux, db *sql.DB) {
 	mux.HandleFunc("GET /api/v1/proxypool/job-runs", func(w http.ResponseWriter, r *http.Request) {
 		limit, okLimit := runPageValue(r, "limit", 20, 1, 100)
@@ -37,26 +64,7 @@ func RegisterRuns(mux *http.ServeMux, db *sql.DB) {
 			runResponse(w, http.StatusUnprocessableEntity, map[string]any{"detail": "分页参数不正确"})
 			return
 		}
-		now := time.Now()
-		day := now.Format(time.DateOnly)
-		next := now.AddDate(0, 0, 1).Format(time.DateOnly)
-		const statement = `WITH today AS (
-			SELECT * FROM proxy_job_runs WHERE started_at>=? AND started_at<?
-		), page AS (
-			SELECT ` + runPayloadSQL + ` AS payload FROM proxy_job_runs ORDER BY id DESC LIMIT ? OFFSET ?
-		)
-		SELECT json_object(
-			'summary', json((SELECT json_object(
-				'day',?,'runs',COUNT(*),'success',COUNT(*) FILTER(WHERE status='success'),
-				'partial',COUNT(*) FILTER(WHERE status='partial'),'failed',COUNT(*) FILTER(WHERE status='failed'),
-				'interrupted',COUNT(*) FILTER(WHERE status='interrupted'),'running',COUNT(*) FILTER(WHERE status='running'),
-				'avgDurationMs',CAST(round(AVG(duration_ms)) AS INTEGER),
-				'poolExitIpCount',(SELECT pool_exit_ip_count FROM today WHERE pool_exit_ip_count IS NOT NULL ORDER BY id DESC LIMIT 1))
-			FROM today)),
-			'total',(SELECT COUNT(*) FROM proxy_job_runs),
-			'items',json((SELECT json_group_array(json(payload)) FROM page)))`
-		var payload string
-		err := db.QueryRowContext(r.Context(), statement, day, next, limit, offset, day).Scan(&payload)
+		payload, err := QueryJobRunsJSON(r.Context(), db, limit, offset)
 		runPayload(w, payload, err)
 	})
 	mux.HandleFunc("GET /api/v1/proxypool/job-runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +116,5 @@ func runPayload(w http.ResponseWriter, payload string, err error) {
 }
 
 func runResponse(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }

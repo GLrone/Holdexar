@@ -1,22 +1,16 @@
 package dbwriter
 
-// 批量语句体：games / 现价 / 历史 / 欠账 / 基线 / 复活清标。
-// UPSERT 键与 SET 子句逐字对齐现网语义，禁随意增删列。
-
 import (
 	"context"
 	"database/sql"
 )
 
-// missingKey 批量 missing 记账的去重键（保首个出现序）。
 type missingKey struct {
 	appid int64
 	cc    string
 }
 
-// gameUpsertSQL games 批量 UPSERT。带模型缺省的 NOT NULL 列显式落缺省值
-// （对齐 Python 侧 INSERT 缺参时自动补默认）；SET 子句固定可更新列
-// （created_at 冲突保留）；hasFree 组追加免费态两键以 excluded 引用逐行携带。
+// gameUpsertSQL 批量 UPSERT games（冲突保留 created_at）；hasFree 时额外携带免费态两列。
 func gameUpsertSQL(hasFree bool) string {
 	set := `name=excluded.name, name_en=excluded.name_en, type=excluded.type,
 header_image=excluded.header_image, store_url=excluded.store_url,
@@ -41,7 +35,6 @@ positive_rate, positive_reviews, review_count, view_count, created_at, updated_a
 		") ON CONFLICT(appid) DO UPDATE SET " + set
 }
 
-// upsertGames 按组批量写 games 元数据（可空列显式渲染保持批量形状）。
 func upsertGames(ctx context.Context, conn *sql.Conn, rows []gameRowValues, hasFree bool) error {
 	stmt, err := conn.PrepareContext(ctx, gameUpsertSQL(hasFree))
 	if err != nil {
@@ -67,10 +60,8 @@ func upsertGames(ctx context.Context, conn *sql.Conn, rows []gameRowValues, hasF
 	return nil
 }
 
-// currentUpsertSQL 现价 UPSERT：失败观察只推进尝试，冲突更新保留上次成功
-// 事实（价格三件套/汇率/促销截止/last_success_at 在 excluded.attempt_outcome
-// ='failed' 时保留旧行值）。fail_count 不进 SET（避免误清），新行落缺省 0
-// （对齐 Python 侧 INSERT 缺参自动补默认）。
+// currentUpsertSQL 冲突且 excluded.attempt_outcome='failed' 时保留旧价格字段与 last_success_at；
+// fail_count 不进 SET 防误清（新行初值 0）。
 const currentUpsertSQL = `INSERT INTO game_current_prices
 (appid, region_code, currency, price, original_price, discount_percent, sub_id,
 price_status, fail_count, cny_fen, discount_end_ts, updated_at, attempt_outcome, steam_answer, last_success_at)
@@ -117,8 +108,8 @@ func upsertCurrentPrices(ctx context.Context, conn *sql.Conn, rows []currentRow)
 	return nil
 }
 
-// historyUpsertSQL 历史切片 UPSERT：唯一观测键（同游戏/同区/同时刻/同购买包/
-// 同价与史低标记）冲突时更新非键详情保留原行身份；促销三列保留旧值兜底。
+// historyUpsertSQL 冲突键为 (appid,region_code,snapshot_at,sub_id,price,is_gold)；
+// 冲突时 steam_event_key 优先保留旧值，促销详情优先新值并回退旧值。
 const historyUpsertSQL = `INSERT INTO game_price_history
 (appid, region_code, currency, price, original_price, discount_percent, sub_id,
 is_gold, version_suffix, is_bundle, price_status, cny_fen, discount_end_ts,
@@ -182,7 +173,6 @@ func upsertHistory(ctx context.Context, conn *sql.Conn, rows []historyRow) error
 	return nil
 }
 
-// clearFailCount 补抓成功结转清账：本批有 ok 价的区 fail_count 归零。
 func clearFailCount(ctx context.Context, conn *sql.Conn, appids []int64, regions map[string]bool) error {
 	sqlText := "UPDATE game_current_prices SET fail_count=0 WHERE appid IN (" +
 		inPlaceholders(len(appids)) + ") AND region_code IN (" +
@@ -200,9 +190,7 @@ func clearFailCount(ctx context.Context, conn *sql.Conn, appids []int64, regions
 	return nil
 }
 
-// bumpMissingLedger 欠账结转：fail_count 语义 = 连续「真实响应缺价」次数，
-// 第 missingMaxRetries 次转 blocked（该区大概率无货的终态）。价格与
-// last_success_at 不在此列，由调用方语义决定保留。
+// bumpMissingLedger 递增 fail_count，达 missingMaxRetries 转 blocked；不改价格与 last_success_at。
 func bumpMissingLedger(ctx context.Context, conn *sql.Conn, appids []int64, regions map[string]bool) error {
 	sqlText := `UPDATE game_current_prices SET
 price_status=CASE WHEN game_current_prices.fail_count + 1 >= ? THEN 'blocked' ELSE 'missing' END,
@@ -225,8 +213,7 @@ WHERE appid IN (` + inPlaceholders(len(appids)) + `) AND region_code IN (` +
 	return nil
 }
 
-// missingBatchUpsertSQL 批量记 missing：首次插入 fail_count=1；已有行只盖
-// 失败章刷新时刻（传输类失败不消耗补抓预算），价格三件套不在 SET 里。
+// missingBatchUpsertSQL 首次插入置 missing/fail_count=1；冲突仅刷新尝试时间与失败章，不改 fail_count 与价格。
 const missingBatchUpsertSQL = `INSERT INTO game_current_prices
 (appid, region_code, currency, price, original_price, discount_percent, sub_id,
 price_status, fail_count, cny_fen, attempt_outcome, last_success_at, updated_at)
@@ -248,8 +235,6 @@ func markMissingBatch(ctx context.Context, conn *sql.Conn, keys []missingKey, no
 	return nil
 }
 
-// queryBaselines 沿索引跳过旧历史，读取各区最新快照的全部版本：
-// known = 同 sub 最新非空版本名（丢名行回填），latest = 差量门禁 prev。
 func queryBaselines(ctx context.Context, conn *sql.Conn, appids []int64) (
 	map[int64]map[int64]string, map[int64]map[obsKey]snapTuple, error,
 ) {
@@ -347,8 +332,6 @@ h.is_gold FROM history_regions r JOIN game_price_history h
 	return known, latest, nil
 }
 
-// clearRemovedMarks 复活清标：只碰真正带标记的行，返回清标数。
-// 不提交不建会话。
 func clearRemovedMarks(ctx context.Context, conn *sql.Conn, appids []int64) (int, error) {
 	seen := map[int64]bool{}
 	ids := make([]int64, 0, len(appids))

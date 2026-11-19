@@ -1,9 +1,5 @@
 package clashcfg
 
-// 配置生成对照验收（核心门禁）：运行配置生成、探针 lane 注入、池 lane 生成、
-// 节点依赖解析与 lane 上限，用 worktree venv 直调真实 Python 参考实现对拍，
-// YAML 解析后逐值比对（键序不作要求）。venv 缺失自动 skip（跨语言对照先例）。
-
 import (
 	"encoding/json"
 	"fmt"
@@ -25,7 +21,6 @@ func venvPython(t *testing.T) string {
 	return py
 }
 
-// runPythonRef 直调真实参考实现：读 inputs.json、写 outputs.json。
 func runPythonRef(t *testing.T, refBody string, inputs any, outputs any) {
 	t.Helper()
 	py := venvPython(t)
@@ -69,7 +64,6 @@ func runPythonRef(t *testing.T, refBody string, inputs any, outputs any) {
 	}
 }
 
-// jsonNormalize JSON 数字统一化（int64/float64 语义对齐后逐值比较）。
 func jsonNormalize(t *testing.T, v any) any {
 	t.Helper()
 	raw, err := json.Marshal(v)
@@ -198,8 +192,6 @@ func nodePayload(name string) map[string]any {
 	}
 }
 
-// TestCrossLangRenderSubscription 订阅运行配置渲染对照（含本地链/自动组降级/
-// tun 与地理剥除/空组边界）。
 func TestCrossLangRenderSubscription(t *testing.T) {
 	subscription := "mixed-port: 17890\n" +
 		"external-controller: 0.0.0.0:9999\n" +
@@ -292,7 +284,6 @@ func TestCrossLangRenderSubscription(t *testing.T) {
 	}
 }
 
-// TestCrossLangRenderErrors 渲染拒绝边界对照。
 func TestCrossLangRenderErrors(t *testing.T) {
 	cases := []map[string]any{
 		{"kind": "render_error", "text": "proxies: []\n"},
@@ -320,7 +311,6 @@ func TestCrossLangRenderErrors(t *testing.T) {
 		if goErr == nil {
 			t.Fatalf("case %d：参考侧拒绝（%s），Go 侧却通过", i, c.Error)
 		}
-		// 语义性错误消息对齐（YAML 解析错误的细节允许实现差异）
 		if strings.Contains(c.Error, "没有节点") || strings.Contains(c.Error, "未展开的节点来源") {
 			if goErr.Error() != c.Error {
 				t.Fatalf("case %d：错误消息不对齐\nPython：%s\nGo：%s", i, c.Error, goErr.Error())
@@ -329,7 +319,6 @@ func TestCrossLangRenderErrors(t *testing.T) {
 	}
 }
 
-// TestCrossLangResolveNodeDependencies 节点依赖解析对照（改名映射 + 本地链 + 组依赖）。
 func TestCrossLangResolveNodeDependencies(t *testing.T) {
 	payloads := []map[string]any{
 		nodePayload("原始A"),
@@ -365,7 +354,6 @@ func TestCrossLangResolveNodeDependencies(t *testing.T) {
 	}
 }
 
-// TestCrossLangInjectProbeLanes 探针 lane 注入对照（钉住全量端口保证确定性）。
 func TestCrossLangInjectProbeLanes(t *testing.T) {
 	base := "mixed-port: 17890\n" +
 		"external-controller: 127.0.0.1:19090\n" +
@@ -415,8 +403,6 @@ func TestCrossLangInjectProbeLanes(t *testing.T) {
 	}
 }
 
-// TestCrossLangPrepareRuntimeConfig 池 lane 生成对照：钉住端点的热重载通道逐值
-// 等价；冷通道动态端点掩码后等价。
 func TestCrossLangPrepareRuntimeConfig(t *testing.T) {
 	poolText := "proxies:\n" +
 		"- name: 池节点A\n  type: ss\n  server: a.example.com\n  port: 8388\n  cipher: aes-256-gcm\n  password: pa\n" +
@@ -465,7 +451,6 @@ func TestCrossLangPrepareRuntimeConfig(t *testing.T) {
 		"data_dir": pyDataDir,
 		"cases":    cases,
 	}
-	// 参考侧需要 data_dir 字面量，改写为本次临时目录
 	runPythonRef(t, refScriptBody, inputs, &outputs)
 	if len(outputs.Cases) != len(cases) {
 		t.Fatalf("case 数不对：%d", len(outputs.Cases))
@@ -521,8 +506,6 @@ func TestCrossLangPrepareRuntimeConfig(t *testing.T) {
 	}
 }
 
-// maskDynamic 掩掉冷通道的动态端点（密钥/控制器/混合口/全部 listener 端口），
-// 只比结构。
 func maskDynamic(doc map[string]any) {
 	doc["secret"] = "*"
 	doc["external-controller"] = "*"

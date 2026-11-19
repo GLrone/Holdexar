@@ -1,5 +1,3 @@
-// user_proxy_http_test.go 用户代理 CRUD + resolve 四策略测试（形状对齐
-// proxies/router.py venv 实测锚点：400 文案、422 形状、掩码投影、机器码）。
 package proxypool
 
 import (
@@ -48,7 +46,6 @@ func userProxyFixture(t *testing.T) (*sql.DB, *store.WriteGate, string, func(met
 	return db, gate, dir, do
 }
 
-// TestAddProxyShapes 多行批量/单条归一/坏 URL 400（逐字文案）。
 func TestAddProxyShapes(t *testing.T) {
 	_, _, _, do := userProxyFixture(t)
 	rec := do("POST", "/api/v1/proxies", `{"url": "http://user:pass@127.0.0.1:8080", "label": "L1"}`)
@@ -97,7 +94,6 @@ func TestAddProxyShapes(t *testing.T) {
 	}
 }
 
-// TestUpdateAndDeleteProxy enabled 复位连败 + label 更新 + 404 幂等。
 func TestUpdateAndDeleteProxy(t *testing.T) {
 	db, _, _, do := userProxyFixture(t)
 	rec := do("POST", "/api/v1/proxies", `{"url": "socks5://127.0.0.1:1080"}`)
@@ -171,8 +167,6 @@ func writeKV(t *testing.T, db *sql.DB, key, strategy string) {
 	}
 }
 
-// TestResolveStrategies 策略矩阵：direct_first 直连、proxy_first 池节点
-// 加权/轮询兜底、proxy_only 无节点 RuntimeError 语义 200。
 func TestResolveStrategies(t *testing.T) {
 	db, _, _, do := userProxyFixture(t)
 	setStrategy := func(strategy string) {
@@ -183,7 +177,6 @@ func TestResolveStrategies(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("空策略应 200：%d %s", rec.Code, rec.Body.String())
 	}
-	// proxy_only 无启用节点 → RuntimeError 语义 200 {"proxyUrl":null,"message":...}
 	setStrategy("proxy_only")
 	rec = do("GET", "/api/v1/proxies/resolve", "")
 	if rec.Code != 200 {
@@ -193,14 +186,12 @@ func TestResolveStrategies(t *testing.T) {
 	if body["proxyUrl"] != nil || !strings.Contains(toString(body["message"]), "策略 proxy_only 需要至少一条启用的代理") {
 		t.Fatalf("RuntimeError 语义不符：%s", rec.Body.String())
 	}
-	// direct_first 恒直连
 	setStrategy("direct_first")
 	rec = do("GET", "/api/v1/proxies/resolve", "")
 	body = decodeUserProxy(t, rec)
 	if body["proxyUrl"] != nil {
 		t.Fatalf("direct_first 应直连：%s", rec.Body.String())
 	}
-	// proxy_first：内核未在跑（hook 缺省零值）→ 池节点轮询兜底（全败权重 0 → rr_index）
 	setStrategy("proxy_first")
 	doAdd := func(port int64) {
 		rec := do("POST", "/api/v1/proxies", `{"host": "127.0.0.1", "port": `+utoa(port)+`, "scheme": "http"}`)
@@ -230,7 +221,6 @@ func TestResolveStrategies(t *testing.T) {
 	if rrIndex != 2 {
 		t.Fatalf("rr_index 应为 2：%d", rrIndex)
 	}
-	// 健康池加权随机：返回值必属启用池节点集合
 	if _, err := db.Exec(`UPDATE proxies SET status='ok', consecutive_failures=0, latency_ms=120`); err != nil {
 		t.Fatal(err)
 	}
@@ -242,12 +232,9 @@ func TestResolveStrategies(t *testing.T) {
 	}
 }
 
-// TestResolveStrategyProxyProgrammatic 程序化出站口与 HTTP /resolve 同链：
-// 内核在跑取内核口 → 内核未起取池节点 → 池空且兜底口探活关闭时直连。
 func TestResolveStrategyProxyProgrammatic(t *testing.T) {
 	db, gate, dir, do := userProxyFixture(t)
 	writeKV(t, db, "proxy.strategy", "proxy_first")
-	// 兜底口探活依赖本机 7897 在听，测试内关闭保证分支确定
 	savedPorts := localMixedPorts
 	localMixedPorts = nil
 	t.Cleanup(func() { localMixedPorts = savedPorts })
@@ -259,7 +246,6 @@ func TestResolveStrategyProxyProgrammatic(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("播种失败：%s", rec.Body.String())
 	}
-	// 内核分支要求端口真实在听（PortListening 复核），用临时 listener 模拟
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -273,5 +259,28 @@ func TestResolveStrategyProxyProgrammatic(t *testing.T) {
 	proxyURL, _, err = ResolveStrategyProxy(context.Background(), db, gate, dir, nil)
 	if err != nil || proxyURL != "http://127.0.0.1:18080" {
 		t.Fatalf("内核未起应取池节点：%q %v", proxyURL, err)
+	}
+}
+
+func TestRuntimeURLUsesPercent20UserinfoEncoding(t *testing.T) {
+	dir := t.TempDir()
+	su, err := sealProxyCredential(dir, "my user+1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := sealProxyCredential(dir, "p@ss word")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := runtimeURL(dir, proxyRow{
+		Scheme:   "http",
+		Host:     "10.0.0.1",
+		Port:     8080,
+		Username: sql.NullString{String: su, Valid: true},
+		Password: sql.NullString{String: sp, Valid: true},
+	})
+	want := "http://my%20user%2B1:p%40ss%20word@10.0.0.1:8080"
+	if got != want {
+		t.Fatalf("runtimeURL = %q, want %q", got, want)
 	}
 }

@@ -20,7 +20,7 @@ func TestStateTransitionsLegal(t *testing.T) {
 
 func TestStateTransitionsIllegal(t *testing.T) {
 	illegal := [][2]string{
-		{NodeNew, NodeRetired}, // 退休必须先离开运行集
+		{NodeNew, NodeRetired},
 		{NodeActive, NodeRetired},
 		{NodeActive, NodeNew},
 		{NodeRetired, NodeDead},
@@ -58,8 +58,8 @@ func TestEvaluateNodeStateProbeTrue(t *testing.T) {
 		{NodeNew, false, NodeStale},
 		{NodeActive, true, NodeActive},
 		{NodeActive, false, NodeStale},
-		{NodeDead, true, NodeActive},    // 体检成功是最强证据：DEAD 直接回运行集
-		{NodeRetired, true, NodeActive}, // 新的健康成功证据让 RETIRED 回 ACTIVE/STALE
+		{NodeDead, true, NodeActive},
+		{NodeRetired, true, NodeActive},
 		{NodeRetired, false, NodeStale},
 	}
 	for _, c := range cases {
@@ -73,12 +73,10 @@ func TestEvaluateNodeStateProbeTrue(t *testing.T) {
 }
 
 func TestEvaluateNodeStateProbeFalse(t *testing.T) {
-	// 未达阈值：一律 DEAD（从 RETIRED 之外的任意态）
 	got, err := EvaluateNodeState(NodeActive, EvaluateNodeStateInput{ProbeOK: boolPtr(false), ConsecutiveFailures: 2})
 	if err != nil || got != NodeDead {
 		t.Fatalf("ACTIVE 失败 2 次应 DEAD，got %s err %v", got, err)
 	}
-	// 达阈值且在 STALE/DEAD：RETIRED
 	got, err = EvaluateNodeState(NodeStale, EvaluateNodeStateInput{ProbeOK: boolPtr(false), ConsecutiveFailures: 3})
 	if err != nil || got != NodeRetired {
 		t.Fatalf("STALE 失败 3 次应 RETIRED，got %s err %v", got, err)
@@ -87,12 +85,10 @@ func TestEvaluateNodeStateProbeFalse(t *testing.T) {
 	if err != nil || got != NodeRetired {
 		t.Fatalf("DEAD 失败 5 次应 RETIRED，got %s err %v", got, err)
 	}
-	// RETIRED 停留（失败证据不改变退休结论）
 	got, err = EvaluateNodeState(NodeRetired, EvaluateNodeStateInput{ProbeOK: boolPtr(false), ConsecutiveFailures: 99})
 	if err != nil || got != NodeRetired {
 		t.Fatalf("RETIRED 失败应停留，got %s err %v", got, err)
 	}
-	// NEW 失败未达阈值：DEAD（NEW 不在退休起点集）
 	got, err = EvaluateNodeState(NodeNew, EvaluateNodeStateInput{ProbeOK: boolPtr(false), ConsecutiveFailures: 99})
 	if err != nil || got != NodeDead {
 		t.Fatalf("NEW 失败应 DEAD（不允许直跳 RETIRED），got %s err %v", got, err)
@@ -100,7 +96,6 @@ func TestEvaluateNodeStateProbeFalse(t *testing.T) {
 }
 
 func TestEvaluateNodeStateNoProbe(t *testing.T) {
-	// 有来源：NEW/ACTIVE → ACTIVE；DEAD/RETIRED/STALE 原地
 	cases := []struct {
 		current string
 		seen    bool
@@ -108,11 +103,11 @@ func TestEvaluateNodeStateNoProbe(t *testing.T) {
 	}{
 		{NodeNew, true, NodeActive},
 		{NodeActive, true, NodeActive},
-		{NodeDead, true, NodeDead}, // 未经体检不凭来源证据跃回运行权重
+		{NodeDead, true, NodeDead},
 		{NodeRetired, true, NodeRetired},
-		{NodeActive, false, NodeStale}, // 通过过体检的才降级
+		{NodeActive, false, NodeStale},
 		{NodeStale, false, NodeStale},
-		{NodeNew, false, NodeDead}, // 无来源又无体检证据不进池
+		{NodeNew, false, NodeDead},
 		{NodeDead, false, NodeDead},
 		{NodeRetired, false, NodeRetired},
 	}
