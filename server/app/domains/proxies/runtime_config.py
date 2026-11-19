@@ -33,11 +33,8 @@ _GEO_RULE_TYPES = frozenset({
 _LOGIC_RULE_TYPES = frozenset({"AND", "OR", "NOT"})
 _GEO_SELECTOR_PREFIXES = ("geosite:", "geoip:", "ip-asn:", "rule-set:")
 
-# 注入的探测 lane 组前缀：唯一允许使用 include-all 的执行组。
 PROBE_LANE_GROUP_PREFIX = "HlProbeLane"
-# 最终运行配置里允许存在的代理组类型：成员的选择只由程序决定。
 _EXECUTION_GROUP_TYPES = frozenset({"select", "relay"})
-# 来源订阅里可确定性降级为 select 的自动组（保留成员声明顺序，默认取首位）。
 _DETERMINISTIC_DOWNGRADE_TYPES = frozenset({"url-test", "fallback"})
 _GROUP_AUTONOMY_KEYS = (
     "url", "interval", "lazy", "timeout", "max-failed-times", "expected-status",

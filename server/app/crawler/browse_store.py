@@ -42,10 +42,6 @@ from app.domains.games import tags as tags_service
 
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════
-# 接口常量
-# ═══════════════════════════════════════════════════════════════
-
 BROWSE_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
 # 必须 GET（POST → 405）；input_json 只能放查询参数。
 # 最小转义：保留 `{}",:` 与数字/小写字母（全转义会让单发条数掉到 ~260）
@@ -61,14 +57,13 @@ DATA_REQUEST_BASE = {
     "include_basic_info": True,
     "include_all_purchase_options": True,
 }
-# 可选抓取项：全部白送，不额外请求
 DATA_REQUEST_EXTRAS = {
-    "include_release": True,      # → release_date / coming_soon
-    "include_assets": True,       # → header_image（asset_url_format）
-    "include_reviews": True,      # → 好评率/评论数（替掉 appreviews 接口）
-    "include_platforms": True,    # → 平台支持
-    "include_coming_soon": True,  # → 即将推出标记
-    "include_tag_count": 20,      # → tags[]{tagid,weight}（热门用户标签，含票重）
+    "include_release": True,
+    "include_assets": True,
+    "include_reviews": True,
+    "include_platforms": True,
+    "include_coming_soon": True,
+    "include_tag_count": 20,
 }
 
 # browse 的 item.type 标定：
@@ -91,18 +86,13 @@ MAX_PARTIAL_RETRIES = 3
 
 CURRENCY_BY_CC = {cc: cur for cc, _, cur in CC_LIST}
 
-# ══════════════════════════════════════════════════════════════
-# 运行态（预取 → 任务处理器；每轮 crawl 前 reset_run_state()）
-# ══════════════════════════════════════════════════════════════
-
-META: dict[int, dict] = {}          # appid → browse 元数据
-PRESERVED: dict[int, dict] = {}     # appid → 库内原值（browse 拿不到的列）
+META: dict[int, dict] = {}
+PRESERVED: dict[int, dict] = {}
 FAILED_TASKS: list[str] = []
 SKIPPED_UNITS: set[tuple[int, str]] = set()
 FOLLOW_PARENT = True
 EXTRAS_ENABLED = True
 
-# 已有价格成功提交的批次。
 _WRITE_STARTED: set[str] = set()
 
 
@@ -113,11 +103,6 @@ def reset_run_state() -> None:
     FAILED_TASKS.clear()
     SKIPPED_UNITS.clear()
     _WRITE_STARTED.clear()
-
-
-# ══════════════════════════════════════════════════════════════
-# 小工具
-# ══════════════════════════════════════════════════════════════
 
 
 def _to_int(v) -> int | None:
@@ -209,11 +194,6 @@ async def _mark_missing_async(db_writer, appids: list[int], cc: str) -> int:
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# 抓取层：StoreBrowseAPI
-# ══════════════════════════════════════════════════════════════
-
-
 class StoreBrowseAPI:
     """IStoreBrowseService/GetItems 适配器：批量（≤300）× 单区。"""
 
@@ -303,7 +283,7 @@ class StoreBrowseAPI:
         budget = MAX_URL_LEN - base_len
         out: list[list[dict]] = []
         current: list[dict] = []
-        used = 0  # 当前发的 Σ元素长度 + 已产生的分隔符数 = URL 超出 base 的部分
+        used = 0
         for spec in uniq:
             elem = len(json.dumps(spec, separators=(",", ":")))
             add = elem if not current else elem + 1
@@ -312,7 +292,6 @@ class StoreBrowseAPI:
                 current = [spec]
                 used = elem
             else:
-                # 单条自身就超限时留在自己一发里，不静默丢 id
                 current.append(spec)
                 used += add
         if current:
@@ -379,8 +358,6 @@ class StoreBrowseAPI:
             out.setdefault(int(a), None)
         return out, missing
 
-    # ── 解析 ──
-
     @staticmethod
     def evaluate(item: dict | None, name_en: str = "") -> tuple[str, list[dict] | None]:
         """item → (price_status, options)。
@@ -436,7 +413,6 @@ class StoreBrowseAPI:
         # 赠送结束时间戳只在 best_purchase_option 上（purchase_options
         # 各项不带），逐项回填
         best_keep_ends = _to_int((item.get("best_purchase_option") or {}).get("free_to_keep_ends"))
-        # 分组语义对齐旧链路 package_groups["default"]：有 default 就只取 default
         if any(o.get("package_group") == "default" for o in raw):
             raw = [o for o in raw if o.get("package_group") == "default"]
 
@@ -455,7 +431,7 @@ class StoreBrowseAPI:
             price = _to_int(opt.get("final_price_in_cents"))
             original = _to_int(opt.get("original_price_in_cents"))
             if original is None:
-                original = price  # 无促销 → 原价 = 现价
+                original = price
             discount = _to_int(opt.get("discount_pct")) or 0
             if discount <= 0 and price and original and original > price:
                 discount = round((original - price) / original * 100)
@@ -517,10 +493,6 @@ class StoreBrowseAPI:
             "positive_rate": pct,
         }
 
-
-# ══════════════════════════════════════════════════════════════
-# games 表元数据装配
-# ══════════════════════════════════════════════════════════════
 
 # games 表：browse 拿不到的列，保留库内原值（不保留就会被写 NULL）
 _PRESERVED_COLUMNS = [
@@ -584,7 +556,6 @@ def build_game_data(appid: int, meta: dict | None, now_dt) -> dict | None:
 
     return {
         "appid": int(appid),
-        # ↓ browse 可提供（meta 为 None 时保留库内原值）
         "name": name if has_browse_meta else (keep or {}).get("name"),
         "name_en": name_en if has_browse_meta else (keep or {}).get("name_en"),
         "type": (meta.get("type") or (keep or {}).get("type") or "GAME").upper()
@@ -594,7 +565,6 @@ def build_game_data(appid: int, meta: dict | None, now_dt) -> dict | None:
         #   空库首爬（无原值）必须给 bool 缺省，透传 None 会让 INSERT 违约束
         "chinese_support": (keep or {}).get("chinese_support"),
         "is_visual_novel": bool((keep or {}).get("is_visual_novel")),
-        # ↓ browse 可提供
         "family_sharing": bool(meta.get("family_sharing")) if has_browse_meta
         else bool((keep or {}).get("family_sharing")),
         "trading_cards": bool(meta.get("trading_cards")) if has_browse_meta
@@ -611,10 +581,6 @@ def build_game_data(appid: int, meta: dict | None, now_dt) -> dict | None:
         "updated_at": now_dt,
     }
 
-
-# ══════════════════════════════════════════════════════════════
-# 任务处理器
-# ══════════════════════════════════════════════════════════════
 
 async def _follow_parent_apps(context, items: dict, appids: list[int], cc: str) -> int:
     """把「子 app」的购买选项从其父 app 补齐（原地改写 items）。返回补齐条数。
@@ -739,10 +705,6 @@ async def _browse_price_task_inner(context) -> None:
         context, appids, cc, "english", EXTRAS_ENABLED
     )
 
-    # ── 子 app 跟父：type=14 / related_items.parent_appid 的条目自身没有购买
-    #    选项（如 42710 "CoD: BO - Multiplayer" 之于 42700）。旧链路 appdetails
-    #    对这类 appid 会重定向到父 app 返回父的价格，为保价格口径一致，这里
-    #    显式补一发父 appid 并把父的 purchase_options 挂回子 appid ──
     await _follow_parent_apps(context, items, appids, cc)
 
     log_event(
@@ -761,14 +723,8 @@ async def _browse_price_task_inner(context) -> None:
     now_dt = get_beijing_time_obj()
     counts = {"ok": 0, "free_promo": 0, "locked": 0, "missing": 0, "skip": 0, "write_fail": 0}
     pending_writes: list[tuple] = []
-    # 「看见了但不落价」的目标：批量失败整批记 missing 时可能误标过它们，
-    # 这些陈欠行没有任何爬取路径会再写（跳过分支永不 bump），不清就是
-    # 补抓通道每拍重拾的死账——统一收集，落库段一次性清除
     cleared_missing: list[tuple[int, str]] = []
-    # 传输截断的缺失条目（响应里没有该 appid 的答复）：按 missing 记账走补抓
-    # 通道，不当 locked 终态成功观察
     truncated_missing: list[int] = []
-    # 欠账记账对（免费赠送异常 / 批量写失败）：整批一次事务落账，不再逐款开闸
     ledger_missing: list[tuple[int, str]] = []
 
     for idx, appid in enumerate(appids):
@@ -782,8 +738,6 @@ async def _browse_price_task_inner(context) -> None:
         meta = META.get(appid)
         keep = PRESERVED.get(appid)
 
-        # 只收 game/dlc；短路前落 type 让该行脱离首爬候选（榜单反哺判据）。
-        # 已知对象（库内有行）不再依赖网络预取：库内 type 与网络元数据同权重
         if (meta or {}).get("type") or (keep or {}).get("type"):
             eff_type = (meta or {}).get("type") or (keep or {}).get("type")
             if eff_type not in GAME_TYPES:
@@ -799,8 +753,6 @@ async def _browse_price_task_inner(context) -> None:
             (meta or {}).get("name_en") or (keep or {}).get("name_en") or "",
         )
 
-        # 即将推出且该区无购买选项（未开放预购）→ COMING_SOON 暂缓（同旧链路：
-        # 「无价格付费游戏不入库」；有包预购走正常链路），由 coming_soon 重探转正
         if meta and meta.get("coming_soon") and status == "missing":
             await context.db_writer.mark_coming_soon(appid)
             cleared_missing.append((appid, cc))
@@ -880,16 +832,12 @@ async def _browse_price_task_inner(context) -> None:
                     "is_gold": False, "version_suffix": None,
                     "is_bundle": False, "price_status": "ok", "steam_answer": "free",
                     "crawled_at": now_dt,
-                    # promo_end_ts 随行透传给 db_writer 维护 games.promo_end_at
-                    # （仪表盘 Steam 喜加一模块的数据源）；discount_end_ts 同值
-                    # 落现价/历史（100% 折扣的截止即赠送截止）
                     "promo_end_ts": o.get("free_to_keep_ends") or o.get("discount_end_ts"),
                     "discount_end_ts": o.get("free_to_keep_ends") or o.get("discount_end_ts"),
                 }
                 for o in promo_opts
             ]
         elif status == "free":
-            # 免费：与旧链路同语义（price=0 的 ok 记录进 current，不进 history）
             status = "ok"
             prices_arr = [
                 {
@@ -907,8 +855,6 @@ async def _browse_price_task_inner(context) -> None:
                     "price": None, "original_price": None, "discount_percent": 0,
                     "sub_id": 0, "is_gold": False, "version_suffix": None,
                     "is_bundle": False, "price_status": status,
-                    # locked / 无购买选项都是成功观察：拿到了 Steam 对该区的
-                    # 明确答复，只是答复不是价格
                     "steam_answer": "locked" if status == "locked" else "no_options",
                     "crawled_at": now_dt,
                 }
@@ -916,15 +862,13 @@ async def _browse_price_task_inner(context) -> None:
         counts[status if status in counts else "missing"] += 1
 
         game_data = build_game_data(appid, meta, now_dt)
-        if game_data is None:  # 元数据与库内原值双缺 → 不造空行
+        if game_data is None:
             cleared_missing.append((appid, cc))
             counts["skip"] += 1
             continue
         pending_writes.append((appid, game_data, prices_arr))
 
 
-    # 整批一次事务落库：一批一次基线查询 + 一次 commit（逐 appid 各开事务会
-    # 让 1600 万行 history 的基线扫描与提交数按「款数 × 区数」膨胀）
     failed_writes: list[tuple[int, str]] = []
     if pending_writes:
         try:
@@ -942,7 +886,6 @@ async def _browse_price_task_inner(context) -> None:
                 failed_writes.append((appid, cc))
                 ledger_missing.append((appid, cc))
                 continue
-            # 仅收集价格保存成功的条目，捆绑包按批去重后保存。
             try:
                 for found in _discover_bundles_from_item(items.get(appid)):
                     discoveries.setdefault(found["bundle_id"], found)
@@ -960,9 +903,6 @@ async def _browse_price_task_inner(context) -> None:
                 log_event(logger, "捆绑包发现批量保存失败", level=logging.DEBUG,
                           detail={"批次": task_id or "未标注", "原因": e})
 
-    # ── 热门用户标签（include_tag_count 白送，与价格同发）：按 appid 整批替换。
-    #    标签是区域无关的目录事实，不看本区价格状态——locked/无购买选项的条目
-    #    同样落标签，覆盖率不会被区服设置切成碎片。
     tag_entries = [
         (appid, rows) for appid in appids if (rows := _item_tags(items.get(appid)))
     ]
@@ -1039,7 +979,7 @@ def _discover_bundles_from_item(item: dict | None) -> list[dict]:
         if not name:
             continue
         if not is_bundle and name.strip().lower() == item_name:
-            continue  # 同名 sub = 本体 sub / 单 DLC sub，不是捆绑包
+            continue
         seen.add(bid)
         out.append(
             {
@@ -1052,11 +992,6 @@ def _discover_bundles_from_item(item: dict | None) -> list[dict]:
             }
         )
     return out
-
-
-# ══════════════════════════════════════════════════════════════
-# 预取：元数据
-# ══════════════════════════════════════════════════════════════
 
 
 class _Ctx:

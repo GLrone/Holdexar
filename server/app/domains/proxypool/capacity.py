@@ -51,7 +51,6 @@ MODE_DIRECT = "direct"
 MODE_STEAM = "steam"
 MODES = (MODE_NODES, MODE_DIRECT, MODE_STEAM)
 
-# `steam` 模式的业务目标：商店公开轻量端点（单 appid 价格字段），够判定 HTTP 可用性。
 STEAM_TARGET_URL = (
     "https://store.steampowered.com/api/appdetails"
     "?appids=220&filters=price_overview"
@@ -64,25 +63,16 @@ DEFAULT_LADDER: tuple[int, ...] = (8, 16, 32, 48, 64, 80, 96, 128, 160, 192, 256
 class CapacityCriteria:
     """稳定上限判定阈值。ladder 与 soak 共用同一套，soak 另加漂移界。"""
 
-    # listener 全部就绪的等待上限（就绪不满即该档失败）
     ready_timeout_s: float = 20.0
-    # 单请求超时（连接/读/写同值）
     request_timeout_s: float = 10.0
-    # 成功率下限（分母剔除 429：限流是服务端行为，不是内核容量信号）
     min_success_rate: float = 0.99
-    # 延迟退化界：p95 不得超过 基准p95 × latency_factor + latency_floor_ms
     latency_factor: float = 3.0
     latency_floor_ms: float = 500.0
-    # 单档内内存增长界：结束 ≤ 开始 × rss_growth_factor + rss_growth_floor_mb
     rss_growth_factor: float = 1.5
     rss_growth_floor_mb: float = 64.0
-    # 串出口判据：单 lane 偏离自身基线出口 IP 的占比超过该值即记硬串线
     hard_leak_ratio: float = 0.5
-    # soak 延迟界：p95 不得超过该档 ladder p95 × soak_p95_factor + latency_floor_ms
     soak_p95_factor: float = 1.5
-    # soak 内存漂移界：结束 ≤ 开始 × soak_rss_factor + rss_growth_floor_mb
     soak_rss_factor: float = 1.25
-    # 建议生产上限 = 验证容量 × safety_factor
     safety_factor: float = 0.8
 
     def to_dict(self) -> dict:
@@ -142,7 +132,6 @@ class RunMetrics:
     mismatch_count: int = 0
     rotating_lanes: list[int] = field(default_factory=list)
     hard_leak_lanes: list[int] = field(default_factory=list)
-    # 有失败或出口异常的 lane 明细（归因用：区分「个别坏出口」与「系统性过载」）
     suspect_lanes: list[dict] = field(default_factory=list)
     passed: bool | None = None
     failure_reasons: list[str] = field(default_factory=list)
@@ -249,7 +238,6 @@ def evaluate_run(
     return reasons
 
 
-# ── 内核进程资源采样（win32 ctypes，无第三方依赖）────────────────────
 
 _PPROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -285,7 +273,7 @@ class ProcessResourceSampler:
     def __init__(self, pid: int, *, interval_s: float = 2.0) -> None:
         self._pid = int(pid)
         self._interval_s = float(interval_s)
-        self._samples: list[tuple[float, float, float]] = []  # (wall, cpu_100ns, rss)
+        self._samples: list[tuple[float, float, float]] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._handle = None
@@ -395,15 +383,13 @@ def _machine_info() -> dict:
         if kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(kb)):
             info["total_mem_gb"] = round(kb.value / (1024 * 1024), 1)
     try:
-        # 不过滤映像名：本应用内核带应用前缀（holdexar-mihomo.exe），
-        # 子串统计把新旧名与其他软件的 mihomo 一并计入环境并发数。
         out = subprocess.run(
             ["tasklist", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=15,
         ).stdout or ""
         count = sum(1 for line in out.splitlines() if "mihomo" in line.lower())
         info["concurrent_mihomo_processes"] = count
-    except Exception:  # noqa: BLE001 —— 探测环境信息拿不到不阻断
+    except Exception:  # noqa: BLE001
         pass
     return info
 
@@ -515,11 +501,8 @@ class KernelCapacityProbe:
         self.target_url = target_url or (
             STEAM_TARGET_URL if mode == MODE_STEAM else EXIT_IP_TARGET_URL
         )
-        # 出口归因只在目标确为出口 IP 回显端点时启用；自定义目标（如直连可达的
-        # 轻量端点）没有 IP 语义，串线判定自然退化为不做
         self._ip_mode = self.target_url == EXIT_IP_TARGET_URL
 
-    # ── 对外主流程 ────────────────────────────────────────────────
 
     async def run(self, ladder: Sequence[int], *, soak_tier: int | None = None) -> CapacityReport:
         tiers: list[RunMetrics] = []
@@ -529,8 +512,6 @@ class KernelCapacityProbe:
         fail_streak = 0
 
         if soak_tier is not None:
-            # 跳过梯度，直接对指定档做 soak 确认（梯度结论已被冷启动突发等
-            # 一过性因素污染时，用它单独验证稳态）
             soak = await self._run_tier(int(soak_tier), soak_seconds=self.soak_seconds)
             reasons = evaluate_run(
                 soak, expected_lanes=int(soak_tier), criteria=self.criteria,
@@ -587,7 +568,7 @@ class KernelCapacityProbe:
             else:
                 fail_streak += 1
                 if not metrics.started or metrics.listener_ready == 0:
-                    break  # 内核起不来属环境性故障，后续档位无意义
+                    break
                 if fail_streak >= 2:
                     break
             self._cleanup_tier(self._tier_dir(int(n), soak=False), keep=not metrics.passed)
@@ -641,7 +622,6 @@ class KernelCapacityProbe:
             recommended_crawl_workers=recommended,
         )
 
-    # ── 单档执行 ──────────────────────────────────────────────────
 
     def _tier_dir(self, lanes: int, soak: bool) -> Path:
         return self.run_dir / (f"soak-{lanes}" if soak else f"ladder-{lanes}")
@@ -674,8 +654,6 @@ class KernelCapacityProbe:
         begin = time.perf_counter()
         tier_dir = self._tier_dir(lanes, soak=phase == "soak")
         tier_dir.mkdir(parents=True, exist_ok=True)
-        # 档位目录内镜像生产布局（<dir>/proxypool/*.yaml）：runtime 的路径助手
-        # （runtime_lane_ports / controller_endpoint_of 等）按该布局拼路径
         pool_file = tier_dir / "proxypool" / POOL_FILENAME
         pool_file.parent.mkdir(parents=True, exist_ok=True)
         pool_file.write_text(
@@ -694,7 +672,7 @@ class KernelCapacityProbe:
             await asyncio.to_thread(
                 runtime.start, str(self.exe_path), str(config), inject_lanes=False
             )
-        except Exception as e:  # noqa: BLE001 —— 启动失败本身即该档结果
+        except Exception as e:  # noqa: BLE001
             metrics.failure_reasons.append(f"内核启动失败：{type(e).__name__}: {e}")
             metrics.duration_s = time.perf_counter() - begin
             return metrics
@@ -714,7 +692,7 @@ class KernelCapacityProbe:
                     metrics.binding_ok = all(
                         a == s for a, s in zip(applied, selections) if s is not None
                     )
-                except Exception as e:  # noqa: BLE001 —— 绑定失败照常测，记录原因
+                except Exception as e:  # noqa: BLE001
                     metrics.failure_reasons.append(
                         f"lane 绑定未成立：{type(e).__name__}: {e}"
                     )
@@ -761,7 +739,7 @@ class KernelCapacityProbe:
             ) as client:
                 resp = await client.get(f"{controller_url}/version")
                 return resp.status_code == 200
-        except Exception:  # noqa: BLE001 —— 探测性检查，异常即不可达
+        except Exception:  # noqa: BLE001
             return False
 
     def _make_client(self, port: int) -> httpx.AsyncClient:
@@ -800,7 +778,7 @@ class KernelCapacityProbe:
             return
         try:
             ip = str((resp.json() or {}).get("ip") or "")
-        except Exception:  # noqa: BLE001 —— 2xx 但解析不出出口 IP 按其他错误计
+        except Exception:  # noqa: BLE001
             stat.other_errors += 1
             return
         if not ip:

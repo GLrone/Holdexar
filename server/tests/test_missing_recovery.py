@@ -63,18 +63,13 @@ async def _seed():
     appids = [APPID, APPID2, APPID3]
     now = _now_naive()
     async with get_session_factory()() as session:
-        # 三款合成游戏 + 各自的价格欠账/终态行
         session.add_all([_game(a) for a in appids])
         session.add_all(
             [
-                # APPID：过期欠账（冷却窗外）两个区
                 _price(APPID, "CN", "missing", None, fail_count=1, updated_at=now - timedelta(hours=1)),
                 _price(APPID, "UA", "missing", None, fail_count=1, updated_at=now - timedelta(hours=1)),
-                # APPID2：冷却窗口内的欠账（不应入选）
                 _price(APPID2, "CN", "missing", None, fail_count=1, updated_at=now),
-                # APPID2：终态行（不应入选）
                 _price(APPID2, "UA", "blocked", None),
-                # APPID3：正常价（不应入选）
                 _price(APPID3, "CN", "ok", 10000),
             ]
         )
@@ -93,7 +88,6 @@ async def test_degradation_exhaustion_to_blocked():
     """门禁降级穷尽转终态：fail_count 递增至 MISSING_MAX_RETRIES → blocked，
     blocked 行不再进补抓任务。传输类失败不递增（另有传输通道测试钉）。"""
     db = DbWriter()
-    # APPID2 CN 行 fail_count=1；补到 MISSING_MAX_RETRIES-1 后下一次门禁降级应转 blocked
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID2, "CN"))
         row.fail_count = MISSING_MAX_RETRIES - 1
@@ -109,7 +103,6 @@ async def test_degradation_exhaustion_to_blocked():
         row = await session.get(GameCurrentPrice, (APPID2, "CN"))
         assert row.price_status == "blocked"
         assert row.fail_count == MISSING_MAX_RETRIES
-    # blocked 行不再出现在补抓任务里
     tasks = await db.generate_missing_tasks(cooldown_minutes=0)
     assert not any(APPID2 in t.get("appids", []) for t in tasks)
 
@@ -126,7 +119,7 @@ async def test_generate_missing_tasks():
         hits = [a for a in t.get("appids", []) if a in (APPID, APPID2, APPID3)]
         if hits:
             ours.setdefault(t["region"], []).extend(hits)
-    assert ours.get("cn") == [APPID]  # APPID2 冷却窗内欠账 + blocked、APPID3 ok，均不入选
+    assert ours.get("cn") == [APPID]
     assert ours.get("ua") == [APPID]
 
 
@@ -139,7 +132,6 @@ async def test_upsert_gate_degrades_ok_without_price():
         "appid": APPID3, "name": "门禁测试", "updated_at": now,
     }
     prices = [
-        # ok 有价：正常进 current
         {"appid": APPID3, "region_code": "CN", "currency": "CNY",
          "price": 10000, "original_price": 10000, "discount_percent": 0,
          "sub_id": 1, "is_gold": False, "version_suffix": None,
@@ -162,9 +154,9 @@ async def test_upsert_gate_degrades_ok_without_price():
         assert cn.price_status == "ok" and cn.price == 10000
         ua = await session.get(GameCurrentPrice, (APPID3, "UA"))
         assert ua.price_status == "missing"
-        assert ua.fail_count == 1  # 欠账结转：降级即计一次失败
+        assert ua.fail_count == 1
         tr = await session.get(GameCurrentPrice, (APPID3, "TR"))
-        assert tr.price_status == "ok" and tr.price == 0  # 免费游戏不误伤
+        assert tr.price_status == "ok" and tr.price == 0
 
 
 @pytest.mark.asyncio
@@ -172,7 +164,6 @@ async def test_upsert_recovery_clears_ledger():
     """补抓闭环：欠账行补到有价 → 回 ok 且 fail_count 清零。"""
     db = DbWriter()
     now = _now_naive()
-    # APPID 已有 CN/UA missing 欠账（夹具播种）
     game_data = {"appid": APPID, "name": "补抓回填", "updated_at": now}
     prices = [
         {"appid": APPID, "region_code": "CN", "currency": "CNY",
@@ -185,9 +176,9 @@ async def test_upsert_recovery_clears_ledger():
         cn = await session.get(GameCurrentPrice, (APPID, "CN"))
         assert cn.price_status == "ok"
         assert cn.price == 12000
-        assert cn.fail_count == 0  # 清账
+        assert cn.fail_count == 0
         ua = await session.get(GameCurrentPrice, (APPID, "UA"))
-        assert ua.price_status == "missing"  # 未补的区不受影响
+        assert ua.price_status == "missing"
 
 
 @pytest.mark.asyncio
@@ -198,7 +189,7 @@ async def test_generate_tasks_cooldown_boundary():
     assert any(
         APPID2 in t.get("appids", [])
         for t in tasks if t["region"] == "cn"
-    )  # 冷却 0：APPID2 的 CN missing（blocked 转化前）入选
+    )
 
 
 @pytest.mark.asyncio
@@ -220,10 +211,10 @@ async def test_generate_missing_tasks_batches_by_region():
         tasks = await db.generate_missing_tasks(cooldown_minutes=10)
         ours = [t for t in tasks if any(a in id_set for a in t.get("appids", []))]
         covered = [a for t in ours for a in t["appids"] if a in id_set]
-        assert sorted(covered) == sorted(batch_ids)  # 不重不漏
+        assert sorted(covered) == sorted(batch_ids)
         assert all(t["region"] == "cn" for t in ours)
         assert all(len(t["appids"]) <= 400 for t in ours)
-        assert len(ours) >= 2  # 401 行必然拆多发
+        assert len(ours) >= 2
     finally:
         async with get_session_factory()() as session:
             await session.execute(
@@ -303,7 +294,6 @@ async def test_generate_missing_tasks_sql_limit_truncates_oldest():
         db = DbWriter()
         tasks = await db.generate_missing_tasks(cooldown_minutes=10, limit_rows=3)
         picked = [a for t in tasks for a in t["appids"]]
-        # 自动夹具的 APPID（now-1h 更新）比三行都新：被 LIMIT 挡住
         assert sorted(picked) == appids
         assert len(picked) == 3
     finally:
@@ -327,7 +317,6 @@ async def test_generate_missing_tasks_limit_keeps_empty_region_cleanup_complete(
                    updated_at=now - timedelta(hours=h))
             for a, h in zip(appids, ages)
         )
-        # 空区行：老账（8h，远在 limit=2 窗口外）与冷却窗内新鲜行各一
         session.add(_price(empty_old, "", "missing", None, fail_count=1,
                            updated_at=now - timedelta(hours=8)))
         session.add(_price(empty_fresh, "", "missing", None, fail_count=1,
@@ -353,7 +342,7 @@ async def test_generate_missing_tasks_limit_keeps_empty_region_cleanup_complete(
 async def test_clear_missing_regions_deletes_only_missing():
     """clear_missing_regions 只删 missing 状态行：ok 行与历史不动。"""
     db = DbWriter()
-    await db.clear_missing_regions([])  # 空表安全
+    await db.clear_missing_regions([])
 
     async with get_session_factory()() as session:
         session.add(_price(APPID, "RU", "ok", 10000))
@@ -385,10 +374,8 @@ async def test_clear_missing_regions_deletes_only_missing():
 async def test_blocked_aging_reprobe():
     """blocked 老化重探：窗口内的终态行不进补抓，过窗行放行一次。"""
     db = DbWriter()
-    # 夹具的 APPID2/UA 行 blocked 且 updated_at=now（窗口内）→ 不入选
     tasks = await db.generate_missing_tasks(cooldown_minutes=0)
     assert not any(APPID2 in t.get("appids", []) and t.get("region") == "UA" for t in tasks)
-    # 行龄推过 BLOCKED_REPROBE_DAYS 窗口 → 放行重探
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID2, "UA"))
         row.updated_at = _now_naive() - timedelta(days=8)
@@ -397,7 +384,6 @@ async def test_blocked_aging_reprobe():
     assert any(APPID2 in t.get("appids", []) and t.get("region", "").upper() == "UA" for t in tasks)
 
 
-# ── 根因修复回归：降级按行不扩散 + 证据分流预算 ──
 
 
 @pytest.mark.asyncio
@@ -423,7 +409,6 @@ async def test_mixed_region_keeps_ok_semantics():
         assert row.price_status == "ok" and row.price == 9900
         assert row.attempt_outcome == "success" and row.last_success_at is not None
         assert row.fail_count == 0
-    # 不进欠账选取
     assert not any(APPID3 in task.get("appids", [])
                    for task in await db.generate_missing_tasks(cooldown_minutes=0))
 
@@ -473,9 +458,9 @@ async def test_pure_degraded_region_still_burns_budget():
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID3, "CN"))
         assert row.price_status == "missing"
-        assert row.price == 10000  # failed 章保留上次成功价（夹具预置行）
-        assert row.fail_count == 1  # 门禁证据消耗 1 次预算
-        assert row.price != 50000  # gold 价不顶替现价投影
+        assert row.price == 10000
+        assert row.fail_count == 1
+        assert row.price != 50000
 
 
 @pytest.mark.asyncio
@@ -488,5 +473,5 @@ async def test_transport_ledger_does_not_burn_budget():
     async with get_session_factory()() as session:
         row = await session.get(GameCurrentPrice, (APPID, "RU"))
         assert row.price_status == "missing"
-        assert row.fail_count == 1  # 首记=1，传输失败不递增
+        assert row.fail_count == 1
         assert row.price_status != "blocked"

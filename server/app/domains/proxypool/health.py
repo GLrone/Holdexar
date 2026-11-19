@@ -35,15 +35,12 @@ from app.domains.proxypool.state import evaluate_node_state
 
 logger = logging.getLogger(__name__)
 
-# L0 传输层目标：204、无响应体、请求最轻（选型见模块文档）
 PROBE_TARGET_URL = "http://www.gstatic.com/generate_204"
 
 PROBE_LEVEL = "L0"
 DEFAULT_TIMEOUT_MS = 5000
 
-# ── L1：出口 IP ──────────────────────────────────────────────────
 L1_LEVEL = "L1"
-# 生产默认用公网 IP 回显服务（可覆盖）；测试换成本地目标
 EXIT_IP_TARGET_URL = "https://api.ipify.org?format=json"
 DEFAULT_L1_TIMEOUT = 15.0
 
@@ -53,12 +50,8 @@ DEFAULT_L1_TIMEOUT = 15.0
 # busy_timeout 超时。分块后写锁窗口 = 一块的落账耗时（毫秒级），网络等待不持锁。
 PROBE_COMMIT_EVERY = 10
 
-# L0 与探测 lane 通道的单波并发上限：lane 数与并发同源（每波 lane 各选各的节点），
-# L0 不碰选择器、仅以信号量封顶。
 PROBE_CONCURRENCY = 20
 
-# L1 失败必须能区分「节点/选择失败」与「目标服务故障」——否则会建立一个
-# 「公网 IP 回显服务健康状态决定代理池健康」的错误系统。
 NODE_PROBE_FAILED = "NODE_PROBE_FAILED"
 NODE_TUNNEL_FAILED = "NODE_TUNNEL_FAILED"
 TARGET_SERVICE_FAILED = "TARGET_SERVICE_FAILED"
@@ -70,12 +63,10 @@ ATTR_TARGET = "target_service_failed"
 ATTR_UNCERTAIN = "uncertain_failure"
 TUNNEL_FAILURE_STATUS = 502
 
-# ── L2：生产业务（StoreBrowse）────────────────────────────────────
 L2_LEVEL = "L2"
 DEFAULT_L2_TIMEOUT = 30.0
 BUSINESS_OK = "BUSINESS_OK"
 INVALID_BUSINESS_RESPONSE = "INVALID_BUSINESS_RESPONSE"
-# 与 crawler 生产探测同一个 appid / 区服（Half-Life 2，长期在售）
 DEFAULT_BUSINESS_APPID = 220
 BUSINESS_CC = "us"
 
@@ -97,7 +88,7 @@ def _publish_probe_progress(level: str, probed: int, total: int | None = None) -
         payload["total"] = total
     try:
         bus.publish("maintenance.progress", **payload)
-    except Exception:  # noqa: BLE001 —— 进度事件不是生产依赖
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -116,8 +107,6 @@ async def current_maintenance_run() -> dict | None:
                 select(HealthRun)
                 .where(
                     HealthRun.finished_at.is_(None),
-                    # 手动节点检测也写 run 行但不持维护预约位；本读点只在
-                    # 预约位在位时被调用，只对 scheduled 运行行负责
                     HealthRun.channel == "scheduled",
                 )
                 .order_by(HealthRun.started_at.desc())
@@ -199,7 +188,7 @@ async def probe_node(
 ) -> ProbeResult:
     """让内核经指定 proxy 探测目标 URL，返回最基础的一次观测。"""
     headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-    path = quote(runtime_name, safe="")  # `#` 不编码会被当成 fragment 截断整个 path
+    path = quote(runtime_name, safe="")
     try:
         async with httpx.AsyncClient(trust_env=False, timeout=client_timeout, headers=headers,
                                      verify=_ssl_context(True)) as client:
@@ -207,13 +196,11 @@ async def probe_node(
                 f"{controller_url}/proxies/{path}/delay",
                 params={"url": url, "timeout": timeout_ms},
             )
-    except Exception as exc:  # noqa: BLE001 —— 控制器不可达是「内核没起来」的信号
-        # 控制器不可达 ≠ 节点坏：这一探根本没测到节点，不产生健康证据
+    except Exception as exc:  # noqa: BLE001
         return ProbeResult(runtime_name, False, None,
                            f"控制器请求异常：{type(exc).__name__}", valid=False)
 
     if resp.status_code == 404:
-        # 内核不认识这个名字：探错了对象，不是节点访问国外网站超时
         return ProbeResult(runtime_name, False, None, NOT_FOUND_DETAIL, valid=False)
     if resp.status_code in (401, 403):
         return ProbeResult(runtime_name, False, None,
@@ -260,7 +247,6 @@ async def _decide_probe_result(
 ) -> tuple[HealthOutcome, dict, tuple[int, str] | None]:
     """探测结论判定（结论已由调用方取得）。"""
     if state_push:
-        # 归属订阅仍在 = 来源在场（节点跟着订阅走，归属是一对一的身份组成部分）
         source_seen = node.subscription_id is not None
     else:
         source_seen = False
@@ -276,10 +262,6 @@ async def _decide_probe_result(
         target=url,
     )
     if not result.valid:
-        # 这一探没测到节点本身（内核不认识这个名字 / 控制器不可达）：只留观测，
-        # **不累加失败计数、不推进状态**。判"节点坏"的唯一依据是经该节点发真实
-        # 请求失败或超时；把"探不到对象"记成节点不健康会让一次换端口/时序错位
-        # 把整池判死。
         return (
             HealthOutcome(
                 node_id=node.node_id,
@@ -297,10 +279,7 @@ async def _decide_probe_result(
     state = previous
     mutations: tuple[int, str] | None = None
     if state_push:
-        # 连续失败计数：成功归零、失败累加。它既是状态机的输入（退休线判据），
-        # 也是台账事实——判 DEAD 的节点必须带着失败次数，不能留下"DEAD 且计数 0"。
         failures = 0 if result.ok else (node.consecutive_failures or 0) + 1
-        # 唯一的状态决策入口：健康只提供证据，规则仍归状态机
         target = evaluate_node_state(
             previous,
             source_seen=source_seen,
@@ -387,8 +366,6 @@ async def health_check_pool(
                 state_push=False,
             )
             outcomes.append(outcome)
-            # L0 成功只把延迟挂到节点行（排序键的持久化形态），观测行只留失败
-            # 证据——每天 288 拍 × 全池的成功流水没有任何读取方。
             if result.ok and isinstance(result.delay_ms, int) and result.delay_ms > 0:
                 node.l0_delay_ms = result.delay_ms
                 node.last_l0_at = now
@@ -402,14 +379,6 @@ async def health_check_pool(
     return tuple(outcomes)
 
 
-# ══ L1：出口 IP ══════════════════════════════════════════════════
-# 路径：PUT /proxies/GLOBAL 选中节点 → 经 mixed-port 发真实请求 →
-# 目标回显读回出口 IP。mixed-port 由运行配置携带（`prepare_runtime_config`），
-# 这里只读它，不做运行期 PATCH。
-#
-# **L1 首版只记录观测与 `exit_ip`，不碰 `state`**：连 `evaluate_node_state()` 都不
-# 调用。否则「ipify 503 → L1 fail → DEAD」就建立了「公网 IP 回显服务健康状态决定
-# 代理池健康」的错误系统。状态怎么消费，留给后面的规则层。
 
 
 @dataclass(frozen=True)
@@ -420,7 +389,6 @@ class ExitIpResult:
     ok: bool
     exit_ip: str | None
     detail: str
-    # 记录用；**不参与评分**——L0 的 `/delay` 与这里的业务请求耗时是两个量
     latency_ms: int | None
 
 
@@ -551,8 +519,6 @@ async def _commit_exit_ip_wave(
         for node, result in probed:
             if result.ok and result.exit_ip:
                 node.exit_ip = result.exit_ip
-                # 出口身份的可信时刻：维护/启动/爬前补探三条 L1 路径经此统一落账，
-                # 出口槽排序按它取「最近确认的身份」。
                 node.last_l1_at = now
             session.add(HealthObservation(
                 node_id=node.node_id,
@@ -618,7 +584,7 @@ async def exit_ip_check_pool(
                       for (_, name), result in zip(pairs, results)]
         else:
             probed: list[tuple[ProxyNode, ExitIpResult]] = []
-            for name in chunk:  # 严格串行（GLOBAL 兜底路径）
+            for name in chunk:
                 node = by_name.get(name)
                 if node is None:
                     continue
@@ -640,17 +606,10 @@ async def exit_ip_check_pool(
     return tuple(outcomes)
 
 
-# ══ L2：生产业务可用性 ═══════════════════════════════════════════
-# 回答的是「这个节点能不能真正完成 Holdexar 生产所需的 StoreBrowse 请求」：
-# HTTP 200 只是及格线，还要业务语义成立（信封 / AppID / success / 价格字段）。
-#
 # 上游契约的两条口径：
 # - `success` 是整数 `1`（**不是布尔 true**）——所以这里显式拒绝 bool；
 # - `final_price_in_cents` 是**字符串** `"999"`——所以按 crawler 的 `_to_int` 语义
 #   解析，而不是要求 int。
-#
-# 与 L1 一致：**只记录观测，不碰 `state`、不擦 `exit_ip`、不碰 L0/L1 的时间戳**。
-# 业务目标 503 不得变成节点 DEAD——否则就是让外部业务服务的健康决定代理池的健康。
 
 
 @dataclass(frozen=True)
@@ -733,7 +692,6 @@ def _validate_business(payload, appid: int) -> tuple[bool, str, int | None]:
         return False, f"store_items 里没有 appid={appid}", None
 
     success = item.get("success")
-    # success 契约是整数 1；布尔 true 属于契约不符（True == 1 会蒙混过关，故显式拒绝）
     if isinstance(success, bool) or success != 1:
         return False, f"success 不是整数 1（实际 {success!r}）", None
 
@@ -819,8 +777,6 @@ async def _commit_business_wave(
                 .execution_options(populate_existing=True)
             )
         for node, result in probed:
-            # 只有有效业务响应能晋升；目标服务返回错误或归因不确定不罚节点，
-            # 本地代理入口建隧失败与请求超时/连不上计入节点失败证据。
             if result.ok:
                 probe_ok: bool | None = True
             elif result.attribution == ATTR_NODE or result.detail.startswith(NODE_TUNNEL_FAILED):
@@ -831,19 +787,17 @@ async def _commit_business_wave(
                 probe_ok = None
             elif result.detail.startswith((NODE_PROBE_FAILED, UNCERTAIN_FAILURE)):
                 probe_ok = None
-            else:  # 经节点发请求超时/连不上：节点失败证据
+            else:
                 probe_ok = False
             if probe_ok is not None:
                 failures = 0 if probe_ok else (node.consecutive_failures or 0) + 1
                 node.consecutive_failures = failures
                 node.state = evaluate_node_state(
                     node.state,
-                    source_seen=True,  # 池文件成员 = 来源在场
+                    source_seen=True,
                     probe_ok=probe_ok,
                     consecutive_failures=failures,
                 )
-                # 业务结论时间随结论落章：首检复用窗与 6h 体检门槛
-                # 都按它判「最近检测过」
                 node.last_l2_at = now
             session.add(HealthObservation(
                 node_id=node.node_id,
@@ -889,7 +843,7 @@ async def business_check_pool(
     if not lanes:
         try:
             mixed_port = mixed_port_of(data_dir)
-        except Exception:  # noqa: BLE001 —— 运行配置缺失（单测环境）：端口缺省，探针自会失败
+        except Exception:  # noqa: BLE001
             mixed_port = 0
     rows = await session.execute(
         select(ProxyNode).where(ProxyNode.runtime_name.in_(names))
@@ -911,7 +865,7 @@ async def business_check_pool(
                       for (_, name), result in zip(pairs, results)]
         else:
             probed: list[tuple[ProxyNode, BusinessResult]] = []
-            for name in chunk:  # 严格串行（GLOBAL 兜底路径）
+            for name in chunk:
                 node = by_name.get(name)
                 if node is None:
                     continue

@@ -28,8 +28,7 @@ class CrawlerContext:
         self.http_client = http_client
         self.db_writer = db_writer
         self.session = session
-        self.queue: asyncio.Queue | None = None  # Scheduler 运行时注入
-        # 停止信号（Scheduler 运行时注入）：断网等待等长阻塞环节的打断通道
+        self.queue: asyncio.Queue | None = None
         self.stop_event: asyncio.Event | None = None
 
 

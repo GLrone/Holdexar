@@ -24,7 +24,6 @@ def is_gold_edition(package_name: str | None) -> bool:
     return "gold edition" in name_lower or "黄金版" in package_name
 
 
-# ── 价格段判定（各区 option_text 尾巴形态）──
 # 形态全集（勿按记忆补，按这个清单对齐）：
 #   ¥ 37.00 | 259 руб. | 1 850₸ | 169₴ | $5.49 USD | CLP$ 4.400 | P289.95
 #   1.95 KD | 21.95 SR | R 79.00 | 24.99 QR | RM23.50 | ฿189.00 | S/.22.00
@@ -86,9 +85,6 @@ def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
         return ""
     if not name_en:
         return ""
-    # 尾巴语言标注（"(English/Chinese/Japanese/Korean)" 式多语种斜杠列表）
-    # 不是版本：比对两侧都剥掉——否则带 CJK 标注命名的本体被误判成版本款
-    # 出局（三国志14 等）；返回的版本名保留原标注，历史标签不丢信息
     pkg_lower = _LANG_TAG_TAIL_RE.sub("", package_name).strip().lower()
     name_lower = _LANG_TAG_TAIL_RE.sub("", name_en).strip().lower()
     if pkg_lower == name_lower:
@@ -100,7 +96,6 @@ def extract_version_suffix(option_text: str | None, name_en: str | None) -> str:
         if pkg_lower.startswith(name_lower + sep):
             return package_name[len(name_en) + len(sep) :].strip(" -–—:：").strip()
 
-    # 兜底：关键词搜索
     edition_patterns = sorted(EDITION_DICT.keys(), key=len, reverse=True)
     for edition_key in edition_patterns:
         if edition_key in pkg_lower:

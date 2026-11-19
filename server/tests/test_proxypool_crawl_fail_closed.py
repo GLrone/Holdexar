@@ -82,12 +82,11 @@ async def _empty_pool_session(tmp_path):
     return factory()
 
 
-# ══ Case 1：内核在跑 + 池里 0 个出口 → 爬取不可用 ══════════════════
 @pytest.mark.asyncio
 async def test_case1_runtime_running_but_empty_pool_is_unavailable(tmp_path) -> None:
     """池文件为空（proxies: []）+ 入口在听 → 仍必须判不可用。"""
-    _write_pool(tmp_path, [])                      # 空池
-    rt.prepare_runtime_config(tmp_path, lanes=1)   # 生成 1 条 listener（模拟旧运行配置）
+    _write_pool(tmp_path, [])
+    rt.prepare_runtime_config(tmp_path, lanes=1)
     holders = _hold_ports(tmp_path)
     try:
         assert rt.current_runtime_proxy_url(tmp_path) is not None, (
@@ -105,12 +104,11 @@ async def test_case1_runtime_running_but_empty_pool_is_unavailable(tmp_path) -> 
             s.close()
 
 
-# ══ Case 2：池里有节点 + 0 条 lane → 爬取不可用 ════════════════════
 @pytest.mark.asyncio
 async def test_case2_pool_exists_but_no_lane_is_unavailable(tmp_path) -> None:
     """有出口槽但运行配置里没有 lane（listener 未生成）→ 不可用。"""
     _write_pool(tmp_path, ["n1", "n2"])
-    rt.prepare_runtime_config(tmp_path, lanes=0)   # 0 listener
+    rt.prepare_runtime_config(tmp_path, lanes=0)
     rt.runtime_config_path(tmp_path).write_text(
         yaml.safe_dump({"mode": "global", "mixed-port": 1, "proxies": []},
                        allow_unicode=True),
@@ -133,18 +131,14 @@ async def _crawl_with_slots(data_dir, slots):
     raise AssertionError("预期不可用，但一致性判定为通过")
 
 
-# ══ Case 3：lane 计划与出口快照不一致 → 不可用 ════════════════════
 @pytest.mark.parametrize(
     ("plan", "slots", "why"),
     [
-        # 34 条 lane / 33 个出口（真实现象）：长度不等
         ([{"lane": i, "port": 9000 + i, "exitIp": f"10.0.0.{i}", "node": f"n{i}"}
           for i in range(34)],
          [_slot(f"n{i}", f"10.0.0.{i}", i) for i in range(33)], "≠ 当前出口槽数"),
-        # 逐位不一致：同一位次绑了另一个节点的出口
         ([{"lane": 0, "port": 9000, "exitIp": "9.9.9.9", "node": "OLD"}],
          [_slot("n1", "1.1.1.1")], "lane 0 绑的是"),
-        # 计划里的出口与快照不符（节点换了落地）
         ([{"lane": 0, "port": 9000, "exitIp": "1.1.1.1", "node": "n1"}],
          [_slot("n1", "2.2.2.2")], "lane 0 绑的是"),
     ],
@@ -162,7 +156,6 @@ def test_case3_consistent_plan_passes() -> None:
     assert ok and reason == ""
 
 
-# ══ Case 4【核心】：GLOBAL 有节点 + Crawl Pool 为空 → 仍必须拒绝 ═════
 @pytest.mark.asyncio
 async def test_case4_global_available_but_crawl_pool_empty_still_refused(
     tmp_path, monkeypatch
@@ -172,15 +165,13 @@ async def test_case4_global_available_but_crawl_pool_empty_still_refused(
     把「维护视角可用」做到最强（mixed-port 在听、`current_runtime_proxy_url`
     明确给值），爬取口仍必须拒绝。
     """
-    _write_pool(tmp_path, [])                       # 爬取池为空
+    _write_pool(tmp_path, [])
     rt.prepare_runtime_config(tmp_path, lanes=1)
     holders = _hold_ports(tmp_path)
     try:
-        # 维护视角：一切"看起来正常"
         assert rt.current_runtime_proxy_url(tmp_path) is not None
         monkeypatch.setattr(rt, "current_runtime_proxy_url",
                             lambda _d: "http://127.0.0.1:1")
-        # 生产口：必须拒绝，且不得把 GLOBAL 地址当作 lane 交出去
         session = await _empty_pool_session(tmp_path)
         try:
             with pytest.raises(rt.RuntimeUnavailableError):
@@ -210,7 +201,6 @@ async def test_case4_start_job_refuses_when_pool_empty(tmp_path, monkeypatch) ->
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # 空池拒绝语义属代理形态：直连形态（现默认）不依赖池子，先切策略
     from app.domains.settings.service import set_value
 
     await set_value("proxy.strategy", "proxy_first")
@@ -241,7 +231,6 @@ async def _async(value):
     return value
 
 
-# ══ Case 5：正常出口池 → 正确返回 lane URL ════════════════════════
 @pytest.mark.asyncio
 async def test_case5_healthy_pool_returns_lane_urls(tmp_path) -> None:
     """池有 2 个不同出口 + lane 计划与快照一致 → 交出的正是两条 lane 的地址。"""

@@ -57,10 +57,6 @@ async def _seed_games() -> None:
 @pytest.mark.asyncio
 async def test_specials_scope_keeps_board_only_diff(monkeypatch):
     await _seed_games()
-    # 榜单：200 在目录层（重合剔除）/ 300 在监控层（重合剔除）/
-    # 500 免费（业务状态剔除；下架宽限排除层已退役，removed_at 不再剔除）/
-    # 999 榜上出现两次（榜内去重保一）/ 888 榜单独有（保留）
-    # → 尾段只剩 400、999、888
     async def _fake_board(key: str) -> list[int]:
         return [200, 300, 400, 500, 999, 888, 999]
 
@@ -95,9 +91,6 @@ async def test_discounts_scope_keeps_catalog_games(monkeypatch):
     from app.domains.crawl.service import resolve_scope_appids
 
     pairs = await resolve_scope_appids("discounts", None)
-    # 200 目录层保留（与 specials 差集段的关键差异）/ 300 监控层剔除 /
-    # 500 免费（业务状态剔除；下架宽限排除层已退役，removed_at 不再剔除）/
-    # 999 新面孔保留
     assert pairs == [(200, ""), (400, ""), (999, "")]
 
 
@@ -119,7 +112,6 @@ async def test_price_refresh_specs_gate_catalog_segment():
     tail = {"scope": "specials", "kind": "specials_backfill"}
     base = [{"kind": "missing"}, {"scope": "pool"}]
 
-    # 代理形态（显式选择）：默认全量——目录层 + 特惠榜差值段随默认开关打开
     await settings_service.set_value("proxy.strategy", "proxy_first")
     assert await crawl_service.default_queue_specs() == (
         base + [{"scope": "catalog"}, tail]
@@ -130,7 +122,6 @@ async def test_price_refresh_specs_gate_catalog_segment():
         base + [{"scope": "catalog"}, tail]
     )
 
-    # 只盯特定游戏：目录层与特惠榜差值段一并停
     await settings_service.set_value("crawl.catalog_refresh", False)
     assert await crawl_service.default_queue_specs() == base
 
@@ -149,13 +140,11 @@ async def test_direct_only_defaults_catalog_segments_off():
     await settings_service.set_value("proxy.strategy", "direct_only")
     assert await crawl_service.default_queue_specs() == base + [discounts]
 
-    # 显式打开 = 用户明确要目录层，直连形态同样执行（折扣段与目录段并存）
     await settings_service.set_value("crawl.catalog_refresh", True)
     assert await crawl_service.default_queue_specs() == (
         base + [discounts, {"scope": "catalog"}, tail]
     )
 
-    # 代理形态未显式设置时仍默认开（无折扣段——目录层覆盖大盘子）
     await settings_service.set_value("proxy.strategy", "proxy_first")
     await settings_service.delete_value("crawl.catalog_refresh")
     assert await crawl_service.default_queue_specs() == (
@@ -167,20 +156,19 @@ async def test_direct_only_defaults_catalog_segments_off():
 async def test_followed_games_ride_pool_regardless_of_discount_board(monkeypatch):
     """星标关注始终随轮：pool 是两形态常驻段，不看折扣榜——不在折扣列表的
     关注游戏照常进队列（直连下自动更新范围 = 关注层 + 折扣面的边界保证）。"""
-    await _seed_games()  # 300 = 监控层在册（favorite=第一优先级组，星级关注同语义）
+    await _seed_games()
     from app.domains.crawl.service import default_queue_specs, resolve_scope_appids
 
-    # 榜单故意不含 300：关注对象不依赖折扣榜
     async def _fake_board(key: str) -> list[int]:
         return [999]
 
     monkeypatch.setattr(boards_mod, "get_board", _fake_board)
 
     specs = await default_queue_specs()
-    assert {"scope": "pool"} in specs  # 直连/代理两形态常驻
+    assert {"scope": "pool"} in specs
 
     pairs = await resolve_scope_appids("pool", None)
-    assert (300, "") in pairs  # 在册对象照爬，与榜单无关
+    assert (300, "") in pairs
 
 
 @pytest.mark.asyncio
@@ -204,7 +192,6 @@ async def test_manual_full_queue_shares_one_composition(monkeypatch):
     from app.domains.crawl import service as crawl_service
     from app.domains.settings import service as settings_service
 
-    # 代理形态（显式选择）下的全量组成：missing+pool+catalog+specials
     await settings_service.set_value("proxy.strategy", "proxy_first")
     await _seed_games()
 
@@ -240,11 +227,10 @@ async def test_manual_full_queue_shares_one_composition(monkeypatch):
     assert ack["cycleId"] == crawl_service.active_cycle_id()
     assert captured == []
 
-    # 链在跑时重入被挡（防段间隙双开链）
     with pytest.raises(RuntimeError):
         await crawl_service.start_full_queue()
 
-    await crawl_service._queue_chain_task  # 等后台链收尾，防泄漏到别的用例
+    await crawl_service._queue_chain_task
     assert captured == [[
         {"kind": "missing"},
         {"scope": "pool", "kind": "manual", "resolved_appids": [300],
@@ -303,7 +289,6 @@ async def test_catalog_scope_excludes_non_crawl_states():
 
     catalog = [a for a, _ in await resolve_scope_appids("catalog", None)]
     assert catalog == [600]
-    # pool 段口径不变：仍然只有 active（released/excluded 不在其列）
     pool = [a for a, _ in await resolve_scope_appids("pool", None)]
     assert pool == [300]
 
@@ -345,7 +330,6 @@ async def test_queue_segment_switches_gate_specs():
     await settings_service.set_value("crawl.queue_pool", False)
     assert await crawl_service.default_queue_specs() == base_full[2:]
 
-    # 手动全库：catalog 恒含不受 catalog_refresh 影响，但逐段开关同样生效
     assert await crawl_service.default_queue_specs(full_library=True) == [
         {"scope": "catalog"},
         {"scope": "specials", "kind": "specials_backfill"},

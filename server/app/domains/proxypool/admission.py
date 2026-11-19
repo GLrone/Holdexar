@@ -63,10 +63,6 @@ class PromotionResult:
     promoted: bool
     detail: str
     snapshot_sha256: str | None
-    # 本次晋升按快照对齐的**节点数**（去重后的指纹数）。注意它包含"给已有节点
-    # 新增一个来源"的情形——那种情况 `ApplyResult.created/refreshed` 都是 0
-    # （`created` 只算新建的节点行、`refreshed` 只算本订阅原本已有的来源），
-    # 直接拿它们当"晋升生效了几个节点"会误读成 0。
     applied_nodes: int
 
 
@@ -87,7 +83,6 @@ class ExitResult:
     exited: bool
     detail: str
     removed_sources: int
-    # 来源全部流失、状态因此被推进的节点数（身份账本保留，状态如实反映「已无来源」）
     degraded_nodes: int = 0
 
 
@@ -118,8 +113,6 @@ async def exit_from_production(
     if not is_admitted(sub):
         return ExitResult(subscription_id, False, "本来就不在池里", 0)
 
-    # 退出会改 eligible 集合 → 用**既有规则**判断要不要重建（与同步/晋升同一条判据）。
-    # 函数内 import：`bootstrap` 反向依赖本模块的 `is_admitted`，模块级会成环。
     from app.domains.proxypool.bootstrap import pool_signature
 
     before_sig = await pool_signature(session)
@@ -129,7 +122,6 @@ async def exit_from_production(
     ))
     removed = len(source_node_ids)
     if source_node_ids:
-        # 节点跟着订阅走：订阅退出即它的节点整体离场（含健康观测），不留无主台账。
         await session.execute(
             delete(HealthObservation)
             .where(HealthObservation.node_id.in_(source_node_ids))
@@ -177,10 +169,8 @@ async def promote_to_active(
     写 ACTIVE，就会出现 `ACTIVE + Registry 无来源`。
     除边界本身，还有一道兜底：`skipped_stale` 一律**拒绝晋升**（保持 CANDIDATE）。
     """
-    # ① 先取边界（写锁），此后到本事务提交为止不会有更新的快照落库
     await lock_subscription_mutation(session, subscription_id)
 
-    # ② 边界内读：状态与快照都取"锁到手时"的最新事实
     sub = await session.get(ProxySubscription, subscription_id)
     if sub is None:
         raise PromotionError(f"订阅不存在：{subscription_id}")
@@ -195,11 +185,8 @@ async def promote_to_active(
     try:
         snap = await latest_snapshot(session, subscription_id, url=url)
     except SnapshotRecoveryError as exc:
-        # 行在但字节丢失 / sha 对不上 / 解不出来：fail-closed，不晋升
         raise PromotionError(f"最近一次成功快照不可恢复，拒绝晋升：{exc}") from exc
     if snap is None:
-        # 区分两种"没有可用快照"：完全没抓成功过 / 抓成功过但不是**当前 URL** 的
-        # （换链接后旧链接的快照不得顶替——那会让 Registry 与订阅 URL 对不上）
         any_ok = await session.scalar(
             select(func.count())
             .select_from(SubscriptionSnapshot)
@@ -216,9 +203,6 @@ async def promote_to_active(
             "没有成功快照，拒绝晋升（不重新抓取、不用失败快照或旧缓存）"
         )
 
-    # 晋升会改 eligible 集合 → 用**既有规则**判断要不要重建：
-    # 与同步路径同一条判据（eligible 集合/签名是否变化），不另立第二套。
-    # 函数内 import：`bootstrap` 反向依赖本模块的 `is_admitted`，模块级会成环。
     from app.domains.proxypool.bootstrap import pool_signature
 
     before_sig = await pool_signature(session)
@@ -228,9 +212,6 @@ async def promote_to_active(
         session, subscription_id=subscription_id, snapshot=snap, now=now, tag=tag
     )
     if result.skipped_stale:
-        # 兜底（边界内理论上不会发生）：手上有更新的成功快照时，绝不允许把 ACTIVE
-        # 写下去——那正是「ACTIVE + Registry 无来源」。保持 CANDIDATE，由下一轮
-        # 同步/晋升重新按最新快照来。
         raise PromotionError(
             "最近一次成功快照在晋升过程中已被更新的成功快照取代，拒绝晋升（保持 CANDIDATE）"
         )
@@ -263,9 +244,6 @@ async def promote_to_active(
     )
 
 
-# 健康自动转正的门槛：最近一次体检有可用节点即视为健康。准入的判断依据是
-# 体检事实，不是人工点头——用户导入订阅即意图投产；不健康的订阅不转正，
-# 其死节点也永远成不了出口槽（池内体检持续剔除）。
 AUTO_ADMIT_MIN_ALIVE = 1
 
 
@@ -297,7 +275,7 @@ async def auto_admit_healthy_candidate(
         return await promote_to_active(
             session, subscription_id=subscription_id, data_dir=data_dir, now=now
         )
-    except Exception as exc:  # noqa: BLE001 —— 转正不成保持候选原样，等下一轮再试
+    except Exception as exc:  # noqa: BLE001
         log_event(
             logger,
             f"订阅 {subscription_id} 体检健康但暂不能转正，保持候选",

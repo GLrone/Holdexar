@@ -45,7 +45,6 @@ DEFAULT_EVENT_DAYS = 90
 DEFAULT_SNAPSHOT_DAYS = 180
 DEFAULT_CHUNK = 5000
 DEFAULT_MAX_CHUNKS = 20
-# 连续失败不能挤掉可回退的成功快照。
 KEEP_SNAPSHOTS_PER_SUB = 3
 
 
@@ -57,7 +56,6 @@ class PruneResult:
     health_observations: int
     proxy_events: int
     snapshots: int
-    # 有一轮撞到 max_chunks 上限（还有剩）——下一轮继续，不是失败
     truncated: bool
 
     def as_dict(self) -> dict[str, int]:
@@ -198,7 +196,6 @@ async def prune_telemetry(
     )
     truncated = truncated or more
 
-    # 出口账本：每作业×出口数一行，是代理体系增长最快的表，必须封顶。
     run_exits, more = await _delete_chunked(
         session,
         """

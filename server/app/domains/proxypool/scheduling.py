@@ -76,8 +76,6 @@ from app.domains.proxypool.runtime import (
 
 logger = logging.getLogger(__name__)
 
-# 池内 L0 每探这么多个节点提交一次：写锁窗口 = 一块的落账耗时，不随池规模线性
-# 增长。与 L1/L2 内部分块（health.PROBE_COMMIT_EVERY）同值同源。
 L0_COMMIT_EVERY = PROBE_COMMIT_EVERY
 
 # rebuild 跨调用方互斥：take_rebuild_pending 的消费原子只保「取」不保「做」——
@@ -101,8 +99,6 @@ _MAINTENANCE_EVENT_LABELS = {
     MAINTENANCE_REBUILD: "代理通道重建",
 }
 
-# 体检节流：KV 键与默认间隔。节流判据 = 「间隔内 + 合格集签名未变」才跳过，
-# 二者任一不成立（或读取失败）都按到期处理——宁可多跑，不可漏跑。
 MAINTENANCE_INTERVAL_HOURS_KEY = "proxy.pool_maintenance_interval_hours"
 MAINTENANCE_LAST_SIG_KEY = "proxy.pool_maintenance_last_sig"
 DEFAULT_MAINTENANCE_INTERVAL_HOURS = 2
@@ -149,7 +145,7 @@ async def maintenance_due(session: AsyncSession, *, now: datetime) -> bool:
             return True
         signature = _eligible_signature(await eligible_runtime_names(session))
         return (await get_value(MAINTENANCE_LAST_SIG_KEY)) != signature
-    except Exception:  # noqa: BLE001 —— 读侧故障按到期处理
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "体检节流判据读取异常，本轮按到期处理",
@@ -168,7 +164,7 @@ async def _record_maintenance_signature(session: AsyncSession) -> None:
             MAINTENANCE_LAST_SIG_KEY,
             _eligible_signature(await eligible_runtime_names(session)),
         )
-    except Exception:  # noqa: BLE001 —— 签名写失败不影响主流程，下轮按到期重跑
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "体检签名写入失败，下一拍体检可能重复执行",
@@ -203,7 +199,7 @@ async def _announce_maintenance(kind: str, *, totals: dict | None = None) -> Non
         )
     try:
         bus.publish("maintenance.started", **payload)
-    except Exception:  # noqa: BLE001 —— 观测不是生产依赖
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -224,7 +220,6 @@ async def _conclude_maintenance(
             tag="结束",
         )
     elif kind == MAINTENANCE_HEALTH and summary:
-        # 整轮无一条节点结论（探测通道故障）：报「无结论」而不是「正常 0」
         log_event(
             logger,
             f"代理体检结束：用时 {elapsed_s / 60:.1f} 分钟，"
@@ -291,17 +286,10 @@ async def run_l0_cycle(
     **写锁窗口**：池内探针按 `L0_COMMIT_EVERY` 分块，逐块提交——整池一次提交会随池规模
     把写锁按住数分钟，同时段其它 job 的写入会撞满 `busy_timeout`。
     """
-    # 来源自愈（体检 → 池）：先按已准入订阅的最新成功快照补回缺失的来源关联
-    # （缺来源在合格集口径里等于出局，不补回就永久不可探），再清理失主来源。
-    # 前沿放在合格集快照之前——复活节点带来的合格集变化由
-    # 下面的 before/after 比较照常请求重建，不新增调度、不新增信号。
-    # 对齐失败只记日志：它是维护动作，不得拖垮 L0 与重建判定。
     # 对齐是写事务：过写调度器提交，随后的合格集读才不会把挂起写入
     # autoflush 到闸外。
     async with write_gate(WritePriority.BACKGROUND):
         try:
-            # 先删失主来源（指向已删除订阅的残留，存量自愈），再补缺失来源：
-            # 两侧都是「来源=当前事实」的对齐，语义相反、互为兜底。
             purged = await purge_orphan_subscription_sources(session, now=now)
             if purged:
                 log_event(
@@ -319,7 +307,7 @@ async def run_l0_cycle(
                     detail={"订阅编号": "、".join(str(i) for i in repaired)},
                 )
             await session.commit()
-        except Exception:  # noqa: BLE001 —— 对齐失败不阻断 L0 与重建判定
+        except Exception:  # noqa: BLE001
             log_event(
                 logger,
                 "体检结果与池账本对齐失败，本轮跳过",
@@ -333,14 +321,10 @@ async def run_l0_cycle(
     extra = {"url": target_url} if target_url else {}
     for start in range(0, len(targets), L0_COMMIT_EVERY):
         chunk = targets[start:start + L0_COMMIT_EVERY]
-        # 探测与落库的分离在 health_check_pool 内部完成（内部过闸提交）
         outcomes.extend(await health_check_pool(
             session, data_dir=data_dir, controller_url=controller_url, secret=secret,
             now=now, names=chunk, **extra,
         ))
-    # 恢复探测一律走自建临时内核：从数据库现取 DEAD 节点的配置渲染一份最小
-    # 内核，逐节点探测后立即停掉——不依赖旧链路内核在场（旧内核不在 ≠ 节点
-    # 永久出局）。
     await recover_dead_nodes_self_hosted(
         session, data_dir=data_dir, now=now, **extra,
     )
@@ -368,13 +352,11 @@ async def run_maintenance_cycle(
     """
     if crawler_busy():
         return None
-    # 预约包络：检查与预约之间无 await，此处取得失败属防御性兜底
     try:
         begin_maintenance(MAINTENANCE_HEALTH)
     except CrawlerBusyError:
         return None
     started = time.monotonic()
-    # 计划总量 = 池文件节点数（两层各一）：SSE started/progress 用它表达进度比例
     planned_total = len(pool_file_names(data_dir))
     await _announce_maintenance(
         MAINTENANCE_HEALTH, totals={"l1": planned_total, "l2": planned_total}
@@ -429,21 +411,12 @@ async def _maintenance_probe(
 ) -> MaintenanceResult:
     """维护探测主体（`run_maintenance_cycle` 的占用标志包络之内）。"""
     previous = await current_global_selection(controller_url, secret)
-    # 本轮体检的运行台账：独立计时（duration_ms）+ 节点级结论汇总，前端展示
-    # 「本次体检耗时 / 健康数」以此为准；逐节点观测按 run_id 归属。
     run = HealthRun(channel="scheduled", started_at=now)
     session.add(run)
-    # run 行即刻提交：探测是分钟级串行网络段，写事务若从这里一直开到探测循环的
-    # 首个分块提交，SQLite 写锁会被按住 10 个探测的时长（慢节点日可达数百秒），
-    # 同拍的价格落库/钱包/设置写入全部排队甚至撞满 busy_timeout。观测行的归属
-    # 只依赖 run.id，run 行先落库不影响一致性。
     async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
         await session.flush()
         await session.commit()
     before_eligible = await eligible_runtime_names(session)
-    # L1 会刷新出口身份，而 listener 数在重建时就定死了：身份变了（同一出口被两条
-    # lane 绑、或某节点换了落地）就必须再收敛一次 listener 数，否则台账一直比当前
-    # 出口集多。运行期的不变量由 `select_run_lanes` 就地保证，这里负责让内核侧收敛。
     exits_before = await exit_snapshot(session)
     # 每个探针各自兜异常：探针的程序异常不得逃出维护事务——那会跳过收尾提交，
     # 把本轮已写好的遥测留在未提交事务里。异常只记日志、该层本轮无结果（空
@@ -492,8 +465,6 @@ async def _maintenance_probe(
     # 写锁不得跨网络段持有。
     async with write_gate(WritePriority.BACKGROUND, label="health_observation"):
         await session.commit()
-    # L2 现在喂节点状态机：合格集可能因判死/复活而变化，与 L0 周期同款
-    # before/after 比较请求重建，不另立信号。
     if await eligible_runtime_names(session) != before_eligible:
         request_rebuild()
 
@@ -537,16 +508,10 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
         ports = runtime_lane_ports(data_dir)
         nodes = await eligible_nodes(session)
         slots = select_exit_slots(nodes, delays=await latest_l0_delays(session))
-        # 期望 lane 数必须与重建的口径一致（`len(slots) or None` 走 lane_count_for），
-        # 否则闸会放过/误伤与重建产物不同的现状
         expected_lanes = lane_count_for(len(eligible), len(slots) or None)
         if len(ports) != expected_lanes:
             return None
         plan = {int(e.get("lane", -1)): e for e in read_lane_plan(data_dir)}
-        # 重建必要性按**稳定身份**比较：出口集合一致 + 每个 lane 绑定的节点仍合格
-        # 且其当前出口身份未变。延迟排序漂移只换同一出口的代表节点，不换容量与
-        # 限流预算——不构成重建目标，避免 L0 刷新驱动无谓重建。双方都无出口身份
-        # 时（未跑过 L1）保留原口径：池文件一致 + lane 数一致即可。
         plan_exits = {str(e["exitIp"]) for e in plan.values() if e.get("exitIp")}
         slot_exits = {s.exit_ip for s in slots if s.exit_ip}
         if plan_exits or slot_exits:
@@ -564,7 +529,7 @@ async def _rebuild_skip_reason(session: AsyncSession, *, data_dir: Path) -> str 
         if alive:
             return "池与 lane 计划均与现状一致：重建无目标差异"
         return None
-    except Exception:  # noqa: BLE001 —— 必要性检查自身故障时放行重建，不拦真需求
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "重建必要性检查读取异常，本次仍执行重建",
@@ -679,7 +644,7 @@ async def consume_rebuild_after_crawl() -> None:
             )
     except (RuntimeConfigError, OSError):
         return
-    except Exception:  # noqa: BLE001 —— 收尾钩子绝不外抛
+    except Exception:  # noqa: BLE001
         log_event(logger, "任务收尾重建消费异常", level=logging.ERROR, exc_info=True)
 
 
@@ -727,13 +692,10 @@ async def run_proxypool_cycle(
         session, data_dir=data_dir, controller_url=controller_url, secret=secret,
         now=now, target_url=l0_target_url,
     )
-    # L0 段的提交边界（docstring「L0 独立提交一次」）：池函数已内部过闸提交，
-    # 此处兜住任何未在内部提交的 L0 段写入，维护开始前写锁必已放开
     async with write_gate(WritePriority.BACKGROUND):
         await session.commit()
 
     if crawler_busy():
-        # L0 是唯一允许在 crawler 占线时运行的维护动作
         return ProxypoolCycleResult(l0=l0, busy=True, rebuilt=None, maintenance=None)
 
     rebuilt = await run_pending_rebuild(
@@ -741,11 +703,9 @@ async def run_proxypool_cycle(
         runtime=runtime, exe_path=exe_path,
     )
     if rebuilt is not None:
-        # 重建换掉了实例：后续维护必须用**新的** controller
         controller_url = rebuilt.controller_url
         secret = getattr(runtime, "secret", secret)
 
-    # 体检节流：间隔内且合格集签名未变 → 本拍跳过（等价 busy 跳过，维护位不占）
     if not await maintenance_due(session, now=now):
         return ProxypoolCycleResult(l0=l0, busy=False, rebuilt=rebuilt, maintenance=None)
 

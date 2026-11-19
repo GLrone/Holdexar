@@ -129,7 +129,6 @@ MISSING_MAX_RETRIES = 5
 # 请求，配额有界）。
 BLOCKED_REPROBE_DAYS = 7
 
-# 批量参数列表分块，限制单段内存与驱动调用规模。
 _INSERT_CHUNK_ROWS = 2000
 
 _GAME_DEFAULTED_COLUMNS = frozenset(
@@ -376,11 +375,6 @@ class DbWriter:
         history_batch: list[dict] = []
         standard_candidates: dict[str, list[dict]] = {}
 
-        # ── 历史差量门禁基线：该 appid 每个 (区, sub) 的最新快照。
-        #    价格未变不写快照（走势图只需要变化点——线是平的，语义不损）。
-        #    比较键含价三件套 + 版本后缀 + gold 标：折扣往返/价格修正/名称
-        #    修正都会正常产生新快照。现价表不受门禁影响，照常每轮刷新
-        #    （updated_at = 最新验证时刻）。
         # ── 版本名防丢锚（同 sub_id 历史名）：browse 响应的 option name
         #    偶发缺失、档案导入行天生无名——空名行会被「标准版」判据误收：
         #    历史图混入版本价，current 的 min(sub_id) 选择还会让编号更小的
@@ -392,8 +386,6 @@ class DbWriter:
             currency = p.get("currency", "")
             is_gold = p.get("is_gold", False)
             version_suffix = p.get("version_suffix")
-            # 丢名行沿用同 sub_id 的历史名（known_suffix），与
-            # prev 基线同口径——标准版判定 / 差量比较全部一致
             if not version_suffix:
                 version_suffix = known_suffix.get(
                     int(p.get("sub_id") or 0)
@@ -431,7 +423,7 @@ class DbWriter:
                     version_suffix,
                     is_gold,
                 ):
-                    pass  # 与最新快照完全一致：跳过，不产生冗余行
+                    pass
                 else:
                     history_batch.append(
                         {
@@ -457,10 +449,6 @@ class DbWriter:
                         }
                     )
 
-            # 标准版候选: 非 gold 且非捆绑包，且名字无版本后缀——显式命名的
-            # Standard Edition 是本体的官方命名，归一化为标准版候选（否则
-            # 真本体被当版本款排除，某区全后缀时只能走兜底）。bundle-as-sub
-            # 与标准版无法从价格区分，靠 A4 识别标记隔离
             is_standard = (
                 (not is_gold)
                 and not is_bundle
@@ -487,8 +475,6 @@ class DbWriter:
                         "steam_answer": p.get("steam_answer"),
                     }
                 )
-        # 每个区域选标准版写入 current：优先有价（ok+price 有值）行——
-        # 该区任何版本有价就算有数；全部无价才落 missing 状态行
         current_batch: list[dict] = []
         seen_regions: set[str] = set()
         for region, candidates in standard_candidates.items():
@@ -527,7 +513,6 @@ class DbWriter:
                 if priced
                 else rows[-1]
             )
-            # 门禁降级行的实时状态在主循环里已算过，重算保持独立
             raw_status = p.get("price_status", "ok")
             price_cents = p.get("price")
             row_degraded = raw_status == "ok" and not _is_ok_price_row(price_cents)
@@ -553,15 +538,10 @@ class DbWriter:
                 }
             )
 
-        # 门禁降级按行不扩散：只对「选中行自身被门禁降级」的区欠账结转。
-        # 混合区（同区坏行 + 有效价选中行）恢复 ok 语义——坏行本就没有
-        # 价格落点，与此前一致，不构成新缺口
         degraded_regions = {
             row["region_code"] for row in current_batch if row.pop("degraded", False)
         }
 
-        # 门禁降级是失败观察；明确答复含 locked / 无购买选项。
-        # 导入和旧调用方没有显式 answer 时按状态推导。
         for row in current_batch:
             if row["region_code"] in degraded_regions:
                 row.update(attempt_outcome="failed", last_success_at=None, steam_answer=None)
@@ -626,8 +606,6 @@ class DbWriter:
                     )
                 }
                 if free_state is not None:
-                    # 字面量而非 excluded：无 ok 行信号时两键不进 set_——
-                    # 纯 locked/missing 响应绝不洗掉库内免费态
                     upsert_set["free_kind"] = free_state[0]
                     upsert_set["promo_end_at"] = free_state[1]
                 upsert_game = insert_game.on_conflict_do_update(
@@ -785,7 +763,6 @@ class DbWriter:
             return results
         _t0 = time.perf_counter()
         degraded = False
-        # 收尾参数预备（人工列索引 mtime 缓存的 dict 查找）在闸外完成
         ok_ids = [
             int(game_data.get("appid") or 0)
             for game_data, _ in entries
@@ -818,7 +795,6 @@ class DbWriter:
                         key: value for key, value in game_values.items()
                         if value is not None or key not in _GAME_DEFAULTED_COLUMNS
                     }
-                    # 免费态字段缺省的行保留已有标记。
                     game_groups["free_kind" in game_values].append(game_values)
                     now_dt = game_values["updated_at"]
                     if now_dt not in event_keys:
@@ -852,7 +828,6 @@ class DbWriter:
                         continue
                     group_set = dict(upsert_set)
                     if has_free:
-                        # excluded 引用随参数列表逐行携带（无 .values() 编译）
                         group_set["free_kind"] = insert_game.excluded.free_kind
                         group_set["promo_end_at"] = insert_game.excluded.promo_end_at
                     stmt = insert_game.on_conflict_do_update(
@@ -909,8 +884,6 @@ class DbWriter:
                             .values(fail_count=0)
                         )
                         ledger_ms += _ms_since(_tl)
-                    # 欠账结转：门禁降级行计一次失败（递增 + 穷尽转 blocked）。
-                    # 常规 upsert 不带 fail_count（避免误清），账本专门走 bump。
                     for regions, aids in degraded_groups.items():
                         _tl = time.perf_counter()
                         await session.execute(
@@ -929,8 +902,6 @@ class DbWriter:
                     for chunk in _chunks(all_history, _INSERT_CHUNK_ROWS):
                         await session.execute(hist_stmt, chunk)
                     history_ms = _ms_since(_th)
-                # 收尾（复活清标）保存点内联：与主段同事务一次
-                # 提交，段后不再两次重排写闸；失败只回滚保存点不拖垮主段
                 _tp = time.perf_counter()
                 sp = await session.begin_nested()
                 try:
@@ -1050,8 +1021,6 @@ class DbWriter:
                         else:
                             await sp.rollback()
                         results[i] = ok
-                    # 收尾保存点内联：本段 ok 款复活清标 + 人工列补挂与主段
-                    # 同事务提交；失败只回滚保存点不拖垮本段
                     chunk_ok_ids = [
                         int(game_data.get("appid") or 0)
                         for i_in_chunk, (game_data, _) in enumerate(chunk)
@@ -1076,7 +1045,6 @@ class DbWriter:
                     await session.commit()
                     commit_ms += _ms_since(_tm)
                 except Exception as e:  # noqa: BLE001 — 段级失败只作废本段
-                    # 段级失败只作废本段（其余段照常），与主路径段语义对齐
                     results[start : start + len(chunk)] = [False] * len(chunk)
                     log_event(
                         logger,

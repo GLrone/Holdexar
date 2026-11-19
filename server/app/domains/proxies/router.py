@@ -42,7 +42,7 @@ async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
                 tag="成功",
                 detail={"订阅": sub_id, "可用节点": alive},
             )
-    except Exception as e:  # noqa: BLE001 —— 转正不成本身不构成首检失败
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             f"订阅 {sub_id} 首检健康（可用 {alive} 个节点）但暂时无法转正，等同步落快照后自动重试",
@@ -52,7 +52,7 @@ async def _auto_promote_after_check(sub_id: int, alive: int) -> None:
 
 
 class ProxyAdd(BaseModel):
-    url: str | None = None  # scheme://user:pass@host:port 或 host:port（批量用 \n 分隔）
+    url: str | None = None
     scheme: str = "http"
     host: str = ""
     port: int = 0
@@ -70,14 +70,12 @@ class StrategyUpdate(BaseModel):
     strategy: str | None = None
     clashPort: int | None = None
     clashPortMode: str | None = None
-    # 内核随服务自启开关（None = 不变）
     autostart: bool | None = None
-    # 自动节点体检开关（None = 不变；手动检测不受闸）
     healthAuto: bool | None = None
 
 
 class ClashStart(BaseModel):
-    subscriptionId: int | None = None  # proxy_subscriptions.kind=clash；缺省用最近一条
+    subscriptionId: int | None = None
 
 
 class ClashSwitch(BaseModel):
@@ -112,7 +110,7 @@ def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
                 detail={"订阅": sub_id, "节点总数": r.get("total"), "可用节点": r.get("alive")},
             )
             await _auto_promote_after_check(sub_id, int(r.get("alive") or 0))
-        except Exception:  # noqa: BLE001 —— 首检失败不影响内核已生效的事实
+        except Exception:  # noqa: BLE001
             log_event(
                 logger,
                 f"Clash 订阅 {sub_id} 首检的节点检测失败，可稍后手动检测",
@@ -125,15 +123,15 @@ def _spawn_first_check(sub_id: int, *, probe_all: bool = True) -> None:
 
 
 class SubscriptionAdd(BaseModel):
-    kind: str  # clash | plain
+    kind: str
     url: str
     label: str | None = None
 
 
 class SubscriptionUpdate(BaseModel):
-    label: str | None = None  # 订阅名称；空串清名
-    url: str | None = None  # 订阅链接；变更时 clash 订阅自动重拉
-    autoRefresh: bool | None = None  # 自动更新开关；False = 定时刷新跳过，只手动重拉
+    label: str | None = None
+    url: str | None = None
+    autoRefresh: bool | None = None
 
 
 @router.get("")
@@ -199,7 +197,6 @@ async def set_strategy(req: StrategyUpdate):
     return await service.get_strategy()
 
 
-# ─── Clash 模式 ──────────────────────────────────────────────
 # ⚠️ 固定路径必须注册在动态路径 /{proxy_id} 系列之前，否则
 #    POST /clash/test 会被 POST /{proxy_id}/test 抢先匹配（422）——犯过
 
@@ -240,8 +237,6 @@ async def clash_start(req: ClashStart):
     if not detect["found"]:
         raise HTTPException(status_code=400, detail="未找到内核，请先安装")
 
-    # 订阅从持久化订阅表取（可存多条，按 kind=clash 区分）；
-    # 废弃订阅（不可用 >95%）跳过——后端不再选用，但保留给用户手动处理
     subs = await service.list_subscriptions("clash", reveal=True)
     if not subs:
         raise HTTPException(status_code=400, detail="尚未保存 Clash 订阅链接，请先添加")
@@ -256,8 +251,6 @@ async def clash_start(req: ClashStart):
                 "后端不再使用；如需恢复请先检测节点确认恢复达标，或手动删除该订阅",
             )
 
-    # 取配置按候选遍历：请求的订阅取不到（链接失效且无本地缓存）时依次
-    # 降级到其余可用订阅，内核起不来不允许是「下载失败」一个原因
     try:
         picked = await service.resolve_startable_clash(
             settings.data_dir, req.subscriptionId,
@@ -274,10 +267,9 @@ async def clash_start(req: ClashStart):
             detect["path"], picked["configPath"], subscription_url=sub_url,
             **port_options,
         )
-    except Exception as e:  # noqa: BLE001 —— 配置已到手，起不来是内核侧问题
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"内核启动失败: {e}")
 
-    # 流量/节点数落库（启动即顺手回填）；名称走三档链（用户改名 > 机场名 > 缓存）
     await service.apply_subscription_name_chain(sub_id, picked.get("title"))
     if picked.get("userinfo"):
         await service.mark_imported(
@@ -285,14 +277,11 @@ async def clash_start(req: ClashStart):
             {"traffic": picked["userinfo"], "nodes": picked.get("nodes"),
              "cached": picked.get("cached", False)},
         )
-    # 这次启动用的订阅落为「用户最近一次显式选中」——前端回显与下次启动
-    # 缺省同源（降级启到别的订阅时也以实际结果为准）
     await service.remember_selected_clash_sub(sub_id)
     await service.record_event(
         kind="clash", target="subscription", proxy_label=f"clash:{status.get('port')}"
     )
 
-    # ── 启动即首检：后台全量检测写账本，不阻塞启动响应 ──
     _spawn_first_check(sub_id)
     fallback_from = None
     if picked["attempts"]:
@@ -344,7 +333,6 @@ async def clash_switch(req: ClashSwitch):
                 sub["url"], settings.data_dir, await service._saved_proxy_candidates(),
                 target_path=sub_cache,
             )
-        # 交给内核的是项目生成的运行配置（地区规则/接管设置不进内核）
         runtime_path = clash_manager.materialize_subscription_config(sub_cache)
         async with service._clash_test_lock():
             port_options = await service.kernel_port_options()
@@ -358,7 +346,6 @@ async def clash_switch(req: ClashSwitch):
         raise HTTPException(status_code=502, detail=f"切换失败: {e}")
 
     _spawn_first_check(sub["id"], probe_all=True)
-    # 切换成功即「用户最近一次显式选中」，前端回显与下次启动缺省同源
     await service.remember_selected_clash_sub(sub["id"])
     return {"switched": True, **new_status}
 
@@ -422,9 +409,6 @@ async def events(limit: int = 200):
     return await service.recent_events(limit)
 
 
-# ─── 订阅链接（clash / plain）────────────────────────────────
-
-
 @router.get("/subscriptions")
 async def list_subscriptions(kind: str | None = None):
     return {"items": await service.list_subscriptions(kind)}
@@ -449,10 +433,6 @@ async def add_subscription(req: SubscriptionAdd):
         result = await service.add_subscription(req.kind, req.url, req.label)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # 添加即生效（全自动化红线）：clash 订阅验证下载成功后自动走完
-    # 「喂池快照 → 内核拉起/切换 → 后台首检 → 健康自动转正」全链，
-    # 不再依赖 30min 同步拍或用户手动启动——否则内核从未跑过的新订阅
-    # 会永久停在候选态，节点永不进池。生效链失败只降级提示，不回滚保存。
     if req.kind == "clash" and result.get("nodes"):
         result.update(await _effectuate_new_subscription(int(result["id"]), result["url"]))
     return result
@@ -483,14 +463,13 @@ async def _effectuate_new_subscription(sub_id: int, url: str) -> dict:
                     detect["path"], str(runtime_path), subscription_url=url,
                     **port_options,
                 )
-            # 启动成功即「用户最近一次显式选中」，与启动/切换端点同源
             await service.remember_selected_clash_sub(sub_id)
             await service.record_event(
                 kind="clash", target="subscription",
                 proxy_label=f"clash:{new_status.get('port')}",
             )
             extra["kernelStarted"] = True
-    except Exception as e:  # noqa: BLE001 —— 生效链失败不影响保存结果
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             f"订阅 {sub_id} 自动启动内核失败，留待手动启动或重启自启",
@@ -565,7 +544,7 @@ async def sync_subscription(sub_id: int):
                     f"Clash 订阅 {sub_id} 刷新后首检完成：共 {r.get('total')} 个节点，{r.get('alive')} 个可用",
                     detail={"订阅": sub_id, "节点总数": r.get("total"), "可用节点": r.get("alive")},
                 )
-            except Exception:  # noqa: BLE001 —— 首检失败不影响刷新事实
+            except Exception:  # noqa: BLE001
                 log_event(
                     logger,
                     f"Clash 订阅 {sub_id} 刷新后的节点检测失败，可稍后手动检测",

@@ -4,13 +4,10 @@
 """
 from __future__ import annotations
 
-# Steam 端点
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 
-# 数据新鲜度阈值（小时）
 STALE_HOURS = 12
 
-# 区域列表 (code, display_name, currency)
 # 覆盖 Steam 全货币区（欧元区以 pt 为基线 cc，返回 EUR 统一定价）
 CC_LIST: list[tuple[str, str, str]] = [
     ("cn", "中国（CNY）", "CNY"),
@@ -31,7 +28,6 @@ CC_LIST: list[tuple[str, str, str]] = [
     ("ph", "菲律宾（PHP）", "PHP"),
     ("tw", "中国台湾（TWD）", "TWD"),
     # ↑ 中国香港、中国台湾为固有命名，不得改为"香港特别行政区"等变体
-    # ── 扩展货币区 ──
     ("kw", "科威特（KWD）", "KWD"),
     ("sa", "沙特阿拉伯（SAR）", "SAR"),
     ("za", "南非（ZAR）", "ZAR"),
@@ -62,16 +58,8 @@ DEFAULT_WORKER_COUNT = 30
 # 直连 Steam 在部分网络下 TLS 握手可能超过 10s，超时放宽到 20s
 HTTP_TIMEOUT = 20
 
-# ── 主轮 worker 数：按可用出口 IP 节点数开启（crawl/service._resolve_worker_count）──
-# 口径 = proxies.pool_stats() 的 available：手动池可用 + Clash 在跑订阅的存活
-# 出口 IP 按「一个出口 IP 算一个」去重（多入口同落地只算一个）。
-# 规则：一个可用出口 IP 开一个 worker 参与并发，上限 WORKERS_MAX；无可用出口
-# 数据（未配代理 / 内核没跑，直连形态）回退 DEFAULT_WORKER_COUNT。
 WORKERS_MAX = 60
 
-# 请求频率主闸在 crawler/rate_limit.py（200 发/5 分钟，与捆绑包刷新共享窗口预算）。
-
-# 版本后缀关键词字典（key 统一小写匹配）
 EDITION_DICT = {
     "deluxe edition": "豪华版",
     "ultimate edition": "终极版",

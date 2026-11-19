@@ -98,7 +98,6 @@ class Global429CircuitBreaker:
                 self._consecutive_429 = 0
 
 
-# 全局单例
 global_429_breaker = Global429CircuitBreaker()
 
 
@@ -150,9 +149,6 @@ class SteamHttpClient:
     ):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
-        # 直连为标准形态（browse 接口按 country_code 返回各区数据，出口 IP
-        # 不参与判定；加速器在系统网络层透明生效，无需应用侧代理）。
-        # proxy_url 仅供调试通道显式指定（CLI --proxy / 环境变量）。
         self.proxy_url = proxy_url
         self.rate_limiter = rate_limiter
         self.breaker = breaker
@@ -171,7 +167,6 @@ class SteamHttpClient:
         return {
             "Accept-Language": "en-US,en;q=0.9",
             "User-Agent": _USER_AGENTS[self._ua_index],
-            # 断连语义：匀速限流下不留 keep-alive，避免悬挂连接被中间层回收
             "Connection": "close",
         }
 
@@ -256,9 +251,7 @@ class SteamHttpClient:
                             raise Exception("Invalid JSON Response")
 
                     elif response.status == 429:
-                        # ── 幻觉 429 检测：状态码 429 但 body 是有效 JSON ──
-                        #
-                        # ⚠️ 形状限定为 **appdetails 形状**（`{appid: {success, data}}`
+                        # 形状限定为 **appdetails 形状**（`{appid: {success, data}}`
                         # 或裸 `{success, data}`）。只认 `success: true` 是不够的：
                         # `success` 是「这次请求处理成功」的标记，它出现在任何 JSON
                         # API 的常规成功体里——一旦某个调用方的成功体恰好带顶层
@@ -314,7 +307,6 @@ class SteamHttpClient:
                         )
 
                     elif response.status in (403, 404):
-                        # 永久性封锁，不重试
                         self._record("e4xx", started, url)
                         raise aiohttp.ClientResponseError(
                             response.request_info,

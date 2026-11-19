@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 # 订阅链接的静态加密用途串（secretbox 按此派生独立密钥）
 PURPOSE = "proxy-subscription"
 
-# 解密失败的订阅行用户语言提示（用户面不出现实现词）
 UNREADABLE_MESSAGE = "订阅链接无法在本机解密，请删除该订阅后重新添加"
 
 

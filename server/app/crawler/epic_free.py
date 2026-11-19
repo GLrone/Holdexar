@@ -43,30 +43,15 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-# 现役端点（旧域名 store-site-backend-static.ak 已 404）
 FREE_GAMES_URL = (
     "https://store-site-backend-static-ipv4.ak.epicgames.com/freeGamesPromotions"
 )
-# 移动端领取兜底入口：官方移动商店页（无 locale 前缀，App 内跳转落地）
-# 领取动作只在 App 内存在——该链接给的是「去哪领」而非「一键领」
 MOBILE_PAGE_URL = "https://store.epicgames.com/mobile"
-# 移动端每周白送兜底信号：官方 CMS 移动页的 Free Giveaway breaker
-# （URL 固定、内容每周四换）。主判别走 GamerPower 真名 → sandbox Claim
-# 结账直链链，breaker 只在自动源全失败时兜底出卡（仅营销图 + 移动页链接）。
 MOBILE_CMS_URL = (
     "https://store-content-ipv4.ak.epicgames.com/api/en-US/content/static/mobile"
 )
-# 移动商店页兜底链接（breaker 卡与无入口时的落点）
 EPIC_MOBILE_PAGE_URL = MOBILE_PAGE_URL
-# 移动白送自动源：GamerPower 公共 API 免登记，android 平台限免里收录
-# Epic 移动白送（真名/日期/open 跳转链；描述含 "Epic Games Store App"
-# 与 PC 端 Epic 限免及他站 key 赠品区分）。
 GAMERPOWER_ANDROID_URL = "https://www.gamerpower.com/api/giveaways?platform=android"
-# 移动端 Claim 判别数据源：egs-platform-service 公开 sandbox offers 接口
-# （无需认证；UA 用 App 风格）。任一 sandbox 在 android/ios 名下有 0 元
-# Claim 条目即当期移动白送 offer——官方数据直出 offerId/截止日，结账直链
-# 当场拼装；sandbox 来自 GamerPower 真名的持久化查询解析，GamerPower
-# 失败时退用促销端点白送元素的 namespace 逐个探测。
 EGS_PLATFORM_SERVICE = "https://egs-platform-service.store.epicgames.com"
 EGS_APP_UA = "EpicGamesStore/50102 Android/14"
 # 标题 → sandbox 解析：商店持久化查询（HTML 页有 CF，API GET 放行——
@@ -89,14 +74,13 @@ _EGSSTEAM_HTTP_HEADERS = {
     "Referer": "https://store.epicgames.com/en-US/",
 }
 
-# 改名过渡别名：并行会话半成品的引用兜底（内部用点与新名并存）
 STEAM_HTTP_HEADERS = _EGSSTEAM_HTTP_HEADERS
 STORESEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 # 英文标题用于匹配（中文标题对 storesearch 无效；en-US 拉双语对照）
 EN_PARAMS = {"locale": "en-US", "country": "US"}
 CN_PARAMS = {"locale": "zh-CN", "country": "CN"}
 
-_REQUEST_INTERVAL = 0.5  # storesearch 批间隔 500ms（对齐 boards 批间隔）
+_REQUEST_INTERVAL = 0.5
 
 
 @dataclass(frozen=True)
@@ -107,18 +91,18 @@ class EpicFreeGame:
     使用；标记链不用它们，缺省为空即可。
     """
 
-    title: str           # 英文标题（匹配键）
-    title_cn: str        # Epic 中文标题（可能为空，仅日志对照）
-    appid: int | None    # Steam appid；None = 匹配失败/未上架
-    free_start: str      # 白送开始日（UTC 日期原文，对齐 epic_date 单日期语义）
+    title: str
+    title_cn: str
+    appid: int | None
+    free_start: str
     offer_type: str      # BASE_GAME / BUNDLE / ADD_ON
-    upcoming: bool       # True = 下周预告（尚未开始白送）
-    element_id: str = "" # Epic 目录元素 id（中英响应按此对键回填 title_cn）
+    upcoming: bool
+    element_id: str = ""
     namespace: str = ""  # Epic 目录命名空间 id（移动端 sandbox offers 探测键）
-    free_end: str = ""   # 白送结束日（UTC 日期原文，取白送 offer 里最晚的）
-    image: str = ""      # 横版封面（OfferImageWide 优先，回退店头图/缩略图）
-    url: str = ""        # Epic 商店页（productSlug → pageSlug → urlSlug 三级取）
-    price_original: str = ""  # 原价文案（中文区响应优先，如 "¥88.00"；划线展示用）
+    free_end: str = ""
+    image: str = ""
+    url: str = ""
+    price_original: str = ""
 
 
 def _iter_offers(promos: dict | None) -> list[dict]:
@@ -222,8 +206,6 @@ def parse_free_games(payload: dict) -> list[EpicFreeGame]:
         if not starts:
             continue
         ends = [d for o in free_offers if (d := _iso_to_day(o.get("endDate")))]
-        # upcoming 判定：全部白送 offer 均未到 startDate（预告元素）；
-        # 只要有一条已开始即视为「当期在送」
         now = datetime.now(timezone.utc)
         upcoming = all(
             datetime.fromisoformat(o["startDate"].replace("Z", "+00:00")) > now
@@ -232,7 +214,7 @@ def parse_free_games(payload: dict) -> list[EpicFreeGame]:
         out.append(
             EpicFreeGame(
                 title=e.get("title") or "",
-                title_cn="",  # 由调用方在拉中文响应后回填
+                title_cn="",
                 appid=None,
                 free_start=min(starts),
                 offer_type=e.get("offerType") or "",
@@ -321,7 +303,6 @@ async def _fetch_parsed(
     两个入口共用：fetch_free_games（标记链，再做 storesearch 匹配）与
     fetch_free_offers（仪表盘卡片，纯展示轻量链）。
     """
-    # ① 英文促销响应（匹配键源）
     try:
         async with session.get(FREE_GAMES_URL, params=EN_PARAMS,
                                headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
@@ -347,7 +328,6 @@ async def _fetch_parsed(
     if not games:
         return []
 
-    # ② 中文响应回填对照标题与原价文案（失败不影响主链）
     try:
         async with session.get(FREE_GAMES_URL, params=CN_PARAMS,
                                headers=STEAM_HTTP_HEADERS, proxy=proxy) as resp:
@@ -734,7 +714,6 @@ async def fetch_mobile_freebie(proxy: str | None = None,
         freebie = parse_gamerpower_mobile(payload)
         if not freebie:
             return None
-        # 领取入口：结账直链 → 移动商品页 → 官方移动商店页（App 内领取）
         checkout = await resolve_mobile_checkout(freebie["title"], proxy)
         if checkout:
             freebie["url"] = checkout["url"]
@@ -749,9 +728,6 @@ async def fetch_mobile_freebie(proxy: str | None = None,
                 freebie["url"] = page["url"]
                 freebie["direct"] = True
         if not checkout and not (page and page.get("url")):
-            # 官方未公开该期移动 offer：入口只能是移动商店页本身
-            # （领取动作只在 App 内存在），不做 open 链跳转——第三方跳转
-            # 落地同样回到移动页，多绕一跳不增加可达性
             freebie["url"] = MOBILE_PAGE_URL
             freebie["direct"] = False
         return freebie
@@ -789,7 +765,6 @@ async def resolve_mobile_freebie(games: list[EpicFreeGame],
     if best is None:
         return None
     end, g, claims = best
-    # 结账直链（需浏览器 Epic 登录态）；双端 Claim 条目合并成单链
     parts = dict.fromkeys(
         f"1-{c['sandboxId']}-{c['offerId']}" for c in claims)
     query = "&".join(f"offers={p}" for p in parts)
@@ -819,7 +794,6 @@ async def fetch_free_games(proxy: str | None = None,
             log_event(logger, "本轮 Epic 没有白送元素")
             return []
 
-        # ③ storesearch 逐个匹配（间隔 500ms 防限流）
         matched = 0
         for g in games:
             object.__setattr__(g, "appid", await match_steam_appid(session, g.title, proxy))

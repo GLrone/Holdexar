@@ -95,7 +95,6 @@ async def _apply_canonical_probe(db, sub_id: int, result: dict, now):
     return await proxies_service._summarize_node_results(sub_id, [result], [result['name']], now, registry)
 
 
-# ─── 冷却递增 ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -136,7 +135,6 @@ async def test_ok_resets_cooldown(db):
         assert registry.consecutive_failures == 0
 
 
-# ─── 权威节点状态与恢复 ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -190,7 +188,6 @@ async def test_failed_probe_after_recovery_updates_only_registry_state(db):
         assert registry.consecutive_failures == 1
 
 
-# ─── 订阅停用判定（无可用节点 / 资源失效）─────────────────────
 
 
 @pytest.mark.asyncio
@@ -198,7 +195,6 @@ async def test_subscription_deprecated_when_no_alive_node(db):
     """一个可用节点都没有 → 订阅停用（deprecated=True，带原因）；不删除。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    # 100 节点全不通：没有可用出口即停用
     results = [_fail(f"bad{i}") for i in range(100)]
     names = [r["name"] for r in results]
     alive, _, deprecated = await proxies_service._summarize_node_results(sub_id, results, names, now, {})
@@ -216,7 +212,6 @@ async def test_subscription_stays_active_with_few_alive_nodes(db):
     """只要还有可用节点就不停用——存活少不等于资源失效。"""
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
-    # 100 节点只有 1 个通：仍可用，不触发停用
     results = [_ok("ok0")] + [_fail(f"bad{i}") for i in range(99)]
     names = [r["name"] for r in results]
     alive, _, deprecated = await proxies_service._summarize_node_results(sub_id, results, names, now, {})
@@ -232,7 +227,6 @@ async def test_subscription_deprecated_auto_recover(db):
     bad = [_fail(f"bad{i}") for i in range(96)] + [_ok(f"ok{i}") for i in range(4)]
     names = [r["name"] for r in bad]
     await proxies_service._summarize_node_results(sub_id, [_fail(f'bad{i}') for i in range(100)], names, now, {})
-    # 修复到 50 个通
     fixed = [_ok(f"ok{i}") for i in range(50)] + [_fail(f"bad{i}") for i in range(50)]
     _, _, deprecated = await proxies_service._summarize_node_results(sub_id, fixed, names, now, {})
     assert deprecated is False
@@ -248,14 +242,12 @@ async def test_cooldown_nodes_counted_by_registry(db):
     sub_id = await _seed_sub(db)
     now = proxies_service._naive(proxies_service.get_beijing_time_obj())
     await _seed_registry_node(db, sub_id, "n2", last_l2_at=now)
-    # n2 冷却跳过：本轮只探 n1（失败）
     cooldowns = {"n2": now + timedelta(minutes=30)}
     registry = await _registry_map(db, sub_id, ["n1", "n2"])
     alive, _, _ = await proxies_service._summarize_node_results(sub_id, [_fail('n1')], ['n1', 'n2'], now, registry)
     assert alive == 1, "n1 探测失败、n2 冷却跳过按权威账本存活计入"
 
 
-# ─── 6h 体检门槛 ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -277,7 +269,7 @@ async def test_health_summary_refresh_updates_alive_stats(db):
 async def test_health_summary_marks_subscription_without_alive_nodes_deprecated(db):
     """账本里没有存活证据 → 订阅降级判定生效（含原因）。"""
     sub_id = await _seed_sub(db)
-    await _seed_registry_node(db, sub_id, "n1")  # 无 last_l2_at → 不计存活
+    await _seed_registry_node(db, sub_id, "n1")
     state = await proxies_service.refresh_subscription_health_summary()
     assert state == "refreshed"
     async with db() as session:
@@ -290,7 +282,6 @@ async def _async_none():
     return None
 
 
-# ─── 检测串行锁（三源互斥：手动/启动首检/定时体检）─────────
 
 
 @pytest.mark.asyncio
@@ -311,13 +302,12 @@ async def test_clash_nodes_waits_for_shared_lock(db, monkeypatch):
     async with proxies_service._clash_test_lock():
         task = asyncio.create_task(proxies_service.test_clash_nodes())
         await asyncio.sleep(0.05)
-        assert not task.done()  # 未拿到锁：函数体未执行（连「未运行」都没抛）
+        assert not task.done()
 
     with pytest.raises(ValueError, match="Clash 未运行"):
-        await task  # 锁释放后放行，进入函数体立即因未运行报错
+        await task
 
 
-# ─── 检测会话（后台执行 + 进度快照）─────────────────────────
 
 
 @pytest.fixture(autouse=True)
@@ -383,8 +373,8 @@ async def test_clash_test_start_reuses_active_session(db, monkeypatch):
 
     monkeypatch.setattr(proxies_service, "_test_clash_nodes_impl", slow_impl)
     proxies_service.clash_test_start()
-    await asyncio.sleep(0.02)  # 让后台任务起跑、进入 impl
-    proxies_service.clash_test_start()  # 会话仍 active → 复用，不 spawn
+    await asyncio.sleep(0.02)
+    proxies_service.clash_test_start()
     release.set()
     await asyncio.sleep(0.05)
     assert len(calls) == 1
@@ -438,7 +428,6 @@ async def test_clash_nodes_direct_call_finalizes_session(db, monkeypatch):
     assert snap["probed"] == 1
 
 
-# ─── 探测 lane（注入 / 解析 / 重启判定）─────────────────────
 
 
 def _sub_config() -> str:
@@ -480,7 +469,6 @@ def test_inject_probe_lanes_adds_20_lanes_and_keeps_subscription() -> None:
     assert len(lanes) == PROBE_LANE_COUNT
     assert len(listeners) == PROBE_LANE_COUNT
     assert all(g["type"] == "select" and g.get("include-all") for g in lanes)
-    # listener 逐条指向本组，且不碰订阅自己的组与混合口
     assert all(
         listener["proxy"] == listener["name"].removesuffix("-in")
         for listener in listeners
@@ -548,7 +536,6 @@ async def test_probe_via_lanes_chunks_waves_and_streams_session(db, monkeypatch)
     seen_waves: list[int] = []
 
     async def fake_lane(ctl, base, lane, name):
-        # 记录每波首个节点出现时的已测数，验证波边界
         if name.endswith(("0", "1")) or name == "n0":
             seen_waves.append(len(svc._clash_test_session["nodes"]))
         return {"name": name, "alive": True, "steamOk": True, "exitIp": f"1.1.1.{name[1:]}", "ms": 100, "duplicate": False, "probed": True}
@@ -559,12 +546,10 @@ async def test_probe_via_lanes_chunks_waves_and_streams_session(db, monkeypatch)
     assert svc._clash_test_session["probed"] == 25
     assert svc._clash_test_session["alive"] == 25
     assert len(svc._clash_test_session["nodes"]) == 25
-    # 波边界：第 21 个节点开测前，会话里应已有 20 行（第一波整体落账）
     assert seen_waves and min(seen_waves) <= 20
     svc._clash_test_session = None
 
 
-# ─── 同出口代表行择优 ───────────────────────────────────────
 
 
 def _row(name: str, *, alive: bool, ms: int | None = 100, cooling: bool = False, exit_ip: str | None = "1.1.1.1") -> dict:
@@ -616,7 +601,6 @@ def test_same_exit_rows_without_exit_ip_untouched() -> None:
     assert rows[0]["duplicate"] is False
 
 
-# ─── 检测归属：内核在跑哪条订阅 ─────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -655,7 +639,6 @@ async def test_active_subscription_requires_running_identity(db, monkeypatch):
         await proxies_service._runtime_check_nodes({"running": True}, None)
 
 
-# ─── 首检复用窗口（启动/切换触发的全量检测不重复跑）──────────
 
 
 @pytest.mark.asyncio

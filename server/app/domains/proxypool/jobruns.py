@@ -39,16 +39,12 @@ from app.domains.proxypool.pool import eligible_nodes, pool_path
 
 logger = logging.getLogger(__name__)
 
-# ── 状态：由本模块一处定义，前端只渲染不推导 ─────────────────────────
 STATUS_RUNNING = "running"
 STATUS_SUCCESS = "success"
 STATUS_PARTIAL = "partial"
 STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 
-# ── 错误分类：固定枚举（顺序即前端展示顺序）────────────────────────
-# `ledger` = browse 层重试耗尽后只留了任务 id 的那类失败（原因在日志里，账本里没有），
-# 单列一项比塞进 `other` 诚实：它恰恰是失败量最大的一类。
 ERROR_KINDS: tuple[str, ...] = (
     "timeout",
     "connect",
@@ -64,12 +60,9 @@ ERROR_KINDS: tuple[str, ...] = (
     "other",
 )
 
-# error_summary 单行大小上限（字节）。枚举键有界，正常不会碰到；留着防将来加子映射
-# 时把一行写无界。
 _SUMMARY_MAX_BYTES = 8192
 
 
-# ══ 错误分类 ═════════════════════════════════════════════════════
 def classify_error(exc: BaseException) -> str:
     """异常 → `ERROR_KINDS` 之一。**按名字/消息判，不 import 上层的异常类**
     （crawler 的异常类型不该被 proxypool 域依赖）。"""
@@ -165,7 +158,6 @@ def classify_outcome(success_count: int, error_count: int, *, stopped: bool) -> 
     return STATUS_FAILED
 
 
-# ══ 写入 ═════════════════════════════════════════════════════════
 def _file_sha256(path: Path) -> str | None:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -181,7 +173,6 @@ async def _pool_facts(session: AsyncSession, data_dir: Path) -> dict:
     """
     nodes = await eligible_nodes(session)
     node_ids = [n.node_id for n in nodes]
-    # 合格节点的归属订阅（节点跟着订阅走，归属直接在节点行上）
     sub_ids = sorted({int(n.subscription_id) for n in nodes if n.subscription_id})
 
     snapshots: list[int] = []
@@ -200,7 +191,6 @@ async def _pool_facts(session: AsyncSession, data_dir: Path) -> dict:
     return {
         "pool_sha256": _file_sha256(pool_path(data_dir)),
         "pool_node_count": len(nodes),
-        # NULL ≠ 0：一个出口 IP 都还没探到时是 None（尚未探测），不是「0 个出口」
         "pool_exit_ip_count": len(exit_ips) if exit_ips else None,
         "subscription_ids": sub_ids,
         "snapshot_ids": snapshots,
@@ -223,7 +213,7 @@ async def _selected_node(
 
         base, secret = controller_endpoint_of(data_dir)
         name = await current_global_selection(base, secret)
-    except Exception:  # noqa: BLE001 —— 读不到就是读不到，不是失败
+    except Exception:  # noqa: BLE001
         return None, None
     if not name:
         return None, None
@@ -346,7 +336,6 @@ async def mark_interrupted_runs(session: AsyncSession, now: datetime) -> int:
     return len(rows)
 
 
-# ── 自有会话入口（供 crawler / 启动链调用；一律 fail-soft）──────────
 async def record_start(
     *,
     proxy_url: str | None,
@@ -371,7 +360,7 @@ async def record_start(
             )
             await session.commit()
         return run_id
-    except Exception:  # noqa: BLE001 —— 观测失败不得影响爬取
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "作业台账开始记录失败，爬取照常进行",
@@ -435,7 +424,6 @@ async def record_interrupted(now: datetime | None = None) -> int:
         return 0
 
 
-# ══ 读取 ═════════════════════════════════════════════════════════
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
@@ -511,13 +499,11 @@ async def _day_summary(
         if row.duration_ms is not None:
             durations.append(int(row.duration_ms))
         if pool_exit_ip_count is None and row.pool_exit_ip_count is not None:
-            # rows 已按 id 倒序：取当日**最后一次**作业的池出口 IP 数
             pool_exit_ip_count = int(row.pool_exit_ip_count)
 
     return {
         "day": day_start.date().isoformat(),
         **counts,
-        # NULL ≠ 0：没有带时长的作业时是 None（前端显示 —）
         "avgDurationMs": round(sum(durations) / len(durations)) if durations else None,
         "poolExitIpCount": pool_exit_ip_count,
     }

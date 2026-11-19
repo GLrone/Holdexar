@@ -44,7 +44,6 @@ _ALLOWED_SCHEMES = ("http", "https")
 MAX_REDIRECT_HOPS = 3
 MAX_BODY_BYTES = 20 * 1024 * 1024
 
-# ── 格式 ──────────────────────────────────────────────────────────
 FORMAT_YAML = "yaml"
 FORMAT_PROVIDER_YAML = "provider_yaml"
 FORMAT_BASE64 = "base64"
@@ -76,7 +75,6 @@ def saved_proxy_channels(proxies: list[str]) -> list[Channel]:
     return channels
 
 
-# ── 错误类型（稳定、可断言）──────────────────────────────────────
 class SnapshotError(Exception):
     """订阅快照失败基类。任何一种都意味着：不改 Registry、不覆盖旧快照。"""
 
@@ -192,7 +190,6 @@ class SubscriptionTooLargeError(SnapshotError):
         super().__init__("订阅内容过大")
 
 
-# ── 数据对象 ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Channel:
     """一条抓取通道。proxy=None 即直连。"""
@@ -287,7 +284,6 @@ class Snapshot:
         )
 
 
-# ── 格式判定 ──────────────────────────────────────────────────────
 def decode_utf8(raw: bytes) -> str:
     """严格 UTF-8 解码：非法字节一律抛 `InvalidEncodingError`。
 
@@ -326,7 +322,6 @@ def detect_format(raw: bytes) -> str:
     return FORMAT_UNKNOWN
 
 
-# ── 抓取 ──────────────────────────────────────────────────────────
 def build_channels(
     *,
     kernel_proxy: str | None = None,
@@ -357,7 +352,7 @@ def _local_mixed_proxies(kernel_proxy: str | None) -> list[str]:
             tail = kernel_proxy.rsplit(":", 1)[-1]
             exclude = int(tail) if tail.isdigit() else None
         return clash_manager.local_mixed_channels(exclude)
-    except Exception:  # noqa: BLE001 —— 借道口只是加成，探不到就不加
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -1014,7 +1009,6 @@ async def fetch_subscription(
     raise FetchFailedError(url, attempts, duration_ms)
 
 
-# ── 解析 ──────────────────────────────────────────────────────────
 def parse_nodes(raw: bytes, fmt: str) -> list[dict]:
     """解析节点列表。P1.2 只处理 inline YAML；其余格式一律抛 UnsupportedFormatError。
 
@@ -1038,7 +1032,6 @@ def parse_nodes(raw: bytes, fmt: str) -> list[dict]:
     return nodes
 
 
-# ── 快照 ──────────────────────────────────────────────────────────
 def snapshot_dir(data_dir: Path) -> Path:
     return Path(data_dir) / "proxypool" / "snapshots"
 
@@ -1183,8 +1176,6 @@ async def persist_snapshot(session, snap: Snapshot, *, data_dir: Path
         sha256=snap.sha256,
         format=snap.fmt,
         raw_path=str(path),
-        # URL 是快照的 provenance（落库密封，读取侧开封比对）：换链接后靠它
-        # 把"旧链接的成功快照"排除掉
         url=seal_url(snap.url),
         node_count=snap.node_count,
         status="OK",
@@ -1354,8 +1345,6 @@ def _restore_snapshot(row: SubscriptionSnapshot, *, url: str = "") -> Snapshot:
             ))
     return Snapshot(
         subscription_id=row.subscription_id,
-        # 真实的来源 URL 来自快照行本身（开封）——不能回显调用方的入参，否则
-        # 换链接后会把旧链接的内容标成新链接（调用方无从察觉）
         url=open_url(row.url) or url,
         fetched_at=row.fetched_at or datetime.now(),
         http_status=row.http_status or 0,

@@ -33,11 +33,9 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-# 窗口参数（见 module docstring）
 RATE_LIMIT_MAX_REQUESTS = 200
 RATE_LIMIT_WINDOW_SECONDS = 300
 
-# ── 按出口分账的预算 ────────────────────────────────────────────
 # 口径：**当前生产预算**，不是「服务端每 IP 硬限制」。这条线的真实归属（按出口
 # IP、按 endpoint，还是别的维度）要靠 `proxy_run_exits` 的作业统计回答，在那之前不
 # 写死结论。单入口形态仍走下面的进程级单例（`steam_rate_limiter`），行为不变。
@@ -53,7 +51,7 @@ class SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
-        self._waiting = 0  # 当前在窗口外排队的请求数（任务页「排队等发送窗口」读口）
+        self._waiting = 0
 
     async def acquire(self) -> None:
         """取一个请求名额；窗口满时阻塞到有名额释放。
@@ -68,14 +66,12 @@ class SlidingWindowRateLimiter:
             while True:
                 async with self._lock:
                     now = time.monotonic()
-                    # 清掉已出窗的时间戳（窗口滑动）
                     cutoff = now - self.window_seconds
                     while self._timestamps and self._timestamps[0] <= cutoff:
                         self._timestamps.popleft()
                     if len(self._timestamps) < self.max_requests:
                         self._timestamps.append(now)
                         return
-                    # 窗口满：最旧一条出窗的时刻 = 最早可发的时刻
                     wait = self._timestamps[0] + self.window_seconds - now
                     if first_wait:
                         self._waiting += 1

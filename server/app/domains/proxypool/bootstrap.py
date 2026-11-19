@@ -71,8 +71,6 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_SUBSCRIPTION_FETCHES = 5
 POOL_FETCH_HEALTH_MAX_AGE = timedelta(hours=72)
-# 订阅自动重拉最短间隔：距上次成功拉取不足该时长的订阅，30 分钟拍整条跳过
-# （同内容重拉无收益；节点活性由池健康层守护，手动重拉与单订阅口径不受限）
 AUTO_REPULL_MIN_INTERVAL_HOURS = 2
 
 
@@ -84,8 +82,6 @@ class SyncResult:
     pool_names: tuple[str, ...]
     pool_changed: bool
     failures: dict[int, str]
-    # 本次只落快照、**未进 Registry** 的订阅（生产准入为 CANDIDATE）。
-    # 事实留存（快照 + 字节），生产侧无感：不产生节点/来源、不进 eligible、不改签名。
     skipped_candidates: tuple[int, ...] = ()
     snapshots: dict[int, object] = field(default_factory=dict)
     pool_signature_before: tuple[str, ...] | None = None
@@ -114,7 +110,7 @@ async def _healthy_pool_channels(session: AsyncSession, *, data_dir: Path,
         if not clash_manager.pool_runtime.status().get("running"):
             return []
         bindings = lane_bindings(data_dir)
-    except Exception:  # noqa: BLE001 —— an unavailable pool is not a fetch dependency
+    except Exception:  # noqa: BLE001
         return []
     lane_nodes = {
         str(binding.get("node")): binding
@@ -257,12 +253,8 @@ async def _sync_subscriptions_under_locks(
         kernel_proxy = default_kernel_proxy()
     subs = await subscription_sources(session)
     if only_sub_id is not None:
-        # 单订阅口径（手动重拉喂池子）：无视 autoRefresh 开关——用户点了重拉
-        # 就是明确要这条订阅的最新内容进池
         subs = [s for s in subs if s.id == only_sub_id]
     elif only_auto:
-        # 关掉自动更新的订阅不参与本轮：限时订阅只能在窗口内下载、下载后可长期
-        # 使用，每轮都撞一次注定失败的抓取只会刷出噪音 FAILED。手动重拉不受此限。
         auto_subs = [s for s in subs if _auto_refresh_on(s)]
         off = [s.id for s in subs if not _auto_refresh_on(s)]
         if off:
@@ -273,8 +265,6 @@ async def _sync_subscriptions_under_locks(
                 detail={"订阅编号": "、".join(str(i) for i in off)},
             )
         subs = auto_subs
-        # 重拉间隔门：距上次成功拉取不足间隔的订阅本轮整条跳过——不下载、
-        # 不动节点账本；失败的订阅不受此门（照常按拍重试）
         fresh_cutoff = now - timedelta(hours=AUTO_REPULL_MIN_INTERVAL_HOURS)
         gated = [
             s for s in subs
@@ -334,7 +324,6 @@ async def _sync_subscriptions_under_locks(
         channel for channel in saved_proxy_channels(saved_proxies or [])
         if channel.proxy not in existing_proxies
     )
-    # ── 有界并发下载（纯 I/O），落库仍串行（SQLite 单写者）──
     sub_urls = {sub.id: open_url(sub.url) or "" for sub in subs}
     fetched: dict[int, object] = {}
     readable_urls = {sid: url for sid, url in sub_urls.items() if url}
@@ -353,7 +342,7 @@ async def _sync_subscriptions_under_locks(
                     preferred_egress=preferred_egresses.get(sub.id),
                     egress_scores=egress_scores,
                 )
-        except Exception as exc:  # noqa: BLE001 —— 失败在下方按订阅记账
+        except Exception as exc:  # noqa: BLE001
             fetched[sub.id] = exc
 
     await asyncio.gather(*(_prefetch(s) for s in subs))
@@ -375,12 +364,9 @@ async def _sync_subscriptions_under_locks(
         for sub in subs:
             sub_id = sub.id  # 先取出来：savepoint 回滚后 ORM 对象会过期，不能再靠它
             try:
-                # 每条订阅一个 SAVEPOINT：本条目的半截写入只回滚自己，
-                # 同轮其它订阅已完成的成果留在外层事务里
                 async with session.begin_nested():
                     sub_url = sub_urls.get(sub_id) or ""
                     if not sub_url:
-                        # 链接解不开（密钥属主机绑定）：本轮跳过并留原因，不伪装成抓取失败
                         skipped.append(sub_id)
                         message = UNREADABLE_MESSAGE
                         failures[sub_id] = message
@@ -393,7 +379,7 @@ async def _sync_subscriptions_under_locks(
                     result = fetched.get(sub_id)
                     if isinstance(result, Exception):
                         raise result
-                    if result is None:  # 预取缺失（不可达）：按失败记账，不静默丢
+                    if result is None:
                         raise RuntimeError("订阅下载未返回结果")
                     await session.refresh(sub)
                     if (open_url(sub.url) or "") != sub_url:
@@ -420,8 +406,6 @@ async def _sync_subscriptions_under_locks(
                         tag=subscription_tag(sub_url),
                     )
                     if is_admitted(sub):
-                        # 出库留痕：快照对齐删除的来源与随之结算的节点是最高频的
-                        # 出库通道，零日志会让「这批节点为什么变 STALE」不可追溯
                         if applied.removed_sources or applied.state_changes:
                             log_event(
                                 logger,
@@ -434,8 +418,6 @@ async def _sync_subscriptions_under_locks(
                                 },
                             )
                     else:
-                        # 候选订阅的健康自动转正：最近一次体检有可用节点即进池，
-                        # 准入依据是体检事实而不是人工点头（快照刚落盘，转正 apply 的就是它）
                         admitted = await auto_admit_healthy_candidate(
                             session, subscription_id=sub_id, data_dir=data_dir, now=now
                         )
@@ -463,7 +445,7 @@ async def _sync_subscriptions_under_locks(
                                     "节点数": len(nodes),
                                 },
                             )
-            except Exception as exc:  # noqa: BLE001 —— 单条订阅失败不阻断其它
+            except Exception as exc:  # noqa: BLE001
                 message = str(exc)[:500] or type(exc).__name__
                 fetch_error = fetched.get(sub_id)
                 if sub_urls.get(sub_id) and isinstance(fetch_error, Exception):
@@ -478,7 +460,7 @@ async def _sync_subscriptions_under_locks(
                                 now=now,
                             )
                             await session.flush()
-                    except Exception:  # noqa: BLE001 —— 原始失败投影仍需落地
+                    except Exception:  # noqa: BLE001
                         log_event(
                             logger,
                             f"订阅 {sub_id} 抓取失败明细保存失败",
@@ -497,7 +479,6 @@ async def _sync_subscriptions_under_locks(
                 failures[sub_id] = message
                 continue
 
-            # 事实源始终是 subscription_snapshots.sha256；订阅行不再投影快照身份
             sub.last_fetch_at = now
             sub.last_fetch_status = "OK"
             sub.last_success_at = now
@@ -576,10 +557,9 @@ def default_kernel_proxy() -> str | None:
         from app.domains.proxies import clash_manager
 
         status = clash_manager.runtime.status()
-        # 入口硬闸：端口没在听（解析出的默认值无人监听/被占）不交假通道
         if status.get("running") and status.get("port") and clash_manager.runtime.entry_listening():
             return f"http://127.0.0.1:{status['port']}"
-    except Exception:  # noqa: BLE001 —— 老 Clash 不在也不影响直连通道
+    except Exception:  # noqa: BLE001
         return None
     return None
 
@@ -631,7 +611,6 @@ async def ensure_pool_runtime(
                 True, False, current_runtime_proxy_url(data_dir), base,
                 await eligible_runtime_names(session), "已有可用 Runtime",
             )
-        # 可达但池文件落后：交给既有重建链，避免"复用一个过期池"
         request_rebuild()
         rebuilt = await run_pending_rebuild(
             session, data_dir=data_dir, controller_url=base, secret=secret,
@@ -643,7 +622,6 @@ async def ensure_pool_runtime(
                 await eligible_runtime_names(session),
                 "池文件与合格集不一致，本轮未重建（占线或重建让路）",
             )
-        # 重建已执行：池文件此刻应已跟到合格集，才算 current
         now_base, _ = controller_endpoint_of(data_dir)
         if set(await eligible_runtime_names(session)) != set(pool_file_names(data_dir)):
             return BootstrapResult(
@@ -732,8 +710,6 @@ async def ensure_pool_runtime(
                     False, True, None, base, build.runtime_names,
                     f"建立 GLOBAL 失败：now={applied!r}，期望 {chosen!r}",
                 )
-        # lane 入口就绪 + 逐条绑定：内核起来时各 lane 组默认选组内第一项，不建立绑定
-        # 就等于所有 lane 走同一个节点（"多入口"退化成单出口，系统却自称 ready）
         await align_lanes(
             data_dir=data_dir, controller_url=base, secret=secret,
             pool_names=build.runtime_names, slots=slots or None,
@@ -743,11 +719,6 @@ async def ensure_pool_runtime(
             True, True, f"http://127.0.0.1:{port}", base, build.runtime_names,
             "bootstrap 完成",
         )
-
-
-# ══ 订阅刷新链的分流 ═════════════════════════════════════════════
-# 判定"池变了"用的是 **Runtime Pool signature**，不是 Snapshot SHA：快照整体变了
-# （例如来源元数据、无关节点变化）但合格运行集没变时，重启内核毫无意义。
 
 
 async def pool_signature(
@@ -786,7 +757,6 @@ async def pool_signature(
 class RefreshTriageResult:
     synced: bool
     pool_changed: bool
-    # none | bootstrapped | unavailable | rebuild_requested
     action: str
     bootstrap: BootstrapResult | None
 

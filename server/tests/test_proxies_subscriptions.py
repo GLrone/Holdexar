@@ -128,7 +128,6 @@ async def _registry_map(db, sub_id: int, names: list[str]) -> dict:
         return {n.original_name: n for n in rows if n.original_name}
 
 
-# ─── 手动改名 ────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -150,7 +149,6 @@ async def test_rename_missing_subscription(db):
         await proxies_service.update_subscription(999, label="x")
 
 
-# ─── 编辑订阅（改名 + 换链接自动重拉）─────────────────────────
 
 
 @pytest.mark.asyncio
@@ -199,7 +197,6 @@ async def test_update_subscription_url_change_triggers_sync(db, monkeypatch, tmp
         sub_id, label="新名字", url="https://example.com/sub?token=xyz"
     )
     assert calls == [sub_id]
-    # 换链接是用户主动动作：带自动切换开关（定时周期重拉不带）
     assert switches == [True]
     assert res["synced"] is True
     assert res["nodes"] == 7
@@ -274,7 +271,6 @@ async def test_update_subscription_missing(db):
         await proxies_service.update_subscription(999, label="x")
 
 
-# ─── 流量实时回填 ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -321,7 +317,6 @@ async def test_refresh_traffic_no_header(db, monkeypatch):
     assert stats["traffic"] == "upload=1; download=2; total=3"
 
 
-# ─── 删除订阅级联清理账本 ────────────────────────────────────
 
 
 
@@ -384,14 +379,12 @@ async def test_delete_subscription_cascades_pool_ledger(db):
 
 
 
-# ─── 账本收敛 ────────────────────────────────────────────────
 
 
 
 
 
 
-# ─── 内核重启归属判断（共用缓存不串台）──────────────────────
 
 
 @pytest.mark.asyncio
@@ -408,7 +401,7 @@ async def test_running_subscription_is(db, monkeypatch):
     assert runtime.running_subscription_is(SUB_URL) is True
     assert runtime.running_subscription_is("https://other.com/sub") is False
 
-    runtime.subscription_url = None  # 旧内核没登记归属
+    runtime.subscription_url = None
     assert runtime.running_subscription_is(SUB_URL) is False
 
     monkeypatch.setattr(
@@ -416,9 +409,9 @@ async def test_running_subscription_is(db, monkeypatch):
         lambda: {"running": False, "port": None, "configPath": None},
     )
     runtime.subscription_url = SUB_URL
-    assert runtime.running_subscription_is(SUB_URL) is False  # 没跑不放行
+    assert runtime.running_subscription_is(SUB_URL) is False
 
-    runtime.subscription_url = None  # 恢复，不污染进程内单例
+    runtime.subscription_url = None
 
 
 @pytest.mark.asyncio
@@ -485,7 +478,6 @@ async def test_start_switches_subscription_when_running(monkeypatch, tmp_path):
     assert r.subscription_url is None
 
 
-# ─── 检测存活统计落库 ────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -507,10 +499,9 @@ async def test_node_summary_records_alive(db):
     stats = (await _get_sub(db, sub_id)).last_stats
     assert stats["alive"] == 1
     assert stats["total"] == 2
-    assert stats["traffic"] == USERINFO  # 合并不覆盖既有键
+    assert stats["traffic"] == USERINFO
     assert stats["nodes"] == 3
 
-# ─── 明文订阅导入即体检（新节点入库自动校验标记）──
 
 
 async def _stub_sub_fetch(monkeypatch, text: str) -> None:
@@ -564,7 +555,6 @@ async def test_import_plain_checks_only_new_nodes(db, monkeypatch):
     """导入新增行即时体检：stats 带 checked/alive，DB 落 ok/failed 标记；
     跳过的存量行不重测（沿用既有 status）。"""
     sub_id = await _add_sub(db, kind="plain")
-    # 预置一条存量代理：1.1.1.1 已存在（将命中 skipped），9.9.9.9 为新增
     async with db() as session:
         session.add(Proxy(scheme="http", host="1.1.1.1", port=8080,
                           status="ok", enabled=True))
@@ -586,7 +576,7 @@ async def test_import_plain_checks_only_new_nodes(db, monkeypatch):
     assert stats["fetched"] == 3
     assert stats["added"] == 2
     assert stats["skipped"] == 1
-    assert stats["checked"] == 2  # 只检测新增行
+    assert stats["checked"] == 2
     assert stats["alive"] == 1
     assert sorted(calls) == [("8.8.8.8", 3128), ("9.9.9.9", 1080)]
 
@@ -594,10 +584,9 @@ async def test_import_plain_checks_only_new_nodes(db, monkeypatch):
         (p.host, p.port): p.status
         for p in (await proxies_service.list_proxies())
     }
-    assert statuses[("1.1.1.1", 8080)] == "ok"  # 存量行沿用，未重测
+    assert statuses[("1.1.1.1", 8080)] == "ok"
     assert statuses[("9.9.9.9", 1080)] == "ok"
     assert statuses[("8.8.8.8", 3128)] == "failed"
-    # last_stats 落进订阅行（前端导入消息数据源）
     assert (await _get_sub(db, sub_id)).last_stats["alive"] == 1
 
 
@@ -615,7 +604,7 @@ async def test_import_plain_all_duplicates_no_check(db, monkeypatch):
     stats = await proxies_service.import_plain_subscription(sub_id)
 
     assert stats == {"fetched": 1, "added": 0, "skipped": 1}
-    assert calls == []  # added=0 短路，零网络副作用
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -632,13 +621,13 @@ async def test_import_plain_check_errors_do_not_break_stats(db, monkeypatch):
     stats = await proxies_service.import_plain_subscription(sub_id)
 
     assert stats["added"] == 1
-    assert stats["checked"] == 0  # 异常结果不计入 checked
+    assert stats["checked"] == 0
     assert stats["alive"] == 0
     async with db() as session:
         from sqlalchemy import select
 
         rows = (await session.execute(select(Proxy))).scalars().all()
-    assert len(rows) == 1 and rows[0].status == "unknown"  # 行保留，未被删除
+    assert len(rows) == 1 and rows[0].status == "unknown"
 
 
 @pytest.mark.asyncio
@@ -710,7 +699,6 @@ async def test_plain_import_failure_keeps_last_success_snapshot(db, monkeypatch)
     assert (await _get_sub(db, sub_id)).last_fetch_status == "FAILED"
 
 
-# ── 订阅自动取名链（行为对齐：profile-title → Content-Disposition → URL 末段）──
 
 
 def _headers(**kw) -> httpx.Headers:
@@ -722,31 +710,26 @@ def _headers(**kw) -> httpx.Headers:
 @pytest.mark.parametrize(
     "headers,url,expected",
     [
-        # 1 级：profile-title 纯文本
         (
             _headers(**{"profile-title": "某机场"}),
             "https://sub.example.com/link/ABC123",
             "某机场",
         ),
-        # 1 级：profile-title base64（面板专用通道既有语义）
         (
             _headers(**{"profile-title": "base64:" + base64.b64encode("5Lid6YWJ5Y2V".encode()).decode()}),
             "https://sub.example.com/link/ABC123",
             "5Lid6YWJ5Y2V",
         ),
-        # 2 级：Content-Disposition filename* RFC 5987（机场名 UTF-8 percent 编码）
         (
             _headers(**{"content-disposition": "attachment; filename*=UTF-8''%E6%9C%BA%E5%9C%BA%E5%90%8D.yaml"}),
             "https://sub.example.com/link/ABC123",
             "机场名.yaml",
         ),
-        # 2 级：Content-Disposition 普通 filename=
         (
             _headers(**{"content-disposition": 'attachment; filename="airport.yaml"'}),
             "https://sub.example.com/link/ABC123",
             "airport.yaml",
         ),
-        # 3 级：URL 末段（去 query + percent 解码）
         (
             _headers(),
             "https://sub.example.com/%E6%9C%BA%E5%9C%BA?clash=1&token=x",
@@ -758,7 +741,6 @@ def _headers(**kw) -> httpx.Headers:
             "https://sub.example.com/link/ABC123?clash=1",
             "ABC123",
         ),
-        # 全空：URL 末段取不到（根路径）→ None（不造假名）
         (_headers(), "https://sub.example.com/", None),
     ],
 )
@@ -783,7 +765,6 @@ async def test_add_subscription_auto_names_when_label_empty(db, monkeypatch):
         proxies_service.clash_manager.runtime, "download_subscription", fake_download
     )
     monkeypatch.setattr(proxies_service, "resolve_proxy_url", _no_proxy)
-    # 内核已装（避免探测下载）
     monkeypatch.setattr(
         proxies_service.clash_manager, "detect_kernel", lambda d: {"found": True}
     )
@@ -795,7 +776,6 @@ async def test_add_subscription_auto_names_when_label_empty(db, monkeypatch):
         sub = await session.get(ProxySubscription, out["id"])
         assert sub.label == "机场名.yaml"
 
-    # 手动填名优先：自动名不覆写用户输入
     out2 = await proxies_service.add_subscription(
         "clash", "https://example.com/other", "我的机场"
     )
@@ -823,7 +803,6 @@ async def test_add_subscription_no_title_keeps_null(db, monkeypatch):
     assert out["label"] is None
 
 
-# ─── 热重载切换（内核进程不动）──────────────────────────────
 
 _MINI_CONFIG = (
     "mixed-port: 17890\nproxies:\n  - name: A节点\n    type: ss\n"
@@ -889,8 +868,6 @@ def _patch_kernel_launch(monkeypatch):
         _finished = False
 
         def poll(self):
-            # 双语义：直用 Popen（内核进程句柄）时 None=在跑；
-            # communicate 之后（subprocess.run 校验路径）返回退出码 0
             return 0 if self._finished else None
 
         def terminate(self):
@@ -902,7 +879,6 @@ def _patch_kernel_launch(monkeypatch):
         def kill(self):
             pass
 
-        # 启动链上的 subprocess.run（内核版本探测等）把 Popen 当上下文管理器用
         def communicate(self, input=None, timeout=None):
             self._finished = True
             return ("", "")
@@ -1074,7 +1050,6 @@ async def test_ensure_running_reallocates_auto_port_when_listener_is_lost(monkey
     r.stop()
 
 
-# ─── 下载通道顺序（代理优先，直连垫底）──────────────────────
 
 
 def test_download_attempts_proxy_channels_before_direct(monkeypatch):
@@ -1096,7 +1071,6 @@ def test_download_attempts_direct_only_without_kernel(monkeypatch):
     assert attempts == [(None, "直连")]
 
 
-# ─── 热重载被拒：保留运行内核，不重启陪葬 ───────────────────
 
 
 @pytest.mark.asyncio
@@ -1124,7 +1098,6 @@ async def test_ensure_running_reload_rejected_keeps_running_kernel(monkeypatch, 
     r.start("exe", str(cfg), subscription_url="https://a.example/sub")
     first_proc = r.process
 
-    # 重拉已把新下载写入缓存文件（真实流程），内核随后拒载：
     cfg.write_text(_MINI_CONFIG_B, encoding="utf-8")
     monkeypatch.setattr(clash_manager.httpx, "AsyncClient", _RefusingKernel)
 
@@ -1133,7 +1106,6 @@ async def test_ensure_running_reload_rejected_keeps_running_kernel(monkeypatch, 
 
     assert r.process is first_proc, "拒载不重启：内核继续跑旧配置"
     assert r.subscription_url == "https://a.example/sub", "归属不翻转"
-    # 回滚 = 文件恢复到本进程写入前的内容（B 的原始下载，无注入段）
     assert cfg.read_text(encoding="utf-8") == _MINI_CONFIG_B
 
 
@@ -1165,7 +1137,6 @@ async def test_ensure_running_rejects_malformed_config_before_kernel(monkeypatch
     assert cfg.read_text(encoding="utf-8") == broken, "预检在写盘前拒绝：文件保持原样"
 
 
-# ─── 启动候选遍历（订阅失效不连累内核启动）──────────────────
 
 
 async def _add_labeled_sub(db, *, label: str, url: str = SUB_URL,
@@ -1231,7 +1202,7 @@ async def test_resolve_startable_all_fail_raises_aggregated(db, monkeypatch, tmp
     msg = str(ei.value)
     assert "所有可用订阅都取不到配置" in msg
     assert "甲机场" in msg and "乙机场" in msg
-    assert {id_a, id_b}  # 两条都进了候选（顺序断言在下方用例）
+    assert {id_a, id_b}
 
 
 @pytest.mark.asyncio
@@ -1572,7 +1543,6 @@ async def test_url_change_sidecar_write_failure_cannot_reuse_previous_cache(
         )
 
 
-# ─── 缓存元数据随正文落盘 / 降级不丢名称流量 ─────────────────────
 
 
 def test_subscription_id_of_reads_per_subscription_path(tmp_path):
@@ -1664,7 +1634,6 @@ async def test_successful_download_persists_meta_sidecar(db, monkeypatch, tmp_pa
     assert saved["userinfo"] == USERINFO
 
 
-# ─── 删除订阅回收缓存产物（孤儿文件回归） ─────────────────────
 
 
 @pytest.mark.asyncio
@@ -1695,7 +1664,6 @@ def test_remove_subscription_artifacts_is_idempotent(tmp_path):
     assert clash_manager.remove_subscription_artifacts(tmp_path, 404) == []
 
 
-# ─── 流量单调性：失败拉取不得清空已记录值 ─────────────────────
 
 
 @pytest.mark.asyncio
@@ -1723,7 +1691,6 @@ async def test_merge_last_stats_overwrites_traffic_with_fresh_value(db):
     assert row.last_stats["traffic"] == "download=999"
 
 
-# ─── 借道口可用性判定 ──────────────────────────────────────────
 
 
 def test_local_mixed_ports_do_not_scan_holdexar_runtime_port():
@@ -1745,7 +1712,6 @@ def test_local_channel_egress_ok_false_on_failure(monkeypatch):
     assert clash_manager.local_channel_egress_ok("http://127.0.0.1:7890") is False
 
 
-# ─── 信息占位节点兜底取用量 ─────────────────────────────────────
 
 
 _INFO_NODE_CONFIG = """\
@@ -1799,7 +1765,6 @@ def test_auto_name_prefers_content_disposition_over_url():
     ) == "赔钱机场"
 
 
-# ─── 名称三档链（用户改名 > 机场品牌名 > 缓存上次值）─────────────
 
 
 @pytest.mark.asyncio
@@ -1853,14 +1818,12 @@ async def test_saving_unchanged_name_is_not_a_user_rename(db):
     sid = await _add_sub(db)
     await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
 
-    # 原样保存（值未变）
     await proxies_service.update_subscription(sid, label="赔钱机场")
 
     async with db() as session:
         row = await session.get(ProxySubscription, sid)
     assert row.last_stats.get("labelSource") == proxies_service.LABEL_SOURCE_PANEL
 
-    # 因此机场改名仍能更新过来
     assert await proxies_service.apply_subscription_name_chain(sid, "跑路机场") == "跑路机场"
 
 
@@ -1893,12 +1856,11 @@ async def test_legacy_row_without_source_follows_panel_rename(db):
     sid = await _add_sub(db)
     async with db() as session:
         row = await session.get(ProxySubscription, sid)
-        row.label = "赔钱机场"  # 老代码自动取的，没留 labelSource
+        row.label = "赔钱机场"
         await session.commit()
 
     got = await proxies_service.apply_subscription_name_chain(sid, "赔钱机场")
 
-    # 名字与机场一致 → 补上 panel 标记，此后可随机场改名更新
     async with db() as session:
         row = await session.get(ProxySubscription, sid)
     assert row.last_stats["labelSource"] == proxies_service.LABEL_SOURCE_PANEL
@@ -1922,7 +1884,6 @@ async def test_legacy_row_with_divergent_name_is_treated_as_user(db):
     assert row.label == "我自己起的名字"
 
 
-# ─── 流量链独立于名称链 ────────────────────────────────────────
 
 
 @pytest.mark.asyncio

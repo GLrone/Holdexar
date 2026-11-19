@@ -212,8 +212,6 @@ async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
     sources = await source_documents_for_nodes(session, eligible, data_dir=data_dir)
     text, names = render_pool(eligible, source_documents=sources)
 
-    # 门禁一/三：生成的文本自己必须解析得回来，且条目数不能缩水。
-    # 都放在写盘之前——失败时旧池保持原样（不靠回滚补）。
     parsed = yaml.safe_load(text)
     if not isinstance(parsed, Mapping) or not isinstance(parsed.get("proxies"), list):
         raise PoolBuildError("生成的池不是 {proxies: [...]} 形态")
@@ -230,7 +228,6 @@ async def build_pool(session: AsyncSession, *, data_dir: Path) -> PoolBuild:
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
-    # 写完复读：磁盘上的名字集合必须与预期一致（名字是池与内核之间唯一的对账钥匙）
     replayed = yaml.safe_load(path.read_text(encoding="utf-8"))
     disk_names = tuple(str(p["name"]) for p in replayed["proxies"])
     if set(disk_names) != set(names):

@@ -36,16 +36,10 @@ logger = logging.getLogger(__name__)
 class CrawlRunConfig:
     regions: list[str] | None = None
     workers: int = DEFAULT_WORKER_COUNT
-    # 单入口代理（调试通道 / 单入口形态）；生产多出口形态用 proxy_urls
     proxy_url: str | None = None
-    # 多出口形态：每条 lane 一个本机代理地址，worker 按序号固定绑定
     proxy_urls: list[str] | None = None
-    # 与 proxy_urls 同序的出口 IP：限流、熔断与统计都按它记账（同出口的 worker 共享一份）
     exit_keys: list[str] | None = None
-    # 与 proxy_urls 同序的节点运行名：出口账本要能追到"当时是哪个节点在执行"
     exit_nodes: list[str] | None = None
-    # 占用已由调用方预取（start_job 前移）：run_crawl 复用同 tag 占用、不自行
-    # 取还；None = 自取自还（bundles 直调 / CLI）
     occupancy_tag: str | None = None
     timeout: int = HTTP_TIMEOUT
 
@@ -144,7 +138,6 @@ async def run_crawl(
         begin_crawl(occupancy_tag)
     started_monotonic = time.monotonic()
     summary = jobruns.new_error_summary()
-    # 出口账本：内存累计，作业收尾一次性落库（不按请求写库）
     from .exit_stats import ExitStatsCollector
 
     exit_stats = ExitStatsCollector()
@@ -176,14 +169,10 @@ async def run_crawl(
             error_sink=lambda exc: jobruns.note_error(summary, exc),
             exit_stats=exit_stats,
         )
-        # browse 层重试耗尽的失败从不抛到 worker、只进 failure_ledger（已并入
-        # stats["failed"]），分类上单独记一类，别混进 other
         jobruns.note_ledger(summary, len(bs.FAILED_TASKS))
         exit_stats.merge_into(summary)
         stopped = bool(stop_event is not None and stop_event.is_set())
         if stopped:
-            # 「这次没跑完」是行级事实：手动停止与进程中断共用同一个标记，
-            # 与启动清理写进去的那条保持同一语义（状态列仍是 interrupted）
             summary["interrupted"] = True
         status = jobruns.classify_outcome(
             int(stats.get("success") or 0),
@@ -271,8 +260,6 @@ async def _run_crawl_locked(
     db = bs.DbWriter()
     await db.connect()
 
-    # browse 拿不到的 games 列（chinese_support/is_visual_novel…）保留库内原值，
-    # 否则 upsert 会把它们抹成 NULL（整表读取移线程：不在事件循环上同步执行）
     from ..core.config import get_settings
 
     preserved = await asyncio.to_thread(
@@ -310,15 +297,13 @@ async def _run_crawl_locked(
 
     connector = aiohttp.TCPConnector(limit=config.workers * 2, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # ── 预取：只补库内没有的对象（首爬新面孔）──
-        # 已知对象（games 表有行，PRESERVED 已整表加载）不再走网络预取：
+    # 已知对象（games 表有行，PRESERVED 已整表加载）不再走网络预取：
         # 价格轮对它们只需 appid + 库内名字核对，元数据由 handler 回退
         # PRESERVED（type 过滤 / name_en 版本后缀提取 / 建行原值保留）。
         # 整轮两语言全量预取会把 worker 启动挡在分钟级串行请求之后。
         if target_ids:
             unknown = [a for a in target_ids if a not in bs.PRESERVED]
             if unknown:
-                # 两语言互不依赖，并行预取（各自内部仍按回退区串行补齐）
                 zh, en = await asyncio.gather(
                     bs.prefetch_lang(
                         session, http_client, unknown, "schinese", bs.EXTRAS_ENABLED,
@@ -342,8 +327,6 @@ async def _run_crawl_locked(
                         "库内原值": len(target_ids) - len(unknown),
                     },
                 )
-        # failure_ledger：browse 层重试耗尽的批次只记账本不抛异常，调度器
-        # 对外口径（进度事件与这里的返回统计）必须把账本并入「失败」
         unpersisted: set[tuple[int, str]] = set()
 
         def record_error(exc):
@@ -359,8 +342,6 @@ async def _run_crawl_locked(
             failure_ledger=bs.FAILED_TASKS,
             error_sink=record_error,
             client_factory=client_factory,
-            # 入口总数即出口兵源数：大于 worker 数时多出的部分是待用出口池，
-            # 被隔离的 lane 由它们顶替（worker 岗位数不掉）
             lane_count=len(config.proxy_urls or []) or None,
         )
         await scheduler.run(tasks, session)
@@ -375,5 +356,5 @@ async def _run_crawl_locked(
             "skipUnits": [f"{aid}:{cc}" for aid, cc in sorted(bs.SKIPPED_UNITS)],
             "skipped_no_discount": 0,
             "discount_ended": 0,
-            "elapsed_seconds": 0,  # scheduler.run 内部已日志，此处由调用方补充
+            "elapsed_seconds": 0,
         }

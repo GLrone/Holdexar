@@ -32,13 +32,9 @@ from app.domains.proxypool.state import NODE_DEAD, NODE_RETIRED
 
 logger = logging.getLogger(__name__)
 
-# 短命内核使用独立端口段，避免与其他 Runtime 的监听端口冲突。
 PROBE_PORT_BASE = 23200
-# 每批探测的节点数上限：一个进程内每个节点占一个 listener，批次越大启动越慢
 BATCH_SIZE = 24
-# 启动后等控制器就绪的上限
 STARTUP_WAIT = 12.0
-# 单节点探测超时（毫秒，传给内核的 /delay 接口）
 NODE_TIMEOUT_MS = 5000
 
 
@@ -53,7 +49,6 @@ class RecoveredNode:
     subscription_id: int | None = None
 
 
-# 恢复探测结论的归因：只有 NODE 属于节点失败证据，其余都是「这一探没测到节点」。
 CAUSE_NODE = "node"
 CAUSE_DEPENDENCY = "dependency"
 CAUSE_CONFIG = "config"
@@ -179,7 +174,7 @@ async def _wait_controller(base_url: str, secret: str, timeout: float) -> bool:
                 resp = await client.get(f"{base_url}/version", headers=headers)
                 if resp.status_code == 200:
                     return True
-        except Exception:  # noqa: BLE001 —— 还没起来，继续等
+        except Exception:  # noqa: BLE001
             pass
         await asyncio.sleep(0.2)
     return False
@@ -276,7 +271,7 @@ async def probe_out_of_pool_nodes(
             )
 
         return rejected + list(await asyncio.gather(*(probe(node) for node in probe_nodes)))
-    except Exception as exc:  # noqa: BLE001 —— 恢复探测是尽力而为，失败不阻断周期
+    except Exception as exc:  # noqa: BLE001
         log_event(
             logger,
             "出池节点恢复探测失败，本轮跳过",

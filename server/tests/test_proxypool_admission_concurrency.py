@@ -201,7 +201,6 @@ def _snapshot_of(sub_id: int, nodes: list[dict], when: datetime):
     )
 
 
-# ══ A. sync(candidate) 抓取中 → promote 提交 ACTIVE → sync 完成 ══════
 @pytest.mark.asyncio
 async def test_interleave_sync_then_promote(tmp_data_dir, monkeypatch):
     """sync 在抓取中、promote 先提交 ACTIVE，之后 sync 才落盘 S2。
@@ -220,26 +219,23 @@ async def test_interleave_sync_then_promote(tmp_data_dir, monkeypatch):
     async def _fetch(url, channels, **kw):
         calls["n"] += 1
         if calls["n"] == 2:
-            await gate.wait()  # 卡在抓取：此时**一个字节都还没写**
+            await gate.wait()
         return _fetch_result(s1 if calls["n"] == 1 else s2)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch)
 
-    # 第一轮（候选）：S1 快照落盘，Registry 一行不建
     await _sync(tmp_data_dir)
     assert (await _counts())[:2] == (2, 2)
     from app.domains.proxypool.pool import eligible_nodes
     async with get_session_factory()() as session:
         assert await eligible_nodes(session) == []
 
-    # 第二轮卡在抓取处
     task = asyncio.create_task(_sync(tmp_data_dir))
     while calls["n"] < 2:
         await asyncio.sleep(0.01)
     await asyncio.sleep(0.05)
     assert not task.done(), "第二轮应停在 fetch 里（尚未写库）"
 
-    # promote：取边界 → 读 S1 → apply → ACTIVE → commit
     await _promote(sub_id, tmp_data_dir)
     assert await _status(sub_id) == ADMISSION_ACTIVE
     assert await _source_fps(sub_id) == _fps(s1, await _sub_url(sub_id))
@@ -247,18 +243,15 @@ async def test_interleave_sync_then_promote(tmp_data_dir, monkeypatch):
     gate.set()
     await asyncio.wait_for(task, timeout=20)
 
-    # 现读准入：sync 看到 ACTIVE → 落 S2 并 apply → 最终是 S2（最新成功快照）
     assert await _status(sub_id) == ADMISSION_ACTIVE
     assert await _source_fps(sub_id) == _fps(s2, await _sub_url(sub_id)), "现读准入后必须落到最新那份"
     assert await _source_fps(sub_id) != _fps(s1, await _sub_url(sub_id)) | _fps(s2, await _sub_url(sub_id)), "不得是并集"
     nodes, sources, snaps = await _counts()
-    # 来源只有 S2 的两条；节点行是身份台账（a2 的来源流失后行仍在，state→DEAD，不删行）
     assert sources == 2
     assert nodes == 3, "a1/a3 + 被撤下来源的 a2（行保留）"
     assert snaps == 2, "两轮的成功快照都在"
 
 
-# ══ B. promote 先持边界 → sync 等待 → 之后 sync 应用最新 ══════════════
 @pytest.mark.asyncio
 async def test_promote_boundary_first_sync_waits_then_applies_newest(
     tmp_data_dir, monkeypatch
@@ -278,7 +271,7 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
         return _fetch_result(s1)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch_s1)
-    await _sync(tmp_data_dir)  # S1 落盘（候选）
+    await _sync(tmp_data_dir)
 
     import app.domains.proxypool.admission as adm
 
@@ -288,7 +281,7 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
 
     async def _blocking_latest(session, subscription_id, **kw):
         snap = await real_latest(session, subscription_id, **kw)
-        in_boundary.set()  # 走到这里时 promote 已持写锁
+        in_boundary.set()
         await release.wait()
         return snap
 
@@ -314,11 +307,9 @@ async def test_promote_boundary_first_sync_waits_then_applies_newest(
     assert await _status(sub_id) == ADMISSION_ACTIVE
     async with get_session_factory()() as s:
         row = await s.get(ProxySubscription, sub_id)
-        # 快照身份的唯一事实源在快照表（订阅行不再投影）
         assert await _latest_ok_sha(sub_id) is not None
 
 
-# ══ C. 你点名的竞态（场景 A）：同步先落更新的快照 ═══════════════════
 @pytest.mark.asyncio
 async def test_promote_applies_newest_when_sync_lands_before_boundary(
     tmp_data_dir, monkeypatch
@@ -356,14 +347,13 @@ async def test_promote_applies_newest_when_sync_lands_before_boundary(
         calls["n"] += 1
         if calls["n"] == 1:
             started.set()
-            await go.wait()  # 暂停在"取边界之前"
+            await go.wait()
         await real_lock(session, subscription_id)
 
     monkeypatch.setattr(adm, "lock_subscription_mutation", _blocking_lock)
     task = asyncio.create_task(_promote(sub_id, tmp_data_dir))
     await asyncio.wait_for(started.wait(), 5)
 
-    # 并发 sync 完整一轮：B 落盘并更新节点身份，生产池仍排除该候选
     async def _fetch_b(url, channels, **kw):
         return _fetch_result(nodes_b)
 
@@ -380,7 +370,6 @@ async def test_promote_applies_newest_when_sync_lands_before_boundary(
     assert await _source_fps(sub_id) != _fps(nodes_a, await _sub_url(sub_id)), "不得是旧 A"
 
 
-# ══ D. 兜底：apply 被判 skipped_stale 时绝不写 ACTIVE ════════════════
 @pytest.mark.asyncio
 async def test_promote_never_active_when_apply_is_skipped_stale(
     tmp_data_dir, monkeypatch
@@ -396,13 +385,13 @@ async def test_promote_never_active_when_apply_is_skipped_stale(
     later = datetime(2026, 9, 21, 13, 0, 0)
 
     snap_a = await _persist_nodes(sub_id, nodes_a, NOW, tmp_data_dir)
-    await _persist_nodes(sub_id, nodes_b, later, tmp_data_dir)  # 更新的 B 已在库里
+    await _persist_nodes(sub_id, nodes_b, later, tmp_data_dir)
     await _apply_snapshot_nodes(sub_id, nodes_b, tmp_data_dir)
 
     import app.domains.proxypool.admission as adm
 
     async def _stale_latest(session, subscription_id, **kw):
-        return snap_a  # 故意交一份已被取代的快照
+        return snap_a
 
     monkeypatch.setattr(adm, "latest_snapshot", _stale_latest)
     async with get_session_factory()() as s:
@@ -415,7 +404,6 @@ async def test_promote_never_active_when_apply_is_skipped_stale(
     assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id))
 
 
-# ══ C. 两份不同快照交错：最终严格等于最后生效那份，绝不是并集 ═══════
 @pytest.mark.asyncio
 async def test_interleaved_applies_never_union_last_writer_wins(
     tmp_data_dir, monkeypatch
@@ -440,7 +428,7 @@ async def test_interleaved_applies_never_union_last_writer_wins(
 
     async def _blocking_apply_nodes(session, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:  # 第一个writer已取写锁；在共享节点集读写前暂停
+        if calls["n"] == 1:
             first_read.set()
             await release.wait()
         return await real_apply_nodes(session, **kwargs)
@@ -484,7 +472,6 @@ async def test_concurrent_applies_always_end_at_one_snapshot(tmp_data_dir):
         assert got in (_fps(sets[0], await _sub_url(sub_id)), _fps(sets[1], await _sub_url(sub_id))), f"出现并集/混合：{got}"
 
 
-# ══ E. 强制时序：第二个 promote 被边界挡住 → 幂等空转 ════════════════
 @pytest.mark.asyncio
 async def test_forced_interleave_second_promote_waits_then_noops(
     tmp_data_dir, monkeypatch
@@ -508,7 +495,7 @@ async def test_forced_interleave_second_promote_waits_then_noops(
         return _fetch_result(nodes)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch)
-    await _sync(tmp_data_dir)  # 成功快照落盘
+    await _sync(tmp_data_dir)
 
     import app.domains.proxypool.admission as adm
 
@@ -537,20 +524,19 @@ async def test_forced_interleave_second_promote_waits_then_noops(
             return res.promoted
 
     t1 = asyncio.create_task(_promote("T1"))
-    await asyncio.wait_for(ready["T1"].wait(), 5)  # T1 已持写边界并暂停
+    await asyncio.wait_for(ready["T1"].wait(), 5)
     t2 = asyncio.create_task(_promote("T2"))
     await asyncio.sleep(0.2)
     assert not ready["T2"].is_set(), "T2 不该越过边界去读快照"
     assert not t2.done(), "T2 应被挡在自己的取边界语句上"
     assert await _status(sub_id) == ADMISSION_CANDIDATE, "T1 未提交，库里仍是 CANDIDATE"
 
-    go["T1"].set()  # T1 先完成 apply + ACTIVE + commit
+    go["T1"].set()
     r1 = await asyncio.wait_for(t1, timeout=20)
     assert r1 is True
     assert await _status(sub_id) == ADMISSION_ACTIVE
     assert await _source_fps(sub_id) == _fps(nodes, await _sub_url(sub_id))
 
-    # T2 这才继续：取边界 → 读订阅行（新鲜）→ 已是 ACTIVE → 幂等空转
     results = await asyncio.gather(t2, return_exceptions=True)
     assert not isinstance(results[0], BaseException), (
         f"T2 不得出现 SQLITE_BUSY_SNAPSHOT / IntegrityError / 任何异常：{results[0]!r}"
@@ -560,7 +546,6 @@ async def test_forced_interleave_second_promote_waits_then_noops(
     assert await _source_fps(sub_id) == _fps(nodes, await _sub_url(sub_id)), "最终仍是一份完整集合"
 
 
-# ══ F. 顺序语义：最新成功快照胜（out-of-order 不得回退） ═════════════
 @pytest.mark.asyncio
 async def test_out_of_order_older_snapshot_does_not_regress_registry(tmp_data_dir):
     """确定性 out-of-order 回归：
@@ -585,14 +570,14 @@ async def test_out_of_order_older_snapshot_does_not_regress_registry(tmp_data_di
     snap_b = await _persist_nodes(sub_id, nodes_b, later, tmp_data_dir)
 
     tag = subscription_tag(await _sub_url(sub_id))
-    async with get_session_factory()() as s:  # B 先
+    async with get_session_factory()() as s:
         await apply_snapshot(
             s, subscription_id=sub_id, snapshot=snap_b, now=later, tag=tag
         )
         await s.commit()
     assert await _source_fps(sub_id) == _fps(nodes_b, await _sub_url(sub_id))
 
-    async with get_session_factory()() as s:  # A 后（更旧）
+    async with get_session_factory()() as s:
         result = await apply_snapshot(
             s, subscription_id=sub_id, snapshot=snap_a, now=later, tag=tag
         )
@@ -615,7 +600,6 @@ async def test_out_of_order_older_snapshot_does_not_regress_registry(tmp_data_di
     assert await _source_fps(sub_id) == _fps(nodes_c, await _sub_url(sub_id))
 
 
-# ══ H. 「最新」的事实源 = 成功落库顺序（id），不是 fetched_at ════════
 @pytest.mark.asyncio
 async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
     """裁定回归：「最新成功快照」= **成功落库顺序**（`SubscriptionSnapshot.id` 最大者），
@@ -636,7 +620,6 @@ async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
     fetched_early = datetime(2026, 9, 21, 10, 0, 0)
     fetched_late = datetime(2026, 9, 21, 11, 0, 0)
 
-    # B 后抓取但先落库；A 先抓取但后落库 ⇒ id_A > id_B，fetched_at_A < fetched_at_B
     await _persist_nodes(sub_id, nodes_b, fetched_late, tmp_data_dir)
     snap_a = await _persist_nodes(sub_id, nodes_a, fetched_early, tmp_data_dir)
 
@@ -647,7 +630,7 @@ async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
     )
 
     tag = subscription_tag(await _sub_url(sub_id))
-    async with get_session_factory()() as s:  # 最后成功落库的那份必须能应用
+    async with get_session_factory()() as s:
         first = await apply_snapshot(
             s, subscription_id=sub_id, snapshot=latest, now=fetched_early, tag=tag
         )
@@ -655,7 +638,7 @@ async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
     assert first.skipped_stale is False, "最后落库的快照不得被判陈旧"
     assert await _source_fps(sub_id) == _fps(nodes_a, await _sub_url(sub_id))
 
-    async with get_session_factory()() as s:  # 更早落库的那份必须被跳过
+    async with get_session_factory()() as s:
         older = await apply_snapshot(
             s, subscription_id=sub_id, snapshot=_snapshot_of(sub_id, nodes_b, fetched_late),
             now=fetched_late, tag=tag,
@@ -665,7 +648,6 @@ async def test_latest_means_last_landed_not_last_fetched(tmp_data_dir):
     assert await _source_fps(sub_id) == _fps(nodes_a, await _sub_url(sub_id)), "Registry 必须保持最后落库那份"
 
 
-# ══ G. 双击晋升（同快照并发）→ 不 500，最终仍是一份完整集合 ══════════
 @pytest.mark.asyncio
 async def test_double_promote_same_snapshot_stays_consistent(tmp_data_dir, monkeypatch):
     """两次并发 promote（同一条候选、同一份成功快照，双击场景）：
@@ -679,7 +661,7 @@ async def test_double_promote_same_snapshot_stays_consistent(tmp_data_dir, monke
         return _fetch_result(nodes)
 
     monkeypatch.setattr(bs, "fetch_subscription", _fetch)
-    await _sync(tmp_data_dir)  # 候选快照落盘
+    await _sync(tmp_data_dir)
 
     async def _promote_once() -> bool:
         async with get_session_factory()() as s:

@@ -71,7 +71,6 @@ async def _add_node(
     return node
 
 
-# ══ 1. 两笔写入 ═══════════════════════════════════════════════════
 @pytest.mark.asyncio
 async def test_start_run_records_pool_facts_and_selected_node(tmp_data_dir, monkeypatch):
     """开始那笔：池事实（池 SHA / 节点数 / 出口 IP 数 / 来源订阅 / 快照）+ 选中节点。
@@ -128,10 +127,8 @@ async def test_start_run_records_pool_facts_and_selected_node(tmp_data_dir, monk
         assert row.proxy_url == "http://127.0.0.1:45678"
         assert row.pool_sha256 is not None and len(row.pool_sha256) == 64
         assert row.pool_node_count == 3
-        # 两个节点共享同一出口 IP → 去重后 1
         assert row.pool_exit_ip_count == 1
         assert row.subscription_ids_json == [1, 2]
-        # 只取每个订阅 latest status=OK 的快照
         assert row.snapshot_ids_json == [1]
         assert row.selected_node == "1|A"
         assert row.node_exit_ip == "203.0.113.7"
@@ -155,9 +152,9 @@ async def test_pool_exit_ip_count_null_when_never_probed(tmp_data_dir):
         row = await session.get(ProxyJobRun, run_id)
         assert row.pool_node_count == 1
         assert row.pool_exit_ip_count is None
-        assert row.pool_sha256 is None  # 没有池文件 → 无该事实
-        assert row.selected_node is None  # 控制器读不到 → NULL，不阻塞
-        assert row.crawl_job_id is None  # 未传任务身份 → NULL（bundles/CLI 直调形态）
+        assert row.pool_sha256 is None
+        assert row.selected_node is None
+        assert row.crawl_job_id is None
 
 
 @pytest.mark.asyncio
@@ -191,7 +188,6 @@ async def test_finish_run_writes_terminal_state(tmp_data_dir):
         ) is False
 
 
-# ══ 2. 终态与错误分类 ═════════════════════════════════════════════
 @pytest.mark.parametrize(
     ("success", "error", "stopped", "expected"),
     [
@@ -236,7 +232,7 @@ def test_classify_error_uses_http_status_and_names():
     FakeTlsError.__name__ = "SSLCertVerificationError"
     assert jobruns.classify_error(FakeHttpError(503)) == "http_5xx"
     assert jobruns.classify_error(FakeHttpError(404)) == "http_4xx"
-    assert jobruns.classify_error(FakeHttpError(0)) == "other"  # 非 4xx/5xx 不硬塞
+    assert jobruns.classify_error(FakeHttpError(0)) == "other"
     assert jobruns.classify_error(FakeTlsError("certificate verify failed")) == "tls"
 
     class SteamRateLimitError(Exception):
@@ -287,7 +283,6 @@ async def test_by_error_null_not_zero(tmp_data_dir):
         assert payload["byError"] is None
         assert payload["taskCount"] is None
 
-        # 有汇总但全 0 的行：仍是 {}（明确记过"这一次失败分类为空"）
         row2 = ProxyJobRun(
             status=jobruns.STATUS_SUCCESS, started_at=NOW,
             error_summary={"by_error": {}},
@@ -298,18 +293,15 @@ async def test_by_error_null_not_zero(tmp_data_dir):
         assert payload2["byError"] == {}
 
 
-# ══ 3. 读取（今日概览 / 分页 / 详情）═════════════════════════════
 @pytest.mark.asyncio
 async def test_list_runs_paging_and_day_summary(tmp_data_dir):
     await init_db()
     noon = datetime(2026, 9, 19, 12, 0, 0)
     async with get_session_factory()() as session:
         session.add_all([
-            # 前一天：不该进"今日"
             ProxyJobRun(status=jobruns.STATUS_FAILED, started_at=noon - timedelta(days=1),
                         duration_ms=9000, task_count=5, success_count=0, error_count=5,
                         pool_exit_ip_count=40),
-            # 今日三次
             ProxyJobRun(status=jobruns.STATUS_SUCCESS, started_at=noon - timedelta(hours=3),
                         duration_ms=30000, task_count=10, success_count=10, error_count=0,
                         pool_exit_ip_count=44),
@@ -332,9 +324,7 @@ async def test_list_runs_paging_and_day_summary(tmp_data_dir):
         assert summary["partial"] == 1
         assert summary["failed"] == 0
         assert summary["interrupted"] == 1
-        # 平均耗时只对有 duration 的行取（30000 + 50000）/ 2
         assert summary["avgDurationMs"] == 40000
-        # 取当日**最后一次**作业的池出口 IP 数（47），不是最大值也不是 45
         assert summary["poolExitIpCount"] == 47
 
         page2 = await jobruns.list_runs(session, limit=2, offset=2, now=noon)
@@ -436,7 +426,6 @@ async def test_router_serves_real_rows_and_validates_params(tmp_data_dir):
         ).status_code == 422
 
 
-# ══ 4. 中断收尾 / fail-soft ═══════════════════════════════════════
 @pytest.mark.asyncio
 async def test_mark_interrupted_runs(tmp_data_dir):
     """上次进程遗留的 running 行 → interrupted（duration 自 started_at 补）。"""
@@ -463,10 +452,8 @@ async def test_mark_interrupted_runs(tmp_data_dir):
         ]
         assert rows[0].duration_ms == 15 * 60 * 1000
         assert rows[0].error_summary["interrupted"] is True
-        # 已收尾的行一个字节不动
         assert rows[2].duration_ms == 60000
 
-        # 幂等：再来一次没有可标的行
         assert await jobruns.mark_interrupted_runs(session, now) == 0
 
 
@@ -507,13 +494,11 @@ async def test_record_start_is_fail_soft(tmp_data_dir, monkeypatch):
         proxy_url=None, regions=["us"], workers=1, data_dir=tmp_data_dir, now=NOW
     )
     assert run_id is None
-    # 收尾同样 fail-soft（run_id=None 直接返回，不碰库）
     await jobruns.record_finish(
         None, status=jobruns.STATUS_FAILED, now=NOW, error_summary={}
     )
 
 
-# ══ 5. 真链路：run_crawl 落一行 ══════════════════════════════════
 @pytest.mark.asyncio
 async def test_run_crawl_writes_one_row(tmp_data_dir):
     """**唯一生产入口**跑一轮（零任务、零网络）后，库里确实多出一行。
@@ -531,13 +516,12 @@ async def test_run_crawl_writes_one_row(tmp_data_dir):
         rows = (await session.execute(select(ProxyJobRun))).scalars().all()
     assert len(rows) == 1
     row = rows[0]
-    assert row.status == jobruns.STATUS_SUCCESS  # 0/0 不算失败
-    assert row.crawl_job_id == 42  # 执行入口把任务身份带到台账
+    assert row.status == jobruns.STATUS_SUCCESS
+    assert row.crawl_job_id == 42
     assert row.task_count == 0
     assert row.finished_at is not None and row.duration_ms is not None
-    assert row.proxy_url is None  # 直连形态（本轮没有池 Runtime）
+    assert row.proxy_url is None
     assert row.error_summary == {"by_error": {}}
-    # 占用必须已释放（finally 里的 end_crawl）
     from app.crawler.occupancy import crawler_busy
 
     assert crawler_busy() is False
@@ -576,7 +560,6 @@ async def test_run_crawl_interrupted_status_when_stopped(tmp_data_dir):
         rows = (await session.execute(select(ProxyJobRun))).scalars().all()
     assert len(rows) == 1
     assert rows[0].status == jobruns.STATUS_INTERRUPTED
-    # 「没跑完」同时落进行级标记（与启动清理写的 interrupted 同一语义）
     assert rows[0].error_summary == {"by_error": {}, "interrupted": True}
     assert rows[0].finished_at is not None and rows[0].duration_ms is not None
 
@@ -597,8 +580,8 @@ async def test_task_count_is_planned_not_completed(tmp_data_dir, monkeypatch):
     import app.crawler.runner as runner_module
 
     half = {
-        "total": 2,          # 计划 2
-        "processed": 1,      # 只完成 1
+        "total": 2,
+        "processed": 1,
         "success": 1,
         "failed": 0,
         "skipped_no_discount": 0,
@@ -611,7 +594,7 @@ async def test_task_count_is_planned_not_completed(tmp_data_dir, monkeypatch):
 
     monkeypatch.setattr(runner_module, "_run_crawl_locked", _stopped_after_first)
     stop = asyncio.Event()
-    stop.set()  # 完成 1 个之后被停止
+    stop.set()
     stats = await run_crawl(
         None, config=CrawlRunConfig(regions=["us"], workers=1), stop_event=stop
     )
@@ -623,5 +606,4 @@ async def test_task_count_is_planned_not_completed(tmp_data_dir, monkeypatch):
     assert row.success_count == 1
     assert row.error_count == 0
     assert row.status == jobruns.STATUS_INTERRUPTED
-    # 计划数 ≠ 完成数：这正是中断作业应有的形状，不能被「凑平」
     assert row.task_count != row.success_count + row.error_count

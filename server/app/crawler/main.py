@@ -91,8 +91,6 @@ def _load_appids(args) -> list[tuple[int, str]]:
 
 
 async def async_main(args) -> int:
-    # 直连为标准形态：browse 按 country_code 返回各区数据、出口 IP 不参与
-    # 判定，加速器在系统网络层透明生效。代理仅显式指定时启用（调试通道）。
     proxy_url = args.proxy or os.environ.get(f"{ENV_PREFIX}PROXY_URL")
     if proxy_url:
         log_event(logger, "已启用显式指定的代理抓取", detail={"代理": proxy_url})
@@ -127,7 +125,6 @@ async def async_main(args) -> int:
         },
     )
 
-    # 与生产同口径入运行账（CLI 一次调用 = agent_runs 一行；账本失败不拖垮抓取）
     from app.domains.agent.runtime import scheduler_bridge
 
     async def _crawl_body():

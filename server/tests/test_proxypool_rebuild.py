@@ -67,7 +67,6 @@ class _Echo(BaseHTTPRequestHandler):
         pass
 
 
-# ── fixtures ─────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -77,7 +76,6 @@ def clash_runtime():
     runtime.stop()
 
 
-# ── 数据与编排辅助 ───────────────────────────────────────────────
 async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
     """模拟机场轮换出口：同一节点的出口 IP 换成新值。"""
     from sqlalchemy import select as _select
@@ -169,7 +167,6 @@ async def _get_through(port: int, url: str, *, timeout: float) -> httpx.Response
         return await client.get(url)
 
 
-# ── 1. 原节点仍在池中 → 恢复它，不无意义切换 ─────────────────────
 @pytest.mark.asyncio
 async def test_rebuild_keeps_selection_when_node_survives(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -190,7 +187,6 @@ async def test_rebuild_keeps_selection_when_node_survives(
     assert result.proxy_url == f"http://127.0.0.1:{result.mixed_port}"
 
 
-# ── 2. 原节点已出池 → 编排层必须 PUT 新池第一项 ──────────────────
 @pytest.mark.asyncio
 async def test_rebuild_falls_back_when_selected_node_left_pool(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -202,7 +198,6 @@ async def test_rebuild_falls_back_when_selected_node_left_pool(
     base, secret = await _boot(clash_runtime, kernel_exe_path, tmp_data_dir)
     assert await _select(base, secret, "1|C") == "1|C"
 
-    # C 的死因归 L0（已在 P1.4-A 覆盖）；这里只关心"它出池之后"的恢复行为
     await _set_state("1|C", NODE_DEAD)
 
     result = await _rebuild(clash_runtime, kernel_exe_path, tmp_data_dir, base, secret)
@@ -215,7 +210,6 @@ async def test_rebuild_falls_back_when_selected_node_left_pool(
     )
 
 
-# ── 3. 冷通道：旧入口随进程消亡，新入口立即可用 ──────────────────
 @pytest.mark.asyncio
 async def test_cold_rebuild_replaces_endpoints(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -230,7 +224,6 @@ async def test_cold_rebuild_replaces_endpoints(
         assert await _select(base, secret, "1|A") == "1|A"
         old_port = clash_runtime.port
 
-        # 控制器指向一个必然不可达的端口 → 热通道前置探测失败 → 强制走冷通道
         result = await _rebuild(clash_runtime, kernel_exe_path, tmp_data_dir,
                                 "http://127.0.0.1:1", secret)
         assert result.hot_applied is False, "控制器不可达必须走冷通道（进程重启）"
@@ -251,7 +244,6 @@ async def test_cold_rebuild_replaces_endpoints(
         server.shutdown()
 
 
-# ── 4. 热通道：进程不动、端口沿用、新池真的进核 ──────────────────
 @pytest.mark.asyncio
 async def test_hot_rebuild_keeps_process_and_port(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -264,7 +256,6 @@ async def test_hot_rebuild_keeps_process_and_port(
     pid_before = clash_runtime.process.pid
     port_before = clash_runtime.port
 
-    # 池扩容一个节点：重建的唯一差异是池内容，热通道应把它加载进现役进程
     await _add("1|C", port=_closed_port())
     result = await _rebuild(clash_runtime, kernel_exe_path, tmp_data_dir, base, secret)
 
@@ -276,7 +267,6 @@ async def test_hot_rebuild_keeps_process_and_port(
     assert result.selection == "1|B", "GLOBAL 恢复契约与冷通道一致"
     assert await _global_now(result.controller_url, secret) == "1|B"
 
-# ── 5. 出口轮换漂移：crawl_lane_plan 启动时就地收敛，进程不动 ────
 @pytest.mark.asyncio
 async def test_lane_plan_drift_recovers_inline(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -299,7 +289,6 @@ async def test_lane_plan_drift_recovers_inline(
         )
     pid_before = clash_runtime.process.pid
 
-    # 机场轮换：同一节点出口 IP 换新 → lane 计划立刻失配
     await _set_exit_ip("1|A", "2.2.2.2")
     async with get_session_factory()() as s:
         plan = await rt.crawl_lane_plan(

@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 # 结果枚举（固定；增删都要同步改表注释与前端/报表口径）
 OUTCOMES = ("ok", "e429", "e4xx", "e5xx", "timeout", "connect_error", "other")
 
-# 端点标签：把 URL 收敛成稳定短名，避免把带查询串的完整 URL 存进库
 _ENDPOINT_LABELS = (
     ("IStoreBrowseService", "store_browse"),
     ("appdetails", "app_details"),

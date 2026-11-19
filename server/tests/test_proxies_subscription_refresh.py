@@ -63,7 +63,6 @@ def _stub_runtime(monkeypatch, tmp_path, *, subscription_url: str | None) -> Pat
         },
     )
     monkeypatch.setattr(clash_manager.runtime, "subscription_url", subscription_url)
-    # 内核重启分支要真起进程，测试里不碰——统一按「内核目录不可用」跳过
     monkeypatch.setattr(clash_manager, "detect_kernel", lambda d: {"found": False})
     return cfg
 
@@ -85,7 +84,6 @@ async def _refresh_state() -> str:
     return (await proxies_service.maybe_refresh_active_clash_subscription())["state"]
 
 
-# ─── 重启判定去噪（配置等价比较）────────────────────────────
 
 
 def test_config_unchanged_ignores_probe_lane_injection():
@@ -93,7 +91,7 @@ def test_config_unchanged_ignores_probe_lane_injection():
     等价判定必须看穿注入，否则每次重拉都白重启一次内核。"""
     raw = _config_text()
     injected = clash_manager.inject_probe_lanes(raw)
-    assert injected != raw  # 注入确实发生（前置条件）
+    assert injected != raw
 
     assert clash_manager.config_unchanged(injected, raw) is True
     assert clash_manager.config_unchanged(injected, injected) is True
@@ -101,7 +99,6 @@ def test_config_unchanged_ignores_probe_lane_injection():
     assert clash_manager.config_unchanged(None, raw) is False
 
 
-# ─── 间隔门槛 ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -135,7 +132,7 @@ async def test_refresh_runs_after_interval(db, monkeypatch, tmp_path):
     assert out["state"] == "refreshed"
     assert out["subscriptionId"] == sub_id
     assert out["nodes"] == 2
-    assert out["restarted"] is False  # 测试不打桩内核进程，重启分支不入
+    assert out["restarted"] is False
     assert calls == [SUB_URL]
 
     async with db() as session:
@@ -144,12 +141,10 @@ async def test_refresh_runs_after_interval(db, monkeypatch, tmp_path):
         assert sub.last_stats["traffic"] == USERINFO
         assert sub.last_stats["nodes"] == 2
 
-    # 门槛已消费：紧接着再跑一次不再拉
     assert await _refresh_state() == "throttled"
     assert calls == [SUB_URL]
 
 
-# ─── 「在跑哪条」判定 ───────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -211,10 +206,9 @@ async def test_refresh_picks_subscription_actually_running(db, monkeypatch, tmp_
         running = await session.get(ProxySubscription, running_id)
         assert running.last_imported_at is not None
         untouched = await session.get(ProxySubscription, idle_id)
-        assert untouched.last_imported_at is None  # 没在跑的那条不动
+        assert untouched.last_imported_at is None
 
 
-# ─── 拉取成功后自动识别订阅名（仅补空位，本地保存）──────────
 
 
 @pytest.mark.asyncio
@@ -326,12 +320,10 @@ async def test_refresh_uses_saved_proxies_after_direct(db, monkeypatch, tmp_path
     await proxies_service.refresh_clash_subscription(
         (await _seed_sub(db))
     )
-    # 池里的启用代理被作为借道候选传给下载通道（可能抽到 0~3 条，但来自池）
     assert seen_proxy_args and seen_proxy_args[0]
     assert all(p == "http://10.0.0.1:8080" for p in seen_proxy_args[0])
 
 
-# ─── 失败留待重试 ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -350,10 +342,9 @@ async def test_refresh_failure_retries_next_tick(db, monkeypatch, tmp_path):
     assert await _refresh_state() == "failed"
     assert await settings_service.get_value(GATE_KEY) is None
     assert await _refresh_state() == "failed"
-    assert len(attempts) == 2  # 门槛没消费，第二拍照试
+    assert len(attempts) == 2
 
 
-# ─── 调度接线 ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -427,11 +418,11 @@ async def test_job_swallows_errors(monkeypatch):
 
     monkeypatch.setattr(sched_mod, "_crawler_idle", lambda: True)
     monkeypatch.setattr(proxies_service, "maybe_refresh_active_clash_subscription", _boom_refresh)
-    await sched_mod._job_subscription_refresh()  # 不抛出即通过
+    await sched_mod._job_subscription_refresh()
 
     monkeypatch.setattr(proxies_service, "maybe_refresh_active_clash_subscription", _ok_refresh)
     monkeypatch.setattr(proxies_service, "test_clash_nodes", _boom_check)
-    await sched_mod._job_subscription_refresh()  # 首检失败同样不抛出
+    await sched_mod._job_subscription_refresh()
 
 
 @pytest.mark.asyncio
@@ -459,7 +450,6 @@ async def test_start_scheduler_registers_refresh_job(monkeypatch):
     assert kw.get("minutes") == 30
 
 
-# ─── 门槛时间戳解析防呆 ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -491,7 +481,6 @@ async def test_refresh_holds_test_lock_during_lifecycle_change(db, monkeypatch, 
     calls: list = []
     cfg = _stub_runtime(monkeypatch, tmp_path, subscription_url=SUB_URL)
     _stub_download(monkeypatch, cfg, calls)
-    # 内核目录命中：让 ensure_running 分支真实执行（_stub_runtime 默认未命中）
     monkeypatch.setattr(
         clash_manager, "detect_kernel", lambda d: {"found": True, "path": "kernel"}
     )
@@ -501,7 +490,6 @@ async def test_refresh_holds_test_lock_during_lifecycle_change(db, monkeypatch, 
         lock = proxies_service._clash_test_lock()
         lock_probe["held"] = lock.locked()
         try:
-            # 探测侧视角：生命周期变更进行中，拿锁必须等到它结束
             await asyncio.wait_for(lock.acquire(), timeout=0.05)
             lock_probe["contended"] = False
             lock.release()

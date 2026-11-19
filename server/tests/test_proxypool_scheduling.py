@@ -57,10 +57,9 @@ from app.domains.proxypool.scheduling import (  # noqa: E402
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_DEAD  # noqa: E402
 
 NOW = datetime(2026, 9, 19, 12, 0, 0)
-DEFAULT_CONTROLLER_PORT = 19090  # 项目注入的共享默认值——proxypool 不得依赖它
+DEFAULT_CONTROLLER_PORT = 19090
 
 
-# ── 本地夹具 ─────────────────────────────────────────────────────
 
 
 class _ProbeEcho(BaseHTTPRequestHandler):
@@ -72,7 +71,7 @@ class _ProbeEcho(BaseHTTPRequestHandler):
                 "id": 220, "appid": 220, "success": 1, "visible": True,
                 "best_purchase_option": {"final_price_in_cents": "999"},
             }]}}
-        else:  # /ip
+        else:
             payload = {"ip": "203.0.113.10"}
         body = json.dumps(payload).encode()
         self.send_response(200)
@@ -85,7 +84,6 @@ class _ProbeEcho(BaseHTTPRequestHandler):
         pass
 
 
-# ── fixtures ─────────────────────────────────────────────────────
 
 
 @pytest.fixture(autouse=True)
@@ -132,7 +130,6 @@ def probe_echo():
     server.shutdown()
 
 
-# ── 数据与启动辅助 ───────────────────────────────────────────────
 async def _add(runtime_name: str, *, port: int, state: str = NODE_ACTIVE) -> None:
     config = {"name": runtime_name.split("|", 1)[-1], "type": "http",
               "server": "127.0.0.1", "port": port}
@@ -223,7 +220,6 @@ async def _set_exit_ip(runtime_name: str, exit_ip: str) -> None:
         await s.commit()
 
 
-# ══ 1. 两条 crawler 路径统一互斥 ═════════════════════════════════
 @pytest.mark.asyncio
 async def test_crawl_paths_share_one_occupancy(tmp_data_dir, monkeypatch) -> None:
     """`run_crawl` 是唯一的生产执行入口；占用语义必须统一，不能只看 `_active`。
@@ -231,12 +227,11 @@ async def test_crawl_paths_share_one_occupancy(tmp_data_dir, monkeypatch) -> Non
     bundles 直调 `run_crawl` 不经 `start_job`，所以占用必须落在**执行入口**上。
     """
     await init_db()
-    begin_crawl("test-bundles")          # 模拟 bundles 那条直调路径正在跑
+    begin_crawl("test-bundles")
 
     with pytest.raises(CrawlerBusyError):
         await run_crawl(None, config=CrawlRunConfig(regions=["us"]))
 
-    # 手动路径同样必须被挡下（且在创建 job 之前就挡，不留下"失败的任务行"）
     with pytest.raises(RuntimeError, match="已有爬取任务"):
         await crawl_service.start_job(scope="appids", appids=[220], regions=["us"])
 
@@ -244,7 +239,6 @@ async def test_crawl_paths_share_one_occupancy(tmp_data_dir, monkeypatch) -> Non
     assert not crawler_busy()
 
 
-# ══ 2. 占线时 L0 只改状态、置 pending、不重启内核 ════════════════
 @pytest.mark.asyncio
 async def test_l0_while_busy_marks_pending_without_restart(
     tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
@@ -252,12 +246,12 @@ async def test_l0_while_busy_marks_pending_without_restart(
     await init_db()
     await _add("1|A", port=redirect_proxies(probe_echo))
     await _add("1|B", port=redirect_proxies(probe_echo))
-    await _add("1|C", port=_free_port())          # 死端口 → L0 必失败
+    await _add("1|C", port=_free_port())
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     pid_before = proxy_runtime.process.pid
     port_before = proxy_runtime.port
 
-    begin_crawl("test-crawl")                      # crawl 占线
+    begin_crawl("test-crawl")
     async with get_session_factory()() as s:
         outcomes = await run_l0_cycle(
             s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
@@ -273,7 +267,6 @@ async def test_l0_while_busy_marks_pending_without_restart(
     end_crawl()
 
 
-# ══ 3. 空闲时消费 pending → rebuild（热通道：进程与端口都不动） ═══
 @pytest.mark.asyncio
 async def test_pending_rebuild_consumed_when_idle(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -310,7 +303,6 @@ async def test_pending_rebuild_consumed_when_idle(
     assert await _global_now(result.controller_url, secret) == "1|B"
 
 
-# ══ 3b. 空转闸：目标与现状一致 → 重建跳过，内核不受扰 ════════════
 @pytest.mark.asyncio
 async def test_rebuild_skipped_when_target_unchanged(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -321,7 +313,7 @@ async def test_rebuild_skipped_when_target_unchanged(
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     pid_before = proxy_runtime.process.pid
 
-    request_rebuild()  # 池与 lane 计划均无变化：纯空转的重建请求
+    request_rebuild()
     async with get_session_factory()() as s:
         result = await run_pending_rebuild(
             s, data_dir=tmp_data_dir, controller_url=base, secret=secret,
@@ -334,7 +326,6 @@ async def test_rebuild_skipped_when_target_unchanged(
     assert proxy_runtime.process.pid == pid_before, "空转重建不得扰动内核"
 
 
-# ══ 3c. 空转闸：合格集已空而 Runtime 活着 → 拒绝物化空池 ═════════
 @pytest.mark.asyncio
 async def test_rebuild_refuses_empty_pool_while_runtime_alive(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -362,7 +353,6 @@ async def test_rebuild_refuses_empty_pool_while_runtime_alive(
     )
 
 
-# ══ 4. 占线时 L1/L2 直接跳过 ═════════════════════════════════════
 @pytest.mark.asyncio
 async def test_maintenance_skips_while_busy(
     tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
@@ -386,7 +376,6 @@ async def test_maintenance_skips_while_busy(
     assert await _global_now(base, secret) == "1|B", "跳过的维护不得动 GLOBAL"
 
 
-# ══ 5. L1/L2 是 capture → probe → restore 事务 ═══════════════════
 @pytest.mark.asyncio
 async def test_maintenance_restores_global_from_current_pool(
     tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo,
@@ -426,9 +415,8 @@ async def test_maintenance_restores_global_from_current_pool(
     assert await _global_now(base, secret) == "1|B"
     assert result.l1 and result.l2, "L1/L2 确实跑过（它们才是切换 GLOBAL 的人）"
 
-    # 原节点已出池 → 落到当前池第一项（确定性）
     await _set_state("1|B", NODE_DEAD)
-    assert await _select(base, secret, "1|B") == "1|B"   # 内核里还在，先选上
+    assert await _select(base, secret, "1|B") == "1|B"
     async with get_session_factory()() as s:
         second = await run_maintenance_cycle(
             s, data_dir=tmp_data_dir, controller_url=base, secret=secret, now=NOW,
@@ -441,7 +429,6 @@ async def test_maintenance_restores_global_from_current_pool(
     assert await _global_now(base, secret) == "1|A"
 
 
-# ══ P1.6-C：接线（cycle / 两个注入点 / fail closed）══════════════
 async def _cycle(session, data_dir, base, secret, runtime, exe, now=None, **kw):
     from app.domains.proxypool.scheduling import run_proxypool_cycle
 
@@ -453,7 +440,6 @@ async def _cycle(session, data_dir, base, secret, runtime, exe, now=None, **kw):
     )
 
 
-# ── 8. Scheduler 实际调用 proxypool cycle（单 job）────────────────
 @pytest.mark.asyncio
 async def test_scheduler_job_calls_proxypool_cycle(tmp_data_dir, monkeypatch) -> None:
     from app.core import scheduler as core_scheduler
@@ -463,7 +449,7 @@ async def test_scheduler_job_calls_proxypool_cycle(tmp_data_dir, monkeypatch) ->
     await _add("1|A", port=_free_port())
     async with get_session_factory()() as s:
         await build_pool(s, data_dir=tmp_data_dir)
-    prepare_runtime_config(tmp_data_dir)      # 前置条件：池 Runtime 配置存在
+    prepare_runtime_config(tmp_data_dir)
 
     calls: list[dict] = []
 
@@ -488,7 +474,6 @@ async def test_scheduler_job_calls_proxypool_cycle(tmp_data_dir, monkeypatch) ->
     assert calls and calls[0]["data_dir"] == tmp_data_dir
 
 
-# ── 9/10. 占线：L0 照跑改状态 + pending，但不重建/不 L1/L2 ────────
 @pytest.mark.asyncio
 async def test_cycle_while_busy_only_runs_l0(
     tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo
@@ -517,7 +502,6 @@ async def test_cycle_while_busy_only_runs_l0(
     assert proxy_runtime.process.pid == pid_before and proxy_runtime.port == port_before
 
 
-# ── 11/12. 空闲：消费 pending 真重建，之后才 L1/L2 并恢复 GLOBAL ──
 @pytest.mark.asyncio
 async def test_cycle_when_idle_rebuilds_then_maintains(
     tmp_data_dir, kernel_exe_path, proxy_runtime, redirect_proxies, probe_echo,
@@ -548,8 +532,6 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
         )
         await s.commit()
 
-    # 第一轮：L2 经死端口节点 C 的链路拿不到 Steam 响应（mihomo 回 502 网关错）
-    # → C 判死、合格集变化 → 置 pending；重建步在 maintenance 之前，本轮不消费
     assert first.busy is False
     assert first.rebuilt is None, "本轮只置位（重建步在 maintenance 之前）"
     assert rebuild_pending() is True, "L2 判死改变合格集 → 置重建信号"
@@ -558,7 +540,7 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
     async with get_session_factory()() as s:
         second = await _cycle(
             s, tmp_data_dir, base, secret, proxy_runtime, kernel_exe_path,
-            now=NOW + timedelta(hours=3),  # 超出体检间隔：节流不得吞掉本轮维护
+            now=NOW + timedelta(hours=3),
             l0_target_url="http://probe.invalid/ip",
             l1_url="http://probe.invalid/ip", l2_url="http://probe.invalid/browse",
         )
@@ -574,7 +556,6 @@ async def test_cycle_when_idle_rebuilds_then_maintains(
     assert rebuild_pending() is False
 
 
-# ── 13/14. 两个 production run 拿到当前 Runtime（每 run 只取一次）──
 @pytest.mark.asyncio
 async def test_crawl_service_injects_current_runtime_per_run(
     tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
@@ -585,7 +566,6 @@ async def test_crawl_service_injects_current_runtime_per_run(
     from app.domains.proxypool.runtime import lane_proxy_urls
 
     await init_db()
-    # 本测试验证代理形态的 lane 注入：直连形态（现默认）proxy_urls/proxy_url 恒空
     from app.domains.settings.service import set_value
     await set_value("proxy.strategy", "proxy_first")
     await _add("1|A", port=_free_port())
@@ -610,7 +590,6 @@ async def test_crawl_service_injects_current_runtime_per_run(
     await cs._active.task
     assert captured[-1] == lanes_x, "一个 run 只取一次入口集合，整个 run 固定用它"
 
-    # 新增一个**不同出口 IP** 的节点 → 重建后出口槽 1 → 2，lane 追加一条工位
     await _add("1|B", port=_free_port())
     await _set_exit_ip("1|B", "2.2.2.2")
     async with get_session_factory()() as s:
@@ -629,7 +608,6 @@ async def test_crawl_service_injects_current_runtime_per_run(
     assert len({tuple(x or []) for x in captured}) == 2
 
 
-# ── 15/16. bundles 注入 + 两条路径 fail closed ───────────────────
 @pytest.mark.asyncio
 async def test_bundles_path_injects_runtime_and_fails_closed(
     tmp_data_dir, kernel_exe_path, proxy_runtime, monkeypatch
@@ -640,7 +618,6 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
     from app.domains.crawl import service as cs
 
     await init_db()
-    # 本测试验证代理形态的 lane 注入：直连形态（现默认）proxy_urls/proxy_url 恒空
     from app.domains.settings.service import set_value
     await set_value("proxy.strategy", "proxy_first")
     await _add("1|A", port=_free_port())
@@ -665,29 +642,25 @@ async def test_bundles_path_injects_runtime_and_fails_closed(
     monkeypatch.setattr("app.crawler.runner.run_crawl", _stub_run_crawl)
     monkeypatch.setattr("app.domains.regions.service.enabled_regions", _regions)
 
-    # ① 没有池 Runtime → 拒绝启动（不直连、不退旧订阅代理）
     await rf._enqueue_new_bundle_apps()
     assert captured == [], "拿不到 Runtime 时不得启动 run"
 
-    # ② 有 Runtime → 注入当前**lane**地址（不是 mixed-port/GLOBAL 入口）
     base, secret = await _boot(proxy_runtime, kernel_exe_path, tmp_data_dir)
     await rf._enqueue_new_bundle_apps()
     assert captured == [lane_proxy_urls(tmp_data_dir)[0]], (
         "bundles 也必须走爬取唯一取值口（lane），不得退回 GLOBAL 单入口"
     )
 
-    # ③ crawl 域同样 fail closed
     async def _regions2(regions=None):
         return regions or ["us"]
 
     monkeypatch.setattr(cs, "effective_regions", _regions2)
     monkeypatch.setattr(cs, "run_crawl", _stub_run_crawl)
-    proxy_runtime.stop()                       # Runtime 不可用
+    proxy_runtime.stop()
     with pytest.raises(RuntimeUnavailableError):
         await cs.start_job(scope="appids", appids=[220], regions=["us"])
 
 
-# ══ 6. 与老订阅 Runtime 真正隔离 ═════════════════════════════════
 @pytest.mark.asyncio
 async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -700,7 +673,6 @@ async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
     await _add("1|A", port=_free_port())
     await _add("1|B", port=_free_port())
 
-    # —— 老订阅 Runtime（独立实例，绝不用 clash_manager.runtime）——
     legacy_dir = tmp_data_dir / "clash"
     legacy_dir.mkdir(parents=True, exist_ok=True)
     legacy_controller = _free_port()
@@ -737,7 +709,6 @@ async def test_proxypool_rebuild_leaves_subscription_runtime_alone(
         legacy.stop()
 
 
-# ══ 7. controller 端口不依赖共享默认值 19090 ════════════════════
 @pytest.mark.asyncio
 async def test_proxypool_controller_port_is_dedicated(
     tmp_data_dir, kernel_exe_path, proxy_runtime
@@ -759,8 +730,6 @@ async def test_proxypool_controller_port_is_dedicated(
     assert doc.get("secret"), "自带 secret，避免与别的实例共用凭据"
     assert config == runtime_config_path(tmp_data_dir)
 
-    # 现实场景：老 Runtime 的配置没有 external-controller → 启动时按共享默认
-    # 端口（19090 起避让）解析控制器，经命令行参数下发生效
     legacy_dir = tmp_data_dir / "clash"
     legacy_dir.mkdir(parents=True, exist_ok=True)
     legacy_mixed = _free_port()

@@ -37,7 +37,6 @@ def _fresh_network_checker():
     network_check.network_checker = NetworkChecker()
 
 
-# ─── 断网检测器 ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -104,7 +103,6 @@ async def _async_false() -> bool:
     return False
 
 
-# ─── 手动池加权随机选择 ─────────────────────────────────────
 
 
 async def _seed_pool(db, specs: list[tuple[int, int, int]]) -> list[int]:
@@ -137,9 +135,9 @@ async def test_weighted_pick_prefers_healthy_low_latency(db):
 
     random.seed(42)
     await _seed_pool(db, [
-        (50, 0, 1),      # 快而健康 → 权重 ~99950（期望份额 57%）
-        (30000, 0, 1),   # 30s 慢 → 权重 ~70000（期望份额 40%）
-        (100, 4, 1),     # 连续失败 4 次未到禁用线 → 指数降权（期望份额 3.5%）
+        (50, 0, 1),
+        (30000, 0, 1),
+        (100, 4, 1),
     ])
     enabled = await proxies_service.list_proxies(enabled_only=True)
     picks = [await proxies_service._weighted_pick(enabled) for _ in range(50)]
@@ -148,8 +146,8 @@ async def test_weighted_pick_prefers_healthy_low_latency(db):
     counter = Counter(picks)
     best = "http://10.0.0.1:8000"
     degraded = "http://10.0.0.1:8002"
-    assert counter[best] > counter[degraded] * 4  # 健康快节点显著多于濒死节点
-    assert counter[best] >= 20  # 且占多数（期望 57%，2σ 下界）
+    assert counter[best] > counter[degraded] * 4
+    assert counter[best] >= 20
 
 
 @pytest.mark.asyncio
@@ -157,8 +155,8 @@ async def test_weighted_pick_dead_node_never_chosen(db):
     """连续失败达禁用线（5 次）→ 权重 0，永不被选。"""
     await _seed_pool(db, [
         (50, 0, 1),
-        (200, 5, 1),   # 濒死：权重 0
-        (300, 5, 1),   # 濒死：权重 0
+        (200, 5, 1),
+        (300, 5, 1),
     ])
     for _ in range(30):
         url = await proxies_service._weighted_pick(await proxies_service.list_proxies(enabled_only=True))
@@ -178,7 +176,6 @@ async def test_weighted_pick_all_dead_falls_back_round_robin(db, monkeypatch):
     assert url.startswith("http://10.0.0.1")
 
 
-# ─── 直连传输退避（failover 换出口机制已退役） ───────────────
 
 
 @pytest.mark.asyncio
@@ -207,7 +204,6 @@ async def test_transport_error_retries_then_succeeds(monkeypatch):
     class FakeSession:
         def get(self, url, params=None, headers=None, timeout=None, proxy=None):
             calls["n"] += 1
-            # 第一次：传输层失败（模拟抖动）；第二次（同一直连出口退避后）：成功
             if calls["n"] == 1:
                 raise aiohttp.ClientConnectionError("connection refused")
             return FakeResp()
@@ -263,7 +259,6 @@ async def test_429_trips_breaker_then_backoff_succeeds(monkeypatch):
     await global_429_breaker.reset()
 
 
-# ─── 通道健康：连接建立失败不上同出口重试（换出口交由 handler 重推） ───────────
 
 
 @pytest.mark.asyncio

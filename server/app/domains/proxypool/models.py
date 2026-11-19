@@ -36,8 +36,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 from app.domains.proxypool.state import NODE_NEW
 
-# 不参与节点身份的键：命名必然随来源而变，开关由消费侧自行覆盖，
-# 两者都不改变「这个节点是谁」。
 _IGNORE_FOR_FP = frozenset({
     "name", "display-name",
     "udp", "tfo", "mptcp", "smux",
@@ -71,10 +69,6 @@ def subscription_tag(url: str) -> str:
     label = ".".join(parts[-2:]) if len(parts) >= 2 else host
     return f"{digest}.{label}" if label else digest
 
-# 机场信息占位节点的名称特征：它们是机场公告位（剩余流量 / 到期 / 官网 / 套餐
-# / 重置等），不是可用的代理端点——进了池会占出口工位、污染 GLOBAL 选择、
-# 让出口探测记下垃圾归属；且内容随订阅更新漂移（「剩余流量：31.01 GB」每次
-# 拉取都变），同名会反复重生。
 _INFO_NAME_PATTERNS = (
     "剩余", "到期", "过期", "官网", "套餐", "重置",
     "有效期", "可用设备", "防失联", "失联",
@@ -154,29 +148,19 @@ class ProxyNode(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     node_id: Mapped[str] = mapped_column(String(64), unique=True)
-    # 首次登记时铸造（<来源订阅>|<原名>，撞名加 #N），此后绝不重算：
-    # 重算会让已绑定的 lane / 池文件条目指向一个不存在的名字
     runtime_name: Mapped[str] = mapped_column(String(400), unique=True)
     proxy_type: Mapped[str] = mapped_column(String(32))
     server: Mapped[str | None] = mapped_column(String(255))
     normalized_config: Mapped[dict | None] = mapped_column(JSON)
     state: Mapped[str] = mapped_column(String(16), default=NODE_NEW)
     first_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 归属订阅与它在订阅里的原名：节点跟着订阅走，归属是身份的一部分（`node_id`
-    # 已含订阅标识），因此直接落本表而不是另立来源关联表。同一份配置由两个订阅
-    # 提供时是两行，各自记账。原名只作观测与审计（改名不影响身份），体检要拿它去
-    # 定位旧链路内核里的节点名。
     subscription_id: Mapped[int | None] = mapped_column(Integer, index=True)
     original_name: Mapped[str | None] = mapped_column(String(255))
     # legacy / 暂不使用：登记时赋值，此后**不再推进**。来源时间的事实源是
     # last_source_seen，健康时间在 last_l0/l1/l2_at——本列若也定义成「最近见到」，
     # 就会造出第二套时间真相。
     last_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 最后一次出现在订阅快照里的时刻（登记/刷新时推进）
     last_source_seen: Mapped[datetime | None] = mapped_column(DateTime)
-    # 最近一次成功 L0 探测的延迟与时刻（出口槽排序键的持久化形态）。
-    # L0 成功只更新这两列、不落观测行——全池 5min 一拍的延迟流水会把
-    # health_observations 撑成每天数万行；失败才留观测（证据归流水）。
     last_l0_at: Mapped[datetime | None] = mapped_column(DateTime)
     l0_delay_ms: Mapped[int | None] = mapped_column(Integer)
     last_l1_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -203,10 +187,10 @@ class ProxyRunExit(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    run_id: Mapped[int] = mapped_column(Integer, index=True)  # proxy_job_runs.id
+    run_id: Mapped[int] = mapped_column(Integer, index=True)
     exit_ip: Mapped[str] = mapped_column(String(64))
     endpoint: Mapped[str] = mapped_column(String(32))
-    node: Mapped[str | None] = mapped_column(String(400))  # 当时绑在该出口上的节点
+    node: Mapped[str | None] = mapped_column(String(400))
     requests: Mapped[int] = mapped_column(Integer, default=0)
     success: Mapped[int] = mapped_column(Integer, default=0)
     e429: Mapped[int] = mapped_column(Integer, default=0)
@@ -231,7 +215,6 @@ class HealthObservation(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     detail: Mapped[str | None] = mapped_column(Text)
     observed_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # 归属哪次体检运行（NULL = 不挂 run 的零散观测）；channel 区分写入通道
     run_id: Mapped[int | None] = mapped_column(Integer, index=True)
     channel: Mapped[str | None] = mapped_column(String(16))
     target: Mapped[str | None] = mapped_column(String(500))
@@ -272,7 +255,6 @@ class SubscriptionSnapshot(Base):
     subscription_id: Mapped[int] = mapped_column(Integer, index=True)
     sha256: Mapped[str] = mapped_column(String(64))
     format: Mapped[str] = mapped_column(String(16))
-    # 原始字节按 sha 内容寻址落盘（订阅动辄数十 KB，不进库），这里只存路径
     raw_path: Mapped[str | None] = mapped_column(String(500))
     # 这份内容是从哪个 URL 抓下来的（provenance）：订阅换链接后，旧链接的成功快照
     # 不得被 `latest_snapshot(url=当前URL)` 选中。历史行无此列为 NULL。
@@ -281,7 +263,6 @@ class SubscriptionSnapshot(Base):
     status: Mapped[str] = mapped_column(String(16))
     http_status: Mapped[int | None] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(100))
-    # 抓取成功的通道名（direct / mihomo / proxypool / local）
     source_channel: Mapped[str | None] = mapped_column(String(32))
     source_egress: Mapped[str | None] = mapped_column(String(100))
     profile_title: Mapped[str | None] = mapped_column(String(100))
@@ -324,28 +305,21 @@ class ProxyJobRun(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # running | success | partial | failed | interrupted（由 jobruns 一处定义）
     status: Mapped[str] = mapped_column(String(16), index=True)
-    # 预留触发来源（manual|scheduled|bundles|cli）；v1 一律 'crawl'（run_crawl 是唯一入口）
     kind: Mapped[str] = mapped_column(String(16), default="crawl")
-    # 关联爬取任务行（NULL = bundles/CLI 直调，或本列上线前的历史行）
     crawl_job_id: Mapped[int | None] = mapped_column(Integer)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     regions_json: Mapped[list | None] = mapped_column(JSON)
     workers: Mapped[int | None] = mapped_column(Integer)
-    # 本轮固定使用的池入口（run 内不换端口）
     proxy_url: Mapped[str | None] = mapped_column(String(120))
-    # 池文件内容哈希：回答「这一轮用的是哪一版池」，无需 generation 概念
     pool_sha256: Mapped[str | None] = mapped_column(String(64))
     pool_node_count: Mapped[int | None] = mapped_column(Integer)
     # 池内**已知**出口 IP 去重数；NULL = 尚未探测（与「0 个出口」不是一回事）
     pool_exit_ip_count: Mapped[int | None] = mapped_column(Integer)
-    # GLOBAL 选中节点的 runtime_name（run 开始时读控制器取得；读不到为 NULL）
     selected_node: Mapped[str | None] = mapped_column(String(400))
     node_exit_ip: Mapped[str | None] = mapped_column(String(64))
-    # 池内合格节点的全部来源订阅 + 各订阅最新 OK 快照（事实，不是「生产订阅」）
     subscription_ids_json: Mapped[list | None] = mapped_column(JSON)
     snapshot_ids_json: Mapped[list | None] = mapped_column(JSON)
     task_count: Mapped[int | None] = mapped_column(Integer)

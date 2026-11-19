@@ -69,11 +69,9 @@ async def _writeback_production_evidence(
     if not by_runtime:
         return
     environment_alive = any(_row_ok(row) > 0 for row in rows if not row.get("uncertain"))
-    # lane绑定提供运行名，节点指纹是另一种身份，不能拿运行名查node_id。
     node_rows = (await session.execute(
         select(ProxyNode).where(ProxyNode.runtime_name.in_(by_runtime))
     )).scalars().all()
-    # 仍归属订阅的节点才算「有来源」（归属是一对一的身份组成部分）
     sourced = {n.node_id for n in node_rows if n.subscription_id is not None}
     stamp = now or datetime.now()
     for node in node_rows:
@@ -149,7 +147,7 @@ async def write_run_exits(
                 session, run_id=run_id, rows=collector.rows(),
                 node_by_exit=node_by_exit, now=now,
             )
-    except Exception:  # noqa: BLE001 —— 出口账本写失败不改爬取行为
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "出口账本落库失败，不影响本次作业结果",

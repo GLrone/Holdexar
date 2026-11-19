@@ -23,7 +23,6 @@ from app.domains.crawl import events as _events_mod  # noqa: F401  price_events 
 from app.domains.crawl import service as crawl_service
 from app.domains.crawl.models import CrawlJob
 from app.domains.games.models import Game, GameCurrentPrice
-# pool / monitoring 表注册进 Base.metadata
 from app.domains.monitoring import models as _monitoring_models  # noqa: F401
 from app.crawler.occupancy import CrawlerBusyError, begin_crawl, current_holder, end_crawl
 
@@ -35,12 +34,11 @@ def db():
     return get_session_factory()
 
 
-# ── occupancy：同 tag 幂等重入 ──
 
 
 def test_occupancy_same_tag_reentrant():
     begin_crawl("t")
-    begin_crawl("t")  # 同 tag 重入不抛
+    begin_crawl("t")
     assert current_holder() == "t"
     end_crawl()
     assert current_holder() is None
@@ -53,7 +51,6 @@ def test_occupancy_other_tag_raises():
     end_crawl()
 
 
-# ── 链级停止：run_sequential 段间退出 ──
 
 
 def _fake_start_job_factory(started):
@@ -106,11 +103,10 @@ async def test_stop_current_segment_only_keeps_chain(monkeypatch):
     assert await crawl_service.stop_job(whole_chain=False) is True
     results = await runner
     assert len(started) == 2 and len(results) == 2
-    assert not chain.is_set()  # 只停当前段：链级停止位不置位
+    assert not chain.is_set()
     crawl_service.unregister_chain_stop(chain)
 
 
-# ── run_price_cycle：停轮返回 True、终态 cancelled、不进 repairing、不发事件 ──
 
 
 @pytest.mark.asyncio
@@ -151,22 +147,20 @@ async def test_stopped_cycle_returns_true_skips_repairing_and_events(
                 started_at=datetime.now(), finished_at=datetime.now(),
             ))
             await session.commit()
-        # 第一段收尾时用户按停止：整轮语义
         await crawl_service.stop_job()
         return [{"id": 1}]
 
     monkeypatch.setattr(crawl_service, "run_sequential", _stopped_mid_chain)
 
     result = await cycle_run.run_price_cycle([{"scope": "pool"}])
-    assert result is True  # 停轮不得触发调用方让路重试
-    assert crawl_service.chain_stop_requested() is False  # 收尾后注销
+    assert result is True
+    assert crawl_service.chain_stop_requested() is False
     rows = await cycle_mod.list_cycles(5)
-    assert rows and rows[0]["status"] == cycle_mod.CANCELLED  # 全停 → 非 failed
-    assert rows[0]["enteredRepairing"] is False  # 停轮不进 repairing
-    assert calls == {"detect": 0, "notify": 0}  # 停轮不发事件不投递通知
+    assert rows and rows[0]["status"] == cycle_mod.CANCELLED
+    assert rows[0]["enteredRepairing"] is False
+    assert calls == {"detect": 0, "notify": 0}
 
 
-# ── has_pending_missing：EXISTS 直查 ──
 
 
 def _now_naive() -> datetime:
@@ -197,12 +191,12 @@ async def test_has_pending_missing_true_on_old_debt(db):
 @pytest.mark.asyncio
 async def test_has_pending_missing_false_when_empty_or_fresh(db):
     async with db() as session:
-        session.add(_missing_row(770003, region=""))  # 空区痕迹不算待补
+        session.add(_missing_row(770003, region=""))
         await session.commit()
     assert await crawl_service.has_pending_missing(cooldown_minutes=60) is False
 
     async with db() as session:
-        session.add(_missing_row(770004, age_hours=0.01))  # 冷却内不算
+        session.add(_missing_row(770004, age_hours=0.01))
         await session.commit()
     assert await crawl_service.has_pending_missing(cooldown_minutes=60) is False
 
@@ -219,7 +213,6 @@ async def test_has_pending_missing_no_write_side_effect(db, monkeypatch):
     assert await crawl_service.has_pending_missing(cooldown_minutes=60) is True
 
 
-# ── 占用前移：失败释放 / 成功收尾释放 ──
 
 
 @pytest.mark.asyncio
@@ -231,7 +224,7 @@ async def test_start_job_failure_releases_occupancy(db, monkeypatch):
 
     with pytest.raises(ValueError):
         await crawl_service.start_job(scope="appids", appids=[])
-    assert current_holder() is None  # 预取的占用已随失败路径释放
+    assert current_holder() is None
 
 
 @pytest.mark.asyncio
@@ -279,10 +272,10 @@ async def test_start_job_success_releases_at_execute_end(db, monkeypatch):
     monkeypatch.setattr(wishlist_service, "release_free_games", _noop)
 
     result = await crawl_service.start_job(scope="appids", appids=[770006])
-    assert current_holder() == crawl_service.JOB_OCCUPANCY_TAG  # 执行期间持占用
+    assert current_holder() == crawl_service.JOB_OCCUPANCY_TAG
     handle = crawl_service._active
     await handle.task
-    assert current_holder() is None  # 收尾释放（不依赖 run_crawl 桩）
+    assert current_holder() is None
     assert crawl_service._active is None
     assert result["count"] == 1
 

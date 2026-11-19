@@ -42,9 +42,6 @@ from app.domains.proxies.clash_manager import (
     PROBE_LANE_PREFIX,
     inject_probe_lanes,
 )
-# 内核内置的逻辑节点（不是池里的节点）：把 /proxies 里「多出来的键」解释清楚，
-# 同时也是 `dialer-proxy` 的合法目标（走直连/拒绝）。唯一事实源在
-# proxies.runtime_config，这里只导入复用——两份同名单必然漂移。
 from app.domains.proxies.runtime_config import (
     BUILTIN_PROXY_NAMES,
     validate_execution_config,
@@ -78,8 +75,7 @@ RUNTIME_CONFIG_FILENAME = "crawl-runtime.yaml"
 # 运行配置里只有组与 listener；出口 IP 不在内核配置里，必须自己留一份。
 LANE_PLAN_FILENAME = "crawl-lanes.yaml"
 
-# 运行期专属键（只进运行配置，绝不回流进池文件）
-RUNTIME_MODE = "global"          # GLOBAL 是维护入口；生产流量走 lane，不经过它
+RUNTIME_MODE = "global"
 RUNTIME_BIND_ADDRESS = "127.0.0.1"  # 默认是 '*'：测出口 IP 不该把本机入口开给局域网
 RUNTIME_CONTROLLER_HOST = "127.0.0.1"
 # 池 Runtime 的 controller 凭据：冷启动每次随机生成（见 prepare_runtime_config），
@@ -87,21 +83,9 @@ RUNTIME_CONTROLLER_HOST = "127.0.0.1"
 # 固定常量会让同机任意进程拿它 PUT /configs 灌配置进本内核；
 # 「只绑回环」降低的是网络可达性，挡不住本机进程。
 
-# ── lane：一个内核进程内互不干扰的固定出口工位 ──────────────────
-# 结构 = 一个 `select` 组（成员是池内全部节点）+ 一个 mixed listener，listener 的
-# `proxy` 指向该组。组的当前选择由控制器逐条设置，因此切一条 lane 不改变其它 lane。
-#
-# GLOBAL 与 lane 的分工：GLOBAL 是维护入口（健康检查、人工查看、旧消费者），
-# lane 是生产入口。crawler 只拿 lane 地址，不碰任何选择器。
 LANE_GROUP_PREFIX = "lane-"
-# lane 数与 worker 数**不同源**：worker 上限（`exits.MAX_CRAWL_WORKERS`=60）是
-# **同时干活的岗位数**，lane 数是**出口兵源**——lane 多于 worker 时，多出的那批
-# 就是待用出口：某个 lane 的出口连续失败被隔离后，worker 从待用池换一条继续干活，
-# 岗位数不掉。上限取 2 倍岗位数：备用池够厚，内核 listener 与配置体积仍有界。
 MAX_LANES = MAX_CRAWL_WORKERS * 2
 
-# 维护体检的探测 lane（`HlProbeLane-*`）：池运行时配置自有的并行探测通道。
-# 端口段与旧链路内核的 20000 段隔离，消除双内核并存时的端口竞争。
 POOL_PROBE_LANE_PORT_BASE = 21100
 POOL_PROBE_LANE_PORT_SPAN = 900
 
@@ -374,15 +358,10 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
             "mode": RUNTIME_MODE,
             "allow-lan": False,
             "bind-address": RUNTIME_BIND_ADDRESS,
-            # 自带 controller，**不依赖共享默认端口**：19090 起的默认段是各
-            # 内核实例的公共候选，池实例必须与其隔离。与 mixed-port 同一思路：
-            # 各用各的动态端口。
             "external-controller": (
                 pinned["controller"] if pinned
                 else f"{RUNTIME_CONTROLLER_HOST}:{_free_local_port()}"
             ),
-            # 热重载沿现役密钥（换密钥会让已交接出去的控制器连接失效）；
-            # 冷启动每次新生成——固定的可预测密钥等于把控制面对本机全开。
             "secret": pinned["secret"] if pinned else secrets.token_urlsafe(32),
             "mixed-port": pinned["mixed_port"] if pinned else _free_local_port(),
             "proxies": list(doc["proxies"]),
@@ -392,7 +371,6 @@ def prepare_runtime_config(data_dir: Path, *, lanes: int | None = None,
         allow_unicode=True,
         sort_keys=False,
     )
-    # 维护体检的并行探测通道（幂等）：热重载钉住现役端口，冷启动在专属段新分配
     text = inject_probe_lanes(
         text,
         port_base=POOL_PROBE_LANE_PORT_BASE,
@@ -419,13 +397,9 @@ class RuntimeReconcile:
 
     registry_names: frozenset[str]
     pool_names: frozenset[str]
-    # 与池同域：池 ∩ 内核可见。内置逻辑节点天然进不来，M 因此不会被虚高。
     runtime_names: frozenset[str]
-    # 池里有、内核没有——这是真正要盯的差额
     missing: frozenset[str]
-    # 内核有、池里没有、也不是内置——正常情况下应为空
     unexpected: frozenset[str]
-    # /proxies 返回的全部键数（含内置），仅作记录
     observed_total: int
     ok: bool
 
@@ -475,7 +449,7 @@ async def wait_proxy_names(
                 if resp.status_code == 200:
                     return frozenset(resp.json().get("proxies", {}).keys())
                 last = f"HTTP {resp.status_code}"
-            except Exception as exc:  # noqa: BLE001 —— 连不上就是还没起来，继续等
+            except Exception as exc:  # noqa: BLE001
                 last = f"{type(exc).__name__}"
             await asyncio.sleep(interval)
     raise RuntimeUnreachableError(
@@ -520,12 +494,10 @@ def reconcile(
     )
 
 
-# ══ 池重建 + Runtime 选择恢复 ═════════════════════════════════════
 # 选择器（`GLOBAL` 与各 lane 组）的选择权属于 Runtime，**不属于 crawler**：crawler 有
 # worker 池，而选择器是共享状态——多个 worker 各自"请求前确保选择正确"会互相踩。
 # 所以由这里在一次重建后把选择恢复回去；crawler 只拿"当前运行时代理地址"，
 # 不理解选择、重启、重建与端口变化。
-#
 # GLOBAL 与 lane 的差别在于**共享范围**：GLOBAL 全局共享，lane 组各自独立。
 # 因此生产流量走 lane（互不干扰），GLOBAL 留给维护路径。
 
@@ -545,18 +517,18 @@ class _KernelRuntime(Protocol):
 
 @dataclass(frozen=True)
 class RebuildResult:
-    proxy_url: str          # GLOBAL 入口（维护路径与单入口消费者用）
+    proxy_url: str
     mixed_port: int
     controller_url: str
     pool_names: tuple[str, ...]
     previous_selection: str | None
-    selection: str | None    # 恢复后的 GLOBAL
+    selection: str | None
     expected_count: int
     written_count: int
-    lane_urls: tuple[str, ...] = ()       # 生产入口：每条 lane 一个本机地址
-    lane_nodes: tuple[str, ...] = ()      # 各 lane 绑定到的节点（按 lane 序号）
-    lane_exits: tuple[str, ...] = ()      # 各 lane 绑定的出口 IP（同序；容量单位）
-    hot_applied: bool = False             # True = 热重载生效（进程未重启、端口未变）
+    lane_urls: tuple[str, ...] = ()
+    lane_nodes: tuple[str, ...] = ()
+    lane_exits: tuple[str, ...] = ()
+    hot_applied: bool = False
 
 
 def restore_selection(previous: str | None, available: Sequence[str]) -> str | None:
@@ -579,7 +551,7 @@ async def current_global_selection(
         async with httpx.AsyncClient(trust_env=False, timeout=timeout, headers=_headers(secret)) as client:
             resp = await client.get(f"{controller_url}/proxies/GLOBAL")
             return resp.json().get("now")
-    except Exception:  # noqa: BLE001 —— 读不到就不恢复，由 fallback 接手
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -609,7 +581,7 @@ async def controller_alive(
             timeout=timeout, headers=_headers(secret)
         ) as client:
             return (await client.get(f"{controller_url}/version")).status_code == 200
-    except Exception:  # noqa: BLE001 —— 连不上就是不可达，由调用方走冷通道
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -690,9 +662,9 @@ async def current_lane_selections(
                 try:
                     resp = await client.get(f"{controller_url}/proxies/{LANE_GROUP_PREFIX}{i}")
                     out.append(resp.json().get("now"))
-                except Exception:  # noqa: BLE001 —— 单条读不到不影响其它 lane
+                except Exception:  # noqa: BLE001
                     out.append(None)
-    except Exception:  # noqa: BLE001 —— 控制器不可达：当作"没有已知绑定"
+    except Exception:  # noqa: BLE001
         return [None] * count
     return out
 
@@ -766,7 +738,6 @@ async def align_lanes(
             ],
         )
     elif plan_path.is_file():
-        # 退回分配时旧的出口对照已失效：删掉它，宁可没有也不要错的归因
         plan_path.unlink(missing_ok=True)
     return ports, applied
 
@@ -811,7 +782,6 @@ async def rebuild_runtime(
         await current_global_selection(controller_url, secret)
         if controller_url else None
     )
-    # 上次各 lane 绑定的节点：重建时优先原样恢复，避免每次重建都换一遍生产出口
     previous_lanes: list[str | None] = []
     if controller_url:
         previous_lanes = await current_lane_selections(
@@ -819,8 +789,6 @@ async def rebuild_runtime(
         )
 
     build = await build_pool(session, data_dir=data_dir)
-    # 容量单位是**独立出口 IP**，不是节点数：槽数即本次 run 的 lane 数。
-    # 一个出口 IP 都没探到时退回按节点数开工位（池刚建好、尚未跑 L1 的形态）。
     from app.domains.proxypool.health import latest_l0_delays
 
     slots = select_exit_slots(
@@ -835,7 +803,7 @@ async def rebuild_runtime(
                 runtime=runtime, build=build, slots=slots, previous=previous,
                 previous_lanes=previous_lanes, wait_timeout=wait_timeout,
             )
-        except Exception as exc:  # noqa: BLE001 —— 热通道任何一步未通过都回退冷通道
+        except Exception as exc:  # noqa: BLE001
             log_event(
                 logger,
                 "池配置热重载未通过，改走内核重启",
@@ -851,7 +819,6 @@ async def rebuild_runtime(
     base = status["controllerUrl"]
     new_secret = getattr(runtime, "secret", secret)
     observed = await wait_proxy_names(base, new_secret, timeout=wait_timeout)
-    # 入口就绪晚于控制器就绪：不等它，交出去的代理地址会立刻 ConnectError
     port = await wait_mixed_port(data_dir, timeout=wait_timeout)
 
     ledger = reconcile(
@@ -883,7 +850,6 @@ async def rebuild_runtime(
     if chosen is not None:
         applied = await _put_global(base, new_secret, chosen)
         if applied != chosen:
-            # 选择没建立起来 = 流量可能落到 DIRECT（绕过代理池），必须大声失败
             raise RuntimeRebuildError(
                 f"恢复 GLOBAL 失败：now={applied!r}，期望 {chosen!r}"
             )
@@ -932,7 +898,6 @@ async def _hot_apply_rebuild(
     invalidate_lane_plan(data_dir)
     await reload_runtime_config(controller_url, secret, str(config))
     observed = await wait_proxy_names(controller_url, secret, timeout=wait_timeout)
-    # 入口就绪晚于控制器就绪（重载会重绑 listener）：不等它，交出去的地址会 ConnectError
     port = await wait_mixed_port(data_dir, timeout=wait_timeout)
 
     ledger = reconcile(
@@ -981,10 +946,6 @@ async def _hot_apply_rebuild(
     )
 
 
-# ══ 受管爬取的代理地址：拿不到就拒绝启动 ═════════════════════════
-# crawler 只该拿"当前运行时代理 URL"，不理解 GLOBAL / 重建 / 端口变化。而它**必须**
-# 拿到——拿不到就拒绝启动：静默退回直连（或旧订阅代理）会把"池坏了"伪装成"爬取成功"，
-# 并悄悄破坏两套 Runtime 的隔离。
 
 
 def current_runtime_proxy_url(data_dir: Path) -> str | None:
@@ -996,7 +957,6 @@ def current_runtime_proxy_url(data_dir: Path) -> str | None:
     try:
         port = mixed_port_of(data_dir)
     except (RuntimeConfigError, OSError):
-        # 连运行配置都没有（首次启动）也是"不可用"，不是异常
         return None
     if not _port_listening(port):
         return None
@@ -1060,10 +1020,8 @@ def select_run_lanes(
         node = str(binding.get("node") or "")
         exit_ip = known.get(node)
         if not exit_ip:
-            # 该 lane 的执行节点当前没有出口身份：不占本次 run 的工位
             continue
         if exit_ip in used_exits:
-            # 同一出口的第二条 lane：容量上它不增加任何东西，剔除
             continue
         used_exits.add(exit_ip)
         merged = dict(binding)
@@ -1122,7 +1080,7 @@ def _notify_rebuild() -> None:
         from app.domains.proxypool.scheduling import request_rebuild
 
         request_rebuild()
-    except Exception:  # noqa: BLE001 —— 通知失败不影响"拒绝启动"这个结论
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -1167,7 +1125,7 @@ async def hot_reconverge(
             detail={"出口槽数": len(slots), "池内节点数": len(build.runtime_names)},
         )
         return True
-    except Exception as exc:  # noqa: BLE001 —— 收敛不成走原 fail-closed 拒绝
+    except Exception as exc:  # noqa: BLE001
         log_event(
             logger,
             "启动前热通道收敛未通过",
@@ -1178,8 +1136,6 @@ async def hot_reconverge(
         return False
 
 
-# 启动收敛里就地补探的 L1 节点上限：串行探针每个数秒，封顶把启动等待压在
-# 半分钟级；探不完的余下节点交维护周期（rebuild_pending 已置）
 LANE_RECOVERY_L1_NODES = 12
 
 
@@ -1247,9 +1203,6 @@ async def crawl_lane_plan(
         ok, why = lane_plan_consistency(bindings, slots)
     if not ok:
         _notify_rebuild()
-        # 技术细节（缺什么/差多少）进日志；用户面只给结论与下一步——
-        # 未生成 lane plan / listener 未就绪是刚启动时的正常形态，池空是
-        # 订阅侧问题，两者给出的出路不同
         log_event(
             logger,
             "运行时就绪闸未通过，本次爬取拒绝启动",

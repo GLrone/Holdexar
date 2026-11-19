@@ -27,12 +27,8 @@ from datetime import datetime
 from app.domains.proxypool.models import ProxyNode
 from app.domains.proxypool.state import NODE_ACTIVE, NODE_NEW, NODE_STALE
 
-# 执行容量上限：与本项目的 worker 上限同源（crawler/config.WORKERS_MAX）。
-# 它是「一次 crawl 最多开多少个工位」，**不是**出口池能容纳多少个出口。
 MAX_CRAWL_WORKERS = 60
 
-# 节点状态在选槽时的优先级：有健康证据的排前面，仅由来源到达的次之，
-# 来源已撤但曾健康的再次（STALE 仍在池里，可继续服务）。
 _STATE_RANK = {NODE_ACTIVE: 0, NODE_NEW: 1, NODE_STALE: 2}
 
 

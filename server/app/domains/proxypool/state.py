@@ -24,11 +24,8 @@ NODE_STALE = "STALE"
 NODE_DEAD = "DEAD"
 NODE_RETIRED = "RETIRED"
 
-# 退休阈值的缺省值。业务侧一律显式传参，便于后续用长周期运行数据校准。
 DEFAULT_RETIRE_AFTER_FAILED_PROBES = 3
 
-# 允许「失败累计 → 退休」的起点：必须先离开在运行集的 NEW / ACTIVE，
-# ACTIVE → RETIRED 这种直跳由转移表本身挡住。
 _RETIRE_FROM: frozenset[str] = frozenset({NODE_STALE, NODE_DEAD})
 
 _NODE_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -60,7 +57,6 @@ def _check_threshold(retire_after_failed_probes: int) -> None:
         )
 
 
-# ── 节点 ──────────────────────────────────────────────────────────
 def legal_targets(current: str) -> frozenset[str]:
     """该起点的全部合法目标集（未知起点 → 空集）。"""
     return _NODE_TRANSITIONS.get(current, frozenset())
@@ -74,7 +70,6 @@ def apply_transition(current: str, nxt: str) -> str:
     return nxt
 
 
-# ── 决策函数 ──────────────────────────────────────────────────────
 def _settle(current: str, nxt: str) -> str:
     """落到目标态：原地不动视为合法空转，其余必须走合法转移。"""
     return current if nxt == current else apply_transition(current, nxt)
@@ -108,7 +103,7 @@ def evaluate_node_state(
             target = NODE_STALE
         elif current == NODE_RETIRED:
             target = NODE_RETIRED
-        else:  # NEW / DEAD：无来源又无体检证据，不进池
+        else:
             target = NODE_DEAD
         return _settle(current, target)
 

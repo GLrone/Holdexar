@@ -48,8 +48,6 @@ from app.domains.proxies.kernel_release import (
     mihomo_asset,
     mihomo_url,
 )
-# 运行配置生成与节点依赖解析的唯一实现在 runtime_config；本模块只做转发，
-# 使 clash_manager 保持「内核管理」这一处引用面（订阅侧与池侧共用同一实现）。
 from app.domains.proxies.kernel_process import (
     PRECHECK_ADMISSION,
     PRECHECK_CHANGED,
@@ -61,7 +59,7 @@ from app.domains.proxies.kernel_process import (
     run_kernel_cli,
     spawn_kernel,
 )
-from app.domains.proxies.runtime_config import (  # noqa: F401 —— 对外契约
+from app.domains.proxies.runtime_config import (  # noqa: F401
     render_subscription_config,
     PROBE_LANE_GROUP_PREFIX,
     resolve_node_dependencies,
@@ -71,11 +69,8 @@ from app.domains.proxies.runtime_config import (  # noqa: F401 —— 对外契�
 
 logger = logging.getLogger(__name__)
 
-# 兼容旧引用名：镜像链（网络下载兜底用）
 _MIRRORS = MIRRORS
 
-# 生成文件后缀：`clash-sub-{id}.runtime.yaml`。与原始缓存分文件——原文是证据、
-# 生成结果可随时重建，就地改写原文会让「订阅原样」在磁盘上不成立。
 _RUNTIME_SUFFIX = ".runtime.yaml"
 
 
@@ -127,7 +122,7 @@ def _maybe_upgrade_kernel(kernel_path: Path) -> str | None:
         return None
     try:
         shutil.copy2(bundled_exe, exe)
-    except OSError as e:  # noqa: BLE001 —— 文件锁/权限失败：保留旧内核继续可用
+    except OSError as e:  # noqa: BLE001
         log_event(
             logger,
             "内核升级替换失败，保留现有内核继续使用",
@@ -158,7 +153,7 @@ class PROCESSENTRY32W(ctypes.Structure):
         ("dwSize", wintypes.DWORD),
         ("cntUsage", wintypes.DWORD),
         ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_void_p),  # ULONG_PTR：x64 下 8 字节
+        ("th32DefaultHeapID", ctypes.c_void_p),
         ("th32ModuleID", wintypes.DWORD),
         ("cntThreads", wintypes.DWORD),
         ("th32ParentProcessID", wintypes.DWORD),
@@ -382,11 +377,8 @@ def subscription_auto_name(headers: httpx.Headers, url: str) -> str | None:
     )
     if name:
         return name
-    # URL 末段：去 query、去 scheme/netloc（根路径末段是主机名，不是名字），
-    # 取路径最后一段 percent 解码
     path = url.split("?", 1)[0]
     if path.count("/") > 2:
-        # https://host/xxx → /xxx；https://host → /
         path = "/" + path.split("//", 1)[1].split("/", 1)[1]
     else:
         path = "/"
@@ -415,10 +407,7 @@ def _looks_like_opaque_token(text: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_\-=]+", text))
 
 
-# External local proxy defaults. Holdexar's own listener comes from runtime status.
 LOCAL_MIXED_PORTS: tuple[int, ...] = (7897,)
-# 借道口探活后的最小可用性验证：口在听不代表出口能出网
-# （内核起了但没选中节点、节点全挂时端口照样 listen）。
 _LOCAL_CHANNEL_PROBE_URL = "https://www.gstatic.com/generate_204"
 
 
@@ -446,7 +435,7 @@ def local_channel_egress_ok(proxy_url: str | None, timeout: float = 8.0) -> bool
             trust_env=False, follow_redirects=True,
         )
         return resp.status_code < 400
-    except Exception:  # noqa: BLE001 —— 探活失败即视为该口不可用
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -466,9 +455,6 @@ def _download_attempts(
             continue
         if _port_listening(port):
             attempts.append((f"http://127.0.0.1:{port}", f"本地混合端口 {port}"))
-    # 直连放最后：订阅面板域名多数被墙，直连通常要等满超时才轮到下一条通道，
-    # 排在最前会让每次刷新都白等（与 Clash Verge Rev「经当前代理更新订阅」同向）。
-    # 内核没跑（首次添加订阅）时前几条通道自然缺席，直连即唯一通道。
     attempts.append((None, "直连"))
     return attempts
 
@@ -517,7 +503,6 @@ def install_kernel(data_dir: Path) -> dict:
     return download_kernel(data_dir) if is_windows() else download_kernel_linux(data_dir)
 
 
-# 内核下载进度（模块级单例：下载线程写，轮询端点读；dict 原子替换免锁）
 _KERNEL_PROGRESS: dict = {}
 
 
@@ -615,7 +600,7 @@ def _release_digest(channels: list[tuple[str | None, str]]) -> str | None:
                 detail={"资产": asset, "通道": label},
             )
             return None
-        except Exception as e:  # noqa: BLE001 —— 换下一条通道
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "内核校验锚获取失败，换下一通道",
@@ -653,7 +638,6 @@ def download_kernel(data_dir: Path) -> dict:
                         f"下载 Clash 内核：尝试镜像 {mirror or 'github'}、通道 {label}",
                         detail={"镜像": mirror or "github", "通道": label, "下载地址": url},
                     )
-                    # 尝试开始即上报：连接阶段（最长 10s）弹窗也可见当前镜像/通道
                     _KERNEL_PROGRESS.update({
                         "phase": "连接下载源", "source": mirror or "github", "via": label,
                     })
@@ -914,16 +898,10 @@ def _subscription_view(config_text: str) -> dict | None:
             if kept:
                 view[key] = kept
             else:
-                view.pop(key, None)  # 剥空的键与「本就没有」等价
+                view.pop(key, None)
     return view
 
 
-# ─── 探测 lane（节点检测的并行通道）────────────────────────────
-# 与池内核的 lane 同一形态：一个 select 组 + 一个 mixed listener，listener 的
-# `proxy` 指向本组。组选择是组内状态、互不干扰，探测经 listener 直达所选节点
-# （绕过规则引擎与 GLOBAL）——节点检测因此无需切 selector、无需切 mode，可
-# PROBE_LANE_COUNT 路并发。组用 include-all：成员随内核当前节点集自动变化，
-# 注入内容与订阅内容无关，配置比较时剥掉即可。
 PROBE_LANE_PREFIX = PROBE_LANE_GROUP_PREFIX
 PROBE_LANE_COUNT = 20
 # 端口从固定基址起确定性分配：同占用态 → 同端口。避开默认混合口/控制器段与
@@ -1174,7 +1152,7 @@ def remove_subscription_artifacts(data_dir: Path, sub_id: int) -> list[str]:
             removed.append(path.name)
         except FileNotFoundError:
             continue
-        except OSError as e:  # noqa: BLE001 —— 回收尽力而为，失败不阻断删除
+        except OSError as e:  # noqa: BLE001
             log_event(
                 logger,
                 "订阅缓存文件删除失败（订阅行已删，文件成为孤儿）",
@@ -1225,7 +1203,7 @@ def parse_node_names(config_text: str) -> list[str]:
             in_proxies = True
             continue
         if in_proxies:
-            if re.match(r"^[A-Za-z-]+\s*:", line):  # 下一个顶级键
+            if re.match(r"^[A-Za-z-]+\s*:", line):
                 break
             m = re.match(
                 r"-\s*(?:\{\s*)?name\s*:\s*(?:'([^']*)'|\"([^\"]*)\"|([^,}]+))",
@@ -1255,14 +1233,12 @@ class ClashRuntime:
         self.config_path: str | None = None
         self.controller_url: str | None = None
         self.secret: str = ""
-        # 本次启动归属的订阅 URL——「内核在跑哪条订阅」的事实源。配置文本里
-        # 不含订阅 URL（机场 yaml 是纯配置），靠文本匹配永远认不出来。
         self.subscription_url: str | None = None
         # 本次启动实际注入并生效的探测 lane（组名, 端口）——检测通道的事实源。
         # 不从磁盘配置读：订阅下载会在启动后把 config.yaml 覆写回原始文本
         # （内核在内存里照常跑着注入后的配置），磁盘内容不可信。
         self.probe_lanes: list[tuple[str, int]] = []
-        self._startup_text: str | None = None  # 启动时的配置文本（重启判定用）
+        self._startup_text: str | None = None
         # 混合入口就绪事实：启动/重载时验证过「端口真的在听」才为 True。
         # 内核对端口绑定失败只打日志不退出（订阅没写端口时解析出的默认值
         # 无人监听、端口被占同理），「进程在跑」与「入口可用」是两回事。
@@ -1297,7 +1273,7 @@ class ClashRuntime:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.process is not None and self.process.poll() is not None:
-                break  # 进程已退出：不必再等
+                break
             if _port_listening(self.port):
                 return True
             time.sleep(0.1)
@@ -1375,8 +1351,6 @@ class ClashRuntime:
             disk_text = Path(config_path).read_text(encoding="utf-8", errors="ignore")
             validate_execution_config(disk_text)
             if not restart_if_changed:
-                # 已在跑：同订阅（或调用方未带归属）幂等返回；带了**不同**的
-                # 订阅 URL = 用户要求切换订阅，走下方完整启动
                 target = (subscription_url or "").strip()
                 if not target or self.subscription_url == target:
                     return self.status()
@@ -1404,7 +1378,7 @@ class ClashRuntime:
 
         try:
             ensure_kernel_files(Path(config_path).parent)
-        except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "随包内核资产补齐失败，不影响启动",
@@ -1416,7 +1390,7 @@ class ClashRuntime:
             self.stop()
         try:
             self._kill_orphans(exe_path, config_path)
-        except Exception as e:  # noqa: BLE001 —— 清理失败不阻断启动（psutil 缺失等）
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "残留内核进程清理跳过",
@@ -1433,18 +1407,14 @@ class ClashRuntime:
         confirm_config_text(config_path, text)
 
         self.port = parse_mixed_port(text)
-        # 控制器经命令行参数下发（-ext-ctl / -secret）：优先级高于配置文件，
-        # 文件与命令行使用同一次生成的控制密钥。
         self.controller_url, self.secret = controller_url, controller_secret
         controller_addr = self.controller_url.split("://", 1)[-1]
         self.probe_lanes = parse_probe_lanes(text) if inject_lanes else []
         self.config_path = config_path
         self.subscription_url = (subscription_url or "").strip() or None
         self._startup_text = text
-        # stdout/stderr 追加到内核目录的 kernel.log：内核对控制器绑定失败等
-        # 异常只打日志不退出，没有这份日志这些失败完全不可见
         log_path = Path(config_path).parent / "kernel.log"
-        log_file = open(log_path, "ab")  # noqa: SIM115 —— 句柄随子进程存活，父进程不持有
+        log_file = open(log_path, "ab")  # noqa: SIM115
         self.process = spawn_kernel(
             exe_path,
             ["-f", config_path, "-d", str(Path(config_path).parent),
@@ -1626,7 +1596,6 @@ class ClashRuntime:
                 self._startup_text, candidate_text,
             )
         ):
-            # 同订阅且订阅内容没变：不重载（幂等）
             return {**self.status(), "started": False, "reloaded": False}
 
         prev_file_text = ""
@@ -1650,14 +1619,11 @@ class ClashRuntime:
                     raise _ReloadRejected(f"内核拒绝新配置（HTTP {put.status_code}）")
             await self._verify_reloaded(injected)
         except _ReloadRejected as e:
-            # 内核明确拒载 / 配置本身不合法：把目标文件回滚到本进程写入前的
-            # 内容，内核继续跑旧配置——回退重启只会载着同一份坏配置起不来。
-            # 预检阶段（写盘前）被拒时文件本来就没动，无需回滚。
             if wrote:
                 if prev_file_text:
                     Path(config_path).write_text(prev_file_text, encoding="utf-8")
                 else:
-                    Path(config_path).unlink(missing_ok=True)  # 本次新建的缓存，删掉
+                    Path(config_path).unlink(missing_ok=True)
             log_event(
                 logger,
                 "内核拒绝热重载新配置，已保留当前运行配置",
@@ -1665,7 +1631,7 @@ class ClashRuntime:
                 detail={"原因": str(e)},
             )
             raise ValueError(str(e)) from None
-        except Exception as e:  # noqa: BLE001 —— 通路故障才回退进程重启
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "配置热重载失败，回退内核重启",
@@ -1685,7 +1651,6 @@ class ClashRuntime:
         self.port = parse_mixed_port(injected)
         self.probe_lanes = parse_probe_lanes(injected)
         self.subscription_url = sub_url or self.subscription_url
-        # 混合端口在 _verify_reloaded 已验证在听，入口事实随之落章
         self.entry_ready = True
         log_event(
             logger,
@@ -1814,7 +1779,6 @@ class ClashRuntime:
                         await _apply_nodes(session, subscription_id=meta_id, nodes=nodes,
                                            now=datetime.now(), tag=subscription_tag(sub_url), restore_only=True)
                         await session.commit()
-                # 正文与sidecar读写均在写闸外，缓存不伪造成功抓取或推进健康状态。
                 if snapshot is not None:
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(runtime_source)

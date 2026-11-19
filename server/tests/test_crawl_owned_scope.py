@@ -42,17 +42,17 @@ async def _seed(db, appid: int, *, owned: bool, active: bool = True):
 @pytest.mark.asyncio
 async def test_scope_split_selection(db):
     """wishlist=全部活跃（含已购）；wishlist_only=非已购；owned=已购；inactive 不进任何 scope。"""
-    await _seed(db, 570, owned=False)   # 纯愿望单
-    await _seed(db, 620, owned=True)     # 已购
-    await _seed(db, 730, owned=True, active=False)  # 已购但已停用
+    await _seed(db, 570, owned=False)
+    await _seed(db, 620, owned=True)
+    await _seed(db, 730, owned=True, active=False)
 
     wl = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     only = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist_only", None)]
     owned = [a for a, _ in await crawl_service.resolve_scope_appids("owned", None)]
 
-    assert wl == [570, 620]       # 历史合并路径：含已购、排除 inactive
-    assert only == [570]          # 拆分：非已购
-    assert owned == [620]         # 拆分：已购
+    assert wl == [570, 620]
+    assert only == [570]
+    assert owned == [620]
 
 
 @pytest.mark.asyncio
@@ -65,9 +65,7 @@ async def test_scope_owned_empty_list_semantics(db):
     assert [a for a, _ in only] == [570]
 
 
-# ── 队列优先级：手动关注（manual）最优先 ──
 # pairs 序 = 入队序 = worker 消费序（FIFO），排头即先爬；
-# 三档：manual 关注 > hot（打折/史低）> 其余按 appid 稳定序。
 
 
 async def _seed_manual(db, appid: int, *, owned=False, manual=False):
@@ -85,7 +83,6 @@ async def test_manual_priority_over_hot_and_rest(db):
 
     now = __import__("app.crawler.utils", fromlist=["get_beijing_time_obj"]).get_beijing_time_obj().replace(tzinfo=None)
     async with db() as session:
-        # 三个非关注池游戏：400 打折（hot）、300 史低（hot）、200 普通
         session.add_all([
             Game(appid=400, name="打折", created_at=now, updated_at=now),
             Game(appid=300, name="史低", hl_flag=1, created_at=now, updated_at=now),
@@ -96,11 +93,11 @@ async def test_manual_priority_over_hot_and_rest(db):
             discount_percent=50, price_status="ok", updated_at=now,
         ))
         await session.commit()
-    await _seed_manual(db, 400, owned=False, manual=False)   # hot 非 manual
-    await _seed_manual(db, 300, owned=False, manual=False)   # hot 非 manual
-    await _seed_manual(db, 200, owned=False, manual=False)   # 普通
-    await _seed_manual(db, 100, owned=False, manual=True)    # 关注，非 hot
-    await _seed_manual(db, 500, owned=True, manual=True)     # 关注已购
+    await _seed_manual(db, 400, owned=False, manual=False)
+    await _seed_manual(db, 300, owned=False, manual=False)
+    await _seed_manual(db, 200, owned=False, manual=False)
+    await _seed_manual(db, 100, owned=False, manual=True)
+    await _seed_manual(db, 500, owned=True, manual=True)
 
     ordered = [a for a, _ in await crawl_service.resolve_scope_appids("wishlist", None)]
     assert ordered == [100, 500, 300, 400, 200], (
@@ -132,7 +129,6 @@ async def test_manual_from_any_account_counts(db):
     assert ordered == [700, 800]
 
 
-# ── import_appids：批量导入只分类、绝不写 wishlist_items ──────────────────
 
 
 @pytest.mark.asyncio
@@ -144,17 +140,17 @@ async def test_import_appids_classification(db):
 
     async with db() as session:
         session.add(Game(appid=620, name="crawled", updated_at=datetime.now()))
-        session.add(Game(appid=570, name="name-only"))  # 挂名行（updated_at NULL）
+        session.add(Game(appid=570, name="name-only"))
         await session.commit()
 
     out = await crawl_service.import_appids([620, 570, 999, "abc", 0])
     assert out["ok"] == 2 and out["own"] == 1 and out["fail"] == 2
     by = {r["appid"]: r["status"] for r in out["results"]}
-    assert by[620] == "own"       # 已爬过 → 已在库
-    assert by[570] == "ok"        # 挂名行 → 待首爬
-    assert by[999] == "ok"        # 库内无行 → 待首爬
-    assert by["abc"] == "fail"    # 非法 appid
-    assert by[0] == "fail"        # 非正数 appid
+    assert by[620] == "own"
+    assert by[570] == "ok"
+    assert by[999] == "ok"
+    assert by["abc"] == "fail"
+    assert by[0] == "fail"
 
 
 @pytest.mark.asyncio
@@ -192,13 +188,13 @@ async def test_pool_scope_orders_monitoring_first(db):
             ]
         )
         await session.commit()
-    await _seed(db, 700, owned=False, active=True)   # 关注 = 用户显式来源
-    await _seed(db, 701, owned=True, active=True)    # 已购 = 账号派生来源
-    await _seed(db, 702, owned=True, active=False)   # inactive → 无有效来源
+    await _seed(db, 700, owned=False, active=True)
+    await _seed(db, 701, owned=True, active=True)
+    await _seed(db, 702, owned=True, active=False)
     await monitoring_service.ensure_source("game", 700, "favorite")
     await monitoring_service.sync_game_sources([701, 702])
 
     pool = [a for a, _ in await crawl_service.resolve_scope_appids("pool", None)]
     catalog = [a for a, _ in await crawl_service.resolve_scope_appids("catalog", None)]
-    assert pool == [700, 701]        # 关注最先，已购次之
-    assert catalog == [800, 801]     # 纯目录行（下架行剔除）
+    assert pool == [700, 701]
+    assert catalog == [800, 801]

@@ -135,7 +135,6 @@ async def _start_and_read(runtime: ClashRuntime, exe: Path, config: Path,
     )
 
 
-# ── 1. 真启动 + 真加载 + 三方集合一致 ────────────────────────────
 @pytest.mark.asyncio
 async def test_kernel_loads_exactly_the_pool_nodes(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -169,7 +168,6 @@ async def test_kernel_loads_exactly_the_pool_nodes(
     )
 
 
-# ── 2. DEAD / RETIRED 不得凭空出现在内核里 ───────────────────────
 @pytest.mark.asyncio
 async def test_dead_and_retired_never_reach_the_kernel(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -197,7 +195,6 @@ async def test_dead_and_retired_never_reach_the_kernel(
     }
 
 
-# ── 3. 对账函数：差额必须被记出来，而不是静默通过 ─────────────────
 def test_reconcile_reports_missing_and_ignores_builtins() -> None:
     """内核少加载一个节点时必须记成差额。
 
@@ -220,7 +217,6 @@ def test_reconcile_reports_missing_and_ignores_builtins() -> None:
     assert ledger.observed_total == 5
 
 
-# ── 4. 真实差额成因：池里有一条内核不认的节点 ────────────────────
 @pytest.mark.asyncio
 async def test_unloadable_node_makes_the_kernel_die_not_shrink(
     tmp_data_dir, kernel_exe_path, clash_runtime, monkeypatch
@@ -260,7 +256,6 @@ async def test_unloadable_node_makes_the_kernel_die_not_shrink(
         )
 
 
-# ── 5. 池文件是只读产物，内核只吃由它生成的运行配置 ───────────────
 @pytest.mark.asyncio
 async def test_pool_file_is_never_touched_by_the_kernel(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -291,7 +286,6 @@ async def test_pool_file_is_never_touched_by_the_kernel(
     assert "secret" in text
 
 
-# ── 6. 运行期专属键只进运行配置，且 mixed-port 真被监听 ──────────
 @pytest.mark.asyncio
 async def test_runtime_config_carries_runtime_only_keys(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -334,7 +328,6 @@ async def test_runtime_config_carries_runtime_only_keys(
     assert listening, f"内核没有监听运行配置里的 mixed-port {port}"
 
 
-# ── 多入口（lane）：一个内核进程内开 N 个可独立选路的 listener ──────
 @pytest.mark.asyncio
 async def test_kernel_opens_one_listener_per_lane_and_selects_independently(
     tmp_data_dir, kernel_exe_path, clash_runtime
@@ -363,7 +356,6 @@ async def test_kernel_opens_one_listener_per_lane_and_selects_independently(
     assert len(ports) == 3, "一个节点一条 lane"
     assert lane_proxy_urls(tmp_data_dir) == [f"http://127.0.0.1:{p}" for p in ports]
 
-    # 走生产入口（align_lanes）：首启没有上次绑定，也必须把每条 lane 都绑上不同节点
     aligned_ports, applied = await align_lanes(
         data_dir=tmp_data_dir, controller_url=base, secret=clash_runtime.secret,
         pool_names=build.runtime_names, previous=(),

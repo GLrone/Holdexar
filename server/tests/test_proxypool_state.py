@@ -37,7 +37,6 @@ _BASE_CONFIG = {
 }
 
 
-# ── 节点身份：fingerprint ─────────────────────────────────────────
 def test_fingerprint_stable_on_key_order() -> None:
     a = {"type": "trojan", "server": "s.example.net", "port": 443, "password": "p1"}
     b = {"password": "p1", "port": 443, "server": "s.example.net", "type": "trojan"}
@@ -62,9 +61,7 @@ def test_subscription_tag_is_stable_and_distinguishes_plans() -> None:
     a = subscription_tag("https://dash.pqjc.site/v1/sub?plan=basic")
     b = subscription_tag("https://dash.pqjc.site/v1/sub?plan=pro")
     assert a != b
-    # 同一链接重复取值稳定（否则每次同步都换身份）
     assert a == subscription_tag("https://dash.pqjc.site/v1/sub?plan=basic")
-    # 可读片段带上机场域名，排障时能对上
     assert a.endswith("pqjc.site")
 
 
@@ -76,7 +73,6 @@ def test_fingerprint_ignores_consumer_switches() -> None:
         smux={"enabled": True}, **{"display-name": "来源默认名"},
     )
     assert node_fingerprint(noisy) == node_fingerprint(base)
-    # 名字是被刻意忽略的一类：来源改名不算换节点
     assert node_fingerprint(dict(base, name="完全不同的名字")) == node_fingerprint(base)
 
 
@@ -105,7 +101,6 @@ def test_fingerprint_keeps_port_when_it_is_the_only_discriminator() -> None:
     assert node_fingerprint(a) != node_fingerprint(b)
 
 
-# ── 节点身份：runtime_name（防执行器按 name 静默去重） ────────────
 def test_runtime_name_isolates_across_subscriptions() -> None:
     taken: set[str] = set()
     assert {make_runtime_name(1, "香港01", taken),
@@ -131,7 +126,6 @@ def test_runtime_name_is_stable() -> None:
     assert make_runtime_name(1, "香港01", {"1|香港01", "1|香港01#2"}) == "1|香港01#3"
 
 
-# ── 节点状态转移 ──────────────────────────────────────────────────
 _LEGAL_NODE = [
     (NODE_NEW, NODE_ACTIVE), (NODE_NEW, NODE_DEAD), (NODE_NEW, NODE_STALE),
     (NODE_ACTIVE, NODE_STALE), (NODE_ACTIVE, NODE_DEAD),
@@ -150,9 +144,9 @@ def test_all_legal_node_transitions(current: str, nxt: str) -> None:
 @pytest.mark.parametrize(
     "current,nxt",
     [
-        (NODE_ACTIVE, NODE_RETIRED),   # 必须先经 STALE 或 DEAD
+        (NODE_ACTIVE, NODE_RETIRED),
         (NODE_NEW, NODE_RETIRED),
-        (NODE_RETIRED, NODE_DEAD),     # 退休节点重新评估后直接进 ACTIVE / STALE
+        (NODE_RETIRED, NODE_DEAD),
         (NODE_ACTIVE, NODE_NEW),
         (NODE_STALE, NODE_NEW),
         (NODE_ACTIVE, NODE_ACTIVE),
@@ -172,7 +166,6 @@ def test_dead_has_recovery_and_retirement_targets() -> None:
     assert legal_targets(NODE_DEAD) == frozenset({NODE_ACTIVE, NODE_STALE, NODE_RETIRED})
 
 
-# ── 退休语义 ──────────────────────────────────────────────────────
 def test_stale_retires_after_threshold() -> None:
     below = DEFAULT_RETIRE_AFTER_FAILED_PROBES - 1
     assert evaluate_node_state(
@@ -206,7 +199,6 @@ def test_retired_recovery_paths() -> None:
     assert evaluate_node_state(
         NODE_RETIRED, source_seen=False, probe_ok=True, consecutive_failures=9
     ) == NODE_STALE
-    # 没拿到成功证据就不许擅自回池
     assert evaluate_node_state(
         NODE_RETIRED, source_seen=True, probe_ok=None, consecutive_failures=9
     ) == NODE_RETIRED
@@ -220,17 +212,14 @@ def test_dead_is_not_retired() -> None:
     assert evaluate_node_state(
         NODE_DEAD, source_seen=True, probe_ok=True, consecutive_failures=9
     ) == NODE_ACTIVE
-    # ACTIVE 临时失败只到 DEAD，绝不直跳 RETIRED
     assert evaluate_node_state(
         NODE_ACTIVE, source_seen=True, probe_ok=False, consecutive_failures=99
     ) == NODE_DEAD
 
 
-# ── 决策矩阵 ──────────────────────────────────────────────────────
 @pytest.mark.parametrize(
     "current,source_seen,probe_ok,failures,expected",
     [
-        # probe_ok=True：成功体检是最强证据，只看来源决定 ACTIVE / STALE
         (NODE_NEW, True, True, 0, NODE_ACTIVE),
         (NODE_NEW, False, True, 0, NODE_STALE),
         (NODE_ACTIVE, True, True, 0, NODE_ACTIVE),
@@ -241,16 +230,12 @@ def test_dead_is_not_retired() -> None:
         (NODE_DEAD, False, True, 9, NODE_STALE),
         (NODE_RETIRED, True, True, 9, NODE_ACTIVE),
         (NODE_RETIRED, False, True, 9, NODE_STALE),
-        # probe_ok=False：达线且已离开运行集才退休，其余一律 DEAD
         (NODE_NEW, True, False, 9, NODE_DEAD),
         (NODE_ACTIVE, True, False, 9, NODE_DEAD),
         (NODE_STALE, True, False, 2, NODE_DEAD),
         (NODE_STALE, True, False, 3, NODE_RETIRED),
         (NODE_DEAD, False, False, 3, NODE_RETIRED),
         (NODE_RETIRED, False, False, 9, NODE_RETIRED),
-        # probe_ok=None：只按来源判。未测不得把 DEAD / RETIRED 拉回 ACTIVE；
-        # 无来源又无体检证据（NEW / DEAD）一律 DEAD——STALE 是池成员，其语义是
-        # 「订阅已不再返回 **但 仍通过健康验证**」，DEAD 从未通过体检。
         (NODE_NEW, True, None, 0, NODE_ACTIVE),
         (NODE_ACTIVE, True, None, 0, NODE_ACTIVE),
         (NODE_ACTIVE, False, None, 0, NODE_STALE),
@@ -271,7 +256,6 @@ def test_evaluate_node_state_matrix(
         current, source_seen=source_seen, probe_ok=probe_ok, consecutive_failures=failures
     )
     assert got == expected
-    # 决策函数的输出必须是合法转移（或原地空转）——不许绕过状态机
     if got != current:
         assert got in legal_targets(current)
 
@@ -293,13 +277,10 @@ def test_dead_node_losing_its_last_source_stays_out_of_the_pool() -> None:
     流量池；NEW（从未体检）同理会被判成"历史上仍可工作"。
     """
     lost_source = dict(source_seen=False, probe_ok=None, consecutive_failures=0)
-    # 无来源 + 无体检证据：不得进池
     assert evaluate_node_state(NODE_DEAD, **lost_source) == NODE_DEAD
     assert evaluate_node_state(NODE_NEW, **lost_source) == NODE_DEAD
-    # 曾经通过体检的 ACTIVE / STALE 失去来源 → 降权保留（STALE 仍可服务）
     assert evaluate_node_state(NODE_ACTIVE, **lost_source) == NODE_STALE
     assert evaluate_node_state(NODE_STALE, **lost_source) == NODE_STALE
-    # 有来源也不能把 DEAD 拉回运行权重（既有语义，一并锁住）
     assert evaluate_node_state(
         NODE_DEAD, source_seen=True, probe_ok=None, consecutive_failures=0
     ) == NODE_DEAD

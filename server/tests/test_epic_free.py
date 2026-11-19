@@ -21,10 +21,10 @@ from app.crawler.epic_free import EpicFreeGame  # noqa: E402
 from app.domains.games.models import Game  # noqa: E402
 from app.domains.metadata import service as epic  # noqa: E402
 
-APP_NEW = 990_501      # 缺行占位
-APP_PLAIN = 990_502    # 已有行，未标记
-APP_DATED = 990_503    # 已标记且带历史日期（不覆写判据）
-APP_LIST_NEW = 990_504  # 外部名单导入的占位行
+APP_NEW = 990_501
+APP_PLAIN = 990_502
+APP_DATED = 990_503
+APP_LIST_NEW = 990_504
 OLD_DATE = "2020-1-1"
 
 
@@ -63,7 +63,6 @@ async def _seed():
         await session.commit()
 
 
-# ─── 纯逻辑 ────────────────────────────────────────────────────────
 
 
 def test_norm_epic_date_variants():
@@ -74,13 +73,12 @@ def test_norm_epic_date_variants():
     assert epic._norm_epic_date("2026年5月28日") == "2026-5-28"
     # 区间串取首日期（起始日语义）
     assert epic._norm_epic_date("2026-5-28 ~ 2026-6-4") == "2026-5-28"
-    assert epic._norm_epic_date("2026-13-01") is None  # 月越界
-    assert epic._norm_epic_date("2026-5-32") is None  # 日越界
+    assert epic._norm_epic_date("2026-13-01") is None
+    assert epic._norm_epic_date("2026-5-32") is None
     assert epic._norm_epic_date("") is None
     assert epic._norm_epic_date("免费送过") is None
 
 
-# ─── 展示链（仪表盘卡片）────────────────────────────────────────────
 
 
 def _iso_offset(days: float) -> str:
@@ -133,7 +131,6 @@ def test_parse_free_games_rich_fields():
                     {"promotionalOffers": [_offer_payload(2, 9, 0)]},
                 ]},
             },
-            # 打折 20% 不是白送，必须排除
             {
                 "id": "elem-off", "title": "Discounted", "namespace": "ns-off",
                 "promotions": {"promotionalOffers": [
@@ -178,8 +175,8 @@ def test_parse_mobile_breaker():
         "image": "https://cdn/breaker.jpg",
         "url": "https://store.epicgames.com/mobile",
     }
-    assert parse_mobile_breaker({"layout": {}}) is None  # 无 breaker
-    assert parse_mobile_breaker({}) is None  # 空结构
+    assert parse_mobile_breaker({"layout": {}}) is None
+    assert parse_mobile_breaker({}) is None
 
 
 def _mobile_game(title: str, namespace: str, *, upcoming: bool = False,
@@ -211,7 +208,6 @@ async def test_resolve_mobile_freebie(monkeypatch):
         if namespace != "ns-live":
             return []
         purchase: list[dict] = [
-            # 付费条目混在前面也不影响 Claim 判别
             {"purchaseType": "Purchase", "price": {"decimalPrice": 1999},
              "purchasePayload": {"offerId": "paid", "sandboxId": "ns-live"}},
         ]
@@ -222,23 +218,22 @@ async def test_resolve_mobile_freebie(monkeypatch):
 
     monkeypatch.setattr(ef, "_sandbox_offers_sync", fake_offers)
     games = [
-        _game("No Namespace", None),  # 无 namespace 不探测
-        _mobile_game("Upcoming", "ns-up", upcoming=True),  # 预告不探测
-        _mobile_game("Other", "ns-other"),  # 无 Claim 跳过
+        _game("No Namespace", None),
+        _mobile_game("Upcoming", "ns-up", upcoming=True),
+        _mobile_game("Other", "ns-other"),
         _mobile_game("Live", "ns-live", title_cn="真在送",
                      image="https://cdn/wide.jpg", price="$19.99"),
     ]
     out = await ef.resolve_mobile_freebie(games)
     assert out == {
-        "title": "真在送",  # 中文名优先（无则回落英文）
+        "title": "真在送",
         "image": "https://cdn/wide.jpg",
         "url": ("https://store.epicgames.com/purchase"
                 "?offers=1-ns-live-and-offer&offers=1-ns-live-ios-offer"),
         "end": "2026-09-24",
         "worth": "$19.99",
-        "direct": True,  # 结账直链 = 登录后一键领取
+        "direct": True,
     }
-    # 预告与无 namespace 元素不发起探测
     assert ("ns-up", "android") not in probed
     assert all(ns for ns, _ in probed)
 
@@ -274,7 +269,6 @@ async def test_resolve_mobile_freebie_none(monkeypatch):
     assert await ef.resolve_mobile_freebie([]) is None
 
 
-# ─── 移动白送主发现链：GamerPower → 持久化查询 → 结账直链 ──────────────
 
 
 def test_parse_gamerpower_mobile():
@@ -290,20 +284,17 @@ def test_parse_gamerpower_mobile():
             "published_date": "2026-09-24 11:19:31", "end_date": "2026-10-01 23:59:00",
             "worth": "$4.99",
         },
-        # PC 端 Epic 限免（描述无 App 字样）不误收
         {
             "title": "Some Game (Epic Games) Giveaway", "status": "Active", "type": "Game",
             "description": "Claim it via Epic Games Store!", "open_giveaway_url": "https://gp/open/y",
             "published_date": "2026-09-25 09:00:00", "end_date": "2026-10-02 23:59:00",
         },
-        # key 赠品：无有效截止日不收
         {
             "title": "Keys Giveaway", "status": "Active", "type": "Game",
             "description": "Keys for the Epic Games Store App users.",
             "open_giveaway_url": "https://gp/open/z",
             "published_date": "2026-09-26 09:00:00", "end_date": "N/A",
         },
-        # 非在送不收
         {
             "title": "Expired (Mobile) Giveaway", "status": "Expired", "type": "Game",
             "description": "Was free on the Epic Games Store App.",
@@ -405,7 +396,6 @@ async def test_resolve_store_page_url_pc_only_no_mobile(monkeypatch):
         }}}}
 
     monkeypatch.setattr(ef, "_egs_persisted", fake_persisted)
-    # 无移动 offer：url 缺（调用方退官方移动商店页），封面仍可用
     assert await ef.resolve_store_page_url("The Big Con") == {
         "url": None, "image": "https://cdn/w.jpg",
     }
@@ -432,7 +422,6 @@ async def test_resolve_store_page_url_none_paths(monkeypatch):
         }}}}
 
     monkeypatch.setattr(ef, "_egs_persisted", no_mapping)
-    # 无移动 slug 但有官方封面：仍返回（url 缺由调用方退移动商店页）
     assert await ef.resolve_store_page_url("Whatever") == {
         "url": None, "image": "https://cdn/w2.jpg",
     }
@@ -493,7 +482,6 @@ async def test_resolve_mobile_checkout_none(monkeypatch):
     assert await ef.resolve_mobile_checkout("Y") is None
 
 
-# ─── GamerPower 发现链入口优先级（fetch_mobile_freebie）────────────────
 
 
 def _gp_payload(title: str) -> list:
@@ -551,7 +539,7 @@ async def test_fetch_mobile_freebie_falls_back_to_mobile_page(monkeypatch):
     assert out is not None
     assert out["title"] == "The Big Con"
     assert out["url"] == "https://store.epicgames.com/mobile"
-    assert out["direct"] is False  # 入口不是一键领取
+    assert out["direct"] is False
     assert out["end"] == "2026-10-15"
 
 
@@ -571,7 +559,7 @@ async def test_fetch_mobile_freebie_checkout_wins(monkeypatch):
     out = await ef.fetch_mobile_freebie(session=_FakeSession(_gp_payload("Cardpocalypse")))
     assert out["url"] == "https://store.epicgames.com/purchase?offers=1-a-b"
     assert out["direct"] is True
-    assert out["image"] == "https://cdn/k.jpg"  # 官方封面优先
+    assert out["image"] == "https://cdn/k.jpg"
 
 
 @pytest.mark.asyncio
@@ -603,7 +591,6 @@ def _async_value(value):
     return _inner()
 
 
-# ─── 自动链 ────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -630,16 +617,15 @@ async def test_refresh_marks_and_preserves(monkeypatch):
         new_row = await session.get(Game, APP_NEW)
         assert new_row is not None and new_row.is_epic is True
         assert new_row.epic_date == "2026-9-10"
-        assert new_row.updated_at is None  # 占位行进回补池
+        assert new_row.updated_at is None
 
         plain = await session.get(Game, APP_PLAIN)
         assert plain.is_epic is True
         assert plain.epic_date == "2026-9-10"
 
         dated = await session.get(Game, APP_DATED)
-        assert dated.epic_date == OLD_DATE  # 首见日期不覆写
+        assert dated.epic_date == OLD_DATE
 
-    # 幂等：二次运行零新标
     second = await epic.refresh_epic_free()
     assert second["marked"] == []
 
@@ -657,41 +643,36 @@ async def test_refresh_empty_window_not_ok(monkeypatch):
     assert "error" in result
 
 
-# ─── 外部名单 ──────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_import_epic_list_normalizes_and_marks():
     result = await epic.import_epic_list([
         {"appid": APP_LIST_NEW, "free_start": "2026年5月28日", "title": "Listtest"},
-        {"appid": APP_PLAIN, "free_start": "2026-05-08"},  # 补标 + 归一
-        {"appid": APP_DATED, "free_start": "2026-9-10"},    # 日期已存不覆写
-        {"appid": "not-a-number"},                          # 非法跳过
-        {"appid": APP_LIST_NEW},                            # 重复条目幂等
+        {"appid": APP_PLAIN, "free_start": "2026-05-08"},
+        {"appid": APP_DATED, "free_start": "2026-9-10"},
+        {"appid": "not-a-number"},
+        {"appid": APP_LIST_NEW},
     ])
     assert result["ok"] is True
     assert result["received"] == 5
     assert result["skipped"] == 1
-    # 重复条目第二次不再写；日期已存的不进 marked
     assert {m["appid"] for m in result["marked"]} == {APP_LIST_NEW, APP_PLAIN}
 
     async with get_session_factory()() as session:
         listed = await session.get(Game, APP_LIST_NEW)
         assert listed is not None and listed.is_epic is True
-        assert listed.epic_date == "2026-5-28"  # 年月日形态归一
+        assert listed.epic_date == "2026-5-28"
         assert listed.updated_at is None
 
         plain = await session.get(Game, APP_PLAIN)
         assert plain.is_epic is True
-        assert plain.epic_date == "2026-5-8"  # 前导零剥除
+        assert plain.epic_date == "2026-5-8"
 
         dated = await session.get(Game, APP_DATED)
         assert dated.epic_date == OLD_DATE
 
 
-# ─── 展示链缓存：落库快照 + 后台刷新（stale-while-revalidate）─────────
-# 仪表盘卡片语义：冷启动先回落库快照（stale）+ 后台刷新覆盖，避免每次
-# 启动首开都等一轮完整抓取。落库键走 app_settings KV，夹具清账防串场。
 
 
 def _offers_payload(title: str = "Cached Game") -> dict:
@@ -748,14 +729,13 @@ async def test_offers_cold_start_serves_snapshot_then_refreshes(monkeypatch):
     first = await epic.epic_free_offers()
     assert first["ok"] is True
     assert first["cached"] is True and first["stale"] is True
-    assert first["offers"][0]["title"] == "Old Cached"  # 先显旧快照，不等网络
+    assert first["offers"][0]["title"] == "Old Cached"
 
-    await epic._epic_offers_refresh_task  # 后台刷新收尾
+    await epic._epic_offers_refresh_task
 
     second = await epic.epic_free_offers()
     assert second["stale"] is False
     assert second["offers"][0]["title"] == "Fresh From Net"
-    # 落库同步更新：下次冷启动读到的就是新数据
     snap = await settings_service.get_value(epic._EPIC_OFFERS_CACHE_KEY)
     assert snap["payload"]["offers"][0]["title"] == "Fresh From Net"
 

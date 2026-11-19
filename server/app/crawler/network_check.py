@@ -32,13 +32,12 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-FAILURE_THRESHOLD = 3  # 连续传输失败达此次数 → 值得怀疑，转入核实
-PING_ATTEMPTS = 3  # 核实阶段的探测轮数（任一轮通即否决断网）
+FAILURE_THRESHOLD = 3
+PING_ATTEMPTS = 3
 PING_TIMEOUT = 5.0
-PING_RETRY_GAP = 2.0  # 探测轮之间的间隔：留出瞬时抖动自行恢复的窗口
-POLL_INTERVAL = 30  # 等待模式下重新探测本机网络的间隔（秒）
+PING_RETRY_GAP = 2.0
+POLL_INTERVAL = 30
 
-# 直连可达的国内目标，不经代理；拿到任意响应即证明本机链路通
 PING_URLS = ["http://www.baidu.com", "https://www.qq.com"]
 
 
@@ -74,7 +73,6 @@ class NetworkChecker:
         属于另一类问题，不应计入。
         """
         if self._is_offline:
-            # 已确认断网期间不再累计：计数没有消费者，只会在长时间断网里无限增长
             return
         self._failure_count += 1
         if self._failure_count >= FAILURE_THRESHOLD:
@@ -125,10 +123,9 @@ class NetworkChecker:
                 async with httpx.AsyncClient(
                     timeout=PING_TIMEOUT,
                     follow_redirects=True,
-                    trust_env=False,  # 关键：不被 HTTP_PROXY 等环境变量拽回代理
+                    trust_env=False,
                 ) as client:
                     await client.get(url)
-                    # 拿到响应即证明链路可达——状态码无关紧要，429/404/503 都算通
                     return True
             except Exception:  # noqa: BLE001 —— 这一个目标没通不代表本机断网，换下一个再试
                 continue
@@ -175,9 +172,8 @@ async def _sleep_or_stop(stop_event: asyncio.Event | None, seconds: float) -> bo
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
     except asyncio.TimeoutError:
-        return False  # 正常睡满：超时才是常态
+        return False
     return True
 
 
-# 事件循环级单例：爬虫各 worker 共享同一份网络状态判定
 network_checker = NetworkChecker()

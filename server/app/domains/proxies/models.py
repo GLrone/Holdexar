@@ -9,14 +9,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
-# ── 订阅级「生产准入」────────────────────────────────────────────────
-# 它只回答一个问题：**这条订阅的节点是否获准进入 Registry / 生产池**。
-# **不是**「当前内核在跑哪条订阅」，**不是** Runtime GLOBAL 的选择，也**不是**
-# 节点级健康（那是 `ProxyNode.state`）。
-# - `ACTIVE`   ：获准进入生产——订阅同步会把它 apply 进 Registry；
-# - `CANDIDATE`：新来源尚未获准——只抓取 + 落快照，不进 Registry
-#                （见 `domains/proxypool/admission.py`）。
-# 与 `deprecated`（旧来源的可用性弃用）**完全独立**：两者互不转换、互不跟随。
 ADMISSION_ACTIVE = "ACTIVE"
 ADMISSION_CANDIDATE = "CANDIDATE"
 
@@ -26,7 +18,7 @@ class Proxy(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     label: Mapped[str | None] = mapped_column(String(100))
-    scheme: Mapped[str] = mapped_column(String(10), default="http")  # http | socks5
+    scheme: Mapped[str] = mapped_column(String(10), default="http")
     host: Mapped[str] = mapped_column(String(255))
     port: Mapped[int] = mapped_column(Integer)
     # 代理账号口令属长期凭据：与 Steam Cookie 同级，落库为 `enc1:` 密文。
@@ -34,7 +26,7 @@ class Proxy(Base):
     username: Mapped[str | None] = mapped_column(String(255))
     password: Mapped[str | None] = mapped_column(String(255))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    status: Mapped[str] = mapped_column(String(20), default="unknown")  # ok|failed|unknown
+    status: Mapped[str] = mapped_column(String(20), default="unknown")
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -48,9 +40,9 @@ class ProxyEvent(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[datetime | None] = mapped_column(DateTime)
-    kind: Mapped[str] = mapped_column(String(20), default="crawl")  # crawl | test | clash
+    kind: Mapped[str] = mapped_column(String(20), default="crawl")
     target: Mapped[str | None] = mapped_column(String(255))
-    proxy_label: Mapped[str | None] = mapped_column(String(100))  # direct 或代理标签
+    proxy_label: Mapped[str | None] = mapped_column(String(100))
     status_code: Mapped[int | None] = mapped_column(Integer)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
@@ -66,12 +58,12 @@ class ProxySubscription(Base):
     __tablename__ = "proxy_subscriptions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    kind: Mapped[str] = mapped_column(String(10))  # clash | plain
+    kind: Mapped[str] = mapped_column(String(10))
     url: Mapped[str] = mapped_column(Text)
     label: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_imported_at: Mapped[datetime | None] = mapped_column(DateTime)
-    last_stats: Mapped[dict | None] = mapped_column(JSON)  # 最近一次导入/检测结果
+    last_stats: Mapped[dict | None] = mapped_column(JSON)
     deprecated: Mapped[bool] = mapped_column(Boolean, default=False)
     deprecated_at: Mapped[datetime | None] = mapped_column(DateTime)
     deprecated_reason: Mapped[str | None] = mapped_column(String(200))
@@ -82,15 +74,11 @@ class ProxySubscription(Base):
     admission_status: Mapped[str] = mapped_column(
         String(16), default=ADMISSION_CANDIDATE, server_default=ADMISSION_ACTIVE
     )
-    # ── proxypool 抓取 / 快照元数据（仅增列，不影响既有代理链路）──
-    # 快照身份的唯一事实源是 subscription_snapshots 表（sha256/版本都在那边）。
     last_fetch_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_fetch_status: Mapped[str | None] = mapped_column(String(32))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_error: Mapped[str | None] = mapped_column(String(500))
     cache_url_identity: Mapped[str | None] = mapped_column(String(64))
-    # 自动更新订阅：False = 定时刷新跳过它，只保留手动重拉。
-    # 限时订阅（只在窗口内可下载、下载后长期可用）关掉即不再每轮撞失败。
     auto_refresh: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )

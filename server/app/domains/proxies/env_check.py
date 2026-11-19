@@ -15,17 +15,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# 判定用域名：必然真实存在且与业务无关，避免把「目标站点挂了」误判成环境接管
 PROBE_HOST = "www.baidu.com"
 # 假地址段（主流内核的默认取值）：解析结果落进这里即判定被接管
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/16")
 
-# 判定结果短缓存：体检每 5 分钟一拍、价格链每段一问，不必每次都解析
 _CACHE_TTL = 30.0
 _cache_value = False
 _cache_at = 0.0
 
-# 用户语言说明：只说结果与可执行下一步，实现词一律不进用户面
 USER_MESSAGE = "本机网络被其他软件接管，为避免误判已暂停相关动作，关闭后会自动继续"
 
 
@@ -33,7 +30,6 @@ def _resolves_to_fake_ip(host: str = PROBE_HOST) -> bool:
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError:
-        # 解析失败不是接管的证据（可能只是本机断网），宁可不判
         return False
     for info in infos:
         try:

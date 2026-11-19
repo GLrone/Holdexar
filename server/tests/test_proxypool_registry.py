@@ -123,7 +123,6 @@ async def _set_state(fingerprint: str, state: str) -> None:
         await s.commit()
 
 
-# ── 1. 首次登记 ──────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_first_snapshot_registers_one_node_and_one_source(tmp_data_dir) -> None:
     await init_db()
@@ -148,7 +147,6 @@ async def test_first_snapshot_registers_one_node_and_one_source(tmp_data_dir) ->
     assert src.last_seen == NOW and src.first_seen == NOW
 
 
-# ── 2. 重复刷新不产生重复 ────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_repeat_identical_refresh_creates_no_duplicates(tmp_data_dir) -> None:
     await init_db()
@@ -165,7 +163,6 @@ async def test_repeat_identical_refresh_creates_no_duplicates(tmp_data_dir) -> N
     assert row.first_seen == NOW, "first_seen 是首次见到，不随刷新前移"
 
 
-# ── 3. 同配置跨订阅 → 两行独立节点（节点跟着订阅走）──────────────
 @pytest.mark.asyncio
 async def test_same_config_from_two_subscriptions_makes_two_nodes(tmp_data_dir) -> None:
     await init_db()
@@ -182,7 +179,6 @@ async def test_same_config_from_two_subscriptions_makes_two_nodes(tmp_data_dir) 
     assert len({r.node_id for r in rows}) == 2, "归属订阅进身份，指纹必须不同"
 
 
-# ── 4. 一个订阅撤掉它 → 只影响自己那份 ───────────────────────────
 @pytest.mark.asyncio
 async def test_drop_from_one_subscription_leaves_the_other_node_intact(tmp_data_dir) -> None:
     await init_db()
@@ -199,16 +195,15 @@ async def test_drop_from_one_subscription_leaves_the_other_node_intact(tmp_data_
     assert len([r for r in rows if r.subscription_id is None]) == 1, "订阅1 的 X 归属已解除"
 
 
-# ── 5. 归属解除 → 按已封板的 D1 语义落状态 ───────────────────────
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial,expected",
     [
-        (NODE_NEW, NODE_DEAD),        # 从未通过体检，失去归属不得进池
-        (NODE_ACTIVE, NODE_STALE),    # 曾通过体检，降权保留
-        (NODE_STALE, NODE_STALE),     # 已是 STALE，原地不动
-        (NODE_DEAD, NODE_DEAD),       # 已判死，不得被「归属消失」洗白成 STALE
-        (NODE_RETIRED, NODE_RETIRED),  # 退休是终态，除非健康证据
+        (NODE_NEW, NODE_DEAD),
+        (NODE_ACTIVE, NODE_STALE),
+        (NODE_STALE, NODE_STALE),
+        (NODE_DEAD, NODE_DEAD),
+        (NODE_RETIRED, NODE_RETIRED),
     ],
 )
 async def test_last_source_gone_follows_locked_state_semantics(
@@ -228,7 +223,6 @@ async def test_last_source_gone_follows_locked_state_semantics(
     assert result.removed_sources == (fp,)
 
 
-# ── 6. 订阅侧改名：只有 original_name 变 ─────────────────────────
 @pytest.mark.asyncio
 async def test_rename_updates_source_name_only(tmp_data_dir) -> None:
     await init_db()
@@ -251,7 +245,6 @@ async def test_rename_updates_source_name_only(tmp_data_dir) -> None:
     assert src.last_source_seen == NOW
 
 
-# ── 7. last_source_seen 只在续见时推进 ───────────────────────────
 @pytest.mark.asyncio
 async def test_last_source_seen_advances_only_when_still_provided(tmp_data_dir) -> None:
     """`last_source_seen` 是「最近一次出现在订阅快照里」的时刻。
@@ -270,7 +263,6 @@ async def test_last_source_seen_advances_only_when_still_provided(tmp_data_dir) 
     fp = _fp(x)
     assert (await _node_row(fp)).last_source_seen == t12, "续见时推进"
 
-    # 13:00：订阅不再提供 X
     await _apply(_snap([_node("别的", server="hk9.example.net")], subscription_id=1), now=t13)
 
     row = await _node_row(fp)
@@ -278,7 +270,6 @@ async def test_last_source_seen_advances_only_when_still_provided(tmp_data_dir) 
     assert row.subscription_id is None
 
 
-# ── 8. 同一份快照内的重复指纹只登记一条来源 ──────────────────────
 @pytest.mark.asyncio
 async def test_duplicate_fingerprint_in_one_snapshot_collapses(tmp_data_dir) -> None:
     """同一份快照里的重复配置只算一条来源（`name` 不参与身份）。
@@ -290,8 +281,8 @@ async def test_duplicate_fingerprint_in_one_snapshot_collapses(tmp_data_dir) -> 
     await init_db()
     duplicated = [
         _node("香港01", server="hk1.example.net"),
-        _node("香港01", server="hk1.example.net"),          # 字面重复
-        _node("香港高速01", server="hk1.example.net"),       # 同配置、换名（name 不参与指纹）
+        _node("香港01", server="hk1.example.net"),
+        _node("香港高速01", server="hk1.example.net"),
     ]
 
     result = await _apply(_snap(duplicated))

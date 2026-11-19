@@ -41,7 +41,6 @@ from .models import (
 from .subscription_secret import UNREADABLE_MESSAGE, open_url, seal_url
 
 
-# ─── Clash 检测串行锁（按事件循环缓存）──────────────────────
 # test_clash_nodes 逐个切 selector 探测——手动检测/启动首检/定时体检三源
 # 并发会互踩 selector 与延迟读数。锁按事件循环缓存：uvicorn 单 loop 常态
 # 下等效模块级单例；测试里每用例新 loop 则各拿各的锁，互不卡死。
@@ -60,14 +59,8 @@ def _clash_test_lock() -> asyncio.Lock:
 
 logger = logging.getLogger(__name__)
 
-# 健康检查目标：**生产抓取端点**（IStoreBrowseService/GetItems/v1），不是 ping
-# ——须与生产主链路（api.steampowered.com）同主机/同路径/同编码：探测别的目标
-# （如 store.steampowered.com/api/appdetails）时链路可达性与生产并不一致，
-# 体检通过不代表生产可用。探针取单 appid + 不带 extras（最小负载），
-# 编码约定由生产侧单一来源提供。
 TEST_URL = StoreBrowseAPI.probe_url()
-TEST_PARAMS = None  # 编码已内嵌在 TEST_URL（input_json 查询参数）
-# 走线日志的目标标签：TEST_URL 带 input_json 会超长（proxy_events.target 列 255）
+TEST_PARAMS = None
 TEST_TARGET = "IStoreBrowseService/GetItems"
 TEST_TIMEOUT = 12.0
 
@@ -83,19 +76,17 @@ def _steam_payload_ok(resp: httpx.Response) -> bool:
         return False
     try:
         return isinstance(resp.json(), dict)
-    except Exception:  # noqa: BLE001 —— 非 JSON 响应（拦截页 / 空体）
+    except Exception:  # noqa: BLE001
         return False
-MAX_CONSECUTIVE_FAILURES = 5  # 连续失败自动禁用
+MAX_CONSECUTIVE_FAILURES = 5
 
-# ── 代理池加权选择（_weighted_pick）的参数 ──
-SPEED_REF_MS = int(TEST_TIMEOUT * 1000)  # 速度参照 = 体检超时；比这更慢的一律按最慢算
-SPEED_FLOOR = 0.5  # 最慢出口仍保留的速度分（不归零：否则慢节点永不复测、永远翻不了身）
-UNTESTED_SPEED = 0.7  # 未测速节点的速度分：中游，够它分到流量被测出来
-WEIGHT_SCALE = 100_000  # 权重分辨率，不影响各出口的相对份额
+SPEED_REF_MS = int(TEST_TIMEOUT * 1000)
+SPEED_FLOOR = 0.5
+UNTESTED_SPEED = 0.7
+WEIGHT_SCALE = 100_000
 
-# ── Clash 订阅刷新与探测复用 ───────────────────────────────
-SUBSCRIPTION_REFRESH_HOURS = 6  # 订阅重拉间隔（与节点体检同拍，跨重启靠 KV 门槛）
-FIRST_CHECK_REUSE_MINUTES = 5  # 启动/切换触发的首检复用窗口：窗口内检测过就沿用账本，不重测
+SUBSCRIPTION_REFRESH_HOURS = 6
+FIRST_CHECK_REUSE_MINUTES = 5
 
 
 def _naive(dt: datetime) -> datetime:
@@ -124,8 +115,6 @@ async def clash_nodes_fresh(sub_id: int) -> bool:
     return elapsed < timedelta(minutes=FIRST_CHECK_REUSE_MINUTES)
 
 
-# 用户最近一次显式选中的 Clash 订阅（点选行 / 切换 / 启动成功都落这里）：
-# 内核未运行时跨页面与重启保留点选，启动（含自启）缺省用它，前端回显同源
 SELECTED_CLASH_SUB_KEY = "proxy.selected_clash_sub_id"
 
 
@@ -149,12 +138,9 @@ def proxy_label(p: Proxy | None) -> str:
     return p.label or (f"{p.scheme}://{p.host}:{p.port}") if p else "direct"
 
 
-# ─── 策略 ────────────────────────────────────────────────────
 
 STRATEGIES = ("proxy_first", "direct_only", "direct_first", "proxy_only")
 
-# 用户显式选过策略的标记：自动切换（订阅导入成功 → 代理）只在「默认直连、
-# 用户没有表达过策略偏好」时生效，用户手动选过的策略永不被自动行为覆盖
 STRATEGY_EXPLICIT_KEY = "proxy.strategy_explicit"
 
 
@@ -163,14 +149,9 @@ async def get_strategy() -> dict:
 
     strategy = await get_value("proxy.strategy", None)
     if strategy is None:
-        # 默认策略：初次打开即直连模式——作业托管到
-        # 本机网络环境（系统代理 / 加速器透明生效，限速闸保底）；导入有效
-        # 订阅时自动切代理优先，用户显式选过的策略不被自动行为覆盖
         strategy = "direct_only"
         await set_value("proxy.strategy", strategy)
     if strategy in ("pinned", "clash"):
-        # 策略下架：pinned/clash 移除（自启 Verge 由代理优先回落探测
-        # 覆盖），存量值一次性迁移，避免静默退化为 proxy_only 语义（无代理即报错）。
         strategy = "proxy_first"
         await set_value("proxy.strategy", strategy)
         from app.domains.settings.service import delete_value
@@ -188,7 +169,6 @@ async def get_strategy() -> dict:
         ),
         "runtimeRunning": bool(runtime_status.get("running")),
         "runtimeEntryReady": bool(runtime_status.get("entryReady")),
-        # 内核自启 / 自动节点体检开关（默认开；体检的 force 手动路径不受闸）
         "autostart": bool(await get_value("proxy.autostart", True)),
         "healthAuto": bool(await get_value("proxy.health_auto", True)),
     }
@@ -207,8 +187,6 @@ async def set_strategy(
         if strategy not in STRATEGIES:
             raise ValueError(f"未知策略: {strategy}")
         await set_value("proxy.strategy", strategy)
-        # 显式选择标记：与自动切换（订阅导入）区分——用户亲手选的策略，
-        # 自动行为不得覆盖
         if (await get_value(STRATEGY_EXPLICIT_KEY, False)) is not True:
             await set_value(STRATEGY_EXPLICIT_KEY, True)
     old_mode, old_port = await kernel_port_config()
@@ -254,7 +232,7 @@ async def _restart_kernel_for_port(new_port: int) -> None:
         if not outcome.get("entryReady"):
             raise RuntimeError("代理入口没有成功监听")
         log_event(logger, f"内核工作端口已切换为 {new_port}，已按新端口重启", tag="成功")
-    except Exception as exc:  # noqa: BLE001 —— restore the previous working port on failure
+    except Exception as exc:  # noqa: BLE001
         if not clash_manager.runtime.status()["running"]:
             try:
                 await clash_manager.runtime.ensure_running(
@@ -380,8 +358,6 @@ async def _local_fallback_port() -> int | None:
     return None
 
 
-# ─── 直连形态的系统代理解析 ─────────────────────────────────
-#
 # aiohttp 不读 Windows 注册表系统代理（trust_env 默认关），纯系统代理型
 # 本地工具（Clash Verge 等）的直连模式原本只有 TUN 接管才生效。这里用
 # urllib.getproxies()（环境变量优先 → 注册表 ProxyEnable/ProxyServer，与
@@ -397,7 +373,7 @@ def _system_proxy_candidates() -> list[str]:
 
     try:
         proxies = urllib.request.getproxies()
-    except Exception:  # noqa: BLE001 —— 读取失败等同无系统代理
+    except Exception:  # noqa: BLE001
         return []
     out: list[str] = []
     for key in ("https", "http"):
@@ -446,7 +422,7 @@ async def strategy_proxy_or_direct() -> str | None:
     """
     try:
         return await resolve_proxy_url()
-    except Exception:  # noqa: BLE001 — 后台同步失败不改写为直连以外的语义
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -460,20 +436,13 @@ async def resolve_proxy_url() -> str | None:
     strategy = await get_value("proxy.strategy", "direct_only")
 
     if strategy == "direct_only":
-        # 直连 = 托管用户本机网络环境：TUN 型加速器裸连即走；系统代理型
-        # （Clash Verge 等）由 resolve_system_proxy_url 找到并显式挂上
         return await resolve_system_proxy_url()
 
     if strategy == "direct_first":
         return None
 
     if strategy == "proxy_first":
-        # 代理优先（2026-09 起默认）：Clash 内核在跑 → 内核端口（工作端口，
-        # 网络页配置的那个）；代理池有启用节点 → 轮询；都没有 → 探用户自启
-        # Verge 的兜底口（7897，与工作端口设置无关）；仍无 → 直连。
         status = clash_manager.runtime.status()
-        # 入口硬闸：进程活着但混合端口没在听（订阅没写端口/端口被占）时
-        # 交出去的地址必然 ConnectError，直接落到后续通道
         if status["running"] and status.get("port") and clash_manager.runtime.entry_listening():
             return f"http://127.0.0.1:{status['port']}"
         enabled = await list_proxies(enabled_only=True)
@@ -484,7 +453,6 @@ async def resolve_proxy_url() -> str | None:
             return f"http://127.0.0.1:{fallback}"
         return None
 
-    # proxy_only: 加权随机（延迟+健康反馈到流量分配；rr_index 顺序轮询兜底）
     enabled = await list_proxies(enabled_only=True)
     if not enabled:
         raise RuntimeError(f"策略 {strategy} 需要至少一条启用的代理")
@@ -543,15 +511,11 @@ async def _weighted_pick(enabled: list[Proxy]) -> str:
             return 0.0
         if fails == 0 and p.status != "failed":
             return 1.0
-        # 有失败计数、或被人工标成 failed 的，按 2^-失败次数 降权（1/2, 1/4, 1/8…）。
-        # 手动标 failed 但计数为 0 时按 1 次失败算，否则人工拉黑的出口权重照旧。
         return 2.0 ** -max(fails, 1)
 
     scores = [_speed(p) * _health(p) for p in enabled]
     if sum(scores) <= 0:
         return await _round_robin(enabled)
-    # 健康分为 0 的出口权重精确为 0（不被下限抬起来），其余最低也有
-    # SPEED_FLOOR × 2^-(MAX-1) × WEIGHT_SCALE，不会因取整掉到 0
     weights = [round(s * WEIGHT_SCALE) for s in scores]
     chosen = random.choices(enabled, weights=weights, k=1)[0]
     return _runtime_url(chosen)
@@ -593,7 +557,7 @@ async def _saved_proxy_candidates(limit: int = 3) -> list[str]:
     seen: set[str] = set()
     try:
         enabled = await list_proxies(enabled_only=True)
-    except Exception:  # noqa: BLE001 —— 池不可用按空池处理，不拖垮拉取
+    except Exception:  # noqa: BLE001
         enabled = []
     for _ in range(limit):
         if not enabled:
@@ -607,12 +571,6 @@ async def _saved_proxy_candidates(limit: int = 3) -> list[str]:
             out.append(pick)
     return out
 
-
-# ─── 名称三档链（用户改名 > 机场品牌名 > 缓存上次值）────────────
-#
-# 事实源唯一性：`label` 列始终是「当前生效名称」，`last_stats.labelSource`
-# 只记这个名字**从哪来**（user=用户真改过 / panel=机场给的），不另存一份名字。
-# 这样「用户改过」这个事实有唯一记录者，且不需要新增列。
 
 LABEL_SOURCE_USER = "user"
 LABEL_SOURCE_PANEL = "panel"
@@ -649,18 +607,11 @@ async def apply_subscription_name_chain(sub_id: int, panel_name: str | None) -> 
         current = sub.label
         source = _label_source(sub)
 
-        # ① 用户命名：锁死，任何机场名都不许覆盖。判定分两种情形——
-        #    a) 有 user 标记：用户手动改过名（含改成别的再改回来）；
-        #    b) 无任何标记但有名字：老版本自动取的名（旧代码没留来源）或
-        #       添加订阅时用户自己填的。这两种靠名字是否等于「机场当前给的名字」
-        #       区分：相等 → 就是机场给的，不算用户命名（可跟随机场改名更新）；
-        #       不等 → 用户动过，锁死。旧数据因此自动归位，无需迁移脚本。
         if current and source == LABEL_SOURCE_USER:
             return current
         if current and source is None and (not name or name != current):
             return current
 
-        # ② 本次机场名：用户没改过就用它（含机场自己改名的情况）
         if name and name != current:
             sub.label = name
             stats = dict(sub.last_stats or {})
@@ -669,8 +620,6 @@ async def apply_subscription_name_chain(sub_id: int, panel_name: str | None) -> 
             await session.commit()
             return name
 
-        # ②' 名字与本次机场名一致：补上 panel 标记（历史行归位）。
-        # 不补的话这些行永远是「无标记」，下次机场改名时又会被当成用户命名而锁死。
         if name and name == current and source != LABEL_SOURCE_PANEL:
             stats = dict(sub.last_stats or {})
             stats["labelSource"] = LABEL_SOURCE_PANEL
@@ -706,8 +655,6 @@ async def update_subscription(
                 raise ValueError("订阅不存在")
             if label is not None:
                 new_label = (label or "").strip()[:100] or None
-                # 只有值真的变了才算用户命名：原样保存（打开窗口没碰名字）不得把
-                # 机场名永久锁死——判据是「值变了没有」，不是「保存按了没有」。
                 if new_label != (sub.label or ""):
                     stats = dict(sub.last_stats or {})
                     stats["labelSource"] = LABEL_SOURCE_USER if new_label else None
@@ -740,7 +687,7 @@ async def update_subscription(
     if url_changed and result["kind"] == "clash":
         try:
             sync = await refresh_clash_subscription(sub_id, auto_switch=True)
-        except Exception as e:  # noqa: BLE001 —— 重拉失败不撤销改名换链
+        except Exception as e:  # noqa: BLE001
             result["warning"] = f"订阅链接已更新，但自动重拉失败：{e}"
             return result
         result.update({
@@ -833,24 +780,20 @@ async def refresh_clash_subscription(
     if _require_fresh_traffic and (meta.get("cached") or not meta.get("userinfo")):
         raise ValueError("面板未返回在线流量头（subscription-userinfo）；已保留上次记录")
 
-    # 流量/节点数一并回填（下载响应里就有；失败不阻塞刷新）
     fields: dict = {
         "nodes": meta.get("nodes"),
         "cached": meta.get("cached", False),
     }
-    # 在线头优先；缓存回退没有新流量时沿用上次记录。
     traffic = meta.get("userinfo")
     traffic = await _resolve_traffic(sub_id, traffic)
     if traffic:
         fields["traffic"] = traffic
 
-    # 账本收敛：以新下载内容为准，已下线/改名节点的旧行删除
     current_names = set(clash_manager.parse_node_names(
         Path(meta["path"]).read_text(encoding="utf-8", errors="ignore")
     ))
     if current_names:
 
-        # 存活统计读权威节点账本：新下载节点尚无证据 → 从 0 起算
         from app.domains.proxypool.models import ProxyNode
         from app.domains.proxypool.state import NODE_ACTIVE, NODE_STALE
 
@@ -871,14 +814,8 @@ async def refresh_clash_subscription(
         fields["total"] = len(node_rows)
     await _merge_last_stats(sub_id, **fields)
 
-    # 名称三档链（用户改名 > 本次机场名 > 缓存上次值）：无条件走一次，
-    # 由链自己按来源决定用哪个——用户没改过时机场改名要能更新过来，
-    # 只有用户亲手动过的名字才锁死。降级时 title 来自响应头 sidecar。
     label = await apply_subscription_name_chain(sub_id, meta.get("title")) or label
 
-    # 内核在跑且跑的就是这条订阅：配置变化自动重启生效；跑的是别的订阅
-    # 或没在跑 → 只下载不重启（避免共用缓存路径把内核悄悄切到别的订阅）
-    # restarted 字段语义 = 「新配置已生效」：热重载（内核不动）或进程重启都算
     restarted = False
     detect = clash_manager.detect_kernel(settings.data_dir)
     if clash_manager.runtime.running_subscription_is(sub_url) and detect["found"]:
@@ -886,8 +823,6 @@ async def refresh_clash_subscription(
         # stop/start 切断在途探测的 lane 连接，会把节点误记失败写进账本
         async with _clash_test_lock():
             try:
-                # 刷新后重新渲染运行配置：交给内核的始终是生成结果，地区规则
-                # 不会被这次刷新重新带回内核
                 runtime_path = clash_manager.materialize_subscription_config(
                     Path(meta["path"])
                 )
@@ -897,7 +832,7 @@ async def refresh_clash_subscription(
                     **port_options,
                 )
                 restarted = bool(outcome.get("reloaded") or outcome.get("started"))
-            except Exception:  # noqa: BLE001 —— 更新失败保留旧内核运行
+            except Exception:  # noqa: BLE001
                 log_event(
                     logger,
                     "订阅刷新时内核配置更新失败，沿用运行中的内核实例",
@@ -919,9 +854,6 @@ async def refresh_clash_subscription(
     }
     if _include_sync:
         result["_syncResult"] = meta.get("_sync_result")
-    # 用户主动重拉/换链接也算一次「订阅有效」的表示：默认直连且没表达过
-    # 偏好时切代理优先。定时周期重拉不传 auto_switch——自动行为不该由
-    # 后台节拍翻转用户当前的出口形态。
     if auto_switch and await maybe_autoswitch_on_subscription(meta.get("nodes")):
         result["strategySwitched"] = True
     return result
@@ -955,15 +887,12 @@ async def resolve_startable_clash(
             "请在订阅区手动删除或更换订阅"
         )
     if requested_id is None:
-        # 无显式请求时吃落库的「用户最近一次显式选中」（点选/切换/启动成功
-        # 都会写）；那条已被删除则自然落空，按原候选序兜底
         requested_id = await remembered_clash_sub_id()
     if requested_id is not None:
         ordered = [s for s in subs if s["id"] == requested_id]
         ordered += [s for s in reversed(subs) if s["id"] != requested_id]
     else:
         ordered = list(reversed(subs))
-    # 无指定订阅时允许"缓存只作兜底"；显式指定则命中即用（尊重用户选择）
     defer_cached = requested_id is None
     proxy_candidates = await _saved_proxy_candidates()
     attempts: list[dict] = []
@@ -977,13 +906,10 @@ async def resolve_startable_clash(
             meta = await clash_manager.runtime.download_subscription(
                 sub["url"], data_dir, proxy_candidates, **download_options,
             )
-            # 交给内核的是**项目生成的运行配置**，不是机场原文：原文留作来源
-            # 证据与离线缓存（cache_path），渲染失败（如依赖残缺）按本候选不可用
-            # 处理，继续找下一个候选。
             runtime_path = clash_manager.materialize_subscription_config(
                 Path(meta["path"])
             )
-        except Exception as e:  # noqa: BLE001 —— 单条候选不可用，换下一条
+        except Exception as e:  # noqa: BLE001
             attempts.append(
                 {"id": sub["id"], "label": sub["label"], "error": _brief_error(e)}
             )
@@ -1069,9 +995,6 @@ async def ensure_clash_running(*, snapshot_only: bool = True) -> None:
             else:
                 log_event(logger, "还没有 Clash 订阅，跳过内核自启", tag="跳过")
             return
-        # 取配置按候选遍历（新→旧）：某条订阅链接失效且无本地缓存时降级到
-        # 下一条，内核起不来不允许是「下载失败」一个原因——节点好不好交给
-        # 启动后的首检与定时体检
         try:
             picked = await proxies_service.resolve_startable_clash(
                 settings.data_dir, snapshot_only=snapshot_only
@@ -1093,7 +1016,7 @@ async def ensure_clash_running(*, snapshot_only: bool = True) -> None:
             **port_options,
         )
         log_event(logger, "Clash 内核已随服务自启", detail={"端口": status.get("port")})
-    except Exception:  # noqa: BLE001 —— 自启失败不阻塞服务
+    except Exception:  # noqa: BLE001
         log_event(logger, "Clash 内核自启失败，不影响服务运行", level=logging.ERROR, exc_info=True)
 
 
@@ -1141,7 +1064,6 @@ async def maybe_refresh_active_clash_subscription() -> dict:
     usable = [s for s in await list_subscriptions("clash", reveal=True) if not s["deprecated"]]
     if not usable:
         return {"state": "no_subscription", **skip}
-    # 从新到旧找「URL 出现在启动文本里」的那条（与「最近一条」默认序一致）
     sub = next(
         (
             s
@@ -1159,7 +1081,7 @@ async def maybe_refresh_active_clash_subscription() -> dict:
         return {"state": "unknown_subscription", **skip}
     try:
         result = await refresh_clash_subscription(sub["id"], _include_sync=True)
-    except Exception as e:  # noqa: BLE001 —— 失败不消费门槛，下一拍重试
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             f"订阅 {sub['id']} 重拉失败，下一拍再试",
@@ -1187,7 +1109,6 @@ async def maybe_refresh_active_clash_subscription() -> dict:
     }
 
 
-# ─── CRUD ────────────────────────────────────────────────────
 
 async def list_proxies(enabled_only: bool = False) -> list[Proxy]:
     query = select(Proxy).order_by(Proxy.id)
@@ -1298,7 +1219,6 @@ async def delete_proxy(proxy_id: int) -> bool:
         return True
 
 
-# ─── 健康检查 ────────────────────────────────────────────────
 
 async def test_proxy(proxy_id: int) -> dict:
     async with write_session(WritePriority.INTERACTIVE) as session:
@@ -1373,7 +1293,6 @@ async def _check(proxy: Proxy) -> tuple[str, int | None, str | None]:
     return status, latency, error
 
 
-# ─── 订阅链接（clash / plain 双方式，长期保存在本地库）─────────
 
 SUB_KINDS = ("clash", "plain")
 
@@ -1391,7 +1310,6 @@ async def migrate_legacy_subscription() -> None:
                 select(ProxySubscription).where(ProxySubscription.kind == "clash")
             )
         ).scalars().all()
-        # 行内是密文（或存量明文），去重比对走解密口径
         exists = any(open_url(r.url) == legacy.strip() for r in rows)
         if not exists:
             session.add(
@@ -1441,7 +1359,6 @@ async def list_subscriptions(kind: str | None = None, *, reveal: bool = False) -
             "deprecated": bool(s.deprecated) or s.resource_block_reason() is not None,
             "deprecatedAt": s.deprecated_at.isoformat() if s.deprecated_at else None,
             "deprecatedReason": s.resource_block_reason() or s.deprecated_reason,
-            # 自动更新：False 时定时刷新跳过它（手动重拉照常）
             "autoRefresh": bool(s.auto_refresh)
             if s.auto_refresh is not None
             else True,
@@ -1463,7 +1380,7 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
     from app.core.config import get_settings
 
     settings = get_settings()
-    kernel_installed = None  # None=原本就有 / dict=本次自动安装结果
+    kernel_installed = None
     if kind == "clash" and not clash_manager.detect_kernel(settings.data_dir)["found"]:
         import asyncio
 
@@ -1479,8 +1396,6 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
     async with write_session(WritePriority.INTERACTIVE) as session:
         sub = ProxySubscription(
             kind=kind, url=seal_url(url), label=label, created_at=_naive(get_beijing_time_obj()),
-            # clash 走候选准入（默认 CANDIDATE，显式写清意图）；明文订阅没有候选
-            # 观察期，直接 ACTIVE。
             admission_status=(
                 ADMISSION_CANDIDATE if kind == "clash" else ADMISSION_ACTIVE
             ),
@@ -1490,7 +1405,6 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
         sub_id = sub.id
     result = {"id": sub_id, "kind": kind, "url": url, "label": label}
 
-    # 订阅验证下载（clash：拉配置拿节点数/流量头；失败保留行，warning 带回）
     if kind == "clash":
         try:
             meta = await clash_manager.runtime.download_subscription(
@@ -1499,22 +1413,17 @@ async def add_subscription(kind: str, url: str, label: str | None = None) -> dic
             )
             result["nodes"] = meta.get("nodes")
             result["cached"] = meta.get("cached", False)
-            # 在线头优先，缓存回退沿用上次已记录的值。
             traffic = await _resolve_traffic(sub_id, meta.get("userinfo"))
             result["traffic"] = traffic
             await _merge_last_stats(
                 sub_id, nodes=meta.get("nodes"), traffic=meta.get("userinfo")
             )
-            # 名称三档链（用户改名 > 本次机场名 > 缓存上次值）：无条件走一次，
-            # 用户没改过时机场改名能更新过来，只有用户亲手动过的名字才锁死。
             named = await apply_subscription_name_chain(sub_id, meta.get("title"))
             if named:
                 result["label"] = named
-            # 订阅有效（节点数>0）且用户处在默认直连 → 自动切代理优先
-            # （导入有效订阅即代理模式）
             if await maybe_autoswitch_on_subscription(meta.get("nodes")):
                 result["strategySwitched"] = True
-        except Exception as e:  # noqa: BLE001 —— 验证失败不撤销保存
+        except Exception as e:  # noqa: BLE001
             result["warning"] = f"订阅已保存，但下载验证失败：{e}（可稍后重拉）"
     if kernel_installed is not None:
         result["kernelInstalled"] = True
@@ -1545,16 +1454,12 @@ async def delete_subscription(sub_id: int) -> bool:
             )
         await session.delete(sub)
         await session.commit()
-    # 行已删，快照原始字节按订阅目录整体回收（内容寻址，行没了字节即孤儿）
     shutil.rmtree(
         snapshot_dir(get_settings().data_dir) / str(sub_id), ignore_errors=True
     )
-    # 缓存正文与响应头元数据同批回收：只删行不删文件会在 clash 目录留下无人
-    # 引用的孤儿（旧订阅内容继续占盘，且「已删除」在文件系统层面不成立）。
     clash_manager.remove_subscription_artifacts(
         get_settings().data_dir, sub_id
     )
-    # 删到一条不剩即无出口：回退直连（事务外，避免与写闸重入）
     await maybe_revert_to_direct()
     return True
 
@@ -1583,7 +1488,6 @@ def parse_plain_proxy_line(line: str) -> dict | None:
     if "://" in raw:
         scheme, host, port, username, password = _parse_proxy_url(raw)
         return {"scheme": scheme, "host": host, "port": port, "username": username, "password": password}
-    # user:pass@host:port
     if "@" in raw:
         auth, _, addr = raw.rpartition("@")
         user, _, pwd = auth.partition(":")
@@ -1732,7 +1636,6 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
             added += 1
         await session.commit()
 
-    # ── 入库即体检（导入后自动校验标记可用节点）──
     # 只测本次新增行（存量行沿用既有 status，重测留给 6h 体检）；全失败也
     # 保留数据——enabled 由 _check 连败计数器自然处置，不在导入里删行。
     stats: dict = {"fetched": len(parsed), "added": added, "skipped": skipped}
@@ -1763,13 +1666,11 @@ async def import_plain_subscription(sub_id: int, timeout: float = 30.0) -> dict:
         kind="import", target=f"plain:{sub_id}", proxy_label=f"plain:{sub_id}",
         status_code=fetched.http_status, duration_ms=fetched.duration_ms, error=None,
     )
-    # 订阅有效（体检有存活节点）且用户处在默认直连 → 自动切代理优先
     if stats.get("alive") and await maybe_autoswitch_on_subscription(stats["alive"]):
         stats["strategySwitched"] = True
     return stats
 
 
-# ─── Clash 节点检测（出口 IP 去重 + 存活）─────────────────────
 
 _EXIT_IP_URLS = [
     "http://ip-api.com/json/?fields=query",
@@ -1794,7 +1695,6 @@ async def _fetch_exit_ip(client: httpx.AsyncClient) -> str | None:
     return None
 
 
-# ─── Clash 节点检测会话（进度快照）──────────────────────────────
 # 检测是分钟级串行探测，同步等响应会让界面长时间无反馈。每次检测
 # （手动/启动首检/定时体检同源）对应一份模块级会话快照：探测逐节点
 # 写入，前端经 GET /proxies/clash/test/progress 轮询。写入全部发生在
@@ -1864,9 +1764,9 @@ def clash_test_start() -> dict:
 
 async def _clash_test_session_task() -> None:
     try:
-        await test_clash_nodes(probe_all=True)  # 手动检测 = 要全量结论
+        await test_clash_nodes(probe_all=True)
     except ValueError:
-        pass  # 失败原因（用户语言）已落会话，由进度端点带回
+        pass
     except Exception:  # noqa: BLE001
         log_event(
             logger,
@@ -1885,7 +1785,7 @@ async def test_clash_nodes(
     都是「用户要当前完整结论」的场景；定时体检走缺省 False，冷却期节点
     跳过不耗探测。"""
     if _clash_test_session is None:
-        _clash_test_session_reset()  # 体检/首检直调路径：等锁期间即有 queued 可看
+        _clash_test_session_reset()
     try:
         result = await _test_clash_nodes_impl(subscription_id, probe_all=probe_all)
     except Exception as e:  # noqa: BLE001
@@ -1990,7 +1890,7 @@ async def _probe_nodes_via_selector(
             prev_mode = (mode_resp.json() or {}).get("mode")
             if prev_mode != "global":
                 await ctl.patch(f"{base}/configs", json={"mode": "global"})
-    except Exception:  # noqa: BLE001 —— 模式切换失败则按当前模式尽力检测
+    except Exception:  # noqa: BLE001
         prev_mode = None
     try:
         for name in names:
@@ -2014,8 +1914,6 @@ async def _probe_nodes_via_selector(
             async with httpx.AsyncClient(
                 timeout=TEST_TIMEOUT, proxy=f"http://127.0.0.1:{mixed_port}", trust_env=False
             ) as via:
-                # 存活判定（Steam）与出口 IP 探测并发：IP 仅用于同落地
-                # 去重，不阻塞也不参与 alive 判定
                     (steam_ok, steam_status), exit_ip = await asyncio.gather(
                     _probe_steam(via), _fetch_exit_ip(via)
                 )
@@ -2141,12 +2039,10 @@ async def _test_clash_nodes_impl(
             resp.raise_for_status()
             all_proxies = resp.json().get("proxies", {})
 
-        # 手动全测沿用同一身份集合，自动体检按节点自身冷却跳过。
         to_probe = (list(node_names) if probe_all else
                     [name for name in node_names if not _in_cooldown(registry[name].cooldown_until)])
         now = _naive(get_beijing_time_obj())
 
-        # 路由组（selector 自愈用；探测 lane 的组是检测专用通道，不作路由组）
         groups = [
             info for info in all_proxies.values()
             if str(info.get("type", "")).lower() in ("selector", "fallback", "urltest")
@@ -2163,7 +2059,6 @@ async def _test_clash_nodes_impl(
         groups.sort(key=_group_score)
         selector = (str(groups[0].get("name") or "") or "GLOBAL") if groups else "GLOBAL"
 
-        # 会话进入 running：总量/待测量/冷却跳过数一次落定，之后探测逐节点追加
         _clash_test_session_update(
             phase="running",
             total=len(node_names),
@@ -2173,12 +2068,6 @@ async def _test_clash_nodes_impl(
             selector=selector,
         )
 
-        # 探测通道：内核本次启动注入的 lane（含可用端口预检）→ 20 并发分波；
-        # lane 缺席（注入前启动的内核）回退逐节点切 selector 的串行路径。
-        # 事实源是运行时状态不是磁盘配置——订阅下载会在启动后把 config.yaml
-        # 覆写回原始文本，内核内存里仍跑着注入后的配置。
-        # lane listener 端口在听才可用：内核启动时端口被占的 lane 绑不上，
-        # 走它的探测会把「通道不通」误判成「节点不通」——探测前先剔除。
         lanes = [
             lane for lane in clash_manager.runtime.probe_lanes
             if clash_manager._port_listening(lane[1])
@@ -2188,8 +2077,6 @@ async def _test_clash_nodes_impl(
             if lanes:
                 results = await _probe_nodes_via_lanes(ctl, base, lanes, to_probe)
             else:
-                # selector 回退路径的探测流量走混合端口：入口没在听时全部节点
-                # 会误判失败污染账本（并连带触发订阅误废弃），如实报错代替
                 if not clash_manager.runtime.entry_listening():
                     raise ValueError(
                         "内核入口不可用（混合端口未监听）且探测 lane 缺席，无法检测；请重启内核后重试"
@@ -2198,13 +2085,10 @@ async def _test_clash_nodes_impl(
                     ctl, base, headers, mixed_port, to_probe, selector
                 )
 
-        # 同出口代表行择优 + 其余标 duplicate（前端按出口 IP 分组收敛，
-        # 代表行即该出口的展示位——取本次检测中最可信的快节点）
         order = {name: i for i, name in enumerate(node_names)}
         results.sort(key=lambda r: order.get(r["name"], len(order)))
         _mark_same_exit(results, order)
 
-        # 健康、观测与冷却同一事务；落账失败不能继续写一份冷却结果。
         from app.domains.proxypool.bridge import ingest_node_check
         from app.domains.proxypool.models import HealthRun, ProxyNode
         from app.domains.proxypool.scheduling import request_rebuild
@@ -2242,7 +2126,6 @@ async def _test_clash_nodes_impl(
             sub_id, results, node_names, now, registry
         )
 
-        # ── selector 自愈：当前选中节点已死 → 切最快健康节点 ──
         try:
             healthy = sorted(
                 (r for r in results if r["alive"] and r["ms"] is not None),
@@ -2269,7 +2152,7 @@ async def _test_clash_nodes_impl(
                     tag="已修复",
                     detail={"原节点": current, "新节点": self_heal_target},
                 )
-        except Exception:  # noqa: BLE001 —— 自愈失败不影响检测结果
+        except Exception:  # noqa: BLE001
             log_event(
                 logger,
                 "切换健康节点失败，不阻塞检测",
@@ -2357,7 +2240,6 @@ async def _summarize_node_results(
             if row.get("exitIp"):
                 unique_ips.add(row["exitIp"])
 
-    # 冷却跳过节点的存活口径读权威账本（与投影期 ok 判定同语义）
     probed_names = {r["name"] for r in results if r.get("probed")}
     for name in node_names:
         if name in probed_names:
@@ -2383,7 +2265,6 @@ async def _summarize_node_results(
         deprecated = await _evaluate_subscription_deprecation(
             sub_id, alive_count, len(node_names)
         )
-    # 存活统计落库——订阅行「存活 x/y」标签的数据源
     if not target_response_only:
         await _merge_last_stats(sub_id, alive=alive_count, total=len(node_names))
 
@@ -2433,7 +2314,7 @@ async def _merge_last_stats(sub_id: int, **fields) -> None:
                 continue
             stats[key] = value
         if stats == (sub.last_stats or {}):
-            return  # 同值重算不落写：周期拍的无变化回填不再逐次进 WAL
+            return
         sub.last_stats = stats
         await session.commit()
 
@@ -2498,7 +2379,7 @@ async def refresh_subscription_health_summary() -> str:
     from app.domains.settings.service import get_value
 
     if not await get_value("proxy.health_auto", True):
-        return "disabled"  # 「自动节点体检」开关关闭：定时摘要一并停转，手动检测照常
+        return "disabled"
     async with get_session_factory()() as session:
         subs = (
             await session.execute(
@@ -2561,7 +2442,6 @@ async def pool_stats() -> dict:
         all_idents: set[str] = set()
         ok_idents: set[str] = set()
         for n in nodes:
-            # 出口 IP 未知的节点（IP 探测失败）各自算一个
             ident = n.exit_ip or f"node:{n.node_id}"
             all_idents.add(ident)
             if (
@@ -2583,7 +2463,6 @@ async def pool_stats() -> dict:
     }
 
 
-# ─── 出口节点明细（Agent 只读工具）────────────────────────────
 
 async def clash_nodes_overview() -> dict:
     """出口节点明细只读投影：权威节点账本 × 内核当前订阅，逐节点
@@ -2643,7 +2522,6 @@ async def clash_nodes_overview() -> dict:
     return {"running": True, "nodes": nodes}
 
 
-# ─── 走线日志 ────────────────────────────────────────────────
 
 async def record_event(
     *, kind: str, target: str | None, proxy_label: str | None,
@@ -2685,7 +2563,6 @@ async def recent_events(limit: int = 200) -> list[dict]:
     ]
 
 
-# ─── 存量明文订阅链接静态加密（启动幂等步骤）──────────────────
 
 async def seal_subscription_urls() -> int:
     """明文订阅链接封装为密文（`enc1:` 前缀）：订阅表 + 快照 provenance 列。

@@ -87,7 +87,6 @@ async def test_controller_auth_failure_is_not_node_failure(status, valid):
         server.server_close()
 
 
-# ── 本地真实 CONNECT 隧道代理（当"可用节点"用）────────────────────
 
 
 def _tunnel(conn: socket.socket, redirect_to: int | None = None) -> None:
@@ -99,7 +98,6 @@ def _tunnel(conn: socket.socket, redirect_to: int | None = None) -> None:
         if len(parts) >= 2 and parts[0].upper() == "CONNECT":
             if redirect_to is not None:
                 # L1 用：忽略 CONNECT 目标，一律隧道到本节点专属回显，
-                # 让"每个节点有自己的出口身份"可证
                 upstream = socket.create_connection(("127.0.0.1", redirect_to), timeout=5)
             else:
                 host, _, port = parts[1].partition(":")
@@ -223,7 +221,6 @@ def _closed_port() -> int:
     return port
 
 
-# ── fixtures ─────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -305,7 +302,6 @@ def probe_target():
     server.shutdown()
 
 
-# ── 数据与流水线 ─────────────────────────────────────────────────
 async def _add(state: str, runtime_name: str, *, port: int,
                with_source: bool = True) -> str:
     config = {"name": runtime_name.split("|", 1)[-1], "type": "http",
@@ -354,7 +350,6 @@ async def _state_of(runtime_name: str) -> str:
         return row.state
 
 
-# ── 1. 可用节点：真探测拿到 delay ────────────────────────────────
 @pytest.mark.asyncio
 async def test_working_node_gets_a_delay(tmp_data_dir, kernel_exe_path,
                                          clash_runtime, local_proxies,
@@ -386,7 +381,6 @@ async def test_working_node_gets_a_delay(tmp_data_dir, kernel_exe_path,
     )
 
 
-# ── 2. 不可用节点：明确的失败观测 ────────────────────────────────
 @pytest.mark.asyncio
 async def test_dead_node_yields_explicit_failure_observation(
     tmp_data_dir, kernel_exe_path, clash_runtime, probe_target
@@ -408,7 +402,6 @@ async def test_dead_node_yields_explicit_failure_observation(
     assert obs.ok is False and obs.latency_ms is None and obs.detail
 
 
-# ── 3. 特殊 runtime_name 能正确定位节点 ──────────────────────────
 @pytest.mark.asyncio
 async def test_special_runtime_names_are_located(
     tmp_data_dir, kernel_exe_path, clash_runtime, probe_target
@@ -444,7 +437,6 @@ async def test_special_runtime_names_are_located(
     assert not missing.ok and "没有这个节点" in missing.detail
 
 
-# ── 4. 状态机：OK / FAIL 落到正确状态 ────────────────────────────
 @pytest.mark.asyncio
 async def test_probe_result_drives_state(tmp_data_dir, kernel_exe_path,
                                          clash_runtime, local_proxies,
@@ -469,7 +461,6 @@ async def test_probe_result_drives_state(tmp_data_dir, kernel_exe_path,
     assert await _state_of("1|已退休") == NODE_RETIRED
 
 
-# ══ P1.4-B：L1 出口 IP ═══════════════════════════════════════════
 # 本地回显是明文 HTTP，所以目标 URL 用 http://（https 会先握手 TLS，回显谈不了）。
 LOCAL_EXIT_TARGET = "http://exit-echo.invalid/"
 
@@ -500,7 +491,6 @@ async def _node(runtime_name: str) -> ProxyNode:
         )).scalar_one()
 
 
-# ── L1-1. 单节点：选中它并拿到它专属的出口 IP ────────────────────
 @pytest.mark.asyncio
 async def test_l1_single_node_yields_its_own_exit_ip(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
@@ -520,7 +510,6 @@ async def test_l1_single_node_yields_its_own_exit_ip(
     )
 
 
-# ── L1-2. 串行切换：各节点的出口 IP 归属必须正确 ─────────────────
 @pytest.mark.asyncio
 async def test_l1_serial_switch_attributes_each_exit_ip(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
@@ -547,7 +536,6 @@ async def test_l1_serial_switch_attributes_each_exit_ip(
     assert await _node("1|香港01") is not None
 
 
-# ── L1-3. 回显服务自身故障：只记观测，绝不判节点死 ───────────────
 @pytest.mark.asyncio
 async def test_l1_target_service_failure_never_kills_the_node(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, broken_target
@@ -574,7 +562,6 @@ async def test_l1_target_service_failure_never_kills_the_node(
     assert obs.level == "L1" and obs.ok is False and obs.detail
 
 
-# ── L1-4. 成功：落 L1 观测 + 出口 IP，不碰 state 与 L0 字段 ───────
 @pytest.mark.asyncio
 async def test_l1_success_records_observation_and_exit_ip_only(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, echoes
@@ -600,7 +587,6 @@ async def test_l1_success_records_observation_and_exit_ip_only(
     assert rows[0].latency_ms is not None, "耗时记录下来，但首版不参与评分"
 
 
-# ══ P1.4-C：L2 业务可用性（生产 StoreBrowse 契约）═══════════════
 # 本地假服务是明文 HTTP，所以目标 URL 用 http://（https 会先握手 TLS）。
 LOCAL_BUSINESS_TARGET = "http://fake-browse.invalid/IStoreBrowseService/GetItems/v1/"
 
@@ -620,7 +606,6 @@ async def _l2_observations() -> list[HealthObservation]:
         return list((await s.execute(select(HealthObservation))).scalars())
 
 
-# ── L2-1. 业务成功：只落观测，别的一律不碰 ──────────────────────
 @pytest.mark.asyncio
 async def test_l2_business_ok_records_observation_only(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
@@ -656,7 +641,6 @@ async def test_l2_business_ok_records_observation_only(
     assert "IStoreBrowseService" in business_probe_url(220)
 
 
-# ── L2-2. 串行切换：业务归因必须正确 ─────────────────────────────
 @pytest.mark.asyncio
 async def test_l2_serial_switch_attributes_business_response(
     tmp_data_dir, kernel_exe_path, clash_runtime, local_proxies, fake_browse
@@ -681,7 +665,6 @@ async def test_l2_serial_switch_attributes_business_response(
     assert len(hits_a) == 1 and len(hits_b) == 1, "各节点只该命中自己的假服务一次"
 
 
-# ── L2-3. 业务目标故障：不改变节点状态 ───────────────────────────
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [502, 503, 504])
 async def test_l2_target_service_failure_never_changes_state(
@@ -741,14 +724,12 @@ async def test_l2_gateway_status_is_not_counted_as_node_failure(status: int):
     assert node.consecutive_failures == 0
 
 
-# ── L2-4. HTTP 200 但业务响应非法 ────────────────────────────────
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload,marker",
     [
         # success 契约是整数 1；写成布尔 true 就是契约不符
         (_browse_payload(success=True), "success"),
-        # 价格字符串不可解析 → 必须走 _to_int 语义而不是 isinstance(int)
         (_browse_payload(final="not-a-number"), "final_price_in_cents"),
     ],
 )

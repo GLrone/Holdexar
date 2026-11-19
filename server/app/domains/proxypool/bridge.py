@@ -38,7 +38,6 @@ from app.domains.proxypool.state import (
 
 logger = logging.getLogger(__name__)
 
-# 观测明细标签（HealthObservation.detail 是固定枚举，不放自由文本）
 CLASH_STEAM_OK_DETAIL = "CLASH_STEAM_OK"
 CLASH_STEAM_HTTP_ERROR_DETAIL = "CLASH_STEAM_HTTP_ERROR"
 CLASH_STEAM_HTTP_502_DETAIL = "CLASH_STEAM_HTTP_502"
@@ -105,7 +104,6 @@ def _match(
     node = by_runtime.get(name)
     if owned(node):
         return node
-    # 名字可能带着池内前缀「订阅|原名」：拆出来按来源再试一次
     prefix, sep, rest = str(name or "").partition("|")
     if sep and prefix == str(sub):
         for key in _name_keys(rest):
@@ -370,7 +368,6 @@ async def purge_orphan_subscription_sources(
         settle_nodes_after_source_change,
     )
 
-    # 归属订阅已不存在（订阅被删但节点行没跟着清）的存量自愈
     orphan_ids = list(await session.scalars(
         select(ProxyNode.subscription_id)
         .where(ProxyNode.subscription_id.is_not(None))

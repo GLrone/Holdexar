@@ -117,7 +117,6 @@ async def resolve_sub_id(appid: int) -> int | None:
                     GameCurrentPrice.sub_id > 0,
                 )
                 .order_by(
-                    # CN 优先
                     (GameCurrentPrice.region_code == "CN").desc(),
                     GameCurrentPrice.sub_id.asc(),
                 )
@@ -140,11 +139,6 @@ async def resolve_proxy_for_request() -> str | None:
     return resolve_proxy_url()
 
 
-# ── 进程内 TTL 缓存（stale-while-revalidate，范式同 family service）────────
-# 详情页每次进页都会打 SteamPY/SteamCICI 两个外网接口，而挂牌价变化以分钟计。
-# 时间窗内的重复请求（详情页往返、切板块回跳）直接复用；过期后**先回旧值再后台
-# 刷新**，调用方不再等一次最长 15s 的 HTTPS 往返。失败结果用更短 TTL：失败往往
-# 是瞬时的（代理闪断），不能把坏响应钉满一个完整窗口。
 _CDK_TTL_SECONDS = 300
 _CDK_ERROR_TTL_SECONDS = 60
 _CDK_CACHE_MAX = 256
@@ -176,7 +170,6 @@ async def _fetch_cdk_uncached(appid: int, sub_id: int | None = None, proxy_url: 
 async def fetch_cdk(appid: int, sub_id: int | None = None, proxy_url: str | None = None) -> dict[str, Any]:
     """查询双平台 CDK 状态（TTL 缓存优先）。sub_id 不传时从库内自动解析。"""
     now = time.monotonic()
-    # 显式 sub_id 时以 (appid, sub_id) 为缓存键，否则以 appid 为键
     cache_key = (appid, sub_id) if sub_id is not None else appid
     cached = _CDK_CACHE.get(cache_key)
     if cached is not None:
@@ -184,7 +177,6 @@ async def fetch_cdk(appid: int, sub_id: int | None = None, proxy_url: str | None
         ttl = _CDK_ERROR_TTL_SECONDS if _cdk_had_error(data) else _CDK_TTL_SECONDS
         if now - ts < ttl:
             return data
-        # 过期有旧值：立即回旧值，同键的后台刷新只挂一个
         if cache_key not in _CDK_REFRESHING:
             _CDK_REFRESHING.add(cache_key)
 

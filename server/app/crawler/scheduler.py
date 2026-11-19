@@ -28,12 +28,9 @@ logger = logging.getLogger(__name__)
 
 _PROGRESS_LOG_EVERY = 25
 
-# 每任务连接预算（TCPConnector 参数）
 _PER_TASK_CONNECTOR_LIMIT = 20
 _PER_TASK_DNS_CACHE = 60
 
-# 死通道冷却秒数：绑在连续连接失败出口上的 worker 暂停拉任务的间隔，
-# 到期放一发探测（成功即复位恢复，见 SteamHttpClient.lane_unhealthy）
 _LANE_COOLDOWN_SECONDS = 60
 
 
@@ -56,23 +53,15 @@ class CrawlerScheduler:
         self.db_writer = db_writer
         self.worker_count = worker_count
         self.client_factory = client_factory
-        # 出口兵源条数（默认 = worker 数）：可大于 worker_count——多出的即待用出口
         self.lane_count = lane_count
-        # 岗位池（Coordinator 的 lane 管理）：run 时由 factory 物化全部 lane，
-        # worker 逐任务租借；lane_unhealthy → 隔离进冷却区，到期放一条探测。
-        # worker 协程不销毁——没有岗位就等，岗位回来立刻继续领任务。
         self._lanes: list = []
         self._cooldown_lanes: list = []
         self._cooldown_until: dict[int, float] = {}
         self._lanes_ready = False
         self.queue: asyncio.Queue = asyncio.Queue()
         self.stop_event = stop_event or asyncio.Event()
-        # 错误分类回调（生产作业台账用）：worker 捕获到的异常在这里分类计数。
-        # **None = 不记账**（CLI/测试不必知道台账）。browse 层重试耗尽的失败不抛异常、
-        # 只进 failure_ledger，见 run_crawl 侧的补记。
         self.error_sink = error_sink
 
-        # 统计
         self.fail_count = 0
         self.total_processed = 0
         self._counter_lock = asyncio.Lock()
@@ -87,7 +76,6 @@ class CrawlerScheduler:
         self._completed_ids: set[str] = set()
         self.total_target = 0
 
-        # 速率统计（10s 窗口）
         self._speed_window: deque[float] = deque()
         self._speed_lock = asyncio.Lock()
 
@@ -181,9 +169,6 @@ class CrawlerScheduler:
         self._sweep_unhealthy()
 
     async def _worker(self, worker_id: int, session) -> None:
-        # Coordinator 岗位模型：worker 不再终身绑定 lane。每个任务前从岗位池
-        # 租一条健康 lane；lane_unhealthy → 隔离进冷却区并立刻换下一条——
-        # 死节点拖不住 worker，任务队列由健康岗位继续消化。
         http_client = (
             self.client_factory(worker_id) if self.client_factory is not None
             else self.http_client
@@ -192,7 +177,6 @@ class CrawlerScheduler:
             if self.client_factory is not None:
                 http_client, is_probe = self._acquire_lane()
                 if http_client is None:
-                    # 全部岗位在隔离/租出：等岗位回来或停止（队列由别的岗位消化）
                     try:
                         await asyncio.wait_for(
                             self.stop_event.wait(), timeout=1.0
@@ -208,7 +192,7 @@ class CrawlerScheduler:
             except asyncio.CancelledError:
                 break
 
-            if task is None:  # 毒丸信号
+            if task is None:
                 self.queue.task_done()
                 break
 
@@ -321,7 +305,6 @@ class CrawlerScheduler:
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
-            # 排干剩余队列，保持计数器一致
             while True:
                 try:
                     self.queue.get_nowait()

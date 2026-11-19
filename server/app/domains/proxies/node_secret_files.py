@@ -23,10 +23,7 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-# 承载节点认证明文的产物（相对数据目录）
 SECRET_BEARING = ("clash", "proxypool")
-# 允许保留的后缀：订阅原始缓存是来源证据，重建需重新下载，故保留但收紧权限；
-# 运行配置可从池文件重建，随时可删。
 _TRANSIENT_SUFFIXES = (".runtime.yaml", ".tmp")
 
 
