@@ -62,7 +62,6 @@ DLC_EXEMPT_APPIDS = frozenset({2778580})
 # 用户在维护面板显式设置的排除语义不被恢复动作洗掉
 REMOVAL_EXCLUSION_REASON = "catalog_removed"
 
-# ── 汇率进程内缓存（300s TTL）──
 _RATES_TTL_SECONDS = 300.0
 _rates_cache: tuple[float, dict[str, float]] | None = None
 
@@ -119,7 +118,7 @@ async def _primary_steamid() -> str:
         primary = await account_service.get_primary_steam_id()
         if primary:
             return primary
-    except Exception:  # noqa: BLE001 —— 账号表读不到按未配置处理
+    except Exception:  # noqa: BLE001
         pass
     from app.domains.settings.service import get_value
 
@@ -132,7 +131,7 @@ async def _followed_appids() -> list[int]:
         from app.domains.wishlist.follows import followed_appids
 
         return await followed_appids()
-    except Exception:  # noqa: BLE001 —— 关注层故障不阻断列表
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -149,7 +148,7 @@ async def _wishlist_appids() -> list[int]:
                 )
             )
             return sorted({row[0] for row in rows.all()})
-    except Exception:  # noqa: BLE001 —— 愿望单层故障不阻断列表
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -256,12 +255,9 @@ def _build_filter_conditions(
     conditions: list = [g.name.is_not(None), g.name != ""]
 
     if is_locked:
-        # 锁国区：无 ok 状态的国区行（LEFT JOIN 后 appid 为空即不存在）
         conditions.append(cn.appid.is_(None))
     else:
         conditions += [cn.price.is_not(None), cn.price > 0]
-        # 近似全区最低（±5 元容差）= COALESCE(非CN最低, 国区价) >= 国区价 - 容差
-        # （由预计算列表达，等价于对 lowest_prices 的相关子查询）
         if region_code == "CN":
             conditions.append(func.coalesce(g.min_cny_fen, cn.price) >= cn.price - tolerance)
         if is_lowest:
@@ -290,7 +286,7 @@ def _build_filter_conditions(
                 cn.price - sr.cny_fen >= 5000,
                 func.coalesce(g.min_cny_fen, sr.cny_fen) >= sr.cny_fen - tolerance,
             ]
-        else:  # global
+        else:
             conditions += [
                 sr.cny_fen < cn.price - 100,
                 func.coalesce(g.min_cny_fen, sr.cny_fen) >= sr.cny_fen - tolerance,
@@ -314,7 +310,6 @@ def _build_filter_conditions(
     if max_price is not None:
         conditions.append(cn.price <= max_price)
 
-    # 与国区差价区间（absolute=分；percent=0-100 百分比，差值以国区价为基数）
     if diff_min_fen is not None or diff_max_fen is not None:
         if sr is not None:
             diff_expr = cn.price - sr.cny_fen
@@ -333,7 +328,6 @@ def _build_filter_conditions(
                 conditions.append(diff_expr <= diff_max_fen)
     if sort == "new2026":
         conditions.append(g.release_date.like("2026%"))
-    # [模块三] 元数据筛选（onlyHb / onlyEpic / onlyXgp）
     if only_hb:
         conditions.append(g.is_hb.is_(True))
     if only_epic:
@@ -367,8 +361,6 @@ def _build_filter_conditions(
             )
         )
     elif flag:
-        # 逗号组合的史低三态值（new/flat/nonhl 子集）：逐值 OR。
-        # 未知词直接忽略——空组合等价无过滤，不阻断列表
         sub = []
         for part in flag.split(","):
             if part == "new":
@@ -379,9 +371,6 @@ def _build_filter_conditions(
                 sub.append(g.hl_flag.not_in((1, 2)))
         if sub:
             conditions.append(or_(*sub))
-    # [gift] 送礼分析（判据见 GIFT_TRACK_BAND）：out=送礼方固定+多目标任一命中；
-    # in=收礼方固定，送礼方全区自动遍历。out 需要送礼方与目标齐备，in 只看
-    # 收礼方；in 模式 receivers 多于一个时取首个（语义=单收礼方）。
     gift_targets = [x for x in (p.strip().upper() for p in gift_receivers.split(",")) if x]
     if gift_mode == "out" and gift_sender.strip() and gift_targets:
         conditions.append(
@@ -390,7 +379,6 @@ def _build_filter_conditions(
     elif gift_mode == "in" and gift_targets:
         conditions.append(_gift_exists(g, sender="", receiver=gift_targets[0], targets=[]))
     if top100_appids is not None:
-        # [Top100] 榜内过滤（appid 集合注入）
         conditions.append(g.appid.in_(top100_appids))
     if hide_owned:
         from app.domains.wishlist.models import WishlistItem
@@ -402,11 +390,6 @@ def _build_filter_conditions(
             owned_sq = owned_sq.where(WishlistItem.steamid == primary_steamid)
         conditions.append(g.appid.not_in(owned_sq))
 
-    # 屏蔽家庭共享：排除「非主账户的追踪账户已拥有」的 appid——与游戏卡紫色
-    # 「家庭共享」归属徽章同口径（ownership() 的 family 分支：owned 行且账户
-    # 非主账户）。与 hide_owned 互为补集：两者同开 = 除愿望单外所有已获取渠道
-    # 都隐藏。未配置主账户时全部 owned 行归属「已拥有」，没有 family 归属可
-    # 排除（同 ownership() 的判定），条件不生效。
     if hide_family_sharing and primary_steamid:
         from app.domains.wishlist.models import WishlistItem
 
@@ -417,8 +400,6 @@ def _build_filter_conditions(
         )
         conditions.append(g.appid.not_in(family_sq))
 
-    # 游戏商店默认隐藏 DLC（type='DLC'）；type 为 NULL 的游戏（未归类）按非 DLC 处理，
-    # 白名单豁免个别确需常驻的 DLC（黄金树幽影）。exclude_dlc 缺省 False，仅商店页显式开启。
     if exclude_dlc:
         conditions.append(
             or_(
@@ -428,8 +409,6 @@ def _build_filter_conditions(
             )
         )
 
-    # 目录移除（假删除）作用域：catalog_removals 行存在与否即过滤判据，
-    # 主列表与 top100 分支共用（两条分支都经本函数构建 WHERE）
     removed_sq = select(CatalogRemoval.appid)
     conditions.append(g.appid.in_(removed_sq) if removed_only else g.appid.not_in(removed_sq))
 
@@ -580,16 +559,9 @@ async def list_games(
         removed_only=removed,
     )
 
-    # ── 基础查询（join 形态：LOCKED 走 LEFT JOIN，其余 INNER）──
     base = _build_base_stmt(g=g, cn=cn, sr=sr, conditions=conditions,
                            region_code=region_code, is_locked=is_locked)
 
-    # ── 排序（统一在 sorting.py）──
-    # 置顶前缀：关注恒第一（通用排序的「收藏游戏置顶」优先级——关注集是
-    # 用户手工策展的小集合，IN 布尔降序即置顶）；愿望单优先开关开启时在
-    # 关注之后叠加愿望单成员前缀（wishlisted 行含家庭愿望单派生源）。
-    # 地区模式里置顶前缀压过 3-group（priorityGroup「关注极致优先」的
-    # 同位语义）。空集不注入，SQL 保持原样。
     followed = await _followed_appids()
     fav_order = [desc(g.appid.in_(followed))] if followed else []
     wish_order: list = []
@@ -602,24 +574,19 @@ async def list_games(
         order = fav_order + wish_order + build_order_by(g, cn, sort=sort, region_mode=has_region, sr=sr)
 
     async with get_session_factory()() as session:
-        # total 分离（COUNT(*) 独立查询）
         total = (
             await session.execute(select(func.count()).select_from(base.subquery()))
         ).scalar() or 0
 
-        # limit+1 探测 hasMore
         rows = (
             await session.execute(base.order_by(*order).limit(limit + 1).offset(offset))
         ).all()
         has_more = len(rows) > limit
         rows = rows[:limit]
 
-        # ── 页级取价：只拉当前页的全区价格 ──
         appid_list = [row[0].appid for row in rows]
         price_rows = await _load_page_prices(session, appid_list)
 
-    # 覆盖分母 = 用户启用区服（regions 域唯一事实），整页取一次；
-    # 未启用任何区服时不给覆盖（分母无意义），列表照常服务
     try:
         regions_expected = [r.upper() for r in await effective_regions(None)]
     except ValueError:
@@ -752,10 +719,6 @@ async def _list_games_top100(
     async with get_session_factory()() as session:
         rows = (await session.execute(base)).all()
 
-    # ── 榜序重排（等价 array_position；榜外 appid 不会出现——IN 过滤保证）──
-    # 排序优先级：置顶前缀压过榜序（top100 分支的
-    # 收藏第一优先级）：锁国区最低价 ASC（早退分支，压过榜序）
-    # > 地区模式 3-group 前缀 + 组内榜序 > 纯榜序。
     followed = set(await _followed_appids())
     wished = set(await _wishlist_appids()) if wishlist_priority else set()
     rank = {appid: i for i, appid in enumerate(appids)}
@@ -894,8 +857,7 @@ async def _catalog_rows(session: AsyncSession, q: str, limit: int) -> list:
                     )
                 ).scalars()
             )[:_FTS_APPID_CAP]
-        except Exception:  # noqa: BLE001 — 影子表不可用时退回 LIKE 通道
-            # 影子表缺失/异常（未跑迁移的异常库）→ LIKE 通道仍可用
+        except Exception:  # noqa: BLE001
             appids = []
     cn = aliased(GameCurrentPrice)
     if appids:
@@ -1084,32 +1046,23 @@ async def get_game_detail(appid: int) -> dict | None:
         "isVisualNovel": game.is_visual_novel or False,
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
-        # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "seriesId": game.series_id,
         "isHb": game.is_hb or False,
         "isEpic": game.is_epic or False,
         "epicDate": game.epic_date,
         "hbData": game.hb_data,
-        # 第三方渠道 bundle 计数（Barter.vg 档案；NULL=未拉取）
         "bundleCount": game.bundle_count,
         "viewCount": game.view_count,
-        # 下架监控：非空 = 已判定下架（前端角标依据）
         "removedAt": game.removed_at.isoformat() if game.removed_at else None,
-        # 商店数据缺失：现价矩阵完全为空（无任何可用观察行）——详情页
-        # 「重新探测」横幅的另一显隐依据，与下架对象共用同一入口
         "storeDataMissing": not price_map,
-        # 免费态：f2p=永久免费 / promo=限时赠送中（前端价格区显示「免费」、
-        # 赠送徽章倒计时用）；NULL=付费正常
         "freeKind": game.free_kind,
         "promoEndAt": game.promo_end_at,
         "priceMatrix": price_matrix,
-        # 爬过但未抓到价格的区（大写码，missing/blocked）：详情页与列表口径一致
         "unavailableRegions": sorted(unavailable_regions),
         "cnPriceCents": cn_price_cents,
         "cnCnyFen": cn_cny_fen,
         "cnDiscount": cn_discount,
-        # 国区折扣截止（Unix 秒；无折扣/未带促销元数据 = None）
         "cnDiscountEndsAt": (cn_data["discountEndsAt"] if cn_data else None),
         "lowestCnyFen": lowest_cny_fen,
         "lowestRegionCode": lowest_region_code,
@@ -1119,8 +1072,6 @@ async def get_game_detail(appid: int) -> dict | None:
     }
 
 
-# Steam 图片 CDN 三域同库：akamai 域国内直连可达（fastly 被墙/不稳定，
-# queniuqe 为历史镜像域）。与 bundles.service._normalize_image 同一规则。
 _BUNDLE_IMG_HOSTS = re.compile(
     r"^https?://shared\.(?:fastly\.steamstatic|cdn\.queniuqe)\.com", re.IGNORECASE
 )
@@ -1157,8 +1108,6 @@ async def linked_bundles(appid: int) -> list[dict]:
     快照) 命中的区）；双产品隔离由快照侧统一负责（bundles.service 同源逻辑）。
     """
     async with get_session_factory()() as session:
-        # appid 命中筛选：app_ids 是 JSON 数组列，逐行解析（命中集极小，
-        # 只取两列不构造实体）；命中后再取主档行（按差价快照降序）
         pairs = (await session.execute(select(Bundle.bundle_id, Bundle.app_ids))).all()
         hit_ids = [
             bid for bid, aids in pairs if appid in {int(a) for a in (aids or [])}
@@ -1318,8 +1267,6 @@ async def get_game_history(
     standard = standard_product_where(GamePriceHistory)
 
     if product == "unknown":
-        # 商品身份未知序列（社区历史源 appid 级数据）：独立呈现，
-        # 永不与标准版/具体版本混合
         version_cond = GamePriceHistory.product_unknown.is_(True)
     elif sub_id is None:
         async with get_session_factory()() as session:
@@ -1359,7 +1306,6 @@ async def get_game_history(
 
     point_conditions = [
         GamePriceHistory.appid == appid,
-        # 库内 region_code 统一大写存储
         GamePriceHistory.region_code == region.upper(),
         GamePriceHistory.price_status == "ok",
         version_cond,
@@ -1393,7 +1339,6 @@ async def get_game_history(
                     GamePriceHistory.appid == appid,
                     GamePriceHistory.region_code == region.upper(),
                     GamePriceHistory.price_status == "ok",
-                    # 商品身份未知的行不进版本枚举——它们是独立 unknown 序列
                     GamePriceHistory.product_unknown.is_(False),
                 )
                 .distinct()
@@ -1420,7 +1365,6 @@ async def get_game_history(
             "subId": v.sub_id,
             "suffix": v.version_suffix,
             "isGold": bool(v.is_gold),
-            # 归属标注：标准版 / 具体 sub（变体）
             "product": (
                 "standard" if (not (v.version_suffix or "") and not v.is_gold) else "sub"
             ),
@@ -1428,7 +1372,6 @@ async def get_game_history(
         for v in sorted(version_rows, key=_version_sort_key)
     ]
     if has_unknown:
-        # 商品身份未知的独立序列（社区历史源）：显式条目，永不冒充标准版
         versions.append(
             {"subId": None, "suffix": None, "isGold": False, "product": "unknown"}
         )
@@ -1537,7 +1480,6 @@ async def get_price_context(appid: int, date: str, region: str = "cn") -> dict:
     except ValueError:
         return empty
 
-    # 标准版判据与 get_game_history 逐字同口径（读取侧不得独立演化）
     standard = and_(
         standard_product_where(GamePriceHistory),
     )
@@ -1550,7 +1492,6 @@ async def get_price_context(appid: int, date: str, region: str = "cn") -> dict:
                     GameCurrentPrice.region_code == region.upper(),
                     GameCurrentPrice.price_status == "ok",
                     GameCurrentPrice.sub_id.is_not(None),
-                    # sub_id=0 是 db_writer 的 `or 0` 归一产物，不是有效 sub
                     GameCurrentPrice.sub_id > 0,
                 )
                 .order_by(GameCurrentPrice.updated_at.desc())
@@ -1654,7 +1595,6 @@ async def get_game_versions(appid: int) -> dict:
     if not rows:
         return {"versions": []}
 
-    # 每 (region, sub) 最新行（升序扫描覆盖）；顺带收集 sub 的版本元信息
     latest: dict[tuple[str, int], object] = {}
     sub_meta: dict[int, dict] = {}
     for r in rows:
@@ -1667,7 +1607,6 @@ async def get_game_versions(appid: int) -> dict:
                 "isBundle": bool(r.is_bundle),
             },
         )
-        # 行间版本元信息以非空者为准（理论上同 sub 恒定）
         if r.version_suffix and not sub_meta[r.sub_id]["suffix"]:
             sub_meta[r.sub_id]["suffix"] = r.version_suffix
 
@@ -1675,7 +1614,7 @@ async def get_game_versions(appid: int) -> dict:
     for (region_code, sub_id), r in latest.items():
         meta = sub_meta[sub_id]
         if meta["isBundle"]:
-            continue  # bundle 行改道「关联捆绑包」区块
+            continue
         v = next((x for x in versions if x["subId"] == sub_id), None)
         if v is None:
             v = {
@@ -1701,7 +1640,6 @@ async def get_game_versions(appid: int) -> dict:
             "cnyFen": cny_fen,
         }
 
-    # 排序：标准版（无后缀非 gold）→ 有后缀 → gold
     versions.sort(
         key=lambda v: (
             0 if (not v["suffix"] and not v["isGold"]) else 1,
@@ -1742,8 +1680,6 @@ def _build_list_item(
             continue
         stale = p.attempt_outcome != "success"
         if p.price_status in ("missing", "blocked"):
-            # missing=本次尝试失败（旧价保留在行上，矩阵带 stale 标记）；
-            # blocked=连败终态，大概率无货
             unavailable_regions.append(code)
         if p.price is None or int(p.price) <= 0:
             continue
@@ -1767,9 +1703,6 @@ def _build_list_item(
     diff = int(game.diff_fen or 0)
     discount = cn_row.discount_percent or 0 if cn_row is not None else 0
 
-    # 覆盖（唯一事实源 = 活表尝试状态，与触发方无关）：分母 = 启用区服；
-    # regions 只点名非成功区（outcome/answer/lastSuccessAt 供前端说
-    # 「本次失败，展示的是 X 时刻的数据」）；启用区为空时不给覆盖
     coverage: dict | None = None
     if regions_expected:
         rows_by_region = {
@@ -1814,8 +1747,6 @@ def _build_list_item(
         "nameEn": game.name_en,
         "discount": discount,
         "discountLabel": f"-{discount}%" if discount > 0 else "",
-        # 国区折扣截止（browse active_discounts 下发的 Unix 秒；无折扣/本轮
-        # 未带促销元数据 = None，前端过期也不展示）
         "discountEndsAt": (
             int(cn_row.discount_end_ts)
             if cn_row is not None and cn_row.discount_end_ts
@@ -1833,15 +1764,11 @@ def _build_list_item(
         "headerImage": game.header_image or build_steam_header_url(int(game.appid)),
         # 区服键控价格矩阵：{"CN": [formatted, cnyFen, cents, discountPct, stale], ...}，只含有价区
         "priceMatrix": all_prices,
-        # 爬过但未抓到价格的区（大写码，missing/blocked）：前端黄框区分「待更新」与锁区
         "unavailableRegions": sorted(unavailable_regions),
         "hlFlag": game.hl_flag or 0,
         "ppFlag": game.pp_flag or 0,
-        # 最近一次原价跳变时刻：永降/永涨徽章 14 天时效判据（前端判定显隐）
         "ppChangedAt": game.pp_changed_at.isoformat() if game.pp_changed_at else None,
         "updatedAt": game.updated_at.isoformat() if game.updated_at else None,
-        # 价格数据状态：observedAt/freshness 是价格观察时间（≠ updatedAt 的实体
-        # 更新时间）；coverage 从活表尝试状态现算（分母 = 启用区服）
         "priceData": {
             **freshness_service.regional_freshness(price_rows, regions_expected, pending_units),
             "coverage": coverage,
@@ -1853,9 +1780,7 @@ def _build_list_item(
         "isEpic": game.is_epic or False,
         "epicDate": game.epic_date,
         "hbData": game.hb_data,
-        # 第三方渠道 bundle 计数（Barter.vg 档案；NULL=未拉取）
         "bundleCount": game.bundle_count,
-        # 下架监控：非空 = 已判定下架（前端角标依据）
         "removedAt": game.removed_at.isoformat() if game.removed_at else None,
     }
 
@@ -1889,11 +1814,9 @@ async def retry_removed_game(appid: int) -> dict:
         )
         return {"ok": True, "jobId": result["id"], "requeued": True}
     except (RuntimeError, ValueError) as e:
-        # 已有任务在跑 / 空列表：清标已生效，下一轮关注层刷新自然带上
         return {"ok": True, "jobId": None, "requeued": False, "note": str(e)}
 
 
-# ── 目录移除（假删除）：商店列表隐藏 + 停止价格刷新，可恢复 ──────────
 
 
 
@@ -1983,7 +1906,6 @@ async def restore_games(appids: list[int]) -> dict:
         try:
             await crawl_service.start_job(scope="appids", appids=recrawl, kind="catalog_restore", trigger="manual")
         except (RuntimeError, ValueError) as e:
-            # 已有任务在跑 / 空列表：恢复已生效，取价留给下一轮手动刷新
             log_event(
                 logger,
                 f"目录恢复后 {len(recrawl)} 款未自动取价，留待下一轮刷新",

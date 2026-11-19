@@ -39,13 +39,10 @@ EVENT_TYPES = (
     FREE_PROMO, REMOVED,
 )
 
-# 状态类事件：它们的 current_json.status 就是该单元此后的「上一状态」
 STATUS_EVENT_TYPES = (REGION_LOCKED, REGION_UNLOCKED, PRICE_UNAVAILABLE, PRICE_RESTORED)
 
-# 游戏级免费状态的优先观察地区。
 BENCHMARK_REGION = "CN"
 
-# 失败态：明确表示「本轮没有拿到可购买价格」
 _FAILED_STATUSES = ("missing", "blocked")
 
 # 证据查询在 SQL 侧按观察单元下推（每单元一次索引探测取 argmax/聚合行），
@@ -103,10 +100,8 @@ class PriceEvent(Base):
     # NULL = 该事件由游戏级对象表达，不属于单一区域
     region_code: Mapped[str | None] = mapped_column(String(8))
     event_type: Mapped[str] = mapped_column(String(32))
-    # 变化前的有效值 / 变化后的值；没有前值时 previous_json 为 NULL
     previous_json: Mapped[dict | None] = mapped_column(JSON)
     current_json: Mapped[dict | None] = mapped_column(JSON)
-    # 该事件依据的观察时刻（本轮快照时间 / 状态行更新时间 / removed_at）
     occurred_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -164,8 +159,6 @@ async def detect_window(
     if not appids or not regions:
         return []
 
-    # ── 本轮观察：只认窗口内的行（未观察的单元不产生任何事件）；区服与
-    # 窗口过滤在 SQL 完成，结果只含本轮观察到的单元 ──
     observed: dict[tuple[int, str], dict] = {}
     async with get_session_factory()() as session:
         rows = (
@@ -213,7 +206,6 @@ async def detect_window(
 
         current = _price_snapshot(snap, region) if snap is not None else None
         prior = _price_snapshot(prev, region) if prev is not None else None
-        # 本轮有效 Steam 快照是价格变化的当前证据。
         if snap is not None and cur["status"] == "ok" and prev is not None and prev["price"] and (cur["price"] or 0) > 0:
             if cur["price"] < prev["price"]:
                 events.append(_event(
@@ -254,7 +246,6 @@ async def detect_window(
                     occurred_at=snap["at"],
                 ))
 
-        # 状态跃迁：没有上一状态（首次观察的新单元）不产生事件
         prev_state = prev_status.get(unit) or (
             "ok" if unit in had_valid else None
         )
@@ -273,14 +264,13 @@ async def detect_window(
                                         prev_state, cur))
 
     # 促销免费：本轮写下促销快照（0 价 + 有原价），且窗口前最近快照不是促销。
-    # 探区优先 CN——与写库侧 _classify_free_kind 的锚区口径一致
     for appid in appids:
         unit, snap = _promo_unit(appid, snapshots, regions)
         if snap is None:
             continue
         prev = previous.get(unit)
         if prev is None:
-            continue  # 首次观察：没有「之前」可比，不声称发生了进入促销
+            continue
         if not prev.get("promo"):
             events.append(_event(
                 cycle_id, appid, None, FREE_PROMO,
@@ -289,7 +279,6 @@ async def detect_window(
                 occurred_at=snap["at"],
             ))
 
-    # 下架：removed_at 落在本轮窗口 = 本轮标记的那一刻（持续态不重复产生）
     for appid, removed_at in games.items():
         if removed_at is not None and started_at <= removed_at <= window_end:
             events.append(_event(
@@ -302,7 +291,6 @@ async def detect_window(
     return await _persist(events)
 
 
-# ── 证据查询 ──
 
 
 async def _history_evidence(
@@ -416,7 +404,6 @@ def _promo_unit(
     return cn_unit, None
 
 
-# ── 组装与落库 ──
 
 
 def _event(
@@ -484,7 +471,6 @@ async def _persist(events: list[dict]) -> list[dict]:
     return written
 
 
-# ── 只读查询 ──
 
 
 async def notification_batches(cycle_id: int, watched: set[int], *, batch: int = 1000,

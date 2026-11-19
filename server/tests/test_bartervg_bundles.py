@@ -24,10 +24,10 @@ from app.domains.settings.models import AppSetting  # noqa: E402
 
 TEST_STATE_KEY = "bartervg_bundles_last_fetch_test"
 
-APP_STALE = 990_501  # 库内旧计数 2 → 档案 5，应覆写
-APP_SAME = 990_502  # 库内已是 3 → 零写入
-APP_ABSENT = 990_503  # 档案无此 appid → 保持 NULL
-APP_NOT_IN_DB = 990_504  # 档案有、库内无 → 不落占位行
+APP_STALE = 990_501
+APP_SAME = 990_502
+APP_ABSENT = 990_503
+APP_NOT_IN_DB = 990_504
 
 
 def _archive() -> dict:
@@ -35,9 +35,9 @@ def _archive() -> dict:
         str(APP_STALE): {"bundles": 5, "bundles_packages": 1},
         str(APP_SAME): {"bundles": 3},
         str(APP_NOT_IN_DB): {"bundles": 7},
-        "not_a_number": {"bundles": 9},  # 非数字键剔除
-        "666666": {"bundles": 0},  # 非正计数剔除
-        "777777": {"bundles": "x"},  # 非整数剔除
+        "not_a_number": {"bundles": 9},
+        "666666": {"bundles": 0},
+        "777777": {"bundles": "x"},
     }
 
 
@@ -60,7 +60,6 @@ async def _seed():
         await session.commit()
 
 
-# ─── 纯逻辑 ────────────────────────────────────────────────────────
 
 
 def test_parse_bundles_map_filters_and_counts():
@@ -68,7 +67,6 @@ def test_parse_bundles_map_filters_and_counts():
 
 
 def test_parse_bundles_map_sanity_gate():
-    # 低于完整性哨兵门槛 → 视为截断响应，抛错由调用方丢弃本轮
     with pytest.raises(ValueError, match="截断"):
         meta._check_archive_integrity({"18500": {"bundles": 5}})
 
@@ -76,7 +74,6 @@ def test_parse_bundles_map_sanity_gate():
         meta._check_archive_integrity(["not", "an", "object"])
 
 
-# ─── 链路（真实落库 + 合成档案）──────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -94,7 +91,7 @@ async def test_refresh_diff_writes_and_skips_placeholder(monkeypatch):
     result = await meta.refresh_bundle_counts(force=True)
     assert result["ok"] is True and result["skipped"] is False
     assert result["records"] == 3
-    assert result["updated"] == 1  # 仅 APP_STALE 覆写；APP_SAME 同值零写
+    assert result["updated"] == 1
 
     async with get_session_factory()() as session:
         stale = await session.get(Game, APP_STALE)
@@ -102,8 +99,7 @@ async def test_refresh_diff_writes_and_skips_placeholder(monkeypatch):
         same = await session.get(Game, APP_SAME)
         assert same.bundle_count == 3
         absent = await session.get(Game, APP_ABSENT)
-        assert absent.bundle_count is None  # 不在档案中 → 保持 NULL
-        # 档案里多出的 appid 不落占位行
+        assert absent.bundle_count is None
         ghost = await session.scalar(
             select(Game.appid).where(Game.appid == APP_NOT_IN_DB)
         )
@@ -111,7 +107,6 @@ async def test_refresh_diff_writes_and_skips_placeholder(monkeypatch):
         state = await session.get(AppSetting, TEST_STATE_KEY)
         assert state is not None and state.value_json["updated"] == 1
 
-    # 48h 闸内跳过（不触达拉取层）；force=True 绕过且差量为零（幂等）
     skipped = await meta.refresh_bundle_counts()
     assert skipped["skipped"] is True
     again = await meta.refresh_bundle_counts(force=True)
@@ -133,6 +128,6 @@ async def test_refresh_failure_keeps_old_values(monkeypatch):
 
     async with get_session_factory()() as session:
         stale = await session.get(Game, APP_STALE)
-        assert stale.bundle_count == 2  # 库内旧值保留
+        assert stale.bundle_count == 2
         state = await session.get(AppSetting, TEST_STATE_KEY)
-        assert state is None  # 失败不记账
+        assert state is None

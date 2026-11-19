@@ -31,13 +31,7 @@ async def list_games(
     filterMode: str = Query("global"),
     onlyDiscounted: bool = False,
     isLowest: bool = False,
-    # 史低/永降标记过滤：hl=史低(新+平) pp=永降 any=并集（降价动态 feed）；
-    # new/flat/nonhl = 史低三态细分（新史低 / 平史低 / 非史低），可逗号组合
-    # 按 OR 叠加（游戏库史低三态 checkbox 是多选）
     flag: str = Query("", pattern=r"^(|hl|pp|any|(new|flat|nonhl)(,(new|flat|nonhl))*)$"),
-    # 送礼分析（判据：收礼侧区价 ≤ 送礼侧区价×1.15）：out=我可以送给谁
-    # （giftSender 固定送礼方 + giftReceivers 多目标任一命中）；in=哪些游戏
-    # 可以低价送给我（giftReceivers 单收礼方，送礼方全区自动遍历）
     giftMode: str = Query("", pattern="^(|out|in)$"),
     giftSender: str = Query("", pattern="^(|[a-z]{2})$"),
     giftReceivers: str = Query("", pattern=r"^([a-z]{2}(,[a-z]{2})*)?$"),
@@ -57,10 +51,8 @@ async def list_games(
     diffType: str = Query("absolute", pattern="^(absolute|percent)$"),
     toleranceFen: int | None = Query(None, ge=0),
     strictLowest: bool = False,
-    # 愿望单优先：关注恒置顶，开启后愿望单成员（含家庭愿望单）叠加置顶前缀
     wishlistPriority: bool = False,
     excludeDlc: bool = Query(False),
-    # 目录移除（假删除）作用域：默认隐藏已移除款；true 只出已移除款（恢复视图）
     removed: bool = False,
 ):
     return await service.list_games(

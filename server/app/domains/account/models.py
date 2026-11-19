@@ -25,7 +25,6 @@ class SteamAccount(Base):
     cookies: Mapped[str] = mapped_column(Text, default="")
     persona_name: Mapped[str] = mapped_column(String(100), default="")
     avatar_url: Mapped[str] = mapped_column(String(300), default="")
-    # 每账号独立钱包快照：{balance, balance_display, currency_code, region_code, ...}
     wallet_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     # Steam 真实在线状态（miniprofile/GetPlayerSummaries 双通道，按活跃感知
@@ -39,11 +38,6 @@ class SteamAccount(Base):
     online_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     # 最近一次钱包同步失败原因（空串 = 正常）；用于每分钟轮转的指数退避
     wallet_error: Mapped[str] = mapped_column(String(300), default="")
-    # 递增退避级别：0=正常，每次失败 +1（成功清零）；间隔查
-    # service._WALLET_BACKOFF_MINUTES（2→5→15→30min 封顶）
     wallet_backoff_level: Mapped[int] = mapped_column(Integer, default=0)
-    # 钱包熔断连续失败计数（成功清零）：达 _WALLET_BREAKER_SLOW_AFTER 进
-    # 10min 慢车道，达 _WALLET_BREAKER_FREEZE_AFTER 置 wallet_frozen 终态
     wallet_fail_streak: Mapped[int] = mapped_column(Integer, default=0)
-    # 熔断冻结终态：自动轮转不再请求该账号，等手动刷新余额或换绑 Cookie 解锁
     wallet_frozen: Mapped[bool] = mapped_column(Boolean, default=False)

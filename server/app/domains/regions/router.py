@@ -10,12 +10,10 @@ router = APIRouter(prefix="/regions", tags=["regions"])
 
 
 class EnabledUpdate(BaseModel):
-    # None = 全部启用；否则为 cc 小写代码精确列表
     enabled: list[str] | None = None
 
 
 class OwnedUpdate(BaseModel):
-    # None = 跟随启用集；否则为 cc 小写代码精确列表（空列表 400）
     regions: list[str] | None = None
 
 

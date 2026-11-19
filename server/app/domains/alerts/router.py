@@ -42,7 +42,6 @@ class SmtpUpdate(BaseModel):
     useSsl: bool = True
 
 
-# ─── 固定路径端点（必须注册在 {alert_id} 之前）───
 
 @router.get("")
 async def list_alerts():
@@ -140,7 +139,6 @@ async def search_games(q: str, region: str = "CN"):
     return await service.search_games(q, region)
 
 
-# ─── 路径参数端点（放在最后）───
 
 @router.put("/{alert_id}")
 async def update_alert(alert_id: int, req: AlertUpdate):

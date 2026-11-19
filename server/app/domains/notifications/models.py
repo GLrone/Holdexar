@@ -63,16 +63,12 @@ class NotificationCandidate(Base):
     appid: Mapped[int] = mapped_column(Integer)
     # NULL = 游戏级事件（促销免费 / 下架），不属于单一地区
     region_code: Mapped[str | None] = mapped_column(String(8))
-    # 冗余一份事件类型与类别：摘要组装不必回查事件表
     event_type: Mapped[str] = mapped_column(String(32))
     category: Mapped[str] = mapped_column(String(16))
     recipient: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(12), default="pending")
-    # suppressed / failed 的原因（quiet / smtp:…）；投递成功为 NULL
     reason: Mapped[str | None] = mapped_column(Text)
-    # 已尝试投递次数（首次投递记为 1）；只有可重试的失败才会再进队列
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    # 最近一次投递失败的原因原文（`send_mail_ex` 返回），用于区分可重试与永久失败
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)

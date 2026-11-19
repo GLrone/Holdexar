@@ -41,7 +41,6 @@ def _mask_account(user: str) -> str:
 
 async def _smtp_view() -> dict:
     """SMTP 配置的可公开部分（不含密码 / 授权码）。"""
-    # get_smtp_config 返回前端键形（toAddr / useSsl，密码已掩码）
     cfg = await get_smtp_config()
     return {
         "configured": bool(cfg["toAddr"]) and bool(cfg["host"]),
@@ -114,7 +113,6 @@ async def get_prefs():
             if row.delivered_at or row.updated_at
             else None,
             "attempts": row.attempts,
-            # 失败原因原文可能含服务端细节，只给用户一句可行动的提示
             "reason": row.reason,
             "retryable": notification_service.retryable(row.last_error),
         }
@@ -266,7 +264,6 @@ async def stats():
         "sending": counts.get("sending", {"count": 0})["count"],
         "unknown": counts.get(UNKNOWN, {"count": 0})["count"],
         "failed": failed,
-        # 失败里还能再试的（临时故障且未到次数上限）与已经永久放弃的
         "retryable": can_retry,
         "permanent": failed - can_retry,
         "attempts": sum(v["attempts"] for v in counts.values()),

@@ -17,7 +17,7 @@ class CrawlRegion(Base):
 
     __tablename__ = "crawl_regions"
 
-    code: Mapped[str] = mapped_column(String(10), primary_key=True)  # cc 小写
+    code: Mapped[str] = mapped_column(String(10), primary_key=True)
     name: Mapped[str] = mapped_column(String(50))
     currency: Mapped[str] = mapped_column(String(10))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

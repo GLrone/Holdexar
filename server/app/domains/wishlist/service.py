@@ -37,9 +37,6 @@ WISHLIST_URL = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/"
 OWNED_URL = "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/"
 RESOLVE_VANITY_URL = "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/"
 
-# Steam Friend Code → SteamID64 转换常量
-# 公式：SteamID64 = int(friend_code) + 76561197960265728
-# （Steam 社区公开换算公式）
 STEAM64_BASE = 76561197960265728
 STEAMID64_REGEX = r"7656119\d{10}"
 
@@ -116,32 +113,26 @@ async def _resolve_steamid(raw: str) -> str:
 
     raw = raw.strip()
 
-    # 1. 直接是 SteamID64
     if re.match(f"^{STEAMID64_REGEX}$", raw):
         return raw
 
-    # 2. 个人资料 URL（含 SteamID64）
     profile_match = re.search(r"steamcommunity\.com/profiles/(\d+)", raw)
     if profile_match:
         return profile_match.group(1)
 
-    # 3. 好友码（纯数字 4-10 位，不以 7656 开头）
     if re.match(r"^\d{4,10}$", raw) and not raw.startswith("7656"):
         steamid = int(raw) + STEAM64_BASE
         return str(steamid)
 
-    # 4. 自定义 URL（完整 URL 或纯 vanity name）
     from app.domains.settings.service import get_secret_value
 
     api_key = (await get_secret_value("account.steam_api_key", "")) or ""
     vanity_match = re.search(r"steamcommunity\.com/id/([^/]+)", raw)
     vanity = vanity_match.group(1) if vanity_match else raw
 
-    # 如果是纯数字但不符合好友码格式，报错
     if vanity.isdigit() and not re.match(r"^\d{4,10}$", vanity):
         raise ValueError(f"无法识别的 Steam 标识符: {raw}")
 
-    # vanity name 需要调用 Steam API（需要 API Key）
     if not re.match(r"^[a-zA-Z0-9_-]+$", vanity):
         raise ValueError(f"无法识别的 Steam 标识符: {raw}")
 
@@ -245,7 +236,7 @@ async def fetch_owned_games(steamid: str) -> tuple[list[dict], str | None]:
     try:
         cookies = await account_service.get_cookies_of(steamid) or await account_service.get_primary_cookies()
         token = extract_webapi_token(cookies) if cookies else None
-    except Exception as e:  # noqa: BLE001 —— Cookie 读取失败降级走 Key，不阻断同步
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             "账号 Cookie 读取失败，已购拉取改走 WebAPI Key 通道",
@@ -288,7 +279,7 @@ async def _family_personas() -> dict[str, tuple[str, str]]:
         from app.domains.family.service import get_primary_steamid
 
         primary = await get_primary_steamid()
-    except Exception:  # noqa: BLE001 —— 主账号不可知时无快照可读
+    except Exception:  # noqa: BLE001
         return {}
     if not primary:
         return {}
@@ -303,7 +294,6 @@ async def _family_personas() -> dict[str, tuple[str, str]]:
             continue
         name = (m.get("personaName") or m.get("persona_name") or "").strip()
         avatar = (m.get("avatarUrl") or m.get("avatar_url") or "").strip()
-        # 快照可能是旧 CDN 域（eccdnx 等）：读出即归一自愈（与前端 HlAvatar 同规则）
         if avatar:
             from app.domains.account.steam_wallet import normalize_avatar_url
 
@@ -330,9 +320,6 @@ async def list_accounts() -> list[dict]:
                 )
             ).all()
         }
-    # 档案回填三级链：账户行已有 → 家庭组快照补（离线零请求）→
-    # miniprofile 后台拉（快照也没有时，如纯手动绑定的外账户）。
-    # 快照补到的顺手落库——下次打开页面不再重复拼装。
     fam = await _family_personas()
     global _PERSONA_BACKFILL_TASK
     missing = [
@@ -367,7 +354,6 @@ async def list_accounts() -> list[dict]:
             "steamid": a.steamid,
             "label": a.label,
             "personaName": (a.persona_name or "").strip() or fam.get(a.steamid, ("", ""))[0] or None,
-            # 读出即归一（历史 CDN 域自愈；前端 HlAvatar 亦有同款兜底）
             "avatarUrl": normalize_avatar_url(
                 (a.avatar_url or "").strip() or fam.get(a.steamid, ("", ""))[1] or ""
             ) or None,
@@ -384,7 +370,6 @@ async def list_accounts() -> list[dict]:
 async def add_account(steamid_or_vanity: str, label: str = "", kinds: dict | None = None) -> dict:
     steamid = await _resolve_steamid(steamid_or_vanity)
     now = _naive(get_beijing_time_obj())
-    # 绑定即抓昵称/头像（愿望单页账户行展示；失败不阻断绑定）
     persona = await _fetch_persona(steamid)
     async with write_session(WritePriority.INTERACTIVE) as session:
         existing = await session.get(TrackedAccount, steamid)
@@ -517,7 +502,6 @@ async def sync_account(steamid: str, auto_crawl: bool = True) -> dict:
 
 
 async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
-    # 取数段（无写闸）：账号校验 + 三路网络拉取 + 基线读，全部不持写者位
     async with get_session_factory()() as session:
         account = await session.get(TrackedAccount, steamid)
         if account is None:
@@ -525,8 +509,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
 
         wishlist = await fetch_wishlist(steamid)
 
-        # 已购拉取：通道失败 ≠ 库空。失败时中断 owned 覆写（保留既有标记），
-        # 否则会把全部 owned=True 静默清空；HTTP 200 + 空 games 才是"库空/私有"。
         owned: list[dict] = []
         owned_error: str | None = None
         owned_source: str | None = None
@@ -541,7 +523,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                 level=logging.WARNING,
             )
 
-        # 昵称/头像随手刷新（Steam 昵称会改；拉取失败静默保留旧值）
         persona = await _fetch_persona(steamid)
 
         existing = {
@@ -553,7 +534,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
             ).scalars()
         }
 
-        # 落库段（过写调度器）：成员资格覆写 + 欠账 reconcile 一次事务提交
         async with write_gate(WritePriority.BACKGROUND):
             now = _naive(get_beijing_time_obj())
             new_appids: list[int] = []
@@ -583,8 +563,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                     if not row.active and not row.excluded:
                         row.active = True
 
-            # 已购并入任务池（active 标记，kinds 按账户开关——任务页「已购游戏抓取
-            # ·账户设置」可关掉库太大的账户，只盯愿望单）
             kinds = dict(account.kinds_json or {"wishlist": True, "owned": True})
             owned_failed = bool(kinds.get("owned")) and owned_error is not None
             owned_synced = bool(kinds.get("owned")) and owned_error is None
@@ -607,22 +585,14 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                     elif not row.active and not row.excluded:
                         row.active = True
 
-            # 已购标记覆写：以本次 GetOwnedGames 结果为准（库转私有时回落为愿望单条目）。
-            # 通道失败时 owned_synced 已置 False，跳过覆写——标记保留到下次成功同步。
             if owned_synced:
                 for appid, row in existing.items():
                     row.owned = appid in owned_ids
 
-            # 愿望单里已移除的且非已购 → active=0（已购条目常驻任务池，不随愿望单移除停用）。
-            # 例外：通道失败时已购状态未知，已购行保守保留，等下次成功同步再判定；
-            # 手动来源条目免疫——星标关注（manual）与手动入池（manual_pool）的
-            # 存续不取决于 Steam 真实愿望单（账户同步 15min 高频后，无免疫的
-            # 手动条目 15 分钟内即被反向核对洗掉）。
             wished_ids = {it["appid"] for it in wishlist}
             if wishlist:
                 for appid, row in existing.items():
                     if appid not in wished_ids:
-                        # 成员资格覆写：Steam 侧已移除 → 清愿望单标
                         row.wishlisted = False
                         if appid in owned_ids or not row.active:
                             continue
@@ -645,8 +615,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
             account.last_sync_at = now
             await session.commit()
 
-    # 账户同步会改写来源标记（成员资格覆写 / 反向核对停用），同步后按现状
-    # 重算 Tracking Source；排除状态不动（用户意图不由自动同步改写）
     await _sync_monitoring(list(existing) + new_appids)
 
     result = {
@@ -678,14 +646,11 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
     if auto_crawl and new_appids:
         from app.domains.crawl import service as crawl_service
 
-        # 首次入库场景禁用打折预检（无历史数据可判断"刷新跳过"）。
-        # 自定义已购区域时：愿望单新增走全局区、已购新增走自定义区；
-        # 跟随模式（未配置）保持单 job 合并抓取——不为此多拆一次预检。
         try:
             from app.domains.regions.service import owned_regions
 
             owned_cfg = await owned_regions()
-        except Exception:  # noqa: BLE001 —— 配置读不到按跟随处理
+        except Exception:  # noqa: BLE001
             owned_cfg = None
 
         owned_new_set = set(new_owned_appids)
@@ -693,8 +658,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
         need_split = owned_cfg is not None and bool(wish_only_new) and bool(new_owned_appids)
 
         if need_split:
-            # 双来源 + 自定义区：后台链式（愿望单 job → 已购 job 串行，
-            # 单任务模型不能并行；HTTP 语境不等待爬完）
             if crawl_service.active_job_id() is not None:
                 result["crawlTriggered"] = False
                 log_event(
@@ -726,7 +689,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
             try:
                 crawl_service.active_job_id()  # 探测占用
                 if owned_cfg is not None and new_owned_appids and not wish_only_new:
-                    # 全部新增都来自已购且已配自定义区：单 job 直接带自定义区
                     await crawl_service.start_job(
                         scope="appids",
                         appids=new_appids,
@@ -741,7 +703,6 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                     )
                 result["crawlTriggered"] = True
             except ValueError as e:
-                # 空列表等参数性拒绝：静默跳过，下轮同步再探
                 result["crawlTriggered"] = False
                 log_event(
                     logger,
@@ -750,7 +711,7 @@ async def _sync_account_inflight(steamid: str, auto_crawl: bool) -> dict:
                     detail={"新增": len(new_appids), "原因": e},
                 )
             except RuntimeError:
-                result["crawlTriggered"] = False  # 已有任务运行，稍后手动触发
+                result["crawlTriggered"] = False
                 log_event(
                     logger,
                     "已有爬取任务运行，新增条目本轮未自动爬取",
@@ -810,7 +771,6 @@ async def list_items(steamid: str | None = None) -> list[dict]:
                 "boardPool": False,
             }
         it["steamids"].append(row.steamid)
-        # 来源标记按任一账户计（并集）：任一行落在该来源即标
         it["wishlisted"] = it["wishlisted"] or bool(row.wishlisted)
         it["followed"] = it["followed"] or bool(row.manual)
         it["owned"] = it["owned"] or bool(row.owned)
@@ -872,7 +832,6 @@ async def list_items(steamid: str | None = None) -> list[dict]:
                 it["owned"] = it["owned"] or "owned" in srcs
                 it["manualPool"] = it["manualPool"] or "manual" in srcs
                 it["boardPool"] = it["boardPool"] or "board" in srcs
-            # 用户移出（排除）的对象不再出现在关注列表
             states = await monitoring_service.states_of("game", list(merged))
             merged = {
                 a: it for a, it in merged.items() if states.get(a) != "excluded"
@@ -979,7 +938,7 @@ async def owned_library() -> dict:
             }
         )
         st = stats.get(item.steamid)
-        if st is None:  # tracked 行已删的残留条目：照常带出，不计入账户统计
+        if st is None:
             continue
         st["count"] += 1
         if cny_fen is not None:
@@ -1077,12 +1036,9 @@ async def ownership(appids: list[int]) -> dict:
         rows = rows.scalars().all()
 
     def display(a: TrackedAccount) -> tuple[str, str]:
-        # 存量 avatar_url 可能是旧 CDN 域——读出即归一自愈（与家庭页同口径）
         avatar = normalize_avatar_url(a.avatar_url) if a.avatar_url else ""
         if primary and a.steamid == primary:
             return "我", avatar
-        # 名称三级兜底：备注名 → Steam 昵称 → steamid。缺 persona_name 时
-        # 无备注账户会把 ID 数串直接甩给用户
         return a.label or a.persona_name or a.steamid, avatar
 
     owned_by: dict[int, list[tuple[str, str]]] = {}
@@ -1118,15 +1074,6 @@ async def ownership(appids: list[int]) -> dict:
     return {"ownerships": result}
 
 
-# ── 监控池管理：监控条目的添加 / 移除 ──────────────────────────
-#
-# 监控池对象两路落点：账户同步写 wishlist_items 活跃行（Steam 账户事实）；
-# 项目自加直挂 monitor_sources 来源（不落任何账户名下，不要求绑定账户）。
-# 池内所有游戏均为必须爬取的对象；愿望单（wishlisted）与星标关注
-# （manual）是叠加在监控条目之上的爬取第一优先级。本节的增删操作与
-# 账户同步的差异：
-# - 移除以 monitor_exclusions 挡复活——Steam 愿望单/已购侧仍在名单时，
-#   15min 一轮的账户同步不会把用户删掉的条目洗回来。
 
 
 async def _sync_monitoring(appids: list[int], *, exclusion: bool | None = None) -> None:
@@ -1227,7 +1174,6 @@ async def ensure_board_pool(appids: list[int], *, source: str = "board") -> dict
             exists += 1
             continue
         if src_active is not None:
-            # 该来源已被摘（用户移出 / 业务态脱池）——轮询不复活
             skipped += 1
             continue
         await monitoring_service.ensure_source("game", appid, source)
@@ -1279,7 +1225,6 @@ async def add_pool_items(
         for appid in clean:
             had = before.get(appid, set())
             state = states.get(appid)
-            # 显式加入 = 解除「别再爬它」；已在关注也补挂 manual，使其不依赖 Steam 侧名单
             await monitoring_service.set_exclusion("game", appid, False, "pool_restored")
             if "manual" not in had:
                 await monitoring_service.ensure_source("game", appid, "manual")
@@ -1300,8 +1245,6 @@ async def add_pool_items(
         from app.domains.crawl import service as crawl_service
 
         try:
-            # 首爬：新增/恢复的条目若无 games 行（从未抓过），下轮全池刷新的
-            # games 行侧看不到它——池内行本就排在全池 head，会随本轮一并抓。
             await crawl_service.start_job(
                 scope="appids", appids=touched, kind="pool_add", trigger="manual"
             )
@@ -1314,7 +1257,6 @@ async def add_pool_items(
                 detail={"新增": len(touched), "原因": e},
             )
 
-    # 本机导入来源登记失败不阻断入池。
     if source and clean:
         from app.domains.games import preset as preset_mod
 
@@ -1381,8 +1323,6 @@ async def remove_pool_items(appids: list[int], *, reason: str = "pool_removed") 
             await session.commit()
 
         for appid in clean:
-            # 榜单来源一并摘：board 由落池动作直管，不经账号对账，移除时
-            # 须显式摘除（配合排除挡住榜单轮询复活）
             user_source = sources.get(appid, set()) & {"manual", "favorite", "board"}
             if user_source:
                 for src in user_source:
@@ -1441,10 +1381,6 @@ async def release_free_games(appids: list[int]) -> int:
             row.excluded = True
             row.manual = False
         await session.commit()
-    # 永久免费是业务状态（free_kind），不是用户排除：摘掉全部来源 → released，
-    # 不写 monitor_exclusions（解除后仍可回到监控，届时由下次爬取再判）。
-    # 用户显式来源（关注 / 手动加入）也一并摘——免费游戏的各区分价没有监控意义；
-    # 账户派生来源由随后的对账收敛。
     from app.domains.monitoring import service as monitoring_service
 
     for appid in sorted(free_ids):

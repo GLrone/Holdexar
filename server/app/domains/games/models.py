@@ -33,7 +33,7 @@ class Game(Base):
     chinese_support: Mapped[str | None] = mapped_column(String(50))
     family_sharing: Mapped[bool] = mapped_column(Boolean, default=False)
     trading_cards: Mapped[bool] = mapped_column(Boolean, default=False)
-    xgp_tier: Mapped[str | None] = mapped_column(String(50))  # Xbox Game Pass 档位
+    xgp_tier: Mapped[str | None] = mapped_column(String(50))
     is_epic: Mapped[bool] = mapped_column(Boolean, default=False)  # Epic 免费送过
     epic_date: Mapped[str | None] = mapped_column(String(100))  # 赠送日期（如 "2023-12-25 ~ 2024-01-01"）
     is_hb: Mapped[bool] = mapped_column(Boolean, default=False)  # 进过 HB 慈善包
@@ -41,11 +41,9 @@ class Game(Base):
     # 第三方渠道 bundle 计数（站点预聚合全量档案按 appid 查表；NULL=未拉取），
     # refresh_bundle_counts 维护——只写有计数的行，无记录者保持 NULL
     bundle_count: Mapped[int | None] = mapped_column(Integer)
-    series_id: Mapped[str | None] = mapped_column(String(100))  # 游戏系列（如 GTA / Resident Evil）
+    series_id: Mapped[str | None] = mapped_column(String(100))
     hl_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=新史低 2=平史低 3=打折非史低（update_price_derived 维护）
     pp_flag: Mapped[int] = mapped_column(Integer, default=0)  # 0=无 1=永降 2=永涨（update_price_derived 维护：国区原价最近一次调价方向）
-    # 最近一次原价跳变（相邻快照原价不同）的时刻；徽章时效判据——
-    # 前端只在变化后 14 天内展示永降/永涨，无值或过期即隐藏
     pp_changed_at: Mapped[datetime | None] = mapped_column(DateTime)
     # ── 排序缓存预计算列（update_price_derived 维护）──
     # min_cny_fen = 非 CN 各区 ok 价的最低 CNY 分（原始值，无其他区价为 NULL；
@@ -56,8 +54,8 @@ class Game(Base):
     # smart 排序评分预计算列（update_price_derived 维护，公式见 scoring.py；
     # 0~1 浮点，NULL=尚未计算——DESC 排序天然沉底）
     smart_score: Mapped[float | None] = mapped_column(Float)
-    is_adult: Mapped[bool] = mapped_column(Boolean, default=False)  # 成人内容
-    is_visual_novel: Mapped[bool] = mapped_column(Boolean, default=False)  # 视觉小说
+    is_adult: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_visual_novel: Mapped[bool] = mapped_column(Boolean, default=False)
     release_date: Mapped[str | None] = mapped_column(String(50))
     # 商店移除监控：NULL=在售；非空=判定下架的北京时间。
     # 判定条件（mark_removed，app_handler 终端路径）：Phase 1 五区回退元数据
@@ -128,7 +126,6 @@ class GameCurrentPrice(Base):
         Index("ix_gcp_region_cny", "region_code", "cny_fen"),
         Index("ix_gcp_status", "price_status"),
         Index("ix_gcp_updated", "updated_at"),
-        # isLowest/地区筛选 CTE/增量刷新的核心索引：appid 锚定 + 状态过滤 + 价格范围
         Index("ix_gcp_appid_status_cny", "appid", "price_status", "cny_fen"),
     )
 
@@ -155,7 +152,6 @@ class GamePriceHistory(Base):
     is_bundle: Mapped[bool] = mapped_column(Boolean, default=False)
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
-    # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）；
     discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     discount_desc: Mapped[str | None] = mapped_column(String(60))
     bundle_id: Mapped[int | None] = mapped_column(Integer)
@@ -187,12 +183,10 @@ class HistoryBackfillState(Base):
 
     appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     region_code: Mapped[str] = mapped_column(String(10), primary_key=True)
-    # 最近一次成功拿到点集 / 上游确认无数据 / 请求失败
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_empty_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_error: Mapped[str | None] = mapped_column(String(200))
-    # 最近一次成功回填的新增行数（观测用途，不参与任何判定）
     points_stored: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -222,12 +216,10 @@ class Bundle(Base):
     # server_default：与 _TABLE_EXTRA_COLUMNS 的存量库 ALTER 口径一致，
     # 原始 SQL 插行（历史导入/迁移脚本）省略该列时也拿得到默认值
     diff_fen: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    # smart 排序评分（0~1，refresh_bundle_sort_cache 维护；NULL=未计算）。
-    # 公式对齐 games/scoring.py 四因子：省钱(包差价)+质量(成员游戏评测)+
-    # 时机(限时叠加促销)+熟悉度(成员游戏评测规模)
+    # smart 排序评分（0~1，refresh_bundle_sort_cache 维护；NULL=未计算）
     smart_score: Mapped[float | None] = mapped_column(Float)
     url: Mapped[str | None] = mapped_column(String(1024))
-    app_ids: Mapped[list | None] = mapped_column(JSON, default=list)  # 包含的 Steam AppID 列表
+    app_ids: Mapped[list | None] = mapped_column(JSON, default=list)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -247,8 +239,6 @@ class BundleRegionPrice(Base):
     bundle_base_discount: Mapped[int] = mapped_column(Integer, default=0)
     price_status: Mapped[str] = mapped_column(String(20), default="ok")
     cny_fen: Mapped[int | None] = mapped_column(BigInteger)
-    # 促销截止（browse active_discounts[0].discount_end_date，Unix 秒）：
-    # 每轮刷新随价格行覆盖写入；NULL=无促销/本轮未下发促销元数据
     discount_end_ts: Mapped[int | None] = mapped_column(Integer)
     app_ids: Mapped[list | None] = mapped_column(JSON, default=list)
     crawled_at: Mapped[datetime | None] = mapped_column(DateTime)

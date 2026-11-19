@@ -159,7 +159,6 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
     await _seed_account(db)
     await _seed_games(db)
 
-    # 620 两人共享（presence=2）；570 仅主账号有（不在共享清单但成员已购）
     _mock_steam(
         monkeypatch,
         shared_apps=[
@@ -167,7 +166,7 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
             # Steam 的 exclude_reason 字段**恒存在**，0 = Included（可共享）。
             # 判「被排除」必须严格小于 0 才算排除，`is not None` 会误伤本款。
             {"appid": 730, "presence_count": 1, "exclude_reason": 0},
-            {"appid": 99999, "presence_count": 1, "exclude_reason": 2},  # 本地无行的游戏
+            {"appid": 99999, "presence_count": 1, "exclude_reason": 2},
         ],
         owned_by_member={
             PRIMARY: [
@@ -185,7 +184,6 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
 
     data = await family_service.fetch_family_library()
 
-    # 成员档案 + 已购计数
     assert data["familyName"] == "测试家庭"
     assert len(data["members"]) == 2
     by_sid = {m["steamid"]: m for m in data["members"]}
@@ -193,10 +191,8 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
     assert by_sid[FRIEND]["ownedCount"] == 1
 
     games = {g["appid"]: g for g in data["games"]}
-    # 合并：620（共享）+ 570（仅已购）+ 730（共享·可共享）+ 99999（仅共享清单）
     assert set(games) == {620, 570, 730, 99999}
 
-    # 620：本地元数据 + CN 价 + 双人共享
     g620 = games[620]
     assert g620["name"] == "Portal 2"
     assert g620["headerImage"] == "https://x/620.jpg"
@@ -205,29 +201,24 @@ async def test_library_merge_and_aggregation(db, monkeypatch):
     assert sorted(g620["owners"]) == sorted([PRIMARY, FRIEND])
     assert g620["presence"] == 2
     assert g620["inSharedLib"] is True
-    # 游玩聚合：300+90=390 分钟，最近游玩取最大时间戳
     assert g620["playtimeMinutes"] == 390
     assert g620["lastPlayed"] == 1700000200
 
-    # 570：不在共享清单但成员已购（inSharedLib=False）
     g570 = games[570]
     assert g570["inSharedLib"] is False
     assert g570["ownerCount"] == 1
-    assert g570["cnPriceFen"] is None  # 未播种 CN 价格
+    assert g570["cnPriceFen"] is None
 
-    # 99999：本地无行（name=None），被排除标记
     g99999 = games[99999]
     assert g99999["name"] is None
     assert g99999["excluded"] is True
 
-    # 730：exclude_reason=0 = Included → 可共享，不是「已排除」
     g730 = games[730]
     assert g730["inSharedLib"] is True
     assert g730["excluded"] is False
 
-    # 成员游玩序列（按近2周时长排序）
     p_primary = data["memberPlay"][PRIMARY]
-    assert p_primary[0]["appid"] == 620  # 2周60分钟 > 570 的 0
+    assert p_primary[0]["appid"] == 620
     assert p_primary[0]["minutes2w"] == 60
 
 
@@ -239,7 +230,6 @@ async def test_library_member_avatar_merge(db, monkeypatch):
     await _seed_account(db)
     _mock_steam(monkeypatch, shared_apps=[], owned_by_member={})
 
-    # 模拟同步链路落库的成员档案（_save_group 存 camelCase）
     from app.domains.family.models import FamilyGroup
 
     async with db() as session:
@@ -256,7 +246,6 @@ async def test_library_member_avatar_merge(db, monkeypatch):
         ))
         await session.commit()
 
-    # FRIEND 快照缺头像 → miniprofile 兜底补齐
     async def fake_preview(sid):
         if sid == FRIEND:
             return {"personaName": "好友昵称", "avatarUrl": "https://steamcdn/ava_friend.jpg"}
@@ -265,11 +254,8 @@ async def test_library_member_avatar_merge(db, monkeypatch):
 
     data = await family_service.fetch_family_library()
     by_sid = {m["steamid"]: m for m in data["members"]}
-    # 主号：实时 persona（mock 里 GetPlayerLinkDetails 的 persona_name）保留，
-    # 头像从快照合并
     assert by_sid[PRIMARY]["personaName"] == "成员1"
     assert by_sid[PRIMARY]["avatarUrl"] == "https://steamcdn/ava_primary.jpg"
-    # 好友：快照缺头像 → miniprofile 补齐
     assert by_sid[FRIEND]["avatarUrl"] == "https://steamcdn/ava_friend.jpg"
 
 
@@ -291,11 +277,11 @@ async def test_library_cache_invalidation(db, monkeypatch):
 
     await family_service.cached_family_library()
     await family_service.cached_family_library()
-    assert calls["n"] == 1  # 第二次命中缓存
+    assert calls["n"] == 1
 
     family_service.invalidate_library_cache()
     await family_service.cached_family_library()
-    assert calls["n"] == 2  # 失效后重拉
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -331,7 +317,7 @@ async def test_shared_library_fields_preserved(db, monkeypatch):
                 "appid": 620,
                 "presence_count": 2,
                 "rt_time_acquired": 1690000000,
-                "owner_steamids": [FRIEND, PRIMARY],  # FRIEND 先入库（购买者=PRIMARY）
+                "owner_steamids": [FRIEND, PRIMARY],
                 "name": "Portal 2 (steam)",
             },
         ],
@@ -346,15 +332,14 @@ async def test_shared_library_fields_preserved(db, monkeypatch):
     g = {x["appid"]: x for x in data["games"]}[620]
 
     assert g["timeAcquired"] == 1690000000
-    assert g["owners"] == [FRIEND, PRIMARY]  # Steam 原序（非成员遍历序）
-    assert g["buyer"] == PRIMARY             # at(-1) = 最近入库者
+    assert g["owners"] == [FRIEND, PRIMARY]
+    assert g["buyer"] == PRIMARY
 
 
 @pytest.mark.asyncio
 async def test_snapshot_upsert_and_fallback(db, monkeypatch):
     """持久化兜底链：聚合成功落快照 → 实时失败（如 Cookie 失效）时从快照重建。"""
     await _seed_account(db)
-    # 组档案先行（真实流程：家庭组同步建组档案，库聚合随后）
     from app.domains.family.models import FamilyGroup
 
     async with db() as session:
@@ -374,14 +359,12 @@ async def test_snapshot_upsert_and_fallback(db, monkeypatch):
         owned_by_member={},
     )
 
-    # 1. 聚合成功 → 快照落库
     data = await family_service.fetch_family_library()
     assert len(data["games"]) == 2
     assert not data.get("fromSnapshot")
 
     family_service.invalidate_library_cache()
 
-    # 2. Cookie 摘除（实时聚合必失败）→ cached 回快照兜底
     await _clear_account_cookie(db)
     family_service.invalidate_library_cache()
     snap = await family_service.cached_family_library()
@@ -394,7 +377,6 @@ async def test_snapshot_upsert_and_fallback(db, monkeypatch):
     assert games[620]["buyer"] == PRIMARY
     assert games[570]["buyer"] == PRIMARY
 
-    # 3. 完全无快照无 Cookie → 仍诚实抛 ValueError（无兜底可用）
     from app.domains.family.models import FamilyLibrarySnapshot
 
     async with db() as session:
@@ -431,7 +413,6 @@ async def test_family_wishlist_aggregation(db, monkeypatch):
     from app.domains.wishlist.models import WishlistItem
     from datetime import datetime
 
-    # 未同步家庭组 → fallback=True（全部 tracked 账户的愿望单）
     await _seed_games(db)
     now = datetime(2026, 9, 3, 12, 0, 0)
     async with db() as session:
@@ -439,20 +420,18 @@ async def test_family_wishlist_aggregation(db, monkeypatch):
             WishlistItem(steamid=PRIMARY, appid=620, added_at=now, active=True, owned=False),
             WishlistItem(steamid=FRIEND, appid=620, added_at=now, active=True, owned=False),
             WishlistItem(steamid=FRIEND, appid=570, added_at=now, active=True, owned=False),
-            WishlistItem(steamid=PRIMARY, appid=440, added_at=now, active=True, owned=True),  # 已购不计
+            WishlistItem(steamid=PRIMARY, appid=440, added_at=now, active=True, owned=True),
         ])
         await session.commit()
 
     out = await family_service.family_wishlist()
-    # 无 Cookie 无绑定 SteamID → get_primary_steamid raise → primary=""（回退全量）
     assert out["fallback"] is True
     by_app = {it["appid"]: it for it in out["items"]}
     assert by_app[620]["wantCount"] == 2
     assert sorted(by_app[620]["members"]) == sorted([PRIMARY, FRIEND])
     assert by_app[620]["name"] == "Portal 2"
     assert by_app[620]["cnPriceFen"] == 4200
-    assert 440 not in by_app  # owned=True 不进家庭愿望单
-    # wantCount 降序：620(2人) 在 570(1人) 前
+    assert 440 not in by_app
     assert out["items"][0]["appid"] == 620
 
 
@@ -467,7 +446,6 @@ async def test_play_json_persisted_and_fallback_merged(db, monkeypatch):
     from app.domains.family.models import FamilyGroup
 
     await _seed_account(db)
-    # 同步链路先建组档案（真实流程 _save_group 先于任何库聚合）
     async with db() as session:
         session.add(FamilyGroup(
             steamid=PRIMARY, family_groupid="111", family_name="测试家庭",
@@ -489,12 +467,10 @@ async def test_play_json_persisted_and_fallback_merged(db, monkeypatch):
     live = await family_service.fetch_family_library()
     assert live["memberPlay"][PRIMARY][0]["minutes2w"] == 60
 
-    # Cookie 摘除 → 实时聚合必败 → cached 回快照兜底
     family_service.invalidate_library_cache()
     await _clear_account_cookie(db)
     snap = await family_service.cached_family_library()
     assert snap.get("fromSnapshot") is True
-    # 兜底路径 memberPlay 从 play_json 合并：游玩动态离线也有数据
     assert snap["memberPlay"][PRIMARY][0]["appid"] == 620
     assert snap["memberPlay"][PRIMARY][0]["minutes2w"] == 60
 
@@ -528,10 +504,9 @@ async def test_wishlist_uncrawled_kick(db, monkeypatch):
     monkeypatch.setattr("app.domains.crawl.service.start_job", fake_start_job)
 
     out = await family_service.family_wishlist()
-    assert out["items"][0]["appid"] == 777777  # 未收录照样展示（本地聚合语义不变）
-    assert kicked == [[777777]]  # 缺口 appid 进了补爬队列
+    assert out["items"][0]["appid"] == 777777
+    assert kicked == [[777777]]
 
-    # 冷却期内不重复触发
     out2 = await family_service.family_wishlist()
     assert out2["items"][0]["appid"] == 777777
     assert kicked == [[777777]]
@@ -592,12 +567,11 @@ async def test_sync_multi_account(db, monkeypatch):
         )).scalars().all()
     assert row_a.member_count == 2 and row_a.family_name == "甲组"
     assert row_a.members_json[1]["loccountrycode"] == "RU"
-    assert row_b.member_count == 0  # 未加入也落行（joined=False 快照）
+    assert row_b.member_count == 0
     assert row_c.fetch_ok is False and row_c.last_error
     assert r["results"][2]["error"] == row_c.last_error
     assert {t.steamid for t in tracked} >= {PRIMARY, FRIEND}
 
-    # 指定账号单同步：只动该账号（单账号路径按 get_cookies_of 取 Cookie）
     second_cookie = "sessionid=s; steamLoginSecure=second%7C%7Ctok-b"
     async def fake_cookies_of(sid):
         return second_cookie if sid == SECOND else ""
@@ -646,8 +620,8 @@ async def test_status_groups_and_region_chain(db, monkeypatch):
         await session.commit()
 
     await settings_service.set_value("family.member_regions", {
-        PRIMARY: "in",   # 非 cn 手动值：始终尊重
-        M1: "cn",        # 非绑定成员的 cn：一次性清洗移除，按资料国家呈现
+        PRIMARY: "in",
+        M1: "cn",
         M2: "cn",
     })
 
@@ -659,16 +633,15 @@ async def test_status_groups_and_region_chain(db, monkeypatch):
     g1, g2 = st["groups"]
     assert g1["joined"] is True and g1["familyName"] == "甲组"
     assert g2["joined"] is None and g2["synced"] is False
-    assert g2["members"] == []  # 未加入组：空成员而不是他组数据
+    assert g2["members"] == []
 
     region = {m["steamid"]: (m["region"], m["regionSource"]) for m in g1["members"]}
     assert region[PRIMARY] == ("in", "manual")
-    assert region[M1] == ("us", "profile")   # cn 残留被资料国家顶替
+    assert region[M1] == ("us", "profile")
     assert region[M2] == ("ru", "profile")
-    assert region[M3] == (None, None)        # 未设置：不再兜底国区
+    assert region[M3] == (None, None)
 
-    assert st["memberRegions"] == {PRIMARY: "in"}  # 非绑定成员的 cn 兜底已清洗
-    # 顶层并集 = 各已加入组成员（未加入组不贡献成员）
+    assert st["memberRegions"] == {PRIMARY: "in"}
     assert {m["steamid"] for m in st["members"]} == {PRIMARY, M1, M2, M3}
 
 
@@ -700,22 +673,21 @@ async def test_library_cache_per_account(db, monkeypatch):
     assert a["familyGroupid"] == "g1" and b["familyGroupid"] == "g2"
 
     await family_service.cached_family_library(PRIMARY)
-    assert calls == [PRIMARY, SECOND]  # 第三次命中 PRIMARY 自己的缓存
+    assert calls == [PRIMARY, SECOND]
 
     family_service.invalidate_library_cache(PRIMARY)
     await family_service.cached_family_library(PRIMARY)
     await family_service.cached_family_library(SECOND)
-    assert calls == [PRIMARY, SECOND, PRIMARY]  # SECOND 缓存未被定向失效波及
+    assert calls == [PRIMARY, SECOND, PRIMARY]
 
 
 @pytest.mark.asyncio
 async def test_member_regions_legacy_cleanup(db):
     """一次性清洗：非绑定成员的 cn 兜底条目移除、绑定账号保留、标记后幂等。"""
-    await _seed_account(db)  # PRIMARY 为绑定账号
+    await _seed_account(db)
     manual = {PRIMARY: "in", FRIEND: "cn", "76561198000000099": "ru"}
     cleaned = await family_service._cleanup_legacy_member_regions(manual)
     assert cleaned == {PRIMARY: "in", "76561198000000099": "ru"}
-    # 标记置位后不再清洗：清洗后用户手动加回的 cn 条目受尊重
     assert await family_service._cleanup_legacy_member_regions({FRIEND: "cn"}) == {FRIEND: "cn"}
 
 
@@ -755,7 +727,7 @@ async def test_manual_member_persists_in_status(db):
     assert [m["steamid"] for m in g["members"]] == [MANUAL]
     assert g["members"][0]["origin"] == "manual"
     assert g["members"][0]["personaName"] == "手动成员"
-    assert g["joined"] is False  # 本地组行不计入 Steam 加入状态
+    assert g["joined"] is False
 
     from app.domains.family.models import FamilyGroup
 
@@ -779,7 +751,7 @@ async def test_manual_member_without_bound_account(db):
     g = st["groups"][0]
     assert [m["steamid"] for m in g["members"]] == [MANUAL]
     assert g["members"][0]["origin"] == "manual"
-    assert g["joined"] is None  # 本地组行：不冒充已同步/未加入的 Steam 状态
+    assert g["joined"] is None
     assert {m["steamid"] for m in st["members"]} == {MANUAL}
 
 
@@ -801,8 +773,8 @@ async def test_sync_preserves_manual_members(db, monkeypatch):
     assert by_sid[PRIMARY]["origin"] == "steam"
     assert by_sid[FRIEND]["origin"] == "steam"
     assert by_sid[MANUAL]["origin"] == "manual"
-    assert by_sid[MANUAL]["personaName"] == "手动成员"  # 同步不冲掉手动成员档案
-    assert row.member_count == 2  # member_count 只计 Steam 成员
+    assert by_sid[MANUAL]["personaName"] == "手动成员"
+    assert row.member_count == 2
 
 
 @pytest.mark.asyncio
@@ -829,7 +801,7 @@ async def test_remove_manual_member_keeps_tracked_account(db):
     async with db() as session:
         tracked = await session.get(TrackedAccount, MANUAL)
         row = await session.get(FamilyGroup, PRIMARY)
-    assert tracked is not None  # 解绑账户是愿望单池页的独立动作，移除成员不波及
+    assert tracked is not None
     assert row.members_json == []
 
 
@@ -849,12 +821,11 @@ async def test_remove_steam_member_not_revived_by_sync(db, monkeypatch):
     async with db() as session:
         row = await session.get(FamilyGroup, PRIMARY)
     assert [m["steamid"] for m in row.members_json] == [PRIMARY, FRIEND]
-    assert row.members_json[1]["excluded"] is True  # 排除标记持久保留
+    assert row.members_json[1]["excluded"] is True
 
     st = await family_service.get_status()
     assert [m["steamid"] for m in st["groups"][0]["members"]] == [PRIMARY]
 
-    # 再次同步：Steam 仍返回该成员，但排除标记不复活
     await family_service.sync_family_group()
     async with db() as session:
         row = await session.get(FamilyGroup, PRIMARY)
@@ -862,7 +833,6 @@ async def test_remove_steam_member_not_revived_by_sync(db, monkeypatch):
     st2 = await family_service.get_status()
     assert FRIEND not in [m["steamid"] for m in st2["groups"][0]["members"]]
 
-    # 同一本账的其他读点同样排除：家庭愿望单不再计已移除成员
     now = datetime(2026, 10, 1, 12, 0, 0)
     async with db() as session:
         session.add(WishlistItem(steamid=FRIEND, appid=620, added_at=now, active=True, owned=False))
@@ -871,12 +841,10 @@ async def test_remove_steam_member_not_revived_by_sync(db, monkeypatch):
     assert out["memberIds"] == [PRIMARY]
     assert all(FRIEND not in it["members"] for it in out["items"])
 
-    # 移除不动 tracked_accounts
     async with db() as session:
         tracked = await session.get(TrackedAccount, FRIEND)
     assert tracked is not None
 
-    # 重新添加 = 解除排除
     await family_service.add_family_member(FRIEND)
     st3 = await family_service.get_status()
     assert [m["steamid"] for m in st3["groups"][0]["members"]] == [PRIMARY, FRIEND]
@@ -897,7 +865,6 @@ async def test_local_member_survives_later_binding(db):
     assert [m["steamid"] for m in st["groups"][0]["members"]] == [MANUAL]
     assert st["groups"][0]["members"][0]["origin"] == "manual"
 
-    # 再次添加同员：条目从本地组迁入主账号组，不产生双份
     assert await family_service.add_family_member(MANUAL) == {"ok": True}
     from app.domains.family.models import FamilyGroup
 
@@ -908,13 +875,11 @@ async def test_local_member_survives_later_binding(db):
     assert [m["steamid"] for m in (local.members_json or []) if m.get("origin") == "manual"] == []
     assert "manual" in [m.get("origin") for m in primary.members_json]
 
-    # 绑定态移除：主账号组直取
     assert await family_service.remove_family_member(MANUAL) == {"ok": True, "removed": True}
     st2 = await family_service.get_status()
     assert [m["steamid"] for m in st2["groups"][0]["members"]] == []
 
 
-# ── 删号即清：账号删除时名下家庭组与孤儿快照随删 ──────────
 
 
 async def _seed_family_purge_data(db):
@@ -1075,5 +1040,4 @@ async def test_two_accounts_same_real_family_share_group_projection(db):
     assert [g["familyGroupid"] for g in st["groups"]] == ["333", "333"]
     for g in st["groups"]:
         assert {m["steamid"] for m in g["members"]} == {PRIMARY, second, member}
-    # 顶层并集按 steamid 去重：同组成员不因两组行重复出现
     assert len(st["members"]) == 3

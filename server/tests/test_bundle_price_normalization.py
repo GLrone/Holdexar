@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core import database as database_module  # noqa: E402
 
-JPY = 0.05  # 合成汇率：便于口算
+JPY = 0.05
 VND = 0.0002
 CPC = 0.001
 
@@ -100,21 +100,14 @@ async def _apply(engine) -> None:
 async def test_three_historical_shapes_normalized_and_idempotent(isolated_db) -> None:
     engine = isolated_db
     await _seed(engine, [
-        # 参考行（小数货币，约定无歧义）：每包一条，量级即该包真实 CNY 分
         (900_001, 0, "us", "USD", 1000, 7000),
         (900_002, 1, "us", "USD", 900, 6000),
         (900_003, 1, "us", "USD", 1000, 7000),
-        # ① 元价 + fen=price×rate×100（Bundle 轨）
         (900_001, 0, "jp", "JPY", 6237, round(6237 * JPY * 100)),
-        # ② 分价 + fen=price×rate×100（Sub 轨，cny_fen 虚高 100 倍）
         (900_002, 1, "id", "JPY", 100_000, round(100_000 * JPY * 100)),
-        # ③ 元价 + fen=price×rate（更早版本：两者同时小 100 倍）
         (900_003, 1, "vn", "VND", 291_500, round(291_500 * VND)),
-        # ④ 小数货币 legacy 比例缺陷行（不属本次归一范围）
         (900_004, 0, "cr", "CRC", 5_436, 80),
-        # ⑤ 无汇率行：PGY 汇率在下面删掉
         (900_005, 0, "py", "PYG", 1_000, 999),
-        # ⑥ 无 cny_fen 行
         (900_006, 0, "jp", "JPY", 1_000, None),
     ])
     async with engine.begin() as conn:
@@ -123,12 +116,12 @@ async def test_three_historical_shapes_normalized_and_idempotent(isolated_db) ->
     await _apply(engine)
     after = await _prices(engine)
 
-    assert after[(900_001, "jp")] == (623_700, round(6237 * JPY * 100))  # ① 价格 ×100，fen 保留
-    assert after[(900_002, "id")] == (100_000, round(100_000 * JPY))  # ② 价格不动，fen 纠正
-    assert after[(900_003, "vn")] == (29_150_000, round(291_500 * VND * 100))  # ③ 两者都 ×100
-    assert after[(900_004, "cr")] == (5_436, 80)  # ④ 小数货币不动
-    assert after[(900_005, "py")] == (1_000, 999)  # ⑤ 无汇率不动
-    assert after[(900_006, "jp")] == (1_000, None)  # ⑥ 无 cny_fen 不动
+    assert after[(900_001, "jp")] == (623_700, round(6237 * JPY * 100))
+    assert after[(900_002, "id")] == (100_000, round(100_000 * JPY))
+    assert after[(900_003, "vn")] == (29_150_000, round(291_500 * VND * 100))
+    assert after[(900_004, "cr")] == (5_436, 80)
+    assert after[(900_005, "py")] == (1_000, 999)
+    assert after[(900_006, "jp")] == (1_000, None)
 
     async with engine.begin() as conn:
         version = (await conn.execute(text("PRAGMA user_version"))).scalar_one()
@@ -138,10 +131,8 @@ async def test_three_historical_shapes_normalized_and_idempotent(isolated_db) ->
             )).all()
         )
     assert version == 3
-    # v3 形态回填：item_kind 沿用 mps 旧值（形状当时即 mps 的旧语义之一）
     assert kinds == {900_001: 0, 900_002: 1, 900_003: 1, 900_004: 0, 900_005: 0, 900_006: 0}
 
-    # 幂等：再重放迁移体，逐行与首次结果一致
     await _apply(engine)
     assert await _prices(engine) == after
 
@@ -188,8 +179,8 @@ async def test_upsert_drops_uppercase_duplicate_rows() -> None:
             row = (
                 await db.execute(select(Bundle).where(Bundle.bundle_id == bid))
             ).scalar_one()
-        assert codes == ["jp"]  # 大写的 'JP' 旧行被清掉
-        assert row.must_purchase_as_set == 0  # mps 由 item_type 填 0
+        assert codes == ["jp"]
+        assert row.must_purchase_as_set == 0
     finally:
         from sqlalchemy import delete
 

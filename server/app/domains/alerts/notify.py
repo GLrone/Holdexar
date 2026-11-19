@@ -52,7 +52,6 @@ async def get_smtp_config() -> dict:
     """返回 SMTP 配置（前端用），密码做掩码处理。"""
     cfg = await smtp_config()
     has_password = bool(cfg["password"])
-    # 掩码：只显示首尾字符
     pwd = cfg["password"]
     if len(pwd) > 2:
         masked = pwd[0] + "*" * (len(pwd) - 2) + pwd[-1]
@@ -130,11 +129,7 @@ def _smtp_login(server: smtplib.SMTP, user: str, password: str) -> None:
     mechanisms = [m for m in ("CRAM-MD5", "PLAIN", "LOGIN") if m in advertised]
     if not mechanisms:
         raise smtplib.SMTPException("No suitable authentication method found.")
-    # auth_plain / auth_login / auth_cram_md5 都从 server.user / server.password 取凭据
     server.user, server.password = user, password
-    # 只发一次 AUTH：取优先级最高的可用机制。auth() 非 235/503 即抛
-    # SMTPAuthenticationError，拒绝原因直达调用方；返回即成功。被拒后在
-    # 同一条连接上换机制重试会被部分服务商直接断线，原因随断线丢失。
     mechanism = mechanisms[0]
     server.auth(mechanism, getattr(server, "auth_" + mechanism.lower().replace("-", "_")))
 
@@ -295,9 +290,6 @@ def mail_text(html_body: str) -> str:
                      if (line := " ".join(raw.split())))
 
 
-# ══════════════════════════════════════════════════════════════════
-# 一、设计令牌与外部资源出口
-# ══════════════════════════════════════════════════════════════════
 
 # 卡片内容区宽度：容器 600 − 左右各 24px 内距 = 552
 CARD_W = 552
@@ -308,18 +300,18 @@ COVER_RATIO = 215 / 460
 def _theme_colors() -> dict[str, str]:
     """主题色板（web/src/styles/tokens.css 的 dark 主题同源色值）。"""
     return {
-        "accent": "#66c0f4",         # --accent
+        "accent": "#66c0f4",
         "accent_deep": "#1a9fff",    # 按钮底色（accent 加深一档）
-        "success": "#a4d007",        # --success
+        "success": "#a4d007",
         "danger": "#f44336",         # 降价红
         "warning": "#e6a23c",        # 告警橙
         "on_accent": "#0c1724",      # accent 底上的文字（深色保证对比度）
-        "bg_page": "#0e1a27",        # --bg-base
-        "bg_card": "#1b2838",        # --bg-card
-        "bg_chip": "#223449",        # --bg-chip
+        "bg_page": "#0e1a27",
+        "bg_card": "#1b2838",
+        "bg_chip": "#223449",
         "bg_panel": "#0e1a27",       # 卡片内嵌面板底（与页面底同色）
-        "text_main": "#d9e3ec",      # --text-primary
-        "text_sub": "#8f98a0",       # --text-muted
+        "text_main": "#d9e3ec",
+        "text_sub": "#8f98a0",
         "text_dim": "#6b7683",       # 更弱一档（眉标签 / 页脚注）
         "border_strong": "#2a475e",  # --border-strong 等效实色
         "row_border": "#2e3d4f",     # 行分隔线
@@ -328,7 +320,6 @@ def _theme_colors() -> dict[str, str]:
 
 
 _FLAG_TMPL = "https://flagcdn.com/w40/{code}.png"
-# 封面 CDN 归一：历史域名 → 现行 akamai（与 games/bundles 域的图片归一同一口径）
 _COVER_HOST_RE = re.compile(
     r"^https?://shared\.(?:fastly\.steamstatic|cdn\.queniuqe)\.com", re.IGNORECASE
 )
@@ -388,9 +379,6 @@ def _region_store_url(appid, region: str = "") -> str:
     return f"{base}?cc={cc}&l=schinese" if cc else base
 
 
-# ══════════════════════════════════════════════════════════════════
-# 二、原子组件
-# ══════════════════════════════════════════════════════════════════
 
 
 def _row(inner: str, *, pad: str = "0 24px") -> str:
@@ -483,7 +471,6 @@ def _bullet_list(c: dict[str, str], items: list[str]) -> str:
     )
 
 
-# ─── 邮件骨架 ──────────────────────────────────────────────────────
 
 
 def _brand_header(c: dict[str, str]) -> str:
@@ -608,9 +595,6 @@ def _notice(c: dict[str, str], text: str, *, color: str = "") -> str:
     )
 
 
-# ══════════════════════════════════════════════════════════════════
-# 三、邮件模板
-# ══════════════════════════════════════════════════════════════════
 
 
 def _test_mail_html(*, host: str, port: int, user: str, to_addr: str, use_ssl: bool) -> str:
@@ -651,7 +635,6 @@ def _test_mail_html(*, host: str, port: int, user: str, to_addr: str, use_ssl: b
     return _page_html(c, inner, preheader="邮箱连通性测试通过，Holdexar 推送已就绪")
 
 
-# ─── 连通性测试（前端「测试连通性」键）─────────────────────────────
 
 
 async def send_test_mail(
@@ -668,7 +651,7 @@ async def send_test_mail(
     配置不完整或 SMTP 失败均抛 ValueError（消息可直接展示给用户），
     成功返回 {"ok": True}。
     """
-    if not password:  # 表单密码留空 = 沿用已存密码
+    if not password:
         password = await get_secret_value("smtp.password", "")
     missing = [
         name

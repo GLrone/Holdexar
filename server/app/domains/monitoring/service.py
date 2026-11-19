@@ -39,16 +39,13 @@ from app.domains.monitoring.models import (
 
 logger = logging.getLogger(__name__)
 
-# 来源优先级：只决定 crawl 队列先后，不决定监控资格。
-# 星标关注与家族愿望单同属第一优先级组（关注略先），手动入池 / 已购 /
-# 导入 / 榜单属第二优先级——沿用监控条目排序的既有档位。
 SOURCE_PRIORITY: dict[str, int] = {
-    "favorite": 100,         # 星标关注（follows 直挂）
-    "family_wishlist": 95,   # 家族 / 多账号愿望单（wishlist_items.wishlisted）
-    "manual": 60,            # 手动入池（add_pool_items 直挂）
-    "owned": 40,             # 已购同步（wishlist_items.owned）
-    "import": 30,            # 捆绑包导入（bundles/refresh.import_bundle）
-    "board": 20,             # 榜单发现源落池（ensure_board_pool 直挂）
+    "favorite": 100,
+    "family_wishlist": 95,
+    "manual": 60,
+    "owned": 40,
+    "import": 30,
+    "board": 20,
     # 外部社区「最受期待」榜落池（admin 侧脚本经 ensure_board_pool(source=...) 推）。
     # 与 board 同档但**必须是独立来源**：board 只代表 Steam 官方榜单，两者共用
     # 一个标签会让榜单语义混入外部清单。
@@ -56,17 +53,11 @@ SOURCE_PRIORITY: dict[str, int] = {
 }
 DEFAULT_SOURCE_PRIORITY = 10
 
-# wishlist_items 的来源布尔列 → monitoring source（多账户同 appid 去重后取并
-# 集）。项目自加来源（favorite / manual / board）由各自动作直写监控层，不在
-# 账户对账的输入之列。
 _WISHLIST_SOURCE_FLAGS: tuple[tuple[str, str], ...] = (
     ("wishlisted", "family_wishlist"),
     ("owned", "owned"),
 )
 
-# 账号派生来源：由 wishlist_items（Steam 账户来源数据）对账产生，账号同步时
-# 按现状重算。用户显式来源（favorite / manual）与榜单落池（board）各有直接
-# 管理者——对账只收敛本集合内的种类，不会把它们洗掉。
 DERIVED_SOURCES: frozenset[str] = frozenset({"family_wishlist", "owned"})
 
 # 单次批量同步的 appid 数（SQLite 变量数上限防御）
@@ -83,7 +74,6 @@ def _priority_of(source: str) -> int:
     return SOURCE_PRIORITY.get(source, DEFAULT_SOURCE_PRIORITY)
 
 
-# ── 内部：在册身份与生命周期 ──────────────────────────────────
 
 
 async def _target_states(
@@ -138,7 +128,6 @@ async def _clear_exclusions(session, target_type: str, target_ids: list[int], no
     ).values(active=False, cleared_at=now))
 
 
-# ── 对外：来源维护 ────────────────────────────────────────────
 
 
 async def sync_sources(
@@ -344,7 +333,6 @@ async def detach_all_sources(target_type: str, target_id: int) -> str:
     return state
 
 
-# ── 对外：排除（用户意图，与业务状态正交）────────────────────
 
 
 async def set_exclusion(
@@ -466,7 +454,6 @@ async def forget(target_type: str, target_id: int) -> bool:
     return True
 
 
-# ── 对外：状态查询 ────────────────────────────────────────────
 
 
 async def state_of(target_type: str, target_id: int) -> str | None:
@@ -620,7 +607,6 @@ async def _hot_ids(target_type: str, ids: list[int]) -> set[int]:
     return set()
 
 
-# ── wishlist → Tracking Source 同步 ───────────────────────────
 
 
 async def sync_game_sources(appids: list[int]) -> dict[int, str]:
@@ -710,7 +696,6 @@ async def recycle_orphan_game_sources() -> int:
     )
 
 
-# ── 统计（运行验证用）────────────────────────────────────────
 
 
 async def stats() -> dict:

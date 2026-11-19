@@ -57,7 +57,6 @@ async def sync_status():
     return await service.sync_status()
 
 
-# ─── 游戏生涯（称号 / 热力图 / 偏好画像 / 纪录）──────────
 
 
 @router.get("/career")

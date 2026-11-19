@@ -36,38 +36,25 @@ from app.domains.games.models import Game
 from app.domains.games.series import _display_name_for
 from app.domains.settings import service as settings_service
 
-# 时长分布分档（分钟左闭右开；hi=None 表示不设上界），档位文案由前端按序取 key
 PLAYTIME_BUCKETS: tuple[tuple[int, int | None], ...] = (
     (0, 1), (1, 60), (60, 300), (300, 1200), (1200, 3000), (3000, None),
 )
-# 时段切分（本机时区）：深夜 0-4 / 清晨 5-8 / 白天 9-17 / 夜间 18-23
 NIGHT_HOURS = range(0, 5)
 MORNING_HOURS = range(5, 9)
 DAY_HOURS = range(9, 18)
 EVENING_HOURS = range(18, 24)
 SPOTLIGHT_LIMIT = 18
 TASTE_LIMIT = 12
-# 通关跨度纪录的下限：零星几条解锁挤在几分钟里不算「通关用时」
 SPAN_MIN_UNLOCKS = 5
 SPAN_MIN_MINUTES = 60
-# 里程碑节点（第 N 枚解锁）+ 箴言墙条目数
 MILESTONE_STEPS = (1, 10, 50, 100, 250, 500, 1000)
 QUOTE_LIMIT = 12
 QUOTE_MIN_LEN = 8
-# 未完待续墙 / 尘封角落 的展示条数
 UNFINISHED_LIMIT = 12
 DORMANT_LIMIT = 12
-# 系列进度：只统计拥有 ≥2 款的系列（单款构不成「进度」），展示条数封顶
 SERIES_MIN_OWNED = 2
 SERIES_LIMIT = 18
 
-# 标签 → 风格族。只收「与旧 genres 大类同名的标签」——细粒度标签（农场模拟 /
-# 像素图形…）不猜族，凭空归类会把画像算成拍脑袋结论；未归族的标签只进
-# 标签榜、不进族榜。
-# **中文等值匹配只允许放在后端**：前端 `.ts` 里出现中文字面量会被双语红线
-# （no-hardcoded-cjk）直接拦下，前端只认这里的 ASCII 族 id，再由词典把族 id
-# 译成「手感党 / 剧情党」这类画像标签。
-# 标签表里没有的名字（如旧类型的「网络出版」）不登记，避免悬空映射。
 TAG_FAMILIES: dict[str, tuple[str, ...]] = {
     "action": ("动作",),
     "adventure": ("冒险",),
@@ -340,11 +327,9 @@ def _fill_playtime(career: dict, pairs: list) -> None:
         "untouchedGames": sum(1 for m in minutes if m == 0),
         "histogram": histogram,
     })
-    # 生涯封面墙：时长榜前 N 款带封面陈列（「带游戏图片」的主体来源）
     ordered = sorted(pairs, key=lambda x: (-(x[0].playtime_min or 0), (x[0].name or "").lower()))
     career["spotlight"] = [_game_brief(g, gm) for g, gm in ordered[:SPOTLIGHT_LIMIT]]
 
-    # 未完待续：开过坑但没拿满（差得越少越靠前，同缺口按进度高者优先）
     pending = [
         (g, gm) for g, gm in pairs
         if (g.total_achievements or 0) > 0 and 0 < (g.unlocked or 0) < (g.total_achievements or 0)
@@ -359,7 +344,6 @@ def _fill_playtime(career: dict, pairs: list) -> None:
         for g, gm in pending[:UNFINISHED_LIMIT]
     ]
 
-    # 尘封角落：有实际时长、但最后一次启动最早的那批（长期没再碰）
     stale = [(g, gm) for g, gm in pairs if (g.playtime_min or 0) > 0 and (g.last_played or 0) > 0]
     stale.sort(key=lambda x: x[0].last_played or 0)
     career["dormant"] = [
@@ -402,7 +386,6 @@ def _fill_trophy(career: dict, pairs: list, achieved: list[dict]) -> None:
         "platinumRate": round(perfect * 100.0 / len(trophy), 1) if trophy else 0.0,
         "rareCount": rare_count,
         "rareShare": round(rare_count * 100.0 / len(achieved), 1) if achieved else 0.0,
-        # 平均稀有度 = 已解锁成就全局解锁率均值（越低越硬核）
         "avgRarity": round(sum(rated) / len(rated), 1) if rated else 0.0,
         "perHour": round(unlocked / max(1.0, career["playtime"]["totalMin"] / 60.0), 2),
         "rarity": rarity,
@@ -469,9 +452,7 @@ def _fill_activity(career: dict, achieved: list[dict], pairs: list) -> None:
         "eveningUnlocks": sum(hours[h] for h in EVENING_HOURS),
         "weekendUnlocks": weekdays[5] + weekdays[6],
         "hourWeekday": hour_weekday,
-        # 月度序列（稀疏，只给有解锁的月份；前端补齐空档着色）
         "monthly": [{"month": k, "count": months[k]} for k in sorted(months)],
-        # 最长空窗：相邻活跃日之间最大的间隔（断更天数）
         "maxGapDays": max(((b - a).days for a, b in zip(days, days[1:])), default=0),
         "firstUnlock": (
             {**first, "headerImage": _game_brief(*name_of[first["appid"]])["headerImage"]}
@@ -593,10 +574,8 @@ def _fill_series(career: dict, pairs: list) -> None:
                 row["playedTotal"] += total
 
         brief = _game_brief(g, gm)
-        # 系列封面：取时长最高的一款（大系列里最能代表该系列的那作）
         if row["top"] is None or minutes > row["top"]["playtimeMin"]:
             row["top"] = brief
-        # 「差几枚就全成就」里缺口最小的那款（最有行动价值的下一步）
         remaining = total - unlocked
         if 0 < unlocked < total and (
             row["next"] is None or remaining < row["next"]["remaining"]
@@ -609,8 +588,6 @@ def _fill_series(career: dict, pairs: list) -> None:
     series["perfected"] = sum(
         1 for r in rows if r["platinum"] > 0 and r["platinum"] == r["owned"]
     )
-    # 排序：先看「真的在玩」（已玩作品数），再看白金，最后看时长——
-    # 一款没碰的大系列不该压过款数少但全程通关的系列。
     rows.sort(key=lambda r: (-r["played"], -r["platinum"], -r["playtimeMin"], r["names"][0]))
     out: list[dict] = []
     for r in rows[:SERIES_LIMIT]:
@@ -718,8 +695,6 @@ def _fill_platinum(
 
     tag_counter: Counter[str] = Counter()
     for g, _gm in rows:
-        # 白金作只记票重最高的那个标签：20 个标签全记会让每部白金作都给大众
-        # 标签各投一票，榜单退化成「人人都有的标签」
         top = _tag_weights(tag_map.get(g.appid))
         if top:
             tag_counter[top[0][0]] += 1
@@ -767,16 +742,12 @@ def _fill_taste(career: dict, pairs: list, tag_map: dict[int, list[dict]]) -> No
         platinum = bool(g.platinum)
         tag_list = _tag_weights(tag_map.get(g.appid))
         dev_list = _json_list(gm.developers if gm else None)
-        # 时长按票重分摊：一作的 20 个标签里票高的是它的定义性特征，均分会把
-        # 「口味」摊平成人人都有的大众标签；单作贡献总时长与旧口径同样守恒。
         total_weight = sum(w for _, w in tag_list)
         for name, weight in tag_list:
             row = tags.setdefault(name, {"tag": name, "games": 0, "playtimeMin": 0, "platinum": 0})
             row["games"] += 1
             row["playtimeMin"] += (minutes * weight / total_weight) if total_weight else 0
             row["platinum"] += 1 if platinum else 0
-        # 风格族：同一款的多个标签常落进同一族，按**去重后的族数**均分时长，
-        # 避免一作把某个族撑成双倍权重。
         fam_list = {TAG_FAMILY_OF[n] for n, _ in tag_list if n in TAG_FAMILY_OF}
         fam_share = minutes / max(1, len(fam_list)) if fam_list else 0
         for family in fam_list:

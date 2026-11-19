@@ -72,7 +72,7 @@ class TestItemJudgement:
         assert row is not None
         assert row["price_status"] == "locked"
         assert row["price"] is None
-        assert row["mps"] == 1  # item_type=1 → Sub
+        assert row["mps"] == 1
 
     def test_visible_without_option_is_locked(self) -> None:
         row = refresh._browse_row(_item(best_purchase_option=None, purchase_options=[]),
@@ -97,7 +97,6 @@ class TestPriceUnits:
         assert row["price"] == 499_500
         assert row["original_price"] == 549_500
         assert row["currency"] == "JPY"
-        # cny_fen 按「分 → 分」折算：round(price × rate)，不得再乘 100
         assert refresh._row_cny_fen(row, {"JPY": 0.04353}) == round(499_500 * 0.04353)
 
     def test_original_price_prefers_before_bundle_discount(self) -> None:
@@ -169,8 +168,8 @@ class TestIdentitySemanticsSplit:
             "package_group": "default",
         })
         row = refresh._browse_row(item, 63575, "us", "bundleid")
-        assert row["item_kind"] == 0  # 形态：bundle
-        assert row["mps"] == 1  # 语义：必须整包
+        assert row["item_kind"] == 0
+        assert row["mps"] == 1
 
     def test_sub_shape_semantics_from_option(self) -> None:
         item = _item(item_type=1, best_purchase_option={
@@ -180,7 +179,7 @@ class TestIdentitySemanticsSplit:
         })
         row = refresh._browse_row(item, 1066582, "jp", "packageid")
         assert row["item_kind"] == 1
-        assert row["mps"] == 1  # Sub 形态恒不可拆，选项 mps 只锦上添花
+        assert row["mps"] == 1
 
     def test_plain_bundle_shape(self) -> None:
         row = refresh._browse_row(_item(), 13608, "us", "bundleid")
@@ -198,8 +197,8 @@ class TestIdentitySemanticsSplit:
         )
         row = refresh._browse_row(item, 63575, "ru", "bundleid")
         assert row["price_status"] == "locked"
-        assert row["item_kind"] == 0  # 形态仍有（顶层 item_type 不受锁区影响）
-        assert row["mps"] is None  # 语义不投票
+        assert row["item_kind"] == 0
+        assert row["mps"] is None
 
     def test_majority_vote_decides_mps(self) -> None:
         """多数决：40 区 mps=1 + 1 区 mps=0（首行）→ 仍判 1。"""
@@ -207,7 +206,7 @@ class TestIdentitySemanticsSplit:
         assert refresh._majority(votes) == 1
         assert refresh._majority([1, 1, 0]) == 1
         assert refresh._majority([]) is None
-        assert refresh._majority([0, 1]) is None  # 平票不改写
+        assert refresh._majority([0, 1]) is None
 
     def test_browse_kind_reads_shape_not_semantics(self) -> None:
         """选键判据是形态：mps=1 的 bundle 形态包必须仍按 bundleid 问。"""
@@ -263,7 +262,7 @@ class TestIdentitySemanticsSplit:
         from app.core.database import get_session_factory, init_db
         from app.domains.games.models import Bundle, BundleRegionPrice
 
-        bid = 990_433  # 单 DLC sub 桩（垃圾来源：Civ5 巴比伦类）
+        bid = 990_433
         await init_db()
         try:
             async with get_session_factory()() as db:
@@ -289,7 +288,7 @@ class TestIdentitySemanticsSplit:
                     select(BundleRegionPrice).where(
                         BundleRegionPrice.bundle_id == bid)
                 )).scalars().all())
-            assert b is None and n_prices == 0  # 整包删净
+            assert b is None and n_prices == 0
         finally:
             async with get_session_factory()() as db:
                 await db.execute(delete(BundleRegionPrice).where(
@@ -347,11 +346,11 @@ class TestBundleDiscovery:
                 {"packageid": 1066582, "must_purchase_as_set": False,
                  "purchase_option_name": "Overcooked! 2 - Gourmet Edition"},
                 {"packageid": 279940, "must_purchase_as_set": False,
-                 "purchase_option_name": "Overcooked! 2"},  # 本体 sub 同名 → 丢弃
+                 "purchase_option_name": "Overcooked! 2"},
                 {"bundleid": 8017, "must_purchase_as_set": True,
                  "purchase_option_name": "重复项去重"},
                 {"packageid": 123, "must_purchase_as_set": False,
-                 "purchase_option_name": ""},  # 无名选项跳过
+                 "purchase_option_name": ""},
             ],
         }
         found = bs._discover_bundles_from_item(item)
@@ -425,7 +424,7 @@ class TestBundleDiscovery:
                 {"bundle_id": bid_known, "name": "覆盖尝试", "mps": 0, "item_kind": 1,
                  "app_ids": [728880]},
             ])
-            assert n == 1  # 只插入新的
+            assert n == 1
             async with get_session_factory()() as db:
                 new = (await db.execute(
                     select(Bundle).where(Bundle.bundle_id == bid_new)
@@ -434,7 +433,7 @@ class TestBundleDiscovery:
                     select(Bundle).where(Bundle.bundle_id == bid_known)
                 )).scalar_one()
             assert (new.must_purchase_as_set, new.item_kind) == (1, 0)
-            assert new.updated_at is None  # 发现桩：播种查询按 NULL 捞
+            assert new.updated_at is None
             assert (known.must_purchase_as_set, known.item_kind, known.name) == (0, 0, "完整主档")
         finally:
             async with get_session_factory()() as db:
@@ -447,7 +446,7 @@ class TestBundleDiscovery:
 
 class TestAlignment:
     def test_positional_when_counts_match(self) -> None:
-        items = [{"id": 1}, {"id": 0}, {"id": 3}]  # 未收录条目回 id=0
+        items = [{"id": 1}, {"id": 0}, {"id": 3}]
         assert refresh._align_items(items, [1, 2, 3]) == [(1, {"id": 1}), (2, {"id": 0}), (3, {"id": 3})]
 
     def test_fallback_by_id_when_counts_differ(self) -> None:
@@ -465,7 +464,7 @@ class TestBundleRegionsIdentity:
 
         async def fake(session, want):
             calls.append(want)
-            if want[0][1] == 1:  # 换到 packageid 才有真实条目
+            if want[0][1] == 1:
                 return {13608: [{"price_status": "ok", "mps": 1, "kind": "packageid"}]}
             return {}
 
@@ -483,7 +482,7 @@ class TestBundleRegionsIdentity:
 
         monkeypatch.setattr(refresh, "_fetch_regions_batched", fake)
         assert _run(refresh._fetch_bundle_regions(None, 1066582, force_package=True)) == []
-        assert [w[0][1] for w in calls] == [1]  # 只问一次，不兜底
+        assert [w[0][1] for w in calls] == [1]
 
     def test_locked_rows_count_as_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def fake(session, want):

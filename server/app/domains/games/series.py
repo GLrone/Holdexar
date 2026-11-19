@@ -92,7 +92,6 @@ _FORCED_SERIES_PREFIX = (
 )
 
 
-# ─── 系列覆盖文件（数据目录，机器本地不入库） ────────────────────────────
 
 _OVERRIDES_FILENAME = "series_overrides.json"
 
@@ -235,15 +234,9 @@ def is_same_series(
     c2 = _cn_chars(name2)
     en1_all = name1 if not (en1 or "").strip() else en1
     en2_all = name2 if not (en2 or "").strip() else en2
-    # 结构规则（3/4/5）剥离开头冠词再比：冠词是装饰，剥掉后 The Witcher
-    # 1/2/3 的前缀判定与 Witcher 1/2/3 同轨；The Legend of X 也不再凭
-    # the legend of 三个虚词过 ≥3 词门槛
     s1 = t1[1:] if t1 and t1[0] in ("the", "a", "an") else t1
     s2 = t2[1:] if t2 and t2[0] in ("the", "a", "an") else t2
 
-    # 1) 英文分隔符前缀一致（如 "GTA: ..." / "GTA- ..." 同前缀），≥4 字符；
-    #    变体：前缀只差尾部序号也算（The Witcher: EE ↔ The Witcher 3: Wild
-    #    Hunt 前缀同为 the witcher）——去尾号比较，仍需 ≥4 字符
     b1 = _sep_base(en1_all)
     b2 = _sep_base(en2_all)
     if b1 and b2:
@@ -251,7 +244,6 @@ def is_same_series(
             if x == y and len(x) >= 4:
                 return True
 
-    # 2) 中文分隔符前缀一致，≥2 字且不在负面词表
     cb1, cb2 = _sep_base(name1), _sep_base(name2)
     if cb1 and cb2:
         base1, base2 = _cn_chars(cb1[0]), _cn_chars(cb2[0])
@@ -262,28 +254,18 @@ def is_same_series(
         ):
             return True
 
-    # 3) 英文连续公共词前缀 ≥2（如 Call of Duty 全家）。前缀恰好 2 词时
-    #    证据弱一档：首词不在负面词表，且次词不是虚词（X of Y 撞车高发，
-    #    Call of Duty 与 Call of Juarez 共用 call of 却非同系列）；≥3 词的
-    #    前缀（sid meiers civilization / age of empires）本身已够特异
     pre = _common_prefix_len(s1, s2)
     if pre >= 2 and (
         pre >= 3 or (s1[0] not in _BAD_EN_STARTS and s1[1] not in _GENERIC_MINOR)
     ):
         return True
 
-    # 4) 纯序号续作：短名是长名的完整词前缀，且长名前缀后紧跟序号
-    #   （Portal → Portal 2 / Diablo → Diablo III）。短名须承载得起证据
-    #   （裸序号 "2" 与 "2.0" 开头的版本名前缀相等纯属巧合）
     short, long_ = (s1, s2) if len(s1) <= len(s2) else (s2, s1)
     if _en_usable(short) and long_[: len(short)] == short and len(long_) > len(short):
         nxt = long_[len(short)]
         if _is_sequel_number(nxt):
             return True
 
-    # 5) 同前缀 + 尾部版本号互异（FIFA 22 / FIFA 23、NBA 2K25 / 2K26、
-    #   Doom 3 / Doom 2016）。前缀需 ≥3 字符，防 "Room 13 / Room 66" 一类
-    #   编号撞车；前缀 2 词时与规则 3 同样的弱证据门槛
     if pre >= 1:
         rest1, rest2 = s1[pre:], s2[pre:]
         strong = pre >= 3 or (
@@ -301,7 +283,6 @@ def is_same_series(
         ):
             return True
 
-    # 6) 中文严格前缀（辐射4 → 辐射：新维加斯），≥2 字且不在负面词表
     if c1 != c2 and len(c1) >= 2 and len(c2) >= 2:
         short_c, long_c = (c1, c2) if len(c1) < len(c2) else (c2, c1)
         if (
@@ -310,7 +291,6 @@ def is_same_series(
         ):
             return True
 
-    # 7) 中文完全一致 + 英文有佐证（短中文名撞车最频繁，须英文作保）
     if c1 and c1 == c2:
         ratio = SequenceMatcher(None, en1_all.lower(), en2_all.lower()).ratio()
         if _common_prefix_len(s1, s2) >= 1 or (
@@ -318,7 +298,6 @@ def is_same_series(
         ):
             return True
 
-    # 8) 高相似度兜底（容错重制版/版本差异的英文写法）
     if _en_usable(s1) and _en_usable(s2):
         if SequenceMatcher(None, " ".join(s1), " ".join(s2)).ratio() > 0.90:
             return True
@@ -375,7 +354,6 @@ def build_clusters(
         if ri != rj:
             parent[ri] = rj
 
-    # 覆盖种子先落：同一键下全部成员互连成一组
     appid_key: dict[int, str] = {}
     key_members: dict[str, list[int]] = {}
     if overrides:
@@ -414,7 +392,6 @@ def build_clusters(
 
     out: list[tuple[str, list[int]]] = []
     for grp in groups.values():
-        # 覆盖键命中：组名以文件为准（键内被列成员最多者，并列取键名字序）
         keys_hit: dict[str, int] = defaultdict(int)
         for m in grp:
             key = appid_key.get(m.appid)

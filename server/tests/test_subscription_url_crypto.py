@@ -63,13 +63,12 @@ async def _row_url(sub_id: int) -> str:
         return row.url
 
 
-# ── 原语 ────────────────────────────────────────────────
 
 def test_seal_open_roundtrip_and_plaintext_compat():
     sealed = seal_url(URL_A)
     assert sealed.startswith("enc1:") and URL_A not in sealed
     assert open_url(sealed) == URL_A
-    assert open_url(URL_A) == URL_A  # 存量明文原样可用
+    assert open_url(URL_A) == URL_A
     assert seal_url("") == "" and open_url("") == ""
 
 
@@ -77,7 +76,6 @@ def test_url_matches_and_unreadable(monkeypatch):
     sealed = seal_url(URL_A)
     assert url_matches(sealed, URL_A) and not url_matches(sealed, URL_B)
     assert not url_matches("", URL_A) and not url_matches(None, URL_A)
-    # 换机（指纹不同）后解不开 → 空串 + 不匹配
     original = secretbox._machine_fingerprint
     secretbox._machine_fingerprint = lambda: b"another-machine"
     secretbox.clear_key_cache()
@@ -89,7 +87,6 @@ def test_url_matches_and_unreadable(monkeypatch):
         secretbox.clear_key_cache()
 
 
-# ── 订阅行：落库密文、面板明文、换链比较 ─────────────────
 
 @pytest.mark.asyncio
 async def test_add_and_list_subscription_encrypted_at_rest(db, monkeypatch):
@@ -109,7 +106,7 @@ async def test_add_and_list_subscription_encrypted_at_rest(db, monkeypatch):
     result = await proxies_service.add_subscription("clash", URL_A, "测试机场")
 
     stored = await _row_url(result["id"])
-    assert stored.startswith("enc1:") and URL_A not in stored  # 落库即密文
+    assert stored.startswith("enc1:") and URL_A not in stored
     listed = await proxies_service.list_subscriptions("clash")
     target = next(s for s in listed if s["id"] == result["id"])
     assert target["url"] == "https://provider.example/***"
@@ -121,12 +118,10 @@ async def test_add_and_list_subscription_encrypted_at_rest(db, monkeypatch):
 async def test_update_subscription_compares_and_seals(db):
     sub_id = await _seed_sub(seal_url(URL_A))
 
-    # 同链重存：开封比较相等，不触发换链重写（仍是密封的同一明文）
     await proxies_service.update_subscription(sub_id, url=URL_A)
     stored = await _row_url(sub_id)
     assert secretbox.is_encrypted(stored) and open_url(stored) == URL_A
 
-    # 换链：开封比较不等 → 新链接密封落库，返回明文
     r2 = await proxies_service.update_subscription(sub_id, url=URL_B)
     assert r2["url"] == "https://provider.example/***"
     stored = await _row_url(sub_id)
@@ -137,7 +132,6 @@ async def test_update_subscription_compares_and_seals(db):
 async def test_migrate_legacy_kv_dedupes_on_decrypted_url(db, monkeypatch):
     from app.domains.settings import service as settings_service
 
-    # 预置一条同链密文行：迁移的去重比对要开封识别出「已存在」
     await _seed_sub(seal_url(URL_A))
 
     async def _get_value(key, default=None):
@@ -154,11 +148,10 @@ async def test_migrate_legacy_kv_dedupes_on_decrypted_url(db, monkeypatch):
     await proxies_service.migrate_legacy_subscription()
 
     rows = await proxies_service.list_subscriptions("clash")
-    assert len(rows) == 1  # 同链不重复迁移
-    assert set_calls  # 迁移后清 KV
+    assert len(rows) == 1
+    assert set_calls
 
 
-# ── 快照 provenance：密封落库 + 开封匹配 ─────────────────
 
 def _fetch_result() -> FetchResult:
     nodes = [{"name": "hk-1", "type": "ss", "server": "1.2.3.4", "port": 8388}]
@@ -176,11 +169,10 @@ async def test_snapshot_provenance_sealed_and_matched(db, tmp_path):
     async with proxies_service.get_session_factory()() as session:
         row = await persist_snapshot(session, snap, data_dir=tmp_path)
         stored = await session.get(SubscriptionSnapshot, row.id)
-        assert secretbox.is_encrypted(stored.url) and URL_A not in stored.url  # 落库即密文
+        assert secretbox.is_encrypted(stored.url) and URL_A not in stored.url
 
         got = await latest_snapshot(session, sub_id, url=URL_A)
         assert got is not None and got.url == URL_A
-        # 换链后旧快照不得顶替（provenance 语义保持）
         assert await latest_snapshot(session, sub_id, url=URL_B) is None
 
 
@@ -191,7 +183,6 @@ async def test_snapshot_unreadable_url_skipped_in_match(db, tmp_path, monkeypatc
     snap = build_snapshot(sub_id, URL_A, _fetch_result(), [{"name": "hk-1"}])
     async with proxies_service.get_session_factory()() as session:
         row = await persist_snapshot(session, snap, data_dir=tmp_path)
-        # 把行内密文换成「另一台机器」封装的密文：开封必败
         original = secretbox._machine_fingerprint
         secretbox._machine_fingerprint = lambda: b"another-machine"
         secretbox.clear_key_cache()
@@ -205,21 +196,19 @@ async def test_snapshot_unreadable_url_skipped_in_match(db, tmp_path, monkeypatc
         assert await latest_snapshot(session, sub_id, url=URL_A) is None
 
 
-# ── 启动封存步骤 ────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_seal_subscription_urls_idempotent(db):
-    plain_id = await _seed_sub(URL_A)  # 存量明文行
-    sealed_id = await _seed_sub(seal_url(URL_B))  # 已是密文
-    await _seed_sub("", kind="plain")  # 空值跳过
+    plain_id = await _seed_sub(URL_A)
+    sealed_id = await _seed_sub(seal_url(URL_B))
+    await _seed_sub("", kind="plain")
 
     assert await proxies_service.seal_subscription_urls() == 1
     assert secretbox.is_encrypted(await _row_url(plain_id))
     assert open_url(await _row_url(plain_id)) == URL_A
-    # 已是密文的行原样保留（开封后仍是同一明文）
     assert secretbox.is_encrypted(await _row_url(sealed_id))
     assert open_url(await _row_url(sealed_id)) == URL_B
-    assert await proxies_service.seal_subscription_urls() == 0  # 幂等
+    assert await proxies_service.seal_subscription_urls() == 0
 
 
 @pytest.mark.asyncio
@@ -239,7 +228,6 @@ async def test_unreadable_row_reports_user_guidance(db, monkeypatch):
 
     monkeypatch.setattr(proxies_service, "get_subscription", _fake_get)
 
-    # 「另一台机器」读这行密文 → 空串 → 用户语言报错（可重新添加订阅）
     original = secretbox._machine_fingerprint
     secretbox._machine_fingerprint = lambda: b"another-machine"
     secretbox.clear_key_cache()

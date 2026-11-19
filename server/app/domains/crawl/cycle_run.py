@@ -102,10 +102,6 @@ async def _run_price_cycle(
                 f"本轮链已跑完，共启动 {len(results)} 个爬取任务",
                 detail={"任务": "/".join(str(r["id"]) for r in results)},
             )
-        # 本轮结束时仍有待补欠账 → 本轮进入 repairing。补抓由既有 5min
-        # repair 通道承担（它扫全库账本，与本轮期望集没有确定性关联，job
-        # 暂不挂 Cycle），Cycle 只把「本轮确实遗留了未覆盖单元」记下来。
-        # 用户已停整轮时不进 repairing——停止语义是「到此为止」，不是欠账信号。
         if (
             cycle_id is not None
             and not stop_event.is_set()
@@ -121,8 +117,6 @@ async def _run_price_cycle(
             level=logging.ERROR,
             exc_info=True,
         )
-        # 兜底收敛自身再败（同拍两连败）也不外逃：Cycle 行留给重启收尸，
-        # 调用方按正常返回值走
         with contextlib.suppress(Exception):
             await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
         with contextlib.suppress(Exception):
@@ -136,9 +130,6 @@ async def _run_price_cycle(
     # 下次进程重启才被孤儿清理收尸，期间前端「这轮跑到哪了」永远无解。
     try:
         jobs = await price_cycle.jobs_of(cycle_id)
-        # 终态为 failed 时必须随行写明拒因（error 字段与日志同源）：
-        # 「整轮零启动」「全段失败」「冻结失败」各有真实原因可查，
-        # 账本只记 failed 不记原因等于让使用者面对不可信记录。
         terminal_error: str | None = None
         env_aborted = env_abort_reason(skipped)
         summary = await price_cycle.get(cycle_id)
@@ -154,14 +145,10 @@ async def _run_price_cycle(
                 deferred=bool(deferred),
             )
             if env_aborted is not None and terminal != price_cycle.COMPLETED:
-                # 环境拒因压过通用失败文案：账本上要能看出「本轮是让路停的，
-                # 不是爬挂了」，否则使用者会对着失败记录找不存在的故障。
-                # 一个段都没起来时按取消记：本轮是主动不跑，不是跑坏了
                 terminal_error = env_aborted
                 if not jobs:
                     terminal = price_cycle.CANCELLED
             elif not jobs and stop_event is not None and stop_event.is_set():
-                # 停在了第一个段之前：用户意图明确，不按「无事可做/没跑起来」记
                 terminal = price_cycle.CANCELLED
                 terminal_error = "用户已停止"
             elif terminal == price_cycle.FAILED and not jobs:
@@ -173,8 +160,6 @@ async def _run_price_cycle(
                 terminal_error = "本轮有未更新的游戏，已保留并将在后续更新中优先补跑"
         if not await price_cycle.advance(cycle_id, price_cycle.FINALIZING):
             return True if stop_event.is_set() else started
-        # 收尾段（标记刷新/事件检测/统计）分钟级且无抓取在跑：实时告知前端
-        # 切「汇总中」呈现，别让岛停在「正在抓取 100%」像卡死
         bus.publish("price_cycle.finalizing", cycleId=cycle_id)
         # 停止的轮跳过事件检测与通知：未观察到的单元不等于「不可用」，半轮
         # 事实不产生价格事件、不发邮件；终态与统计照常落账
@@ -205,7 +190,6 @@ async def _run_price_cycle(
                 "期望单元": expected_units,
             },
         )
-        # 通知是 Cycle 收敛后的下游副作用：失败只影响候选状态，不影响终态与统计
         if not stop_event.is_set():
             await notify_events(cycle_id)
         await record_stats(cycle_id)
@@ -218,7 +202,6 @@ async def _run_price_cycle(
             exc_info=True,
             detail={"周期": cycle_id},
         )
-        # 兜底收敛自身再败（同拍两连败）也不外逃：Cycle 行留给重启收尸
         with contextlib.suppress(Exception):
             await settle_cycle(cycle_id, price_cycle.FAILED, error=str(e)[:200])
         with contextlib.suppress(Exception):

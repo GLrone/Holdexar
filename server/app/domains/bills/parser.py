@@ -62,13 +62,10 @@ SYMBOL_MAP = sorted(
 )
 
 GAME_TYPES = {
-    # 中文
     "购买", "礼物购买", "游戏内购买", "退款",
-    # 英文
     "Purchase", "Gift Purchase", "In-Game Purchase", "Refund",
 }
 
-# ── 类型规范化映射（英文 → 中文）──
 TX_TYPE_NORM: dict[str, str] = {
     "Purchase":          "购买",
     "Gift Purchase":     "礼物购买",
@@ -79,11 +76,8 @@ TX_TYPE_NORM: dict[str, str] = {
     "Conversion":                "转换",
 }
 
-# 批量市场交易（如 "6 Market Transactions"）
 _MARKET_BATCH_RE = re.compile(r"^\d+\s+Market\s+Transactions?$", re.I)
 
-# ── 类型识别正则（与 Steam 消费历史分类器 classifyRow 同源，中英繁兼容）──
-# 分类器原文顺序：refund → convert → ingame → market → gift → purchase
 RE_TYPE = {
     "refund": re.compile(r"退款|Refund", re.I),
     "convert": re.compile(r"转换|轉換|Convert", re.I),
@@ -115,22 +109,15 @@ def classify_type(tx_type: str, item_str: str = "", wallet_change: str = "") -> 
             return "market_sell"
         if "-" in (wallet_change or ""):
             return "market_buy"
-        return "market_buy"  # 无变更信息时按买入（分类器判 other，但买入对账侧更合理）
+        return "market_buy"
     if RE_TYPE["gift"].search(text):
         return "gift"
     if RE_TYPE["purchase"].search(text):
-        # 分类器：items 文本含钱包资金关键词 → 充值（convert）
         if RE_TYPE["wallet_pay"].search(item_str):
             return "convert"
         return "store"
     return "other"
 
-# ── 许可分类（商店 / 零售 / 免费 / 礼物四类）──
-# 四类关键词（正则，命中即归类，顺序：store → retail → free → gift）：
-#   store  Steam 商店 / Steam Store
-#   retail 零售 / Retail
-#   free   免费赠送 / 贄品 / Complimentary
-#   gift   礼物 / 玩家通行证 / 禮物 / 招待券 / Gift / Guest Pass
 _LICENSE_CATS: list[tuple[str, re.Pattern, str]] = [
     ("store", re.compile(r"Steam\s*商店|Steam\s*Store", re.I), "Steam 商店"),
     ("retail", re.compile(r"零售|Retail", re.I), "零售"),
@@ -275,13 +262,11 @@ def build_summary_key(item_str: str, items: list[str]) -> str:
 def is_wallet_keyword(item_str: str) -> bool:
     """识别钱包充值关键词（中英文兼容）。"""
     text = normalize_text(item_str).lower()
-    # 中文
     if "钱包资金" in text or ("钱包" in text and ("资金" in text or "wallet" in text)):
         return True
     # 英文: "Purchased $XX Wallet Credit" / "XX Wallet Credit"
     if "wallet credit" in text or "wallet fund" in text:
         return True
-    # 英文 item 以 "Purchased" 开头且含 "Credit"（充值场景）
     if text.startswith("purchased") and "credit" in text:
         return True
     return False
@@ -351,19 +336,16 @@ def parse_report(data: dict) -> dict:
                     "gift": "礼物购买",
                     "store": "购买",
                 }[sema]
-        # 过滤批量市场交易（如 "6 Market Transactions"）——
         # 新导出格式带 type_count（批量行笔数），旧格式仅 type 前缀数字
         if _MARKET_BATCH_RE.match(normalize_text(entry.get("type", ""))):
             continue
         if "市场交易" in tx_type or tx_type in ("转换", "Conversion"):
             continue
 
+
         amount, currency = parse_money(total_str)
         amount_abs = abs(amount) if amount is not None else None
-        # 新 UI：礼物行 item 含「礼物已发送给 X」内嵌段、退款行带「 退款」尾缀。
         # 分类判定用**原始文本**（含标记），展示/对账键用**净化文本**（去标记后）。
-        # 受赠人优先取导出的独立字段（DOM 层提取，名字可含空格），
-        # 无字段时文本剥离兜底（旧格式/异常数据）。
         clean_item, text_recipients = strip_gift_marks(item_str)
         gift_recipients = [
             normalize_text(r) for r in (entry.get("gift_recipients") or []) if normalize_text(r)
@@ -425,7 +407,6 @@ def parse_report(data: dict) -> dict:
             )
             continue
 
-        # tx_type 已被规范化为中文，GAME_TYPES 包含中文值
         if tx_type not in GAME_TYPES:
             continue
 
@@ -448,14 +429,12 @@ def parse_report(data: dict) -> dict:
                 "currency": currency or "CNY",
                 "discount_pct": parse_discount_pct(entry.get("discount")),
                 "orig_price": parse_original_price(entry.get("original_price")),
-                # 新导出字段（分类器对齐）：余额列/基准价/混合支付拆分
                 "wallet_balance": wallet_balance or None,
                 "base_price": base_price or None,
                 "payment_parts": payment_parts or None,
                 "is_gift": is_gift_sent,
                 "is_refund": is_refund,
                 "orig_is_gift": False,
-                # 新 UI 礼物行的受赠人（可能多个）；旧导出为空列表
                 "gift_recipients": gift_recipients,
                 "warn_mixed": is_gift_sent and len(items) > 1,
                 "dedupe_key": (date, round(amount_abs, 4), summary_key),
@@ -529,8 +508,6 @@ def parse_report(data: dict) -> dict:
     cdk_idx = 0
     for entry in licenses_raw:
         method_raw = normalize_text(entry.get("method", ""))
-        # 分类器 MATCH_CFG 同源正则分类（文案变体兜底）；
-        # free（免费赠送/Complimentary）一并落库——只展示不计价
         cat, method = classify_license(method_raw)
         license_stats[cat] = license_stats.get(cat, 0) + 1
         if cat not in ("retail", "gift", "free"):

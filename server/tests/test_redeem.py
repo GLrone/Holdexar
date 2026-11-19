@@ -41,7 +41,6 @@ class FakeResponse:
 
         self.status_code = status_code
         self._payload = payload
-        # 与真实 httpx.Response 一致：有 JSON 体时 text 即序列化结果
         if text is None:
             text = _json.dumps(payload) if payload is not None else ""
         self.text = text
@@ -79,7 +78,6 @@ async def test_activate_key_success_receipt(db, monkeypatch):
     assert r["detail"] == "激活成功"
     assert r["subId"] == "307574"
     assert r["subName"] == "Dark Envoy"
-    # raw = Steam 返回原文（前端"展开原文"核对用）
     assert "purchase_receipt_info" in r["raw"]
 
 
@@ -234,7 +232,6 @@ async def test_activation_count_per_account(db, monkeypatch):
     out = await redeem_service.quota_status()
     assert out["steamId"] == PRIMARY and out["used"] == 2
 
-    # 换绑另一个账号的 Cookie → 计数从 0 重新开始
     await settings_service.set_value(
         "account.steam_cookies",
         "sessionid=xyz; steamLoginSecure=76561198000000002%7C%7Cjwt-token-b",
@@ -297,7 +294,6 @@ async def test_list_activations_order_and_paging(db, monkeypatch):
     assert [r["key"] for r in page1["rows"]] == list(reversed(keys))[:2]
     page2 = await redeem_service.list_activations(limit=2, offset=2)
     assert [r["key"] for r in page2["rows"]] == [keys[0]]
-    # limit 夹取：超上限收 200，非法值不炸
     out = await redeem_service.list_activations(limit=99999, offset=-5)
     assert len(out["rows"]) == 3
 
@@ -309,7 +305,6 @@ async def test_search_activations_filter_and_paging(db, monkeypatch):
         "account.steam_cookies",
         "sessionid=abc123; steamLoginSecure=76561198000000001%7C%7Cjwt-token",
     )
-    # 三条不同状态的账本行（ok 回执带版本名，失败行无版本名）
     ok_resp = FakeResponse(payload={
         "success": 1,
         "purchase_receipt_info": {"line_items": [
@@ -322,30 +317,26 @@ async def test_search_activations_filter_and_paging(db, monkeypatch):
     await redeem_service.activate_key("AAAAA-BBBBB-CCCC2")
     await redeem_service.activate_key("EEEEE-FFFFF-GGGG1")
 
-    # status 过滤：ok 一条 / fail 两条
     ok_page = await redeem_service.search_activations(status="ok")
     assert ok_page["total"] == 1 and ok_page["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
     assert ok_page["rows"][0]["subName"] == "Dark Envoy"
     fail_page = await redeem_service.search_activations(status="fail")
     assert fail_page["total"] == 2
 
-    # key 精确回查（失败码回查历史成功记录的场景）
     by_key = await redeem_service.search_activations(key="AAAAA-BBBBB-CCCC1", status="ok", limit=5)
     assert by_key["total"] == 1 and by_key["rows"][0]["detail"] == "激活成功"
     none_key = await redeem_service.search_activations(key="EEEEE-FFFFF-GGGG1", status="ok")
     assert none_key["total"] == 0
 
-    # q 子串（不分大小写）+ 分页
     hit = await redeem_service.search_activations(q="dark envoy")
     assert hit["total"] == 1 and hit["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
     hit2 = await redeem_service.search_activations(q="aaaa")
     assert hit2["total"] == 2
     paged0 = await redeem_service.search_activations(q="aaaa", limit=1, offset=0)
-    assert paged0["rows"][0]["key"] == "AAAAA-BBBBB-CCCC2"  # 时间倒序：后激活的在前
+    assert paged0["rows"][0]["key"] == "AAAAA-BBBBB-CCCC2"
     paged = await redeem_service.search_activations(q="aaaa", limit=1, offset=1)
     assert len(paged["rows"]) == 1 and paged["rows"][0]["key"] == "AAAAA-BBBBB-CCCC1"
 
-    # 非法 status → ValueError（路由 400）
     with pytest.raises(ValueError, match="未知的结果筛选"):
         await redeem_service.search_activations(status="bogus")
 
@@ -361,7 +352,6 @@ async def test_ledger_raw_truncated(db):
     async with db() as session:
         row = (await session.execute(select(RedeemActivation))).scalars().one()
     assert len(row.raw) == RAW_MAX
-    # 正常激活链路的 raw 先按前端展示口径截到 2000，再受 RAW_MAX 兜底
     await redeem_service._record_ledger(
         kind="cdk", status="fail", product_key="BBBBB-CCCCC-DDDDD",
         detail="测试上限", raw="y" * 5000, steamid=PRIMARY,
@@ -421,5 +411,4 @@ async def test_post_steam_never_downgrades_tls(monkeypatch):
     with pytest.raises(httpx.HTTPError):
         await redeem_service._post_steam(
             redeem_service.REGISTER_KEY_URL, {"product_key": "K"}, {"sessionid": "s"})
-    # 只建过一个客户端，且从未带 verify=False（降级重试分支已删）
     assert constructed == [None]

@@ -46,7 +46,6 @@ def _load_sample(name: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-# ── 纯函数 ────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -87,8 +86,8 @@ def test_get_rate_backtrack():
     """精确日缺失 → 回溯 15 天内取最近可用日。"""
     rows = [("2026-01-01", 0.15), ("2026-01-08", 0.16)]
     assert pick_observed_rate(rows, "KZT", "2026-01-08") == 0.16
-    assert pick_observed_rate(rows, "KZT", "2026-01-10") == 0.16   # 回溯 2 天
-    assert pick_observed_rate(rows, "KZT", "2026-01-30") is None    # 超出 15 天
+    assert pick_observed_rate(rows, "KZT", "2026-01-10") == 0.16
+    assert pick_observed_rate(rows, "KZT", "2026-01-30") is None
     assert pick_observed_rate(rows, "CNY", "2026-01-30") == 1.0
 
 
@@ -97,22 +96,16 @@ def test_wallet_and_refund_classification():
     data = {
         "account": {"nickname": "t", "avatar_base64": ""},
         "history": [
-            # 普通购买（CNY）
             {"date": "2026 年 1 月 1 日", "item": "Game A", "type": "购买",
              "payment": "钱包", "total": "¥30", "wallet_change": "-¥30"},
-            # 送出的礼物
             {"date": "2026 年 1 月 2 日", "item": "Game B", "type": "礼物购买",
              "payment": "钱包", "total": "¥50", "wallet_change": "-¥50"},
-            # 该礼物的退款 → orig_is_gift 应为 True
             {"date": "2026 年 1 月 3 日", "item": "Game B", "type": "退款",
              "payment": "", "total": "¥50", "wallet_change": "+¥50"},
-            # 钱包充值
             {"date": "2026 年 1 月 4 日", "item": "已购买 ¥60.00 钱包资金 退款", "type": "退款",
              "payment": "支付宝", "total": "¥ 60.00", "wallet_change": "+¥60"},
-            # 市场交易（过滤）
             {"date": "2026 年 1 月 5 日", "item": "Case", "type": "市场交易",
              "payment": "", "total": "¥1", "wallet_change": ""},
-            # 转换（过滤）
             {"date": "2026 年 1 月 5 日", "item": "货币转换至 KZT", "type": "转换",
              "payment": "钱包", "total": "", "wallet_change": ""},
         ],
@@ -122,30 +115,23 @@ def test_wallet_and_refund_classification():
         ],
     }
     parsed = parse_report(data)
-    # 游戏交易 3 笔：购买 + 礼物 + 退款
     assert len(parsed["game_txs"]) == 3
     gift_refund = next(t for t in parsed["game_txs"] if t["is_refund"])
     assert gift_refund["orig_is_gift"] is True
-    # 充值退款单独流水
     assert len(parsed["topup_txs"]) == 1
     assert parsed["topup_txs"][0]["is_refund"] is True
-    # CDK 落库；免费赠送一并落库（只展示不计价）
     assert [g["acq"] for g in parsed["cdk_games"]] == ["cdk", "free"]
 
 
-# ── 2026-09 新 UI：礼物标记剥离 + 正则模糊分类 ────────────────
 
 
 @pytest.mark.parametrize(
     ("text", "expected_clean", "expected_recipients"),
     [
-        # 退款行：退款尾缀在末位受赠人名之后
         ("Zefyr: A Thief's Melody 礼物已发送给 recipient_a 退款",
          "Zefyr: A Thief's Melody", ["recipient_a"]),
-        # 受赠人名含空格（俄文名）
         ("Euro Truck Simulator 2 礼物已发送给 тест имя получателя",
          "Euro Truck Simulator 2", ["тест имя получателя"]),
-        # 旧格式（无标记）原样返回
         ("Raging Loop", "Raging Loop", []),
     ],
 )
@@ -174,7 +160,6 @@ def test_newformat_gift_recipients_field_priority():
                 "discount": "-23%",
                 "gift_recipients": ["тест имя получателя"],
             },
-            # 退款行：item 带退款尾缀（兜底口径）→ 剥净不进 items
             {
                 "date": "2026 年 3 月 20 日",
                 "item": "Dead Estate 退款",
@@ -202,7 +187,6 @@ def test_newformat_gift_recipients_field_priority():
 @pytest.mark.parametrize(
     ("tx_type", "item", "wallet_change", "expected"),
     [
-        # 英文/中文变体 → 分类器同源正则兜底
         ("Refund", "Game A", "", "refund"),
         ("Purchase", "Game A", "", "store"),
         ("Gift Purchase", "Game A", "", "gift"),
@@ -283,7 +267,6 @@ def test_english_report():
     assert parsed["cdk_games"][1]["acq"] == "gift"
 
 
-# ── 许可分类（四类）─────────
 
 
 @pytest.mark.parametrize(
@@ -329,7 +312,6 @@ def test_license_stats_and_cdk_scope():
     assert parsed["license_stats"]["retail"] == 1
     assert parsed["license_stats"]["gift"] == 1
     assert parsed["license_stats"]["other"] == 0
-    # cdk_games 收 retail/gift/free；store 类本身有账单流水，不重复建行
     assert [g["name"] for g in parsed["cdk_games"]] == ["Free Game", "Retail Game", "Gift Game"]
     assert all(g["acq"] in ("cdk", "gift", "free") for g in parsed["cdk_games"])
 
@@ -375,7 +357,6 @@ def test_parse_report_license_appid_passthrough():
     assert by_name == {"Linked Game": 440, "Bare Game": None, "Bad Game": None}
 
 
-# ── steam_fetch：真实 HTML 样本解析（history 行提取器）────────
 
 # 样本为本机 scripts/ 下的 gitignored 转储（_history_*.html，含真实消费记录）；
 # 项目相对定位（仓库根/scripts），不存在则 skip
@@ -400,7 +381,6 @@ def test_steam_fetch_history_parser_real_html():
     html = _load_fetch_sample("_history_page_sample.html")
     rows = parse_history_rows_from_html(html)
     assert len(rows) > 400
-    # 受赠人独立提取（DOM 层 a[data-miniprofile]）
     gift_rows = [r for r in rows if r.get("gift_recipients")]
     assert gift_rows, "样本中应有礼物行"
     assert all(
@@ -409,10 +389,8 @@ def test_steam_fetch_history_parser_real_html():
     assert all(
         not r["item"].endswith("退款") for r in rows if r["item"]
     ), "item 不应残留退款尾缀"
-    # 礼物行受赠人独立提取（真实样本中的实名人）
     all_recipients = {name for r in gift_rows for name in r["gift_recipients"]}
     assert all_recipients & {"Sea", "recipient_a", "тест имя получателя"}
-    # 批量市场行 type_count 提取
     market_rows = [r for r in rows if (r.get("type_count") or 1) > 1]
     assert market_rows and all(r["type_count"] >= 2 for r in market_rows)
 
@@ -434,7 +412,6 @@ def test_steam_fetch_full_chain_matches_exporter_format():
     rows = []
     for name in ("_history_first_screen.html", "_history_page_sample.html"):
         rows.extend(parse_history_rows_from_html(_load_fetch_sample(name)))
-    # 同款去重
     seen: set = set()
     deduped = []
     for r in rows:
@@ -451,16 +428,14 @@ def test_steam_fetch_full_chain_matches_exporter_format():
     )
     assert len(parsed["game_txs"]) > 150
     years = {t["date"][:4] for t in parsed["game_txs"]}
-    assert "2021" in years and "2026" in years  # 早期记录全在（根因修复验证）
+    assert "2021" in years and "2026" in years
 
 
-# ── 真实样本：解析产物对账（不触 DB）────────────────────────
 
 
 @pytest.mark.parametrize(
     ("name", "game", "topup", "cdk", "spend", "refund"),
     [
-        # 基准：源脚本输出
         ("a", 143, 108, 140, 8442.51, 1435.42),
         ("b", 87, 41, 9, 4386.28, 1372.09),
     ],
@@ -471,7 +446,6 @@ def test_real_sample_parse(name, game, topup, cdk, spend, refund):
     assert len(parsed["topup_txs"]) == topup
     # 基线数字是「零售 + 礼物」口径——免费入库一并落库后不进基线，单独排除
     assert sum(1 for g in parsed["cdk_games"] if g["acq"] != "free") == cdk
-    # 币种与数量粗校验（总口径依赖汇率库，见端到端用例）
     assert parsed["game_txs"], "解析产物为空"
     spend_any = sum(t["amount"] for t in parsed["game_txs"] if not t["is_refund"])
     assert spend_any > 0
@@ -481,7 +455,6 @@ def test_real_sample_parse(name, game, topup, cdk, spend, refund):
         assert {t["currency"] for t in parsed["game_txs"]} == {"USD", "RUB"}
 
 
-# ── 端到端（临时库 + fx 种子）：与源脚本总口径对账 ──────────
 
 
 @pytest.fixture
@@ -545,20 +518,15 @@ async def test_import_overview_roundtrip(db):
     ov = await bills_service.overview(res["importId"])
     s = ov["summary"]
     assert ov["counts"]["free"] == 1
-    # 净支出 = 30（Game A）；退款 50 冲回礼物
     assert s["netFen"] == 3000
     assert s["spendFen"] == 8000
     assert s["refundFen"] == 5000
-    # 赠礼额度 = 自购净 30 - 礼物净 (50-50) = 30
     assert s["quotaFen"] == 3000
     assert s["selfNetFen"] == 3000
     assert s["giftNetFen"] == 0
-    # 充值净额 60
     assert s["topupNetFen"] == 6000
-    # 账户价值 = 自购净额（CDK 未计价）
     assert s["accountValueFen"] == 3000
 
-    # CDK 计价 → 账户价值联动（free 行不计价、不进合计）
     cdk_list = await bills_service.cdk_games(res["importId"])
     cdk_row = next(r for r in cdk_list["rows"] if r["acq"] == "cdk")
     assert cdk_row["appid"] == 1234
@@ -568,7 +536,6 @@ async def test_import_overview_roundtrip(db):
     assert ov2["summary"]["accountValueFen"] == 4500
     assert ov2["summary"]["cdkTotalFen"] == 1500
 
-    # 明细过滤：年/类型/搜索
     rows = await bills_service.game_txs(res["importId"], year="2026")
     assert rows["total"] == 3
     rows = await bills_service.game_txs(res["importId"], tx_type="退款")
@@ -576,7 +543,6 @@ async def test_import_overview_roundtrip(db):
     rows = await bills_service.game_txs(res["importId"], search="Game A")
     assert rows["total"] == 1
 
-    # 删除
     await bills_service.delete_import(res["importId"])
     imports = await bills_service.list_imports()
     assert imports == []
@@ -589,7 +555,6 @@ async def test_game_txs_projection_four_columns(db):
     data = {
         "account": {"nickname": "proj", "avatar_base64": ""},
         "history": [
-            # 礼物行：混合支付拆分 + 受赠人 + 余额/基准价（新导出形态）
             {
                 "date": "2026 年 3 月 21 日",
                 "item": "Gift Game X",
@@ -605,7 +570,6 @@ async def test_game_txs_projection_four_columns(db):
                 ],
                 "gift_recipients": ["recipient_a", "тест имя получателя"],
             },
-            # 普通购买行：四列无数据
             {
                 "date": "2026 年 3 月 22 日",
                 "item": "Game Plain",
@@ -614,7 +578,6 @@ async def test_game_txs_projection_four_columns(db):
                 "total": "¥30",
                 "wallet_change": "-¥30",
             },
-            # 钱包充值（topup 路径）
             {
                 "date": "2026 年 3 月 23 日",
                 "item": "已购买 ¥60.00 钱包资金",
@@ -645,7 +608,6 @@ async def test_game_txs_projection_four_columns(db):
     assert plain["paymentParts"] is None
     assert plain["giftTo"] is None
 
-    # topup 表无四列语义，投影不新增键
     topups = await bills_service.topup_txs(res["importId"])
     assert topups["total"] == 1
     assert topups["rows"][0]["amount"] == 60.0
@@ -662,17 +624,15 @@ async def test_fx_multi_year(db):
     await _seed_fx(
         db,
         [
-            ("KZT", "2026-01-05", 0.010),  # 2026 档案
-            ("KZT", "2025-08-01", 0.020),  # 2025 档案
+            ("KZT", "2026-01-05", 0.010),
+            ("KZT", "2025-08-01", 0.020),
         ],
     )
     data = {
         "account": {"nickname": "multi-year", "avatar_base64": ""},
         "history": [
-            # 2026 交易（先出现 → 触发 KZT 2026 窗口加载）
             {"date": "2026 年 1 月 6 日", "item": "Game 26", "type": "购买",
              "payment": "钱包", "total": "1000₸", "wallet_change": "-1000₸"},
-            # 2025 交易（若缓存未按年键控，会错用快照/置空）
             {"date": "2025 年 8 月 2 日", "item": "Game 25", "type": "购买",
              "payment": "钱包", "total": "1000₸", "wallet_change": "-1000₸"},
         ],
@@ -680,10 +640,8 @@ async def test_fx_multi_year(db):
     }
     res = await bills_service.import_report(data, "multi.json")
     ov = await bills_service.overview(res["importId"])
-    # 1000×0.010 + 1000×0.020 = 30 元
     assert ov["summary"]["spendFen"] == 3000
     assert ov["summary"]["fxMissing"] == 0
-    # 两笔各自的汇率
     rows = await bills_service.game_txs(res["importId"])
     by_year = {r["date"][:4]: r["fxRate"] for r in rows["rows"]}
     assert by_year["2026"] == 0.010
@@ -701,10 +659,8 @@ async def test_fx_backtrack_and_missing(db, monkeypatch):
     data = {
         "account": {"nickname": "fx", "avatar_base64": ""},
         "history": [
-            # 1月10日 KZT：无当日档案 → 回溯到 1月8日 0.015
             {"date": "2026 年 1 月 10 日", "item": "Game A", "type": "购买",
              "payment": "钱包", "total": "1000₸", "wallet_change": "-1000₸"},
-            # 2月1日 KZT：档案窗口外（>15天）→ cny_fen 置空
             {"date": "2026 年 2 月 1 日", "item": "Game B", "type": "购买",
              "payment": "钱包", "total": "2000₸", "wallet_change": "-2000₸"},
         ],
@@ -713,12 +669,10 @@ async def test_fx_backtrack_and_missing(db, monkeypatch):
     res = await bills_service.import_report(data, "fx.json")
     ov = await bills_service.overview(res["importId"])
     s = ov["summary"]
-    # Game A: 1000 × 0.015 = 15 元；Game B 汇率缺失不入总额
     assert s["spendFen"] == 1500
     assert s["fxMissing"] == 1
     assert ov["monthSeries"][0]["month"] == "2026-01"
 
-    # 补 fx_rates 当前快照后重新导入（同昵称覆盖）：快照不参与折算，缺失行依旧缺失
     from app.domains.rates.models import FxRate
 
     from datetime import datetime
@@ -727,12 +681,12 @@ async def test_fx_backtrack_and_missing(db, monkeypatch):
         session.add(FxRate(currency_code="KZT", rate_to_cny=0.012, fetched_at=datetime(2026, 2, 1)))
         await session.commit()
     res2 = await bills_service.import_report(data, "fx2.json")
-    assert res2["replaced"] == 1  # 同昵称「fx」旧账被覆盖
+    assert res2["replaced"] == 1
     ov2 = await bills_service.overview(res2["importId"])
     assert ov2["summary"]["spendFen"] == 1500
     assert ov2["summary"]["fxMissing"] == 1
     imports = await bills_service.list_imports()
-    assert len(imports) == 1  # 只剩覆盖后的新账
+    assert len(imports) == 1
 
 
 @pytest.mark.asyncio
@@ -757,7 +711,6 @@ async def test_fx_carried_not_consumed(db):
     assert ov["summary"]["spendFen"] == 0
 
 
-# ── sync_bills 调度语义（30min 周期 / 陈旧锁解死 / 失败等下一轮）──────────
 
 
 def _patch_sync_env(monkeypatch, store: dict, fetch) -> list:
@@ -973,7 +926,7 @@ async def test_different_account_syncs_run_in_parallel(db, monkeypatch):
     second = asyncio.create_task(bills_service.sync_bills(force=True, steam_id="76561198000000002"))
     await asyncio.wait_for(entered2.wait(), timeout=2)
     try:
-        assert len(calls) == 2  # 账号二在账号一仍在飞时已开拉
+        assert len(calls) == 2
     finally:
         release1.set()
         results = await asyncio.gather(first, second)
@@ -1021,7 +974,6 @@ async def test_concurrent_account_syncs_keep_separate_snapshots(db, monkeypatch)
     monkeypatch.setattr(account_service, "get_cookies_of", own)
 
     async def account_paced_fetch(cookies, proxy_url=None, on_progress=None):
-        # 账号 A（…001）立即收场，账号 B（…002）阻塞等放行
         if "76561198000000002" in cookies:
             await release.wait()
         return _FakeReport()
@@ -1176,7 +1128,7 @@ async def test_sync_bills_retries_after_store_session_decay(db, monkeypatch):
     assert res["ok"] is True
     assert len(calls) == 2
     assert calls[0]["cookies"] != renewed
-    assert calls[1]["cookies"] == renewed  # 重试携带换发后的新 Cookie
+    assert calls[1]["cookies"] == renewed
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1170,6 @@ async def test_sync_bills_orphan_running_snapshot_does_not_block_restart(db, mon
     res = await bills_service.sync_bills(force=False)
     assert res.get("ok") is True
     assert len(calls) == 1
-    # 快照落回非 running：死锁解除后不再阻塞后续周期
     assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
 
@@ -1242,7 +1193,6 @@ async def test_sync_bills_failure_waits_next_cycle(db, monkeypatch):
     assert len(calls) == 1
     assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
-    # 下一轮：失败态不阻塞，再次发起同步并成功
     state["fail"] = False
     res2 = await bills_service.sync_bills(force=False)
     assert res2.get("ok") is True
@@ -1277,12 +1227,11 @@ async def test_sync_bills_empty_report_rejected(db, monkeypatch):
     res = await bills_service.sync_bills(force=False)
     assert res["ok"] is False and res["status"] == "error"
     assert "拒落空快照" in res["error"]
-    assert import_calls == []  # DB 零接触：旧快照不被空 import 遮蔽
+    assert import_calls == []
     assert len(calls) == 1
     assert store[bills_service.snapshot_key("76561198000000001")]["running"] is False
 
 
-# ── sync_bills 首屏探测分流（降频机制：无新交易不全量翻页）──────────
 
 
 @pytest.mark.asyncio
@@ -1295,7 +1244,6 @@ async def test_sync_bills_probe_skip_when_no_new(db, monkeypatch):
     store: dict = {}
     calls = _patch_sync_env(monkeypatch, store, fetch)
 
-    # 探测桩改为"无新交易"（覆盖 _patch_sync_env 的默认 True）
     from app.domains.bills import steam_fetch as sf
 
     async def fake_probe(cookies, *, known_latest_date=None, proxy_url=None):
@@ -1305,7 +1253,7 @@ async def test_sync_bills_probe_skip_when_no_new(db, monkeypatch):
 
     res = await bills_service.sync_bills(force=False)
     assert res["ok"] is True and res["status"] == "probed_skip"
-    assert calls == []  # 全量抓取零调用——整轮只有探测 1 个 GET
+    assert calls == []
     assert store[bills_service.snapshot_key("76561198000000001")]["probedSkip"] is True
     assert set(store) == {bills_service.snapshot_key("76561198000000001")}
 
@@ -1332,7 +1280,7 @@ async def test_sync_bills_probe_force_bypasses(db, monkeypatch):
 
     res = await bills_service.sync_bills(force=True)
     assert res.get("ok") is True
-    assert probe_calls == []  # force 路径不探测
+    assert probe_calls == []
     assert len(calls) == 1
 
 
@@ -1407,18 +1355,14 @@ async def test_probe_first_screen_logic(db):
             "</table>"
         )
 
-    # 首行 2026-09-10 > 库内 09-01 → 有新交易
     assert await sf.probe_history_first_screen(_ProbeClient(_page("2026年9月10日")), "2026-09-01") is True
     # 首行 2026-09-01 ≤ 库内 09-01 → 无新交易（同日新交易场景保守跳过：
     # 同日增量少见，且下轮探测/手动 force 可兜）
     assert await sf.probe_history_first_screen(_ProbeClient(_page("2026年9月1日")), "2026-09-01") is False
-    # 库内无日期（首拉语义）→ True
     assert await sf.probe_history_first_screen(_ProbeClient(_page("2020年1月1日")), None) is True
-    # 页面无表格（结构异常）→ 保守 True
     assert await sf.probe_history_first_screen(_ProbeClient("<html>empty</html>"), "2026-09-01") is True
 
 
-# ── steam_fetch：账号身份提取（头像域名兼容）──────────────────
 
 
 class _FakeResp:
@@ -1493,7 +1437,6 @@ async def test_fetch_account_identity_no_avatar_nonblocking():
     assert avatar2 == ""
 
 
-# ── steam_fetch：登录页守门（Cookie 过期拒产空报告）──────────────
 
 
 def test_login_page_gate_by_url():
@@ -1539,7 +1482,6 @@ async def test_fetch_history_login_page_raises():
         await steam_fetch._fetch_history(_LoginClient())
 
 
-# ── 删号即清：账号删除时名下账单随删（NULL 归属存量不动）────
 
 
 async def _seed_bill(db, sid: str | None, label: str) -> int:

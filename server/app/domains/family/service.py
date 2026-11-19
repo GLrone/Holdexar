@@ -28,7 +28,6 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.database import WritePriority, get_session_factory, write_session
 from app.core.database import write_gate
 from app.core.logging import log_event
-# SSL 上下文缓存在 core.tls（成就同步/代理池探测同用一份，一事实一记录者）
 from app.core.tls import ssl_context as _ssl_context
 from app.domains.proxies.service import strategy_proxy_or_direct
 from app.domains.games import tags as game_tags
@@ -74,7 +73,6 @@ async def _steam_get(url: str, params: dict, *, method: str = "GET") -> httpx.Re
     return resp
 
 
-# ─── 输入解析（好友码 / SteamID64 / 资料 URL / 自定义 URL）────────
 
 async def resolve_steamid(raw: str) -> dict:
     """把任意输入解析成 {steamid, kind}；好友码即时转换，URL 类走 vanity API。
@@ -116,7 +114,7 @@ async def _profile_xml_preview(steamid: str) -> dict:
         ) as client:
             resp = await client.get(url)
         text = resp.text
-    except Exception:  # noqa: BLE001 —— 兜底失败静默
+    except Exception:  # noqa: BLE001
         return {}
     name_m = re.search(r"<steamID><!\[CDATA\[(.*?)\]\]></steamID>", text)
     avatar_m = re.search(r"<avatarFull><!\[CDATA\[(.*?)\]\]></avatarFull>", text) or re.search(
@@ -152,7 +150,7 @@ async def _persona_preview(steamid: str) -> dict:
         p = await fetch_profile(steamid, proxy_url=await strategy_proxy_or_direct())
         if p.get("persona_name") and not _avatar_missing(p):
             return {"personaName": p["persona_name"], "avatarUrl": p.get("avatar_url", "")}
-    except Exception:  # noqa: BLE001 —— 预览失败不阻断解析
+    except Exception:  # noqa: BLE001
         pass
     fallback = await _profile_xml_preview(steamid)
     if fallback:
@@ -181,7 +179,6 @@ def extract_webapi_token(cookies_raw: str) -> str | None:
     return None
 
 
-# ─── Steam Web API（access_token 通道，免 Key）─────────────────
 
 async def _fetch_family_group(token: str) -> dict:
     """拉取当前登录账号所在家庭组；未加入家庭组返回 {joined: False}。"""
@@ -218,7 +215,7 @@ async def _fetch_player_details(token: str, steamids: list[str]) -> dict[str, di
         # GET + query 串传 steamids[]（POST 该端点会 405）
         resp = await _steam_get(PLAYER_LINK_URL, dict(params))
         accounts = resp.json().get("response", {}).get("accounts", []) or []
-    except Exception as e:  # noqa: BLE001 —— 昵称失败不阻断家庭组同步
+    except Exception as e:  # noqa: BLE001
         log_event(logger, "家庭成员昵称获取失败", level=logging.WARNING, detail={"原因": str(e)})
         return {}
     out: dict[str, dict] = {}
@@ -242,7 +239,6 @@ async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
     """
     if not steamids:
         return {}
-    # 凭据键经 get_secret_value 读取（落库为密文，get_value 只回密文本体）
     api_key = (await settings_service.get_secret_value("account.steam_api_key", "")) or ""
     if not api_key:
         return {}
@@ -252,7 +248,7 @@ async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
         states = await fetch_player_states(
             steamids, api_key, proxy_url=await strategy_proxy_or_direct()
         )
-    except Exception:  # noqa: BLE001 —— 国家补齐失败不阻断同步
+    except Exception:  # noqa: BLE001
         log_event(logger, "成员资料国家获取失败，不阻断同步")
         return {}
     return {
@@ -262,7 +258,6 @@ async def _fetch_member_countries(steamids: list[str]) -> dict[str, str]:
     }
 
 
-# 资料国家读路径回填的冷却：网络断/限流时不让每次 status 都空烧外网
 _COUNTRY_BACKOFF_SECONDS = 600
 _country_backoff_until: datetime | None = None
 
@@ -279,7 +274,6 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
         m for m in (row.members_json or [])
         if isinstance(m, dict) and m.get("steamid")
     ]
-    # 被移除成员（excluded）不再消耗资料国家请求；写回保全量防丢条目
     active = [m for m in members if not m.get("excluded")]
     if not active or all(m.get("loccountrycode") for m in active):
         return
@@ -298,11 +292,10 @@ async def _backfill_member_countries(row: FamilyGroup) -> None:
             if fresh is not None:
                 fresh.members_json = members
                 await session.commit()
-    except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
+    except Exception:  # noqa: BLE001
         log_event(logger, "成员资料国家写回失败", level=logging.ERROR, exc_info=True)
 
 
-# ─── 绑定 / 同步 ────────────────────────────────────────────
 
 async def get_primary_steamid() -> str:
     """主账号 = 第一个绑定的账号（多账号表首行）；家庭组跟随主账号不随切号变。
@@ -353,7 +346,6 @@ async def _sync_group_for_account(steam_id: str, cookies: str, now: datetime) ->
             "loccountrycode": None,
         })
 
-    # 成员资料国家（地区判定源，见 _fetch_member_countries；失败留空不阻断）
     countries = await _fetch_member_countries([m["steamid"] for m in members])
     for m in members:
         m["loccountrycode"] = countries.get(m["steamid"])
@@ -369,7 +361,6 @@ async def _sync_group_for_account(steam_id: str, cookies: str, now: datetime) ->
             m["personaName"] = m["personaName"] or p.get("personaName", "")
             m["avatarUrl"] = m["avatarUrl"] or _norm_avatar(p.get("avatarUrl", ""))
 
-    # 已移除成员（excluded 标记）不再是家庭成员：不再自动入追踪账户
     excluded = await _excluded_member_sids(steam_id)
     if excluded:
         members = [m for m in members if m["steamid"] not in excluded]
@@ -420,7 +411,7 @@ async def sync_family_group(steam_id: str | None = None) -> dict:
     for sid, cookies in targets:
         try:
             results.append(await _sync_group_for_account(sid, cookies, now))
-        except Exception as e:  # noqa: BLE001 —— 单账号失败隔离
+        except Exception as e:  # noqa: BLE001
             error = (f"Steam 家庭请求失败（HTTP {e.response.status_code}），请重试同步"
                      if isinstance(e, httpx.HTTPStatusError) else "家庭组同步未完成，请重试同步")
             async with write_session(WritePriority.BACKGROUND) as session:
@@ -541,7 +532,6 @@ async def _excluded_member_sids(owner: str) -> set[str]:
     }
 
 
-# ─── 成员增删（家庭页手动管理；与 Steam 同步条目同账分 origin 层）──
 
 # 未绑定任何账号时手动成员的承载组行键（steamid 主键列，与 7656…17 位无碰撞面）
 LOCAL_GROUP_SID = "local"
@@ -585,7 +575,7 @@ async def add_family_member(
                 if absorbed:
                     await session.commit()
                 return {"ok": True, "duplicate": True}
-            target.pop("excluded", None)  # 重新添加 = 解除移除
+            target.pop("excluded", None)
             # JSON 条目原位变异不触发列变更检测，须显式标脏
             flag_modified(row, "members_json")
             row.updated_at = now
@@ -667,11 +657,9 @@ async def remove_family_member(steamid: str, group_steamid: str | None = None) -
 
 # app_settings 键：成员地区持久化 {steamid: region_code}（家庭页手动选择的落点）
 KEY_MEMBER_REGIONS = "family.member_regions"
-# 一次性清洗标记：首轮清掉历史整表落库写入的「cn」兜底条目后置位
 KEY_REGION_LEGACY_CLEANUP = "family.region_legacy_cleanup"
 
 
-# miniprofile 补齐失败的节流窗口：网络断时不让每个 status 请求都空烧外网
 _AVATAR_BACKOFF_SECONDS = 60
 _avatar_backoff_until: datetime | None = None
 
@@ -719,7 +707,6 @@ async def _backfill_member_avatars(members: list[dict], owner_sid: str) -> list[
         return members
     _avatar_backoff_until = None
 
-    # 写回快照（只更 members_json；失败不影响本次返回，下次再自愈）
     try:
         async with write_session(WritePriority.BACKGROUND) as session:
             row = await session.get(FamilyGroup, owner_sid)
@@ -835,7 +822,6 @@ async def get_status() -> dict:
     manual = await _cleanup_legacy_member_regions(manual)
     wallet = await account_service.wallet_regions()
 
-    # 资料国家：各组 members_json 的 loccountrycode（同步时随成员档案落库）
     profile: dict[str, str] = {}
     for row in [*rows.values(), *( [local_row] if local_row else [] )]:
         for m in (row.members_json or []):
@@ -872,7 +858,6 @@ async def get_status() -> dict:
         for m in members:
             flat.setdefault(m["steamid"], m)
 
-    # 绑定前落在本地组的手动成员并入主账号组投影（账仍在本地组行，增删可达）
     if local_row is not None and groups:
         for m in await _group_members_payload(local_row, resolved):
             if m["steamid"] not in flat and all(
@@ -980,7 +965,7 @@ async def _resolve_member_regions(
                 {k: v for k, v in manual.items() if k not in stale},
             )
             log_event(logger, "成员地区兜底残留已清除", detail={"清除个数": len(stale)})
-        except Exception:  # noqa: BLE001 —— 写回失败不影响本次返回
+        except Exception:  # noqa: BLE001
             log_event(logger, "成员地区残留清除写库失败", level=logging.ERROR, exc_info=True)
     return resolved
 
@@ -1006,7 +991,6 @@ async def _group_members_payload(row: FamilyGroup, resolved: dict[str, dict]) ->
     return out
 
 
-# ─── 家庭共享库（GetSharedLibraryApps + 成员游玩聚合）──────────
 
 async def _fetch_shared_library(token: str, family_groupid: str) -> list[dict]:
     """拉家庭共享库 app 清单（含入库时间与有序拥有者——全部派生分析的字段来源）。
@@ -1062,8 +1046,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     if not group.get("joined") or not group.get("family_groupid"):
         raise ValueError("当前账号未加入家庭组，无法拉取家庭库")
 
-    # 成员档案快照（后段 persona/头像合并共用）；excluded 标记 = 已移除成员，
-    # 实时聚合不再为其拉取已购/游玩明细
     _fam_row = None
     async with get_session_factory()() as session:
         _fam_row = await session.get(FamilyGroup, owner)
@@ -1076,22 +1058,19 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     shared_apps = await _fetch_shared_library(token, group["family_groupid"])
     shared_map = {a["appid"]: a for a in shared_apps}
 
-    # 成员已购 + 游玩数据（appid → 该游戏在库信息）
     member_rows: list[dict] = [
         m for m in group["members"] if str(m.get("steamid")) not in excluded_sids
     ]
     member_ids = [m["steamid"] for m in member_rows if m.get("steamid")]
     details = await _fetch_player_details(token, member_ids)
 
-    owned_by_app: dict[int, list[str]] = {}   # appid → 拥有者 steamid 列表
-    steam_name_by_app: dict[int, str] = {}   # appid → Steam 返回的游戏名（兜底源）
-    playtime_by_app: dict[int, int] = {}     # appid → 全家总时长（分钟）
-    last_play_by_app: dict[int, int] = {}    # appid → 最近游玩时间戳
-    member_play: dict[str, list[dict]] = {}   # steamid → [{appid, minutes, last}]
+    owned_by_app: dict[int, list[str]] = {}
+    steam_name_by_app: dict[int, str] = {}
+    playtime_by_app: dict[int, int] = {}
+    last_play_by_app: dict[int, int] = {}
+    member_play: dict[str, list[dict]] = {}
     member_owned_count: dict[str, int] = {}
 
-    # 成员已购/游玩**并发**拉取：gather + return_exceptions，单成员失败只缺席
-    # 该成员明细，不再拖垮全家聚合。
     owned_results = await asyncio.gather(
         *(fetch_member_owned_games_full(token, m["steamid"]) for m in member_rows),
         return_exceptions=True,
@@ -1129,8 +1108,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
             plist, key=lambda x: (-(x.get("minutes2w") or 0), -(x.get("minutes") or 0))
         )
 
-    # Steam 返回的游戏名落 games 表（最小 upsert：新 appid 插入、缺名补名）——
-    # 家庭库/愿望单聚合/全站 games join 都靠这张表补名，本地缺行即大量空名
     if steam_name_by_app:
         from app.domains.games.models import Game as GameRow
 
@@ -1152,7 +1129,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
                     row.name = name
             await session.commit()
 
-    # 成员档案（昵称/头像）合并 role
     members_out = []
     for m in member_rows:
         sid = m["steamid"]
@@ -1165,9 +1141,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
             "ownedCount": member_owned_count.get(sid, 0),
         })
 
-    # GetPlayerLinkDetails 的 public_data 早已不返 avatar URL（见下方同步链路
-    # 同款注释），头像从 family_groups.members_json（同步时 miniprofile 补齐过）
-    # 合并；仍缺的走 miniprofile 实时补（失败静默）
     _saved = {
         str(m.get("steamid")): m
         for m in ((_fam_row.members_json if _fam_row else None) or [])
@@ -1176,7 +1149,6 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
     for m in members_out:
         s = _saved.get(m["steamid"], {})
         m["personaName"] = m["personaName"] or s.get("personaName", "") or s.get("persona_name", "")
-        # 存量 members_json 可能是旧 CDN 域（eccdnx/queniuqe）——读出即归一自愈
         m["avatarUrl"] = _norm_avatar(
             m["avatarUrl"] or s.get("avatarUrl", "") or s.get("avatar_url", "")
         )
@@ -1189,10 +1161,8 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
             m["personaName"] = m["personaName"] or p.get("personaName", "")
             m["avatarUrl"] = m["avatarUrl"] or p.get("avatarUrl", "")
 
-    # 全部涉及 appid（共享清单 ∪ 成员已购）
     all_appids = sorted(set(shared_map) | set(owned_by_app))
 
-    # games 表本地补元数据 + CN 现价
     meta = await _local_games_meta(all_appids)
 
     games_out: list[dict] = []
@@ -1213,23 +1183,19 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
             "cnPriceFen": m.get("cn_price_fen"),
             "originalPriceFen": m.get("original_price_fen"),
             "discount": m.get("discount"),
-            "owners": ordered_owners,             # 入库先后序（共享清单口径）
+            "owners": ordered_owners,
             "ownerCount": len(owners),
             "presence": (shared_info["presence"] if shared_info else len(owners)),
             "excluded": bool(shared_info and shared_info["excluded"]),
             "inSharedLib": appid in shared_map,
             "timeAcquired": (shared_info["time_acquired"] if shared_info else 0),
-            "buyer": (ordered_owners[-1] if ordered_owners else None),  # 最近入库者
+            "buyer": (ordered_owners[-1] if ordered_owners else None),
             "playtimeMinutes": playtime_by_app.get(appid, 0),
             "lastPlayed": last_play_by_app.get(appid, 0),
         })
 
-    # 快照 upsert（持久化兜底：重启/断网时家庭页照常出数据）
     await _upsert_library_snapshot(group["family_groupid"], games_out)
 
-    # 游玩明细随组档案落库（play_json）：库快照表只有 app 级字段，成员游玩
-    # 明细必须由本路径落盘——实时聚合失败落到快照兜底时，memberPlay 才有数据。
-    # 成功即存，兜底也有数据。
     if owner and member_play:
         try:
             async with write_session(WritePriority.BACKGROUND) as session:
@@ -1237,7 +1203,7 @@ async def fetch_family_library(steam_id: str | None = None) -> dict:
                 if row is not None:
                     row.play_json = member_play
                     await session.commit()
-        except Exception:  # noqa: BLE001 —— 写库失败不影响本次返回
+        except Exception:  # noqa: BLE001
             log_event(
                 logger,
                 "家庭成员游玩明细快照写库失败，不影响本次返回",
@@ -1312,7 +1278,6 @@ async def _local_games_meta(appids: list[int]) -> dict[int, dict]:
                     "release_date": game.release_date,
                     "tags": game_tags.named_tags(tag_map.get(int(game.appid))),
                     "cn_price_fen": int(price.cny_fen) if price and price.cny_fen is not None else None,
-                    # 原价（未折 CNY 分）——价值洞察「原价合计/节省率」口径
                     "original_price_fen": (
                         int(price.original_price) if price and price.original_price is not None else None
                     ),
@@ -1382,15 +1347,12 @@ async def _library_from_snapshot(
         ))).scalars().all()
         if not rows:
             return None
-        # 未指定组 → 取最新一组（按组内最大 updated_at）
         if not family_groupid:
             groupid = rows[0].family_groupid
             rows = [r for r in rows if r.family_groupid == groupid]
         groupid = rows[0].family_groupid
 
         # 成员档案（family_groups 快照；_save_group 存 camelCase 字段）。
-        # 完全离线可用：账号读不到（Cookie 摘除/账号表空）时跳过档案，
-        # 由快照 owners 全集推成员身份（无名档，前端用 steamid 尾号展示）。
         members_out: list[dict] = []
         fam_row = None
         try:
@@ -1402,7 +1364,7 @@ async def _library_from_snapshot(
         if fam_row and fam_row.members_json:
             for m in fam_row.members_json:
                 if isinstance(m, dict) and m.get("excluded"):
-                    continue  # 已移除成员不再作为家庭成员投影
+                    continue
                 sid = str(m.get("steamid", ""))
                 if sid:
                     members_out.append({
@@ -1453,8 +1415,6 @@ async def _library_from_snapshot(
                 "lastPlayed": 0,
             })
 
-    # 游玩明细（组档案的 play_json 快照）：实时聚合成功时随组落库，
-    # 兜底路径同样带游玩数据，游玩动态不会只剩空态
     play_saved = (
         fam_row.play_json
         if fam_row is not None and isinstance(fam_row.play_json, dict)
@@ -1468,7 +1428,7 @@ async def _library_from_snapshot(
         "games": games_out,
         "memberPlay": play_saved,
         "sharedCount": len(games_out),
-        "fromSnapshot": True,  # 前端可标注「快照数据（离线/拉取失败兜底）」
+        "fromSnapshot": True,
     }
 
 
@@ -1487,7 +1447,7 @@ def _start_library_refresh(steam_id: str) -> None:
             _LIBRARY_CACHE[steam_id] = (
                 datetime.utcnow(), await fetch_family_library(steam_id),
             )
-        except Exception as e:  # noqa: BLE001 —— 后台刷新失败保留旧条目
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "家庭库后台刷新失败，保留现有缓存",
@@ -1523,7 +1483,6 @@ async def cached_family_library(steam_id: str | None = None) -> dict:
     now = datetime.utcnow()
     cached = _LIBRARY_CACHE.get(sid)
     if cached:
-        # 快照命中的条目用更短的 TTL：快照是陈旧数据，而失败往往是瞬时的
         ttl = (
             _SNAPSHOT_TTL_SECONDS
             if cached[1].get("fromSnapshot")
@@ -1570,11 +1529,7 @@ def invalidate_library_cache(steam_id: str | None = None) -> None:
         _LIBRARY_CACHE.clear()
 
 
-# 实时聚合成活时的缓存时长
 _LIVE_TTL_SECONDS = 300
-# 快照兜底命中的缓存时长。刻意远短于实时数据：快照本身是陈旧的，而失败往往是
-# 瞬时的（Cookie 刚被限流、代理刚断），60 秒足够吸收「切 tab / 返回页面」这类
-# 密集重复请求，又不会让 Cookie 修好后继续吃陈旧数据太久。
 _SNAPSHOT_TTL_SECONDS = 60
 
 _LIBRARY_CACHE: dict[str, tuple[datetime, dict]] = {}
@@ -1582,7 +1537,6 @@ _LIBRARY_REFRESHING: set[str] = set()
 _LIBRARY_REFRESH_TASK: dict[str, asyncio.Task] = {}  # 防 create_task 被 GC 提前取消
 
 
-# 未收录补爬节流：同一批缺口不因页面反复刷新而重复起任务
 _WISHLIST_CRAWL_KICK_COOLDOWN_SECONDS = 1800
 _wishlist_crawl_kick_at: datetime | None = None
 
@@ -1618,7 +1572,7 @@ async def _kick_uncrawled_games(appids: list[int]) -> None:
             "家庭成员愿望单有未收录游戏，已触发补爬",
             detail={"款数": len(appids)},
         )
-    except Exception as e:  # noqa: BLE001 —— 任务占用/网络失败都静默
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             "家庭成员愿望单补爬未触发",
@@ -1663,7 +1617,6 @@ async def family_wishlist(steam_id: str | None = None) -> dict:
             stmt = stmt.where(WishlistItem.steamid.in_(members))
         rows = (await session.execute(stmt)).all()
 
-    # appid → (想要者, 各自添加时间)
     by_app: dict[int, dict] = {}
     for steamid, appid, added_at in rows:
         slot = by_app.setdefault(int(appid), {"members": [], "addedAt": None})
@@ -1673,8 +1626,6 @@ async def family_wishlist(steam_id: str | None = None) -> dict:
 
     appids = sorted(by_app)
     meta = await _local_games_meta(appids)
-    # games 表无行 = 爬虫从未抓到（名称/价格全空 → 前端「未收录」）：
-    # 读路径自愈，把缺口送进爬取队列（带冷却，静默失败）
     await _kick_uncrawled_games([a for a in appids if a not in meta])
 
     items = []
@@ -1696,7 +1647,7 @@ async def family_wishlist(steam_id: str | None = None) -> dict:
     items.sort(key=lambda x: -x["wantCount"])
 
     return {
-        "fallback": fallback,  # True = 未同步家庭组，展示的是全部追踪账户
+        "fallback": fallback,
         "familyName": family_name,
         "memberIds": members,
         "items": items,

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from app.crawler.config import CC_LIST
 
-# cc 大写 → 货币
 REGION_TO_CURRENCY: dict[str, str] = {
     code.upper(): currency for code, _, currency in CC_LIST
 }

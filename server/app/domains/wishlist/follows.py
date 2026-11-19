@@ -31,7 +31,6 @@ async def follow(appid: int) -> dict:
     from app.domains.monitoring import service as monitoring_service
 
     target = int(appid)
-    # 关注 = 用户显式要求监控：解除「别再爬它」后挂来源
     await monitoring_service.ensure_source("game", target, "favorite", clear_exclusion=True)
     return {"appid": target, "followed": True}
 
@@ -42,7 +41,6 @@ async def unfollow(appid: int) -> dict:
 
     target = int(appid)
     await monitoring_service.detach_source("game", target, "favorite")
-    # 历史行上的星标标一并清掉（旧模型遗留：manual 标已不再作为关注真相源）
     async with write_session(WritePriority.INTERACTIVE) as session:
         await session.execute(
             update(WishlistItem)

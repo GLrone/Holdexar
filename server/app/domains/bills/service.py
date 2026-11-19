@@ -92,7 +92,6 @@ async def revalue_affected(touched: dict[str, set[date]]) -> dict:
         if not days:
             continue
         c_code = str(c).upper()
-        # 日期 T 的汇率被更新，会影响交易日落在 [T, T + 15] 之间依赖该汇率的交易
         c_start = min(days).isoformat()
         c_end = (max(days) + timedelta(days=15)).isoformat()
         game_conds.append(
@@ -194,9 +193,8 @@ async def import_report(data: dict, source_file: str = "", *, steam_id: str | No
             warnings_json=json.dumps(parsed["warnings"], ensure_ascii=False),
         )
         session.add(imp)
-        await session.flush()  # 拿 import_id
+        await session.flush()
 
-        # 涉及的币种 → 各自年份的日线档案一次性预载（series_cache 复用）
         series_cache: dict[str, list[tuple[str, float]]] = {}
 
         fx_missing = 0
@@ -388,7 +386,6 @@ def _sync_lock(steam_id: str) -> asyncio.Lock:
 async def sync_bills(*, force: bool = False, steam_id: str | None = None) -> dict:
     target = steam_id
     if target is None:
-        # 全局入口目标 = 当前账号（旧部署回退 KV Cookie 属主）；busy 短路防叠跑
         from app.domains.account import service as account_service
         from app.domains.account.steam_wallet import steam_id_from_cookies
 
@@ -442,7 +439,6 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
     now = get_beijing_time_obj().replace(tzinfo=None)
     await settings_service.set_value(snapshot_key(steam_id), {"running": True, "since": now.isoformat(), "steamId": steam_id})
 
-    # 首屏探测：无新交易 → 本轮跳过（写探测跳过快照，等下一周期再探）
     if not force:
         try:
             known_latest = await _latest_known_tx_date(steam_id)
@@ -453,8 +449,6 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
                 ), cookies,
             )
         except (steam_fetch.SteamFetchError, StoreSessionExpiredError) as exc:
-            # 抓取层硬错误与会话失效（续期失败原样上抛的平级错误）：写错误
-            # 快照（与全量失败同语义），等下一轮
             await settings_service.set_value(snapshot_key(steam_id), {
                 "running": False, "error": str(exc), "syncedAt": now.isoformat(), "steamId": steam_id,
             })
@@ -466,8 +460,6 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
             return {"ok": True, "status": "probed_skip", "steamId": steam_id, "historyRows": 0, "licenseRows": 0}
 
     async def _progress(info: dict) -> None:
-        # 阶段进度写进快照 KV：GET /bills/sync 的轮询方（前端进度气泡）实时可读；
-        # 写失败只丢进度显示，不影响同步本体（_emit_progress 已兜一层，双保险）。
         try:
             await settings_service.set_value(
                 snapshot_key(steam_id), {"running": True, "since": now.isoformat(), "steamId": steam_id, **info}
@@ -482,9 +474,6 @@ async def _sync_bills_locked(*, force: bool, steam_id: str) -> dict:
                 ck, proxy_url=proxy_url, on_progress=_progress
             ), cookies,
         )
-        # 空报告门禁：0 账单 + 0 许可说明解析层根本没拿到数据（登录页守门
-        # 漏网/Steam 改版清空表格），落库会生成空 import 遮住真实旧快照。
-        # 属失败语义：写错误快照等下一轮，DB 零接触。
         if not report.history and not report.licenses:
             raise steam_fetch.SteamFetchError(
                 "抓取结果为空（0 账单 + 0 许可），拒落空快照——疑似登录态失效或 Steam 页面改版"
@@ -712,7 +701,6 @@ async def overview(import_id: int) -> dict:
         topup_dicts = [_topup_to_dict(r) for r in topup_rows]
         cdk_dicts = [_cdk_to_dict(r) for r in cdk_rows]
 
-        # ── 年度/月度分组 ──
         years: dict[str, dict] = {}
         months: dict[str, dict] = {}
         for tx in game_dicts:
@@ -734,13 +722,11 @@ async def overview(import_id: int) -> dict:
                     mst["spendFen"] += fen
             yst["count"] += 1
             mst["count"] += 1
-            # 年内月度细分
             ym = yst["months"].setdefault(m[5:7], {"netFen": 0, "count": 0})
             if fen is not None:
                 ym["netFen"] += fen
             ym["count"] += 1
 
-        # 月度序列（升序，给图表）
         month_series = [
             {"month": m, **stats} for m, stats in sorted(months.items())
         ]
@@ -749,7 +735,6 @@ async def overview(import_id: int) -> dict:
             for y, stats in sorted(years.items(), reverse=True)
         ]
 
-        # ── 充值口径 ──
         topup_spend = sum(t["cnyFen"] for t in topup_dicts if t["cnyFen"] is not None and not t["isRefund"])
         topup_refund = sum(abs(t["cnyFen"]) for t in topup_dicts if t["cnyFen"] is not None and t["isRefund"])
         topup_by_currency: dict[str, dict] = {}
@@ -760,7 +745,6 @@ async def overview(import_id: int) -> dict:
             if t["cnyFen"] is not None:
                 c["cnyFen"] += t["cnyFen"]
 
-        # ── CDK / 礼物口径（free 行只展示不计价，不进任何金额）──
         cdk_priced = [
             c for c in cdk_dicts if c["manualFen"] is not None and c["acq"] != "free"
         ]
@@ -835,7 +819,6 @@ async def game_txs(
     rows_stmt = stmt.order_by(BillGameTx.date.desc(), BillGameTx.id.desc()).limit(limit).offset(offset)
     async with get_session_factory()() as session:
         rows = (await session.execute(rows_stmt)).scalars().all()
-        # HAVING 语义计数：SQLite 无 contains 过滤后的 count 便利，直接复用 stmt
         total = (
             await session.execute(select(func.count()).select_from(stmt.subquery()))
         ).scalar_one()

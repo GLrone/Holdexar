@@ -37,9 +37,7 @@ _REQUEST_HEADERS = {
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     ),
 }
-# API 响应的 stale 标记阈值：超过则前端提示「数据较旧」
 RESPONSE_STALE_HOURS = 24 * 7
-# 打标窗口缓存有效期（爬虫高频调用，避免每行观测都查库）
 _WINDOW_CACHE_TTL_MINUTES = 360
 
 
@@ -79,14 +77,12 @@ def _event_key(category: str, name_en: str, start: date,
 
 
 _sync_lock = asyncio.Lock()
-# 打标窗口缓存：None = 未加载；二元组 (windows, loaded_at)
 _windows_cache: tuple[list[tuple[date, date, str]], datetime] | None = None
 
 
 async def _fetch_page(lang: str) -> str:
     from app.domains.rates.http import open_client
 
-    # open_client 是 async 工厂：先 await 拿客户端，再进入上下文管理
     client = await open_client(timeout=15.0)
     async with client:
         resp = await client.get(UPCOMING_URLS[lang], headers=_REQUEST_HEADERS)
@@ -124,7 +120,7 @@ async def sync() -> dict:
         async def _grab(lang: str, sink: list[str | None]) -> None:
             try:
                 sink[0] = await _fetch_page(lang)
-            except Exception:  # noqa: BLE001 —— 单语言失败由主流程按通道语义处理
+            except Exception:  # noqa: BLE001
                 log_event(
                     logger,
                     "Steam 活动文档页抓取失败",
@@ -150,7 +146,6 @@ async def sync() -> dict:
         if zh_html is not None:
             events_zh = parser.parse_upcoming_events(zh_html)
             zh_nav_names = parser.parse_zh_fest_names(zh_html)
-            # 交叉核对：两语通道都解析出的季节大促，日期必须一致（EN 为准）
             zh_windows = {(e["category"], e["start"], e["end"]) for e in events_zh}
             for e in events_en:
                 if e["category"] != "seasonal_sale":
@@ -205,7 +200,7 @@ async def sync() -> dict:
             _write_snapshot("zh", zh_html)
 
         tagged = await _backfill_price_history(prepared)
-        _windows_cache = None  # 失效，下次打标查询按新窗口重建
+        _windows_cache = None
         log_event(
             logger,
             "Steam 活动日历已同步",
@@ -232,8 +227,6 @@ def _write_snapshot(lang: str, raw: str) -> None:
         )
 
 
-# 回贴水位 KV：每窗口已回贴推进到的时刻，与该窗回贴同事务落位（断点续跑
-# 断点形态：键缺失的窗口（首次 / 日历新增活动）全窗口回贴
 _BACKFILL_WATERMARK_KEY = "steam_events.backfill_watermark"
 # 水位回看余量：吸收写库与回贴两侧时钟的偏差，多扫段由 NULL 条件幂等兜底
 _BACKFILL_WATERMARK_MARGIN = timedelta(hours=1)

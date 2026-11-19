@@ -30,7 +30,6 @@ import math
 from datetime import date
 from app.crawler.utils import get_beijing_time_obj
 
-# ── 权重（调参改这里，不动公式）──
 W_SAVE = 0.50
 W_QUALITY = 0.28
 W_TIMING = 0.14
@@ -39,13 +38,11 @@ W_FAMILIARITY = 0.08
 # S_save：对数压缩。差价 ¥20 起价值感陡增，¥200 之后边际价值趋零
 # 归一化分母 = ln(1 + 200/20) = ln(11)
 
-# S_familiarity：10 万评测 = 熟悉度满分
 FAMILIAR_CAP_REVIEWS = 100000
 
-# S_timing 四档（键 = hl_flag）
-TIMING_FLAT_LOW = 0.75  # 平史低
-TIMING_NEW_LOW = 1.00  # 新史低
-TIMING_DISCOUNT = 0.35  # 打折非史低（含有折扣但无 hl 标记）
+TIMING_FLAT_LOW = 0.75
+TIMING_NEW_LOW = 1.00
+TIMING_DISCOUNT = 0.35
 
 # S_quality 零评价成熟度曲线：quality = FLOOR + (0.5-FLOOR)·exp(-age/τ)
 # age = 发行至今的年数；地板低于任何有真实评价的常见区间（混合评价 ≈0.41）

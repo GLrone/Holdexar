@@ -32,7 +32,6 @@ ACCESS_COOKIE = "steamLoginSecure"
 REFRESH_COOKIE = "steamRefresh_steam"
 REMEMBER_COOKIE = "steamRememberLogin"
 
-# 续期提前量（分钟）：访问令牌剩余寿命低于此值即换新，为网络失败留余量
 REFRESH_AHEAD_MINUTES = 120.0
 
 FINALIZE_URL = "https://login.steampowered.com/jwt/finalizelogin"
@@ -46,12 +45,8 @@ FINALIZE_HEADERS = {
 REFRESH_TIMEOUT = 20.0
 _TRANSFER_ATTEMPTS = 4
 _TRANSFER_RETRY_SECONDS = 1.0
-# finalize 第一跳的瞬断重发（代理节点抖动下整段续期链的成败所在）
 _TRANSIENT_RETRY_ATTEMPTS = 3
 _TRANSIENT_RETRY_BACKOFF_S = 0.8
-# 各域 settoken 下发的 steamLoginSecure 逐域不同（JWT aud：web:store /
-# web:community / web:steamtv…），合并为单串时以商店域令牌为准——与手贴
-# 浏览器商店 Cookie 的既有口径一致，其余域不覆盖已取到的值
 _LOGIN_SECURE_HOST_PRIORITY = ("store.steampowered.com", "steamcommunity.com")
 
 
@@ -255,7 +250,6 @@ async def web_cookies_from_refresh_token(
 
     refresh_value = values.get(REFRESH_COOKIE) or inherited.get(REFRESH_COOKIE, "")
     if not refresh_value:
-        # finalize 未轮换凭据时，传入的 nonce 即长命续期凭据
         refresh_value = f"{steam_id}||{refresh_token}"
     merged = {
         SESSION_COOKIE: session_id,

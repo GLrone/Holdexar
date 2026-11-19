@@ -94,7 +94,6 @@ def resolve_source_path(source_dir: str | None, filename: str) -> Path:
     return constrain_source_dir(source_dir) / filename
 
 
-# ─── XGP 名称匹配（名称清洗 + 三级查找）───────────────
 
 _TRADEMARK_RE = re.compile(r"\s*\-\s*pc edition|\s*\(pc\)|\s*\(windows\)|\s*windows edition|\s*xbox one|\s*xbox series x\|s")
 _EDITION_RE = re.compile(
@@ -186,7 +185,6 @@ def _collect_xgp_with_links(data: dict, links_map: dict[str, dict[str, str]]) ->
     return xgp_map, matched
 
 
-# ─── 三个导入器 ─────────────────────────────────────────────────
 
 def _fmt_hb_data(raw: str) -> str:
     m = _HB_RE.search(raw or "")
@@ -305,10 +303,6 @@ async def import_hb(source_dir: str | None = None) -> dict:
         await session.commit()
     return {"source": "hb", "ok": True, "file": str(path), "inSource": len(hb_map), "updated": updated}
 
-
-# ─── HB 当月包：membership 页 → 游戏侧标记（无账本表）─────────────
-# 月包的持久语义只有「哪些游戏进过哪个月的包」，落 games.is_hb/hb_data 即完备；
-# 整包存档属易失数据（往期页对未登录 404），表化只会诱导依赖一份注定不全的存档。
 
 _MEMBERSHIP_URL = "https://www.humblebundle.com/membership"
 _STORESEARCH_URL = "https://store.steampowered.com/api/storesearch"
@@ -651,7 +645,6 @@ async def refresh_hb_choice(force: bool = False) -> dict:
             "platformGames": parsed["platformGames"],
         },
     )
-    # 新月包结案即事实变化（轮次游标 machine 已保证唯一）→ 岛上消息消费
     from app.domains.notifications import facts as facts_service
 
     await facts_service.record_fact(
@@ -681,7 +674,6 @@ async def refresh_hb_choice(force: bool = False) -> dict:
     }
 
 
-# ─── HB 当月包展示：仪表盘卡片数据源（纯本地库读，零外网）─────────────
 
 _SKIP_MONTH_URL = "https://www.humblebundle.com/user/skip-month"
 _HB_SETTINGS_URL = "https://www.humblebundle.com/user/settings"
@@ -842,13 +834,6 @@ async def backfill_hb_prices() -> dict:
     }
 
 
-# ─── Steam 喜加一：限时赠送展示链（纯本地库零外网）────────────────────
-# 事实源 = games.free_kind='promo'（写库层每轮爬取按价格行维护）+
-# promo_end_at（Steam free_to_keep_ends，精确到秒）。发现面 = 特惠反哺
-# 与监控池内游戏转赠送；到期翻转由免费复查 job / 下一轮爬取完成，
-# 已过结束时刻的行直接不出（仪表盘「无赠送即整块隐藏」）。
-
-
 async def steam_free_offers() -> dict:
     """正在赠送中的 Steam 限时免费清单（仪表盘卡片数据源，纯本地库零外网）。"""
     from app.crawler.utils import get_beijing_time_obj
@@ -899,7 +884,6 @@ async def steam_free_offers() -> dict:
     }
 
 
-# ─── Epic 喜加一：促销端点自动链 + 外部名单推送 ──────────────────────
 # 促销端点窗口只含当期+未来两周，无历史——历史深度由静态档案导入
 # （import_epic）与外部名单（import_epic_list，浏览器侧脚本推送）补足；
 # 三路汇合于 games.is_epic/epic_date，标记语义一致：已标记行不覆写
@@ -1093,18 +1077,6 @@ async def import_epic_list(items: list[dict]) -> dict:
     }
 
 
-# ─── Epic 白送展示链（仪表盘卡片）：促销端点 → 快照缓存 + 后台刷新 ──────
-# 与标记链（refresh_epic_free）分离：本链不做 storesearch、不落游戏行。
-# 缓存两层：进程内（热路径零 IO）+ app_settings 落库（进程重启后的数据源）。
-# 本地软件随开随关，进程内缓存在每次启动后都是空的；落库快照让冷启动
-# 立即回上一份快照（stale 标记），后台静默刷新，前端短轮询到时自动覆盖。
-#
-# 取数顺序（stale-while-revalidate，对齐 family 域快照语义）：
-# 1. 内存缓存新鲜（< TTL）：直接回（cached=True, stale=False）；
-# 2. 内存空/过期但有落库快照：**先回快照**（stale=True）+ 后台单飞刷新——
-#    冷启动首开即刻出卡，不等网络；
-# 3. 无任何快照（全新安装首开）：现拉（诚实加载态），成功写两层缓存。
-
 _EPIC_OFFERS_TTL_SECONDS = 30 * 60
 # 落库键（app_settings KV；value = {"fetched_at": epoch 秒, "payload": {...}}）
 _EPIC_OFFERS_CACHE_KEY = "metadata.epic_offers_cache"
@@ -1120,7 +1092,7 @@ async def _read_offers_snapshot() -> dict | None:
 
     try:
         row = await get_value(_EPIC_OFFERS_CACHE_KEY)
-    except Exception as e:  # noqa: BLE001 —— 读缓存失败等同无缓存
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             "Epic 免费游戏快照读取失败，本轮按无缓存处理",
@@ -1145,7 +1117,7 @@ async def _write_offers_snapshot(payload: dict) -> None:
             _EPIC_OFFERS_CACHE_KEY,
             {"fetched_at": time.time(), "payload": payload},
         )
-    except Exception as e:  # noqa: BLE001 —— 落库失败不影响本次返回
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             "Epic 免费游戏快照写入失败，本次忽略",
@@ -1174,10 +1146,7 @@ async def _fetch_offers_payload() -> dict | None:
     raw_mobile = freebie or await resolve_mobile_freebie(games, proxy)
     if raw_mobile:
         mobile = {**raw_mobile, "source": "epic"}
-        # direct=False = 入口不是一键领取（官方未公开该期移动 offer，
-        # 只能给移动商店页），前端卡片须如实说明去哪领
         mobile.setdefault("direct", True)
-        # 封面优先用游戏自己的官方 keyImage；缺图才落 breaker 营销图兜底
         if not mobile.get("image") and breaker and breaker.get("image"):
             mobile["image"] = breaker["image"]
     elif breaker:
@@ -1234,7 +1203,6 @@ def _start_offers_refresh() -> None:
             await _publish_epic_rotation(_epic_offers_cache["payload"], payload)
             _epic_offers_cache["payload"] = payload
             _epic_offers_cache["at"] = time.time()
-            # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
             if payload["offers"]:
                 await _write_offers_snapshot(payload)
             log_event(
@@ -1243,7 +1211,7 @@ def _start_offers_refresh() -> None:
                 tag="成功",
                 detail={"PC 白送": len(payload["offers"])},
             )
-        except Exception as e:  # noqa: BLE001 —— 后台失败保留旧快照
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "Epic 免费游戏后台刷新异常，保留旧快照",
@@ -1267,26 +1235,21 @@ async def epic_free_offers(force: bool = False) -> dict:
     await _ensure_offers_cache_hydrated()
     cached = _epic_offers_cache["payload"]
     if not force and not await _epic_fetch_enabled():
-        # 「Epic 免费游戏」开关关闭：只回已有快照，不触发任何联网刷新
-        # （force=True 的手动刷新不受影响）
         if cached is not None:
             return {**cached, "cached": True, "stale": True}
         return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
     if cached is not None and not force:
         if now - _epic_offers_cache["at"] < _EPIC_OFFERS_TTL_SECONDS:
             return {**cached, "cached": True, "stale": False}
-        # 过期快照先回给前端，后台默默刷新
         _start_offers_refresh()
         return {**cached, "cached": True, "stale": True}
 
     payload = await _fetch_offers_payload()
     if payload is None:
         return {"source": "epic-offers", "ok": False, "offers": [], "mobile": None, "fetchedAt": None}
-    # 快照替换即当期集合可能变化：先比对落事实，再覆盖缓存
     await _publish_epic_rotation(_epic_offers_cache["payload"], payload)
     _epic_offers_cache["payload"] = payload
     _epic_offers_cache["at"] = time.time()
-    # PC 列表失败时只出移动卡，不写快照——下次启动重试 Epic
     if payload["offers"]:
         await _write_offers_snapshot(payload)
     return dict(payload)
@@ -1316,19 +1279,14 @@ def get_beijing_now_iso() -> str:
     return get_beijing_time_obj().isoformat(timespec="seconds")
 
 
-# ─── Barter.vg 第三方 bundle 计数：全量档案 → games.bundle_count ────
 # 单文件全量查表（非逐游戏 API）：一次下载、按 appid 对准库内行。
 # bundles_packages 是 Steam 自家捆绑包口径，与站内 bundles 域重叠，
 # 不取用——本字段只表达「第三方渠道进包史」。
 
 _BARTERVG_BUNDLES_URL = "https://bartervg.com/browse/bundles/json/"
-# 完整性哨兵：全量档案当前 3 万条级，低于此门槛视为截断/错误页响应，
-# 丢弃本轮（保留库内旧值），不写入。
 _BARTERVG_MIN_RECORDS = 10000
 _BUNDLES_STATE_KEY = "bartervg_bundles_last_fetch"
 _BUNDLES_TIMEOUT = 90
-# 新鲜度闸：计数只增不减，档案 48h 内拉过即跳过（调度与启动补跑共用；
-# 手动触发传 force=True 绕过）
 _BUNDLES_TTL_HOURS = 48
 
 

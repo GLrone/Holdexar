@@ -37,7 +37,6 @@ class AlertEvent(Base):
     appid: Mapped[int] = mapped_column(BigInteger)
     region: Mapped[str] = mapped_column(String(10))
     price: Mapped[int | None] = mapped_column(BigInteger)  # 触发时该区货币最小单位
-    # 触发时的人民币分（与 cny_fen 同源，历史行回看免再折算）
     price_cny: Mapped[int | None] = mapped_column(BigInteger)
     triggered_at: Mapped[datetime | None] = mapped_column(DateTime)
     notified: Mapped[bool] = mapped_column(Boolean, default=False)

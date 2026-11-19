@@ -47,7 +47,7 @@ async def region_display_name(code: str) -> str:
     try:
         regions = await regions_service.list_regions()
         return next((r["name"] for r in regions if r["code"] == code.lower()), code)
-    except Exception:  # noqa: BLE001 — 区服表异常时展示 code 即可
+    except Exception:  # noqa: BLE001
         return code
 
 
@@ -59,7 +59,7 @@ async def _owner_region_code() -> str:
     """
     try:
         return await account_service.primary_wallet_region()
-    except Exception:  # noqa: BLE001 — 账号域异常不阻断价格检查
+    except Exception:  # noqa: BLE001
         log_event(logger, "读取主账号地区失败，按无号主地区兜底", tag="降级", level=logging.WARNING)
         return ""
 
@@ -86,7 +86,6 @@ async def list_alerts() -> list[dict]:
         rows = (
             await session.execute(select(PriceAlert).order_by(PriceAlert.id.desc()))
         ).scalars().all()
-        # 批量取游戏名 + 封面
         appids = {int(a.appid) for a in rows}
         games: dict[int, tuple[str, str | None]] = {}
         if appids:
@@ -475,16 +474,10 @@ async def check_new_lows(appids: list[int]) -> list[dict]:
     return await check_featured(appids) if appids else []
 
 
-# ─── 监控范围扩展通知：折扣速报 / 捆绑包 / Epic / HB / 通道告警 ──────
-#
-# 统一语义：新事实写 FactNotice 进候选管线（与降价提醒同一投递生命周期），
-# fact_key 幂等防重复发现；SMTP 未配置不消耗资格，下轮按新事实继续。
-# 发现闸挡噪音：折扣类 20h 上限，告警类按 kind 冷却（SYS_ALERT_COOLDOWN_HOURS）。
-
-DEAL_MIN_DISCOUNT = 50          # 折扣深度门槛（%）
-DEAL_MIN_INTERVAL_HOURS = 20.0  # 同类速报最小间隔
-BUNDLE_MIN_CNY_FEN = 500        # 捆绑包价格下限（¥5，滤掉拆分/占位包）
-PROXY_ALERT_RATIO = 0.2         # 可用通道占比低于此值即告警
+DEAL_MIN_DISCOUNT = 50
+DEAL_MIN_INTERVAL_HOURS = 20.0
+BUNDLE_MIN_CNY_FEN = 500
+PROXY_ALERT_RATIO = 0.2
 
 KEY_BUNDLE_DEAL_AT = "alerts.bundle_deal_at"           # epoch 秒（发现闸）
 KEY_SYS_ALERT_AT = "alerts.sys_alert_at"               # {kind: epoch 秒（冷却）}
@@ -707,7 +700,7 @@ async def _subscription_digest(proxies_service) -> list[dict]:
     """订阅摘要（只取展示字段）：订阅 URL 是凭据，绝不进邮件正文。"""
     try:
         subs = await proxies_service.list_subscriptions()
-    except Exception:  # noqa: BLE001 — 摘要失败不影响告警主体
+    except Exception:  # noqa: BLE001
         return []
     out = []
     for s in subs[:5]:
@@ -731,7 +724,7 @@ async def check_proxy_health() -> bool:
 
     try:
         stats = await proxies_service.pool_stats()
-    except Exception:  # noqa: BLE001 — 统计失败无法判定，不误报
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "代理池统计失败，跳过通道告警",
@@ -798,7 +791,7 @@ async def _mark_alert(kind: str) -> None:
     store = await settings_service.get_value(KEY_SYS_ALERT_AT, {})
     store = dict(store) if isinstance(store, dict) else {}
     store[kind] = time.time()
-    if len(store) > 20:  # 只留最近 20 类，防 KV 无界增长
+    if len(store) > 20:
         for key, _ in sorted(store.items(), key=lambda kv: kv[1])[: len(store) - 20]:
             store.pop(key, None)
     await settings_service.set_value(KEY_SYS_ALERT_AT, store)
@@ -924,9 +917,7 @@ async def search_games(q: str, region: str = "CN") -> dict:
         return {"items": []}
 
     region_cc = region.lower()
-    # 1. 本地搜索（中文名 LIKE / 英文名 LIKE / appid 精确）
     async with get_session_factory()() as session:
-        # 纯数字 → 也按 appid 精确匹配
         is_numeric = q.isdigit()
         if is_numeric:
             appid_val = int(q)
@@ -956,17 +947,15 @@ async def search_games(q: str, region: str = "CN") -> dict:
                     "appid": int(g.appid),
                     "name": g.name or "",
                     "nameEn": g.name_en or "",
-                    "isFree": False,  # 本地库存的游戏默认非免费
+                    "isFree": False,
                 }
                 for g in rows
             ]
         }
 
-    # 2. 本地无结果，如果输入不是纯数字 appid → 返回无效
     if not is_numeric:
         return {"items": [], "error": "输入不是有效的 AppID，且本地无匹配游戏记录"}
 
-    # 3. 输入是 appid → 在线查询 Steam appdetails 验证（代理优先：Steam 域直连基本不通）
     appid_val = int(q)
     try:
         from app.domains.proxies import service as proxies_service

@@ -56,10 +56,8 @@ async def _schema(db):
         await session.commit()
 
 
-# ── Cookie 解析 ──────────────────────────────────────────
 
 def test_parse_cookie_str_is_generic_parser():
-    # 通用解析器保留全部键；收窄由 filter_login_cookies 负责
     jar = parse_cookie_str("sessionid=abc; steamLoginSecure=76561%7C%7Cxyz; junk=1")
     assert jar["sessionid"] == "abc"
     assert jar["steamLoginSecure"] == "76561%7C%7Cxyz"
@@ -68,10 +66,8 @@ def test_parse_cookie_str_is_generic_parser():
 
 
 def test_parse_cookie_str_tolerates_paste_variants():
-    # F12 请求标头整行复制（带 Cookie: 前缀）
     header = "Cookie: sessionid=abc; steamLoginSecure=76561%7C%7Ctok"
     assert parse_cookie_str(header)["steamLoginSecure"] == "76561%7C%7Ctok"
-    # Application 面板逐条复制的换行格式
     multiline = "sessionid=abc\nsteamCountry=CN%7C\nsteamLoginSecure=76561%7C%7Ctok"
     narrowed = filter_login_cookies(multiline)
     assert narrowed == "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok"
@@ -89,7 +85,6 @@ def test_filter_login_cookies_keeps_login_set_and_refresh_credential():
         "sessionid=abc; steamCountry=CN%7C; steamLoginSecure=76561%7C%7Ctok; "
         "steamRefresh_steam=76561%7C%7Cref; steamRememberLogin=true"
     )
-    # 续期凭据缺席时收窄结果仍是合法登录态（只是寿命止于访问令牌到期）
     assert "steamRefresh_steam" not in filter_login_cookies(
         "sessionid=abc; steamLoginSecure=76561%7C%7Ctok"
     )
@@ -114,7 +109,6 @@ def test_steam_id_from_cookies(raw, expected):
     assert steam_id_from_cookies(raw) == expected
 
 
-# ── 币种映射 / 格式化 ────────────────────────────────────
 
 def test_currency_ids_cover_cc_list_unique_currencies():
     from app.crawler.config import CC_LIST
@@ -155,11 +149,9 @@ def test_from_raw_amounts_normalizes_bad_country():
     assert info.country_code == ""
 
 
-# ── 地区派生（反查 crawl_regions）─────────────────────────
 
 @pytest.mark.asyncio
 async def test_derive_region_by_currency_reverse_lookup():
-    # CNY → cn；EUR 欧元区基准 pt；USD 多区固定 us
     assert await account_service._derive_region("CNY") == "cn"
     assert await account_service._derive_region("EUR") == "pt"
     assert await account_service._derive_region("USD") == "us"
@@ -172,7 +164,6 @@ async def test_derive_region_unknown_currency_returns_empty():
     assert await account_service._derive_region("") == ""
 
 
-# ── 服务编排（mock 网络层）─────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_sync_wallet_persists_snapshot(monkeypatch):
@@ -180,7 +171,6 @@ async def test_sync_wallet_persists_snapshot(monkeypatch):
         return from_raw_amounts(20000, 0, 23, "CN")
 
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
-    # 多账号表：经 save_cookies 绑定（upsert + 置 active），不再种 KV
     await account_service.save_cookies(
         "steamLoginSecure=76561198123456789%7C%7Ct"
     )
@@ -222,9 +212,9 @@ async def test_sync_wallet_failure_preserves_ok_at(monkeypatch):
     wallet = (await account_service.get_status())["wallet"]
     assert wallet["check_ok"] is False
     assert wallet["error"] == "模拟网络失败"
-    assert wallet["ok_at"] == ok_at  # 成功时刻原样保留
-    assert wallet["checked_at"] != ok_at  # checked_at 是失败尝试时间
-    assert wallet["balance_display"] == "¥200.00"  # 旧余额字段保留
+    assert wallet["ok_at"] == ok_at
+    assert wallet["checked_at"] != ok_at
+    assert wallet["balance_display"] == "¥200.00"
 
 
 @pytest.mark.asyncio
@@ -258,7 +248,7 @@ async def test_wallet_rotation_success_writes_ok_at(monkeypatch):
     assert snapshot["ok_at"] == snapshot["checked_at"]
 
     wallet = (await account_service.get_status())["wallet"]
-    assert wallet["ok_at"] == snapshot["ok_at"]  # 落行同口径
+    assert wallet["ok_at"] == snapshot["ok_at"]
     assert wallet["check_ok"] is True
 
 
@@ -281,7 +271,6 @@ async def service_save(cookies: str) -> dict:
     return await account_service.save_cookies(cookies)
 
 
-# ── SSL 降级（本机自签证书加速器场景）──────────────────────
 
 @pytest.mark.asyncio
 async def test_fetch_wallet_falls_back_on_ssl_error(monkeypatch):
@@ -299,7 +288,7 @@ async def test_fetch_wallet_falls_back_on_ssl_error(monkeypatch):
 
     monkeypatch.setattr(steam_wallet, "_try_channels", fake_try)
     info = await steam_wallet.fetch_wallet("steamLoginSecure=76561198000000000%7C%7Ct")
-    assert calls == [True, False]  # 严格 → 证书失败降级
+    assert calls == [True, False]
     assert info.currency_code == "USD"
 
 
@@ -318,7 +307,7 @@ async def test_fetch_wallet_no_fallback_on_plain_network_error(monkeypatch):
     monkeypatch.setattr(steam_wallet, "_try_channels", fake_try)
     with pytest.raises(steam_wallet.WalletFetchError):
         await steam_wallet.fetch_wallet("steamLoginSecure=76561198000000000%7C%7Ct")
-    assert calls == [True]  # 非 SSL 错误不降级，避免掩盖 Cookie 失效
+    assert calls == [True]
 
 
 @pytest.mark.asyncio
@@ -338,10 +327,9 @@ async def test_fetch_wallet_explicit_verify_skips_fallback(monkeypatch):
         await steam_wallet.fetch_wallet(
             "steamLoginSecure=76561198000000000%7C%7Ct", verify=False
         )
-    assert calls == [False]  # 显式指定时只跑一次
+    assert calls == [False]
 
 
-# ── 进程级客户端缓存（连接复用 / 自愈重建 / jar 隔离）────────
 
 
 @pytest.fixture
@@ -439,7 +427,6 @@ async def test_wallet_response_cookies_not_carried_over(monkeypatch, _wallet_cac
         assert "steamLoginSecure" in c["cookie"]
 
 
-# ── store account 通道（fixture 取自真实页面结构）───
 
 from app.domains.account.steam_wallet import (  # noqa: E402
     _ACCOUNT_BALANCE_RE,
@@ -562,7 +549,6 @@ async def test_fetch_store_account_link_wrapped_price_variant():
 async def test_fetch_store_account_symbol_mismatch_raises():
     from app.domains.account import steam_wallet as w
 
-    # currency_code=1 (USD $) 但余额符号是 ₹ → 交叉验证应炸（防误配）
     broken = _ACCOUNT_PAGE_FIXTURE.replace("currency_code&quot;:24", "currency_code&quot;:1")
     client = _FakeClient({w.ACCOUNT_URL: broken})
     with pytest.raises(Exception, match="不一致"):
@@ -593,17 +579,14 @@ async def test_fetch_store_account_logged_out_returns_none():
 
 @pytest.mark.asyncio
 async def test_derive_region_multi_currency_disambiguates_by_name():
-    # USD 多区（us/pk/tr/ar/az…）+ history 页地区名「美国」→ us；名字不匹配回落基准区
     assert await account_service._derive_region("USD", "美国") == "us"
     assert await account_service._derive_region("USD", "南亚") == "pk"
     assert await account_service._derive_region("USD", "") == "us"
     # 名字与币种不符时以币种为准（name 来自过期转换记录）
     assert await account_service._derive_region("KZT", "印度") == "kz"
-    # 唯一币种区直接反查
     assert await account_service._derive_region("INR", "印度") == "in"
 
 
-# ── 头像 URL 归一（2026-09 CDN 域名轮换治理）──────────────────
 
 
 @pytest.mark.parametrize(
@@ -617,10 +600,8 @@ async def test_derive_region_multi_currency_disambiguates_by_name():
          "https://avatars.fastly.steamstatic.com/abc.jpg"),
         ("https://avatars.steamstatic.com/abc.jpg",
          "https://avatars.fastly.steamstatic.com/abc.jpg"),
-        # 现行规范域原样保留
         ("https://avatars.fastly.steamstatic.com/abc_full.jpg",
          "https://avatars.fastly.steamstatic.com/abc_full.jpg"),
-        # 非头像 URL / data URI / 空值原样
         ("https://steamcdn-a.akamaihd.net/steamcommunity/public/images/xxx",
          "https://steamcdn-a.akamaihd.net/steamcommunity/public/images/xxx"),
         ("data:image/png;base64,iVBOR", "data:image/png;base64,iVBOR"),
@@ -674,7 +655,7 @@ async def test_sync_profile_row_self_heals_avatar_domain(db, monkeypatch):
     async with db() as session:
         row = await session.get(SteamAccount, sid)
         assert row.avatar_url == "https://avatars.fastly.steamstatic.com/abc_full.jpg"
-        assert row.persona_name == "旧昵称"  # 只在缺失时补写，不覆盖
+        assert row.persona_name == "旧昵称"
 
 
 @pytest.mark.asyncio

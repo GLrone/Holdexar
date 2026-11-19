@@ -16,7 +16,7 @@ from app.core.database import Base, WritePriority, get_session_factory, write_se
 from app.domains.achievements import level
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
 
-NOTE_TEXT_MAX = 140  # 上限对齐 KV 便利贴墙 career.WALL_TEXT_MAX
+NOTE_TEXT_MAX = 140
 NOTE_MOODS: tuple[str, ...] = ("love", "wow", "hard", "fun")
 
 COMPARE_MAX = 6
@@ -30,7 +30,6 @@ class AchievementNote(Base):
 
     steamid: Mapped[str] = mapped_column(String(20), primary_key=True)
     appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    # 与 achievement_defs 同款图标资产名标识
     image_name: Mapped[str] = mapped_column(String(160), primary_key=True)
     content: Mapped[str] = mapped_column(String(140), nullable=False)
     mood: Mapped[str | None] = mapped_column(String(12))
@@ -38,7 +37,6 @@ class AchievementNote(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-# ─── 口径与校验 ────────────────────────────────────────────────
 
 
 def _comment_ref(appid: int, image_name: str) -> str:
@@ -94,7 +92,6 @@ _NOTE_GAME_JOIN = (
 )
 
 
-# ─── 批注（写评语经 xp_events 给小额外 XP，每成就每账号一次）──────
 
 
 async def list_notes(target: str | None = None) -> dict:
@@ -179,7 +176,6 @@ async def save_note(
         await session.commit()
 
     if granted:
-        # 涨级事实自开事务落库（fact_key 幂等），不占本批注的写事务
         async with get_session_factory()() as session:
             await level.notify_level_up(session, steamid, previous_level=prev_level)
     note, d, game_name = row
@@ -207,7 +203,6 @@ async def remove_note(target: str | None, appid: int, image_name: str) -> bool:
         return bool(result.rowcount)
 
 
-# ─── 多账号对比（全部读既有账本，不落任何新表）──────────────────
 
 
 def _parse_steamids(raw: str | None) -> list[str]:
@@ -263,7 +258,7 @@ async def _challenges_completed(session: AsyncSession, steamid: str) -> int:
                 {"sid": steamid},
             )
         ).scalar()
-    except Exception:  # noqa: BLE001 —— 表未建按零计，交付后自动可读
+    except Exception:  # noqa: BLE001
         return 0
     return int(row or 0)
 
@@ -323,7 +318,6 @@ async def compare(steamids: str | None = None) -> dict:
     if not wanted:
         return {"accounts": []}
     async with write_session(WritePriority.BACKGROUND, label="social_compare_baseline") as wsession:
-        # 对比读数前先补齐每个账号的存量基线（幂等），未开过等级页的账号不再显示 1 级 0 经验。
         # 基线必须落库后才读：写会话不自动提交，不提交则本次补的基线在读数前被丢弃
         for sid in wanted:
             await level.ensure_baseline(wsession, sid)
@@ -333,7 +327,6 @@ async def compare(steamids: str | None = None) -> dict:
     return {"accounts": accounts}
 
 
-# ─── 最近解锁动态流（achievement_states join defs，倒序分页）──────
 
 
 async def recent_unlocks(target: str | None = None, limit: int = FEED_DEFAULT_LIMIT) -> dict:

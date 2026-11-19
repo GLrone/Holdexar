@@ -12,7 +12,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
-# Steam 回执原文入库上限（超出截断，防单行膨胀；回执主体信息在前列字段）
 RAW_MAX = 8000
 
 
@@ -24,9 +23,9 @@ class RedeemActivation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
-    # cdk=CDK 激活 · free=免费领取
+
     kind: Mapped[str] = mapped_column(String(10), default="cdk")
-    # ok | own | fail
+
     status: Mapped[str] = mapped_column(String(10))
     product_key: Mapped[str] = mapped_column(String(120), default="")
     subid: Mapped[str] = mapped_column(String(40), default="")

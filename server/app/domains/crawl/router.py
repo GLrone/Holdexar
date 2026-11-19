@@ -19,11 +19,9 @@ router = APIRouter(tags=["crawl"])
 
 class CrawlRunRequest(BaseModel):
     scope: str = "appids"
-    # all（全部符合条件的游戏）| appids | wishlist
-    # | wishlist_only | owned | pool（全池，愿望单优先序排前）
     appids: list[int] | None = None
     regions: list[str] | None = None
-    kind: str = "manual"  # 任务类型标签；未知值按 scope 解析为普通任务（仅标签不同）
+    kind: str = "manual"
     # missing/repair 补抓冷却覆盖（分钟）；None=通道默认（missing 24h / repair 4min），
     # 0=立即补——「立即补抓失败地区」入口用它跳过冷却
     cooldown: int | None = None
@@ -31,7 +29,6 @@ class CrawlRunRequest(BaseModel):
 
 @router.post("/crawl/run")
 async def run(req: CrawlRunRequest):
-    # 已购抓取未显式指定地区时，套用「已购游戏抓取地区」配置（None=跟随监控地区）
     if req.scope == "owned" and req.regions is None:
         from app.domains.regions.service import owned_regions
 
@@ -57,7 +54,6 @@ async def run(req: CrawlRunRequest):
 
 @router.post("/crawl/stop")
 async def stop(jobId: int | None = None, chain: bool = True):
-    # chain=true（默认）停整轮：当前段结束后不再启动后续段；false 只停当前段
     stopped = await service.stop_job(jobId, whole_chain=chain)
     return {"stopped": stopped}
 
@@ -76,7 +72,6 @@ async def import_apps(req: ImportRequest):
     try:
         return await service.import_appids(req.appids)
     except ValueError as e:
-        # 与池页 /pool/items 同款：业务约束不满足时给可读原因，不做未捕获 500
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -129,7 +124,6 @@ async def cycles(limit: int = Query(10, ge=1, le=50)):
     return await cycle_service.list_cycles(limit)
 
 
-# 新鲜度查询一次最多问多少个对象：避免一条请求把全池拉进来
 FRESHNESS_MAX_APPIDS = 200
 
 

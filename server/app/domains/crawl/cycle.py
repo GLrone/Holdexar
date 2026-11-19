@@ -187,11 +187,8 @@ CANCELLED = "cancelled"
 
 TERMINAL_STATES = (COMPLETED, PARTIAL, FAILED, CANCELLED)
 
-# 未收敛状态：进程重启时遗留行要收敛成终态，否则「这一轮跑到哪了」永远无解
 OPEN_STATES = (PLANNING, RUNNING, REPAIRING, FINALIZING)
 
-# 允许的跃迁。worker / job 的内部信息（重试第几次、等代理、解析区服）一律
-# 不进这张表——那属于 attempt 级，不是 Cycle 的生命周期。
 _TRANSITIONS: dict[str, tuple[str, ...]] = {
     PLANNING: (RUNNING, FAILED),
     RUNNING: (REPAIRING, FINALIZING, FAILED, CANCELLED),
@@ -212,13 +209,10 @@ class PriceCycle(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     # scheduled（6h 网格主轮）| manual（用户手动发起）
     kind: Mapped[str] = mapped_column(String(20))
-    # planning | running | repairing | finalizing | completed | partial | failed | cancelled
     status: Mapped[str] = mapped_column(String(20), default=PLANNING)
     # 主范围：pool（监控层）/ catalog（目录层）/ appids（显式列表）
     scope: Mapped[str] = mapped_column(String(20), default="")
-    # 冻结的期望集：{"appids": [...], "regions": [...]}——本轮覆盖率分母
     expected_json: Mapped[dict | None] = mapped_column(JSON)
-    # 冻结的本轮阶段（spec 列表原样留存，供回溯「这轮跑了哪几段」）
     specs_json: Mapped[list | None] = mapped_column(JSON)
     notification_scan_json: Mapped[dict | None] = mapped_column(JSON)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
@@ -230,17 +224,9 @@ class PriceCycle(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime)
     error: Mapped[str | None] = mapped_column(Text)
 
-    # 轮批次总账（任务页的「总队列」口径，1 批 = 1 区 × 一发批量）：
-    # expected 在 planning 冻结（各带 scope 段按款数 ÷ 单发容量向上取整 × 区数，
-    # 补抓欠账段启动时才可知、不含在内）；done 跑动中随 job 收尾重算（各 job
-    # 已处理批次之和）。分母是预估——批量切分还受 URL 预算影响，取显示层
-    # max(预估, 已启动段精确 count) 兜底，进度条不会倒挂。
     batches_expected: Mapped[int | None] = mapped_column(Integer)
     batches_done: Mapped[int | None] = mapped_column(Integer)
 
-    # ── 生产统计（Cycle 收敛时写入，全为 NULL = 本轮没有留下统计）──
-    # 口径见 crawl/stats.py：计数来自冻结期望集 + 本轮价格结果，
-    # 不是另算一套；解释不了来源的数字不写。
     targets_total: Mapped[int | None] = mapped_column(Integer)
     # 本轮「处理完」的对象数：全部期望区服都拿到明确终态（含 missing/blocked），
     # 与「是否成功」无关——targets_done 满格 + coverage 不满可以同时成立
@@ -248,13 +234,10 @@ class PriceCycle(Base):
     units_expected: Mapped[int | None] = mapped_column(Integer)
     units_ok: Mapped[int | None] = mapped_column(Integer)
     units_locked: Mapped[int | None] = mapped_column(Integer)
-    # 明确失败的单元 = missing + blocked
     units_failed: Mapped[int | None] = mapped_column(Integer)
-    # missing/blocked 拆分，覆盖读路径的拆分来源
     units_missing: Mapped[int | None] = mapped_column(Integer)
     units_blocked: Mapped[int | None] = mapped_column(Integer)
     units_unobserved: Mapped[int | None] = mapped_column(Integer)
-    # 对象级：价格记录的最后观察时刻已 ≥ STALE_HOURS 的对象数（与 Freshness 同口径）
     stale_count: Mapped[int | None] = mapped_column(Integer)
 
     __table_args__ = (
@@ -328,8 +311,6 @@ async def freeze_expected(cycle_id: int, specs: list[dict]) -> tuple[list[str] |
             if resolved is None:
                 resolved = await crawl_service.plan_scope_appids(scope, spec.get("appids"))
         except ValueError as e:
-            # 该阶段本轮无可刷对象（空列表 / 未知 scope）：与 run_sequential
-            # 同款容忍——跳过该阶段，不让它掀翻整轮记账
             log_event(
                 logger,
                 "一个抓取阶段本轮没有可刷对象，已跳过",
@@ -484,7 +465,6 @@ def _to_dict(cycle: PriceCycle) -> dict:
         "status": cycle.status,
         "scope": cycle.scope,
         "expectedUnits": expected_units(cycle.expected_json),
-        # 轮批次总账：分母（冻结预估）与已收尾段的完成量——任务页的「总队列」
         "batchesExpected": cycle.batches_expected,
         "batchesDone": cycle.batches_done,
         "enteredRepairing": cycle.repairing_at is not None,

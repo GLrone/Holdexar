@@ -14,7 +14,7 @@ from app.core.database import get_session_factory, init_db
 from app.domains.games import service
 from app.domains.games.models import GamePriceHistory
 
-APPID = 990_001  # 合成 appid，避开真实库
+APPID = 990_001
 STANDARD_SUB = 78771001
 DELUXE_SUB = 78771002
 GOLD_SUB = 78771003
@@ -56,18 +56,13 @@ async def _seed():
     await init_db()
     now = datetime.now()
     rows = [
-        # 标准版三切片：¥100 → ¥80（折）→ ¥90
         _h(APPID, "CN", 10000, 0, STANDARD_SUB, False, None, now - timedelta(days=200)),
         _h(APPID, "CN", 8000, 20, STANDARD_SUB, False, None, now - timedelta(days=100)),
         _h(APPID, "CN", 9000, 10, STANDARD_SUB, False, None, now - timedelta(days=10)),
-        # Deluxe 版两切片
         _h(APPID, "CN", 20000, 0, DELUXE_SUB, False, "Deluxe Edition", now - timedelta(days=150)),
         _h(APPID, "CN", 16000, 20, DELUXE_SUB, False, "Deluxe Edition", now - timedelta(days=50)),
-        # Gold 版（is_gold 无后缀）
         _h(APPID, "CN", 30000, 0, GOLD_SUB, True, None, now - timedelta(days=80)),
-        # UA 区仅标准版（versions 地区感知）
         _h(APPID, "UA", 5000, 0, STANDARD_SUB, False, None, now - timedelta(days=30)),
-        # 锁区行：不应进 points（versions 查询也只取 ok）
         _h(APPID, "CN", None, 0, STANDARD_SUB, False, None, now - timedelta(days=5), status="locked"),
     ]
     async with get_session_factory()() as session:
@@ -87,7 +82,6 @@ async def test_default_is_standard():
     assert r["lowest"]["cnyFen"] == 8000
     assert r["highest"]["cnyFen"] == 10000
     assert r["count"] == 3
-    # 史低次数：¥8000 是唯一跌破前低的点（10000 → 8000 一次），回升后未再触及
     assert r["lowestHits"] == 1
 
 
@@ -98,7 +92,6 @@ async def test_lowest_hits_counts_repeat_visits():
     now = datetime.now()
     repeat_appid = 990_002
     rows = [
-        # 原价 → 折后史低 → 回原价 → 再回史低（第二次）→ 回原价 → 史低期三连快照（第三次）
         _h(repeat_appid, "CN", 10000, 0, STANDARD_SUB, False, None, now - timedelta(days=300)),
         _h(repeat_appid, "CN", 5000, 50, STANDARD_SUB, False, None, now - timedelta(days=200)),
         _h(repeat_appid, "CN", 10000, 0, STANDARD_SUB, False, None, now - timedelta(days=150)),
@@ -115,7 +108,6 @@ async def test_lowest_hits_counts_repeat_visits():
         r = await service.get_game_history(repeat_appid, region="cn")
         assert [p["cnyFen"] for p in r["points"]] == [10000, 5000, 10000, 5000, 10000, 5000, 5000, 5000]
         assert r["lowest"]["cnyFen"] == 5000
-        # 三段史低价：-200d 单点 / -100d 单点 / -30~-28d 连续三快照（一段）
         assert r["lowestHits"] == 3
     finally:
         async with get_session_factory()() as session:
@@ -140,7 +132,7 @@ async def test_versions_region_scoped():
     r = await service.get_game_history(APPID, region="cn")
     versions = r["versions"]
     assert len(versions) == 3
-    assert versions[0]["suffix"] is None and not versions[0]["isGold"]  # 标准版首位
+    assert versions[0]["suffix"] is None and not versions[0]["isGold"]
     assert {v["subId"] for v in versions} == {STANDARD_SUB, DELUXE_SUB, GOLD_SUB}
     deluxe = next(v for v in versions if v["subId"] == DELUXE_SUB)
     assert deluxe["suffix"] == "Deluxe Edition"
@@ -162,7 +154,6 @@ async def test_days_window():
 async def test_price_context():
     """price-context：当时价 = 截止日前最后一个有效快照，史低 = 截止日前最小值；
     日后的切片不漏入；非标准版（Deluxe/Gold）不混入；空窗/非法日期返回 null 对。"""
-    # -50d：窗口内只剩 -200d(10000) 与 -100d(8000) 两个标准版切片
     day = (datetime.now() - timedelta(days=50)).strftime("%Y-%m-%d")
     r = await service.get_price_context(APPID, date=day)
     assert r["at"]["cnyFen"] == 8000
@@ -170,12 +161,10 @@ async def test_price_context():
     assert r["lowest"]["cnyFen"] == 8000
     assert r["lowest"]["snapshotAt"] == r["at"]["snapshotAt"]
 
-    # -150d：只剩首个切片（当时价 = 史低 = 原价）
     early = (datetime.now() - timedelta(days=150)).strftime("%Y-%m-%d")
     r2 = await service.get_price_context(APPID, date=early)
     assert r2["at"]["cnyFen"] == 10000 and r2["lowest"]["cnyFen"] == 10000
 
-    # 日后的切片（-10d 的 9000）与更晚的同 sub 高价行都不得漏入
     late_appid = 990_006
     rows = [
         _h(late_appid, "CN", 10000, 0, STANDARD_SUB, False, None, datetime.now() - timedelta(days=90)),
@@ -193,7 +182,6 @@ async def test_price_context():
             await session.execute(delete(GamePriceHistory).where(GamePriceHistory.appid == late_appid))
             await session.commit()
 
-    # 无任何切片的日期 → null 对；非法日期不抛异常
     r4 = await service.get_price_context(APPID, date="2000-01-01")
     assert r4["at"] is None and r4["lowest"] is None
     r5 = await service.get_price_context(APPID, date="not-a-date")
@@ -217,11 +205,10 @@ async def test_empty_region_still_lists_versions():
     assert r["points"] == []
     assert r["lowest"] is None and r["highest"] is None
     assert r["count"] == 0
-    assert "lowestHits" not in r  # 空序列不返回史低次数
+    assert "lowestHits" not in r
     assert r["versions"] == []
 
 
-# ── 跨 sub 代际的标准版序列 ──────────────────────────────────────────
 # Steam 改包内容就换 sub_id，若把默认序列钉在「当前在售」那一个 sub 上，
 # 换代之前的历史会被整段滤掉（真实库：872410/CN 只出 2 个点而库里 130 行）。
 # 下面三条锁定修复后的口径。
@@ -268,14 +255,11 @@ async def test_standard_series_spans_sub_generations():
     """标准版序列跨 sub 代际取并集：旧代际的历史不被新代际的在售 sub 滤掉。"""
     now = datetime.now()
     rows = [
-        # 旧代际：三切片（2021 起）
         _h(GEN_APPID, "CN", 10000, 0, OLD_GEN_SUB, False, None, now - timedelta(days=1200)),
         _h(GEN_APPID, "CN", 6000, 40, OLD_GEN_SUB, False, None, now - timedelta(days=900)),
         _h(GEN_APPID, "CN", 10000, 0, OLD_GEN_SUB, False, None, now - timedelta(days=600)),
-        # 换代：新代际只有 2 个点
         _h(GEN_APPID, "CN", 12000, 0, NEW_GEN_SUB, False, None, now - timedelta(days=30)),
         _h(GEN_APPID, "CN", 8000, 33, NEW_GEN_SUB, False, None, now - timedelta(days=3)),
-        # 干扰项：Deluxe（带后缀）与 Gold 不得混入标准版序列
         _h(GEN_APPID, "CN", 50000, 0, 78772009, False, "Deluxe Edition", now - timedelta(days=500)),
         _h(GEN_APPID, "CN", 99000, 0, 78772010, True, None, now - timedelta(days=400)),
     ]
@@ -285,10 +269,8 @@ async def test_standard_series_spans_sub_generations():
     await _seed_current(GEN_APPID, "CN", NEW_GEN_SUB)
     try:
         r = await service.get_game_history(GEN_APPID, region="cn")
-        # 旧代际 3 点 + 新代际 2 点（修复前只有新代际的 2 点）
         assert [p["cnyFen"] for p in r["points"]] == [10000, 6000, 10000, 12000, 8000]
         assert r["count"] == 5
-        # 史低 6000 落在旧代际——只取在售 sub 时这个史低会被隐藏
         assert r["lowest"]["cnyFen"] == 6000
     finally:
         await _cleanup(GEN_APPID)
@@ -368,7 +350,6 @@ async def test_history_missing_cny_uses_historical_fx_only():
                 sub_id=990_00401, is_gold=False, version_suffix=None,
                 price_status="ok", cny_fen=None, snapshot_at=day_missing,
             ),
-            # 存量 cny_fen：即使当日有历史汇率也不得重算（存量优先）
             GamePriceHistory(
                 appid=FX_HIST_APPID, region_code="XTS", currency="XTS",
                 price=300_000, original_price=300_000, discount_percent=0,
@@ -392,9 +373,9 @@ async def test_history_missing_cny_uses_historical_fx_only():
     try:
         r = await service.get_game_history(FX_HIST_APPID, region="xts")
         by_ts = {p["timestamp"]: p["cnyFen"] for p in r["points"]}
-        assert by_ts[day_hist.isoformat()] == round(100_000 * 0.015)  # 历史 1500
-        assert by_ts[day_missing.isoformat()] == 0  # 历史缺失 → 不回落当前汇率
-        assert by_ts[day_stock.isoformat()] == 12345  # 存量不重算
+        assert by_ts[day_hist.isoformat()] == round(100_000 * 0.015)
+        assert by_ts[day_missing.isoformat()] == 0
+        assert by_ts[day_stock.isoformat()] == 12345
     finally:
         async with get_session_factory()() as session:
             await session.execute(
@@ -420,17 +401,14 @@ async def test_unknown_product_series_isolated_from_standard():
         session.add_all(unknown_rows)
         await session.commit()
 
-    # 缺省（标准版）：未知行绝不混入——价格仍是有身份的标准版三切片
     default = await service.get_game_history(APPID, region="cn")
     assert [p["cnyFen"] for p in default["points"]] == [10000, 8000, 9000]
 
-    # versions：标准条目带 product=standard；未知是显式独立条目（非标准冒充）
     std_entry = next(v for v in default["versions"] if v["subId"] == STANDARD_SUB)
     unknown_entry = next(v for v in default["versions"] if v.get("product") == "unknown")
     assert std_entry["product"] == "standard"
     assert unknown_entry["subId"] is None and unknown_entry["suffix"] is None
 
-    # 独立未知序列
     unknown = await service.get_game_history(APPID, region="cn", product="unknown")
     assert [p["cnyFen"] for p in unknown["points"]] == [6000, 4500]
 
@@ -450,4 +428,4 @@ async def test_price_context_excludes_unknown_product_rows():
         await session.commit()
 
     ctx_with = await service.get_price_context(APPID, day, region="cn")
-    assert ctx_with["lowest"] == ctx_without["lowest"]  # 未知行不拉低史低
+    assert ctx_with["lowest"] == ctx_without["lowest"]

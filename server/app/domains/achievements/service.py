@@ -53,23 +53,15 @@ HEADER_URL_TMPL = "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/hea
 LANG = "schinese"
 SYNC_KEY = "achievements.sync_state"
 SYNC_STALE_MINUTES = 30
-# 库内快照陈旧阈值：GET summary 命中更旧的快照时后台自动补拉（本轮仍回库内
-# 初版，新数据随下一轮同步落库）；定时同步每天一次，这里兜住白天打开页面的场景
 SYNC_WARM_MAX_AGE_HOURS = 6
-# 自动补拉节流窗：同步失败时 syncedAt 不推进，避免每次 GET 都重试一轮全量
 SYNC_WARM_RETRY_MINUTES = 10
 PROGRESS_BATCH = 100
-API_RETRIES = 3  # Web API 网络类失败的同通道重试次数
-# 社区页请求最小间隔（秒）：逐游戏两页、全量 380 款约 10 分钟
+API_RETRIES = 3
 COMMUNITY_MIN_INTERVAL = 0.7
 COMMUNITY_RETRIES = 3
-# 清单页变更慢（成就定义数月不变）：超过此龄才重抓
 DEFS_TTL_DAYS = 7
-# 解锁态增量门禁：计数未变且近此小时数内已刷过明细 → 跳过该游戏抓取
 DETAIL_SKIP_HOURS = 24
-# 逐款进度兜底（token 失效时的后备通道）的重复点名窗口：这段时间内刷过的行跳过
 PROGRESS_FALLBACK_SKIP_MINUTES = 60
-# Web API 并发度：逐款明细/逐款进度每请求经代理 2~3 秒，串行全库要按小时计；
 # 并发只作用于 api.steampowered.com（社区页通道仍由全局节流串行化）
 API_CONCURRENCY = 5
 
@@ -77,22 +69,19 @@ TIMELINE_MONTHS = 24
 RAREST_LIMIT = 12
 RECENT_LIMIT = 12
 NEAR_LIMIT = 12
-NEAR_THRESHOLD = 75.0  # 「接近白金」完成度门槛（%）
+NEAR_THRESHOLD = 75.0
 
-# 稀有度分档（按全服解锁占比，对齐主机奖杯体系的常/少见/稀有/极稀/传说）
 RARITY_BANDS = (("ultra", 1.0), ("very_rare", 5.0), ("rare", 20.0), ("uncommon", 50.0))
 GRAY_SUFFIX = "_BW"
 
-# 游戏行来源（achievement_games.source）
-SOURCE_OWNED = "owned"    # 本号已购（含玩过的免费游戏）
-SOURCE_SHARED = "shared"  # 库外：家庭共享池里本号未拥有、但已达成成就
+SOURCE_OWNED = "owned"
+SOURCE_SHARED = "shared"
 
 
 class SyncError(Exception):
     """同步通道失败（凭证缺失/页面被拒/网络），区别于「无成就/库空」。"""
 
 
-# ─── 凭证（仅用于已购与批量进度；成就明细走公开页，无需任何 Key）──
 
 async def _primary_steam_id() -> str:
     steamid = await account_service.get_primary_steam_id()
@@ -118,7 +107,7 @@ async def resolve_credentials(target: str | None = None) -> tuple[str, list[tupl
         creds.append(("key", api_key))
     try:
         cookies = await account_service.get_primary_cookies()
-    except Exception:  # noqa: BLE001 —— Cookie 读取失败降级 Key 单通道
+    except Exception:  # noqa: BLE001
         cookies = ""
     token = extract_webapi_token(cookies) if cookies else None
     if token:
@@ -126,7 +115,6 @@ async def resolve_credentials(target: str | None = None) -> tuple[str, list[tupl
     return steamid, creds
 
 
-# ─── Steam Web API（已购 / 批量进度）──────────────────────────
 
 async def _post_form(url: str, data: dict) -> httpx.Response:
     """POST 表单（代理优先 + SSL 证书降级，与 family._steam_get 同规则）。"""
@@ -173,7 +161,7 @@ async def _api_call(
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (401, 403):
                     last_exc = e
-                    break  # 换下一通道
+                    break
                 raise SyncError(f"Steam API 返回 {e.response.status_code}") from e
     raise SyncError(
         "Steam API 鉴权被拒（401/403）：请在「我」页重新绑定 Steam Cookie 或配置 Web API Key"
@@ -260,7 +248,6 @@ async def fetch_progress_keyed(
     return out
 
 
-# ─── Web API 明细通道 + 库外名册（官方接口，不做 HTML 解析）────────
 
 def _to_float(value) -> float | None:
     try:
@@ -280,7 +267,7 @@ async def _api_try(url: str, params: dict, creds: list[tuple[str, str]]) -> dict
         try:
             resp = await _steam_get(url, {**params, key_name: value})
             return resp.json()
-        except Exception:  # noqa: BLE001 —— 失败原因由最终降级结果体现
+        except Exception:  # noqa: BLE001
             continue
     return None
 
@@ -293,7 +280,7 @@ async def _local_token() -> str:
     """本地已绑账号的 access_token（共享池 / 定义清单 / 批量进度用它，免 Key）。"""
     try:
         cookies = await account_service.get_primary_cookies()
-    except Exception:  # noqa: BLE001 —— 读不到就当没有
+    except Exception:  # noqa: BLE001
         return ""
     return (extract_webapi_token(cookies) if cookies else "") or ""
 
@@ -401,7 +388,7 @@ async def shared_pool_candidates(steamid: str) -> tuple[list[int], dict[int, str
                         for a in apps
                         if not a.get("excluded")
                     ]
-        except Exception as e:  # noqa: BLE001 —— 实时不可得时走快照
+        except Exception as e:  # noqa: BLE001
             log_event(
                 logger,
                 "家庭共享池实时获取失败，改用本地快照",
@@ -418,7 +405,7 @@ async def shared_pool_candidates(steamid: str) -> tuple[list[int], dict[int, str
     out: list[int] = []
     names: dict[int, str] = {}
     for appid, owners, name in rows:
-        if steamid in owners:  # 自己也有 = 已购行，不算库外
+        if steamid in owners:
             continue
         out.append(appid)
         if name:
@@ -464,12 +451,11 @@ async def _shared_pool_from_snapshot(
         return [
             (int(s.appid), [str(x) for x in (s.owners_json or [])], s.name) for s in snaps
         ]
-    except Exception as e:  # noqa: BLE001 —— 快照不可读时按「无候选」处理
+    except Exception as e:  # noqa: BLE001
         log_event(logger, "家庭库快照读取失败", detail={"原因": str(e)})
         return None
 
 
-# ─── 公开社区页（免 Key 通道）─────────────────────────────────
 
 _last_community_at = 0.0
 # 节流的「读时刻→改时刻」不是原子的：并发 worker 会在彼此 sleep 间同时通过
@@ -682,7 +668,6 @@ def rarity_tier(percent: float | None) -> str:
     return "common"
 
 
-# ─── 同步编排（进度快照存 settings KV，跨重启可读）─────────────────
 
 _sync_task: asyncio.Task | None = None
 
@@ -698,7 +683,6 @@ def _empty_snapshot() -> dict:
         "error": "",
         "startedAt": "",
         "syncedAt": "",
-        # 本轮同步的目标账号：多账号下前端据此判断「这份状态是不是当前所选账号的」
         "steamid": "",
     }
 
@@ -774,7 +758,7 @@ _last_warm_attempt = 0.0
 async def _warm_sync_later(steamid: str) -> None:
     try:
         await start_sync(steamid)
-    except Exception:  # noqa: BLE001 —— 预热失败静默：进行中 / 无凭证 / 网络失败都不影响本次响应
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -792,7 +776,7 @@ def _maybe_warm_sync(steamid: str, creds: list[tuple[str, str]], snapshot: dict)
         return
     synced_at = snapshot.get("syncedAt") or ""
     if not synced_at:
-        return  # 从未同步过：首次同步由前端「首次进入自动同步」负责
+        return
     try:
         age = datetime.now(timezone.utc) - datetime.fromisoformat(synced_at)
     except ValueError:
@@ -815,7 +799,7 @@ async def _run_sync(steamid: str) -> None:
             detail={"原因": str(e)},
         )
         await _finish_snapshot(ok=False, error=str(e))
-    except Exception:  # noqa: BLE001 —— 同步失败只留日志与快照，不影响服务
+    except Exception:  # noqa: BLE001
         log_event(logger, "成就同步异常中断", level=logging.ERROR, exc_info=True)
         await _finish_snapshot(ok=False, error="同步异常，详见服务日志")
     finally:
@@ -857,9 +841,6 @@ async def _sync_all(target: str = "") -> None:
     await _apply_owned(steamid, owned)
     await _write_snapshot(stage="progress", total=len(owned), done=0)
 
-    # 库外名册：家庭共享池里本号未拥有、但本号在上面达成过成就的游戏。
-    # 免费周末 / 已从库中移除那类没有任何枚举接口（官方清单全按 appid 点名、
-    # 社区游戏列表页要登录态），只能手动补录 —— 见 shared_pool_candidates。
     external_ids, external_names = await shared_pool_candidates(steamid)
     external_ids = [a for a in external_ids if a not in owned_ids]
     if external_ids:
@@ -875,9 +856,6 @@ async def _sync_all(target: str = "") -> None:
         try:
             progress = await fetch_progress(steamid, creds, candidates)
         except SyncError as e:
-            # 批量进度接口只认 access_token（Key 401），而 token 是十分钟级的短命
-            # JWT：Cookie 一旦失效，没有这条兜底整轮同步都会判死——连已购名册都
-            # 进不来。有 Key 就逐款走 GetPlayerAchievements 顶上（慢但通）。
             api_key = _api_key_of(creds)
             if not api_key:
                 raise
@@ -917,7 +895,7 @@ async def _sync_all(target: str = "") -> None:
             and p[2] is not None
             and now - p[2] < timedelta(hours=DETAIL_SKIP_HOURS)
         ):
-            continue  # 计数未变且近期已刷明细：无新解锁可采
+            continue
         pending.append(row)
     if len(pending) != len(targets):
         log_event(
@@ -929,8 +907,6 @@ async def _sync_all(target: str = "") -> None:
 
     await _write_snapshot(stage="details", total=len(pending), done=0)
 
-    # 有界并发抓明细：每款 1~2 个请求、经代理单请求 2~3 秒，串行 406 款约一小时；
-    # 5 路并发把首輪全量压回一刻钟内。SyncError 只记日志不中断整轮；其余异常等
     # 全部 worker 落定后再抛——避免 _finish_snapshot 与在途写库竞争。
     done = 0
     sem = asyncio.Semaphore(API_CONCURRENCY)
@@ -948,7 +924,7 @@ async def _sync_all(target: str = "") -> None:
                     level=logging.WARNING,
                     detail={"AppID": row.appid, "原因": str(e)},
                 )
-            except BaseException as e:  # noqa: BLE001 —— 收集后在 gather 外重抛
+            except BaseException as e:  # noqa: BLE001
                 failures.append(e)
                 return
         done += 1
@@ -1011,7 +987,6 @@ async def _award_sync_xp(steamid: str) -> None:
 
             entries: list[dict] = []
             if baseline is not None:
-                # 存量已折算进基线：0 值事件占住幂等键，本轮不发 XP 不算新增量
                 for st, _d in achieved:
                     entries.append(_xp_marker(level.SOURCE_UNLOCK, f"{st.appid}:{st.image_name}"))
                 for g in games:
@@ -1067,7 +1042,7 @@ async def _award_sync_xp(steamid: str) -> None:
             for start in range(0, len(entries), 400):
                 await level.record_xp_events(session, steamid, entries[start:start + 400])
             await session.commit()
-    except Exception:  # noqa: BLE001 —— 经验记账失败只少一条账，不阻断同步
+    except Exception:  # noqa: BLE001
         log_event(logger, "同步经验记账失败，本轮跳过", level=logging.WARNING, exc_info=True,
                   detail={"SteamID": steamid})
         return
@@ -1084,7 +1059,7 @@ async def _award_sync_xp(steamid: str) -> None:
                       **({"appid": appid} if (appid := _single_unlock_appid(awarded_unlocks)) is not None else {}),
                       "titles": [a["name"] for a in awarded_unlocks]},
             )
-        except Exception:  # noqa: BLE001 —— 事实落库失败不影响主链
+        except Exception:  # noqa: BLE001
             log_event(logger, "新解锁批量事实落库失败", level=logging.WARNING, exc_info=True)
     try:
         async with get_session_factory()() as session:
@@ -1246,7 +1221,6 @@ async def _sync_game(steamid: str, row: AchievementGame, creds: list[tuple[str, 
                 await session.merge(row)
                 await session.commit()
 
-    # 解锁态：有 Key 走官方接口（未拥有 / 他人账号同样可读），否则公开个人页
     states = await fetch_states_api(steamid, appid, api_key)
     page_rows: list[dict] = []
     if states is None and not api_key:
@@ -1351,7 +1325,6 @@ async def _apply_defs(appid: int, defs: list[dict]) -> None:
         await session.commit()
 
 
-# ─── 读取端（汇总 KPI / 游戏列表 / 单游戏明细）────────────────────
 
 def _header_url(header_image: str | None, appid: int) -> str:
     return header_image or HEADER_URL_TMPL.format(appid=appid)
@@ -1407,11 +1380,9 @@ async def get_summary(target: str | None = None) -> dict:
         "unlockedAchievements": 0,
         "completionRate": 0.0,
         "totalPlaytimeMin": 0,
-        # 库外（家庭共享等）单独计数：KPI 合计含它们，但要能一眼看出其中多少来自库外
         "externalGames": 0,
         "externalUnlocked": 0,
         "externalPlatinum": 0,
-        # 同步状态只对「本轮同步的那个账号」有意义，切号后不该显示别人的时间戳
         "lastSyncedAt": snapshot.get("syncedAt") or None
         if (snapshot.get("steamid") or steamid) == steamid
         else None,
@@ -1445,7 +1416,6 @@ async def get_summary(target: str | None = None) -> dict:
     plat_games = [(g, h) for g, h in trophy if g.platinum]
     external = [(g, h) for g, h in trophy if (g.source or SOURCE_OWNED) != SOURCE_OWNED]
 
-    # 白金日期：该游戏最后一条解锁时刻
     platinum_last: dict[int, int] = {}
     for a in achieved:
         platinum_last[a["appid"]] = max(platinum_last.get(a["appid"], 0), a["unlockTime"])
@@ -1624,7 +1594,7 @@ async def available_accounts() -> list[dict]:
                 "isActive": bool(a.get("is_active")),
                 "relation": "bound",
             }
-    except Exception:  # noqa: BLE001 —— 账号域异常不拖垮成就页
+    except Exception:  # noqa: BLE001
         log_event(logger, "已绑账号列表读取失败", exc_info=True)
 
     try:
@@ -1649,11 +1619,9 @@ async def available_accounts() -> list[dict]:
                     "isActive": False,
                     "relation": "family",
                 }
-    except Exception:  # noqa: BLE001 —— 家庭快照缺失时只列已绑账号
+    except Exception:  # noqa: BLE001
         log_event(logger, "家庭成员列表读取失败", exc_info=True)
 
-    # 名字/头像补齐：tracked_accounts 由账户轮转持续维护（含家庭成员），
-    # 成就页不另起网络请求，直接复用这份本地档案。
     try:
         from app.domains.wishlist.models import TrackedAccount
 
@@ -1665,7 +1633,7 @@ async def available_accounts() -> list[dict]:
                 continue
             entry["personaName"] = entry["personaName"] or t.persona_name or ""
             entry["avatarUrl"] = entry["avatarUrl"] or t.avatar_url or ""
-    except Exception:  # noqa: BLE001 —— 档案缺失只影响展示，不阻断账号清单
+    except Exception:  # noqa: BLE001
         log_event(logger, "本地追踪账户档案读取失败", exc_info=True)
 
     items = list(out.values())
@@ -1729,7 +1697,6 @@ async def get_game_detail(appid: int, target: str | None = None) -> dict | None:
             "achieved": bool(st.achieved) if st else False,
             "unlockTime": st.unlock_time if st else 0,
         })
-    # 已解锁在前（新→旧）；未解锁按稀有度（越稀有越靠前）
     achievements.sort(key=lambda a: (
         not a["achieved"],
         -a["unlockTime"] if a["achieved"] else 0,

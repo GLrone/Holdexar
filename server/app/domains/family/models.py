@@ -24,16 +24,11 @@ class FamilyGroup(Base):
     steamid: Mapped[str] = mapped_column(String(20), primary_key=True)
     family_groupid: Mapped[str | None] = mapped_column(String(40), index=True)
     family_name: Mapped[str | None] = mapped_column(String(120))
-    # [{steamid, role, persona_name, avatar_url, steamid64}]
     members_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    # 主账号 Cookie 是否还能拉到（拉不到时提示重绑）
     fetch_ok: Mapped[bool] = mapped_column(Boolean, default=False)
     last_error: Mapped[str | None] = mapped_column(String(300))
     member_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    # 成员游玩明细快照 {steamid: [{appid, minutes, minutes2w, last}]}：
-    # 库快照表只存 app 级字段，这里是游玩动态在快照兜底路径的数据源
-    # （实时聚合成功时随组落库，聚合失败/离线时 _library_from_snapshot 合并返回）
     play_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 

@@ -19,7 +19,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base, WritePriority, get_session_factory, write_session
 from app.domains.achievements.models import AchievementDef, AchievementGame, AchievementState
 
-# xp_events.source 枚举（枚举外值在记账入口拒收）
 SOURCE_UNLOCK = "achievement_unlock"
 SOURCE_PLATINUM = "platinum"
 SOURCE_BUCKET = "playtime_bucket"
@@ -39,7 +38,6 @@ XP_SOURCES: frozenset[str] = frozenset(
     }
 )
 
-# 基数表；challenge_claim 的奖励是挑战目录定值、baseline 为一次性折算，不走基数
 XP_BASE: dict[str, int] = {
     SOURCE_UNLOCK: 15,
     SOURCE_PLATINUM: 200,
@@ -47,7 +45,6 @@ XP_BASE: dict[str, int] = {
     SOURCE_STREAK_DAY: 20,
     SOURCE_COMMENT: 10,
 }
-# 稀有度倍率（tier 判定复用 service.rarity_tier，切点不另立第二套口径）
 RARITY_MULTIPLIERS: dict[str, float] = {
     "common": 1.0,
     "uncommon": 1.25,
@@ -55,13 +52,10 @@ RARITY_MULTIPLIERS: dict[str, float] = {
     "very_rare": 2.0,
     "ultra": 3.0,
 }
-# 连击倍率按 career 口径当前连续解锁天数取档；结算定值与存量折算不追认加成
 STREAK_BANDS: tuple[tuple[int, float], ...] = ((2, 1.1), (7, 1.25), (14, 1.5), (30, 2.0))
 STREAK_EXEMPT: frozenset[str] = frozenset({SOURCE_CHALLENGE, SOURCE_BASELINE})
 
-# 等级里程碑只做节点预览，不发 XP
 MILESTONE_LEVELS: tuple[int, ...] = (10, 25, 50, 75, 100, 150, 200)
-# 段位起点（前四档对齐奖杯陈列件四档视觉，legend 复用 platinum 件）
 TIER_STEPS: tuple[tuple[str, int], ...] = (
     ("bronze", 1),
     ("silver", 10),
@@ -84,7 +78,6 @@ class XpEvent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     steamid: Mapped[str] = mapped_column(String(20), nullable=False)
     source: Mapped[str] = mapped_column(String(24), nullable=False)
-    # 幂等键：与 (steamid, source) 合组唯一，语义按 source 各有定义（unlock=appid:image_name 等）
     source_ref: Mapped[str] = mapped_column(String(220), nullable=False)
     xp: Mapped[int] = mapped_column(Integer, nullable=False)
     multiplier: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
@@ -93,7 +86,6 @@ class XpEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
-# ─── 曲线纯函数（xp = ceil(30·n^1.5)，绝对增量恒为正）─────────────────
 
 
 def xp_for_level(n: int) -> int:
@@ -149,7 +141,6 @@ def tier_progress(level: int) -> float | None:
     return min(1.0, max(0.0, (level - start) / (next_start - start)))
 
 
-# ─── 倍率与取整 ────────────────────────────────────────────────
 
 
 def round_half_up(x: float) -> int:
@@ -161,7 +152,7 @@ def rarity_multiplier(percent: float | None) -> float:
     from .service import rarity_tier
 
     if percent is None:
-        return 1.0  # unknown 不惩罚不奖励
+        return 1.0
     return RARITY_MULTIPLIERS[rarity_tier(percent)]
 
 
@@ -188,7 +179,7 @@ def compose_xp(
     稀有度倍率只作用于 achievement_unlock；连击倍率不作用于 challenge_claim/baseline。
     challenge_claim/baseline 无基数（目录定值/折算合计），由调用方给成品 xp。
     """
-    base = XP_BASE[source]  # 无基数来源走成品 xp，KeyError 即调用方误用
+    base = XP_BASE[source]
     mult = 1.0
     if source == SOURCE_UNLOCK:
         mult *= rarity_multiplier(rarity_percent)
@@ -197,7 +188,6 @@ def compose_xp(
     return round_half_up(base * mult), round(mult, 4)
 
 
-# ─── 记账（批量幂等，事务归调用方）────────────────────────────────
 
 
 async def record_xp_events(
@@ -266,7 +256,6 @@ async def existing_source_refs(session: AsyncSession, steamid: str, source: str)
     return {r[0] for r in rows}
 
 
-# ─── 基线回填（一次性幂等）───────────────────────────────────────
 
 
 async def ensure_baseline(session: AsyncSession, steamid: str) -> dict | None:
@@ -319,7 +308,6 @@ async def ensure_baseline(session: AsyncSession, steamid: str) -> dict | None:
     return entry
 
 
-# ─── career 口径派生（连击日）────────────────────────────────────
 
 
 async def unlock_days(session: AsyncSession, steamid: str) -> list:
@@ -363,7 +351,6 @@ async def notify_level_up(session: AsyncSession, steamid: str, previous_level: i
     )
 
 
-# ─── 读数组装 ────────────────────────────────────────────────
 
 
 def _curve_preview(total: int, level: int) -> list[dict]:

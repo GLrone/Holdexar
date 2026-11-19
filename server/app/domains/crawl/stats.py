@@ -87,7 +87,6 @@ async def cycle_stats(cycle_id: int) -> dict | None:
         "unitsUnobserved": coverage["unobserved"],
         "coverage": coverage["coverage"],
         "coverageConfirmed": coverage["coverageConfirmed"],
-        # missing/blocked 拆分随统计列落库（missing+blocked=unitsFailed 的拆分来源）
         "unitsMissing": coverage["missing"],
         "unitsBlocked": coverage["blocked"],
         "staleCount": sum(1 for f in fresh if f["freshness"] == "stale"),

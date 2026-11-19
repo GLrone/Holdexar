@@ -60,16 +60,12 @@ from .steam_wallet import (
 
 logger = logging.getLogger(__name__)
 
-# app_settings 旧单账号键（迁移源 + 兼容回退，迁移后不再写入）
 KEY_COOKIES = "account.steam_cookies"
 KEY_WALLET = "account.wallet_snapshot"
 KEY_PROFILE = "account.profile"
 
-# 主账号手填 SteamID64（愿望单主池等主账号语义的历史键）。
-# 多账号下该键仅作 profile 兼容回退，主账号身份已由表首行承载。
 KEY_STEAM_ID = "account.steam_id"
 
-# 结算币种反查区服时，多区共用币种固定取的"基准区"
 _CURRENCY_PRIMARY_REGION = {"USD": "us"}
 
 # 登录凭据的静态加密用途串（secretbox 按此派生独立密钥）
@@ -125,22 +121,14 @@ def _row_session_freshness(row: SteamAccount) -> dict:
         plain = value
     return session_freshness(plain)
 
-# 每分钟轮转时每账号抓取前的随机延时区间（秒）：多账号错峰，避免同刻齐发
 _ROTATION_JITTER_SECONDS = (1.0, 8.0)
 
-# 手动同步的钱包快照缓存有效期（小时）：超期后前端触发刷新
 WALLET_STALE_HOURS = 6
 
-# 登录态过期（无续期凭据）时的账号行错误：写进 wallet_error / sync_error
-# 供诊断，同时前端按 session_expired 标记渲染本地化文案
 SESSION_EXPIRED_MESSAGE = "Steam 登录已过期，请重新登录"
 
-# 有续期凭据但本轮续期失败（网络 / Steam 侧拒绝）：仍属可自愈失败，
-# 按普通退避继续重试，不升级成要求用户重新登录
 SESSION_RENEW_FAILED_MESSAGE = "Steam 登录已过期，正在自动续期（失败会自动重试）"
 
-# 绑定结果提示：Cookie 里没有续期凭据（登录 Steam 时未勾选「记住我」）时，
-# 登录态只能维持到访问令牌到期（约 24 小时）
 SESSION_NO_REFRESH_MESSAGE = (
     "未检测到续期凭据：登录 Steam 时请勾选「记住我」，否则约一天后需重新登录"
 )
@@ -152,27 +140,14 @@ SESSION_NO_REFRESH_MESSAGE = (
 _WALLET_BACKOFF_MINUTES = (2.0, 5.0, 15.0, 30.0)
 _RATE_LIMIT_COOLDOWN_MINUTES = 30.0
 
-# 钱包熔断（独立于退避梯子的连续失败计数器）：梯子只管单次失败的短冷却，
-# 连续失败到 _WALLET_BREAKER_SLOW_AFTER 次说明是账号级故障（Cookie 失效/
-# 被风控），进 10min 慢车道按固定间隔观察；慢车道内再失败到累计
-# _WALLET_BREAKER_FREEZE_AFTER 次即冻结终态——自动轮转不再请求该账号，
-# 只等手动刷新余额（sync_wallet force=True）或换绑 Cookie 解锁。
 _WALLET_BREAKER_SLOW_AFTER = 5
 _WALLET_BREAKER_SLOW_MINUTES = 10.0
 _WALLET_BREAKER_FREEZE_AFTER = 10
 
-# 活跃感知降频（无人看时自动拉长间隔，心跳恢复即塌缩回高频）。
-# 前端每 60s 轮询 GET /account 天然是"有人在看"心跳——后端记录最近
-# 心跳时间，轮转按快照新鲜度分级：
-# - 有人看（心跳 <90s）→ 快照 2min 内不重抓（分钟级刷新语义不变）
-# - 无人看 → 阈值自动爬升到 30min（挂机下载/夜间场景砍 ~90% 请求）
-# - 打开 App 瞬间心跳恢复，阈值塌缩，下一轮（≤60s）即补抓，UX 无感
 _ACTIVE_PING_SECONDS = 90.0
 _ACTIVE_FRESH_MINUTES = 2.0
 _IDLE_FRESH_MINUTES = 30.0
 
-# 进程内心跳时间戳（前端轮询 GET /account 时更新；datetime 不易持久化，
-# 重启即"无人看"起步，首轮轮转自然补抓一次，无正确性问题）
 _last_seen: datetime | None = None
 
 
@@ -198,7 +173,6 @@ def _freshness_threshold_minutes() -> float:
     return _IDLE_FRESH_MINUTES
 
 
-# ── 账号行级读取 ────────────────────────────────────────────
 
 async def _all_accounts() -> list[SteamAccount]:
     async with get_session_factory()() as session:
@@ -215,11 +189,6 @@ async def _all_accounts() -> list[SteamAccount]:
         return list(rows)
 
 
-# 登录态续期的进程内节流与串行（按 steamid）：
-# - 令牌健康时 ensure_live_session 只做一次本地 JWT 解码，零网络请求；
-# - 同一账号续期失败后 _SESSION_REFRESH_RETRY_SECONDS 内不再重试，避免
-#   钱包轮转与各消费方的取 Cookie 各自拉起一次续期；
-# - 锁保证并发调用只有一个真正发起续期，其余复用落库后的新 Cookie。
 _SESSION_REFRESH_RETRY_SECONDS = 600.0
 _session_refresh_at: dict[str, datetime] = {}
 _session_refresh_locks: dict[str, asyncio.Lock] = {}
@@ -416,7 +385,6 @@ async def primary_wallet_region() -> str:
     return str((wallet or {}).get("region_code") or "")
 
 
-# ── 绑定 / 切换 / 删除 ──────────────────────────────────────
 
 async def save_cookies(cookies_raw: str) -> dict:
     """upsert 账号（SteamID 识别身份）+ 置 active；返回结果与一致性校验信息。
@@ -437,7 +405,6 @@ async def save_cookies(cookies_raw: str) -> dict:
     if not cookie_sid:
         raise ValueError("无法从 Cookie 解析 SteamID64，请确认复制的是登录后的完整 Cookie")
 
-    # 续期凭据决定登录态能否跨过访问令牌的 24 小时寿命（见 session.py）
     has_refresh = bool(refresh_token_of(filtered))
 
     bound_sid = (await settings_service.get_value(KEY_STEAM_ID, "")) or ""
@@ -454,7 +421,6 @@ async def save_cookies(cookies_raw: str) -> dict:
             session.add(row)
         row.cookies = _seal_credential(filtered)
         row.is_active = True
-        # active 移交：其余账号取消
         others = (
             (
                 await session.execute(
@@ -471,7 +437,6 @@ async def save_cookies(cookies_raw: str) -> dict:
             o.is_active = False
         await session.commit()
 
-    # 换绑/重绑 = 用户显式介入：熔断冻结与失败计数一并清零（新账号本来就干净）
     await _reset_wallet_breaker(cookie_sid)
 
     return {
@@ -507,7 +472,7 @@ async def _post_bind_fetch(steam_id: str) -> None:
                 "活跃条目": r.get("active"),
             },
         )
-    except Exception:  # noqa: BLE001 —— 失败由 15min 定时同步兜底
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "绑定后愿望单与已购同步失败，定时任务将兜底",
@@ -515,8 +480,6 @@ async def _post_bind_fetch(steam_id: str) -> None:
             exc_info=True,
         )
 
-    # 家庭组跟随本账号：绑定即发现（成员自动入追踪，愿望单/已购/监控池随之
-    # 生效）；失败不阻断，下次手动同步继续兜底
     try:
         from app.domains.family import service as family_service
 
@@ -531,7 +494,7 @@ async def _post_bind_fetch(steam_id: str) -> None:
                 "失败成员": r.get("failed"),
             },
         )
-    except Exception:  # noqa: BLE001 —— 单账号失败隔离，不拖垮绑定流程
+    except Exception:  # noqa: BLE001
         log_event(logger, "绑定后家庭组同步失败，下次同步兜底", level=logging.ERROR, exc_info=True)
 
     try:
@@ -554,7 +517,7 @@ async def _post_bind_fetch(steam_id: str) -> None:
                 tag="未完成",
                 detail={"原因": r.get("error")},
             )
-    except Exception:  # noqa: BLE001 —— 失败由 30min 定时同步兜底
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "绑定后账单同步失败，定时任务将兜底",
@@ -572,7 +535,6 @@ async def bind_account(cookies_raw: str) -> dict:
     返回 {"result": save_cookies 结果, "sync": 钱包试抓结果}。
     """
     result = await save_cookies(cookies_raw)
-    # 注册愿望单追踪（游戏数/愿望单数计数来源；失败不阻断）
     await after_bind(result["steam_id"])
     sync = await sync_wallet(force=True)
     if not sync.get("ok"):
@@ -623,7 +585,7 @@ async def _teardown_tracking(steam_id: str) -> dict:
 
     try:
         receipt = await wishlist_service.remove_account(steam_id)
-    except Exception:  # noqa: BLE001 —— 追踪拆除失败不阻断解绑主链
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "账号监控追踪拆除失败，不阻断解绑",
@@ -661,8 +623,6 @@ async def _purge_account_data(session, steam_id: str) -> dict:
     removed_groups = (
         await session.execute(delete(FamilyGroup).where(FamilyGroup.steamid == steam_id))
     ).rowcount or 0
-    # 孤儿快照全局回收（组行是快照唯一读取入口，无组行引用即不可达）：
-    # 被删账号独有组→快照清，共享组由仍绑定账号的组行继续持有
     removed_snapshots = (
         await session.execute(
             delete(FamilyLibrarySnapshot).where(
@@ -707,7 +667,7 @@ async def remove_account(steam_id: str) -> dict:
         )
         if rest:
             if was_active:
-                rest[0].is_active = True  # 回退剩余首个
+                rest[0].is_active = True
             elif not any(r.is_active for r in rest):
                 rest[0].is_active = True  # 数据兜底：无 active 也归位
         await session.commit()
@@ -716,7 +676,6 @@ async def remove_account(steam_id: str) -> dict:
     return {"ok": True, "removed": steam_id, "remaining": remaining, **purge, **teardown}
 
 
-# ── 钱包 / 资料 同步 ────────────────────────────────────────
 
 async def _derive_region(currency_code: str, region_name: str = "") -> str:
     """结算币种 → crawl_regions 反查区服 code（小写）。
@@ -793,7 +752,6 @@ async def sync_wallet(*, force: bool = False) -> dict:
         if age_h < WALLET_STALE_HOURS:
             return {"ok": True, "cached": True, "wallet": snapshot}
 
-    # 登录态先行：临期/过期且留有续期凭据时先换发新令牌，续不上则如实报过期
     cookies = await ensure_live_session(row.steam_id, stored)
     freshness = session_freshness(cookies)
     if freshness["expired"]:
@@ -811,7 +769,7 @@ async def sync_wallet(*, force: bool = False) -> dict:
         info: WalletInfo = await _fetch_wallet_with_live_session(row.steam_id, cookies)
     except UnknownCurrencyError as exc:
         await _save_wallet(row.steam_id, error=str(exc), now=now)
-        await _sync_profile_row(row.steam_id, cookies, now)  # 钱包失败不连坐资料
+        await _sync_profile_row(row.steam_id, cookies, now)
         return {"ok": False, "error": str(exc)}
     except WalletFetchError as exc:
         await _save_wallet(row.steam_id, error=str(exc), now=now)
@@ -829,16 +787,14 @@ async def sync_wallet(*, force: bool = False) -> dict:
         "currency_id": info.currency_id,
         "region_code": region_code,
         "country_code": info.country_code,
-        "steam_id": info.steam_id,  # store account 通道的页面归属账户
+        "steam_id": info.steam_id,
         "checked_at": now.isoformat(),
-        # 上次成功获取余额的时刻（失败不覆盖）；前端显示层用它判「同步成功缓存窗」
         "ok_at": now.isoformat(),
         "check_ok": True,
         "error": "",
     }
     await _save_wallet(row.steam_id, snapshot=snapshot, now=now)
 
-    # 顺带补/换账户资料（头像/昵称）：无资料时拉取，静默失败
     await _sync_profile_row(row.steam_id, cookies, now)
 
     return {"ok": True, "cached": False, "wallet": snapshot}
@@ -989,7 +945,7 @@ async def refresh_online_states(rows: list[SteamAccount] | None = None) -> dict:
             if row is None:
                 continue
             row.online_checked_at = now
-            if s is None:  # 响应缺失 = 离线（私密档案同款语义）
+            if s is None:
                 row.is_online = False
                 row.in_game = ""
                 continue
@@ -1029,8 +985,6 @@ async def sync_wallets_rotational() -> dict:
     fresh_minutes = _freshness_threshold_minutes()
 
     async def _one(row: SteamAccount) -> dict:
-        # 门禁 0：熔断冻结（连续失败终态）——自动轮转不再请求该账号，
-        # 解锁只走手动刷新余额（sync_wallet force）或换绑 Cookie
         if row.wallet_frozen:
             return {
                 "ok": False,
@@ -1038,7 +992,6 @@ async def sync_wallets_rotational() -> dict:
                 "error": _frozen_reason(row.wallet_error),
                 "steam_id": row.steam_id,
             }
-        # 门禁 1：快照新鲜（距上次成功 < 阈值）→ 本轮跳过，不吃配额
         snapshot = row.wallet_json if isinstance(row.wallet_json, dict) else None
         if (
             snapshot is not None
@@ -1051,8 +1004,6 @@ async def sync_wallets_rotational() -> dict:
                 age_min = None
             if age_min is not None and age_min < fresh_minutes:
                 return {"ok": True, "status": "fresh_skip", "steam_id": row.steam_id}
-        # 门禁 2+3：失败退避（级别查表递增；429/403 信号直接顶格；
-        # 熔断慢车道——连续失败达标后固定 10min 观察间隔，风控信号在场除外）
         if row.wallet_error and row.wallet_checked_at is not None:
             elapsed_min = (now - row.wallet_checked_at).total_seconds() / 60
             if _is_rate_limited(row.wallet_error):
@@ -1079,8 +1030,6 @@ async def sync_wallets_rotational() -> dict:
                 detail={"原因": str(r)},
             )
 
-    # 官方在线状态批量刷新：按活跃感知新鲜度门禁先筛过期子集，子集空则本轮
-    # 零出网；实参=子集行，保证「响应缺失=离线」回写不越出查询范围
     stale = [
         r for r in rows
         if r.online_checked_at is None
@@ -1145,10 +1094,6 @@ async def _sync_wallet_of(steam_id: str) -> dict:
     next_level = min(int(row.wallet_backoff_level or 0) + 1, len(_WALLET_BACKOFF_MINUTES))
     next_streak = int(row.wallet_fail_streak or 0) + 1
     will_freeze = next_streak >= _WALLET_BREAKER_FREEZE_AFTER
-    # 登录态先行：临期/过期且留有续期凭据时先换发新令牌（见 ensure_live_session）。
-    # 登录失效不是网络故障，故两种情况都不计入网络退避计数之外的误判：
-    # - 无续期凭据 = 只有用户重新登录能解 → 冻结自动轮转，不再打 Steam；
-    # - 有续期凭据但本轮续期失败 = 可自愈 → 按普通失败退避，下一轮继续尝试。
     cookies = await ensure_live_session(steam_id, stored)
     freshness = session_freshness(cookies)
     if freshness["expired"]:
@@ -1207,7 +1152,6 @@ async def _sync_wallet_of(steam_id: str) -> dict:
         "country_code": info.country_code,
         "steam_id": info.steam_id,
         "checked_at": now.isoformat(),
-        # 上次成功获取余额的时刻（与手动通道同口径；前端同步成功缓存窗判据）
         "ok_at": now.isoformat(),
         "check_ok": True,
         "error": "",
@@ -1244,7 +1188,6 @@ async def clear_cookies() -> None:
         await _teardown_tracking(steam_id)
 
 
-# ── 状态汇总（永不回传 Cookie 明文）─────────────────────────
 
 def _friend_code(steam_id: str) -> str:
     """SteamID64 → 好友码（Steam 好友码列表可复制的整数）。"""
@@ -1320,8 +1263,6 @@ async def _account_payload(row: SteamAccount, primary_id: str, counts: dict) -> 
         "wallet": wallet,
         "wallet_error": row.wallet_error or "",
         "wallet_frozen": bool(row.wallet_frozen),
-        # 登录态：expires_at 为访问令牌到期时刻（北京时间），expired 为本地
-        # 判定结果，has_refresh 表示是否留有可自动续期的凭据
         "session_expires_at": freshness["expires_at"],
         "session_expired": freshness["expired"],
         "session_has_refresh": freshness["has_refresh_token"],
@@ -1392,17 +1333,14 @@ async def get_status() -> dict:
         "message": "",
         "accounts": accounts,
         "primary_steam_id": accounts[0]["steam_id"] if accounts else "",
-        # 登录态：has_cookie 只表示"绑过"，是否还能用由 expires_at/expired 决定
         "session_expires_at": freshness["expires_at"],
         "session_expired": freshness["expired"],
         "session_has_refresh": freshness["has_refresh_token"],
-        # 当前账号 Steam 真实在线状态（顶栏头像 dot 数据源）
         "is_online": bool(row.is_online),
         "in_game": row.in_game or "",
     }
 
 
-# ── 绑定后置任务（账号注册 + 资料拉取 + 愿望单注册）──────────
 
 async def after_bind(steam_id: str) -> None:
     """绑定成功后：确保 wishlist tracked_accounts 注册该账号（愿望单/游戏计数来源）。
@@ -1433,7 +1371,6 @@ async def after_bind(steam_id: str) -> None:
         )
 
 
-# ── 旧单账号 KV → 多账号表 迁移（启动幂等）──────────────────
 
 async def migrate_legacy_kv() -> int:
     """旧 account.steam_cookies（+快照/资料）迁入 steam_accounts；已迁移则跳过。
@@ -1451,7 +1388,6 @@ async def migrate_legacy_kv() -> int:
     async with write_session(WritePriority.BACKGROUND) as session:
         existing = await session.get(SteamAccount, cookie_sid)
         if existing is not None:
-            # 表里已有该账号（多账号时代再回到旧部署不会发生，防御式跳过）
             await settings_service.set_value(KEY_COOKIES, "")
             return 0
         row = SteamAccount(
@@ -1465,7 +1401,6 @@ async def migrate_legacy_kv() -> int:
             wallet_checked_at=None,
             wallet_error="",
         )
-        # 旧资料快照（account.profile）迁入行内
         profile = await settings_service.get_value(KEY_PROFILE, None)
         if isinstance(profile, dict):
             row.persona_name = profile.get("persona_name", "") or ""
@@ -1473,7 +1408,6 @@ async def migrate_legacy_kv() -> int:
         session.add(row)
         await session.commit()
 
-    # KV 清空（表为唯一真源；手填 account.steam_id / API Key 不动）
     await settings_service.set_value(KEY_COOKIES, "")
     await settings_service.set_value(KEY_WALLET, None)
     await settings_service.set_value(KEY_PROFILE, None)
@@ -1485,7 +1419,6 @@ async def migrate_legacy_kv() -> int:
     return 1
 
 
-# ── 存量明文凭据静态加密（启动幂等步骤）──────────────────────
 
 async def seal_credentials_at_rest() -> int:
     """明文凭据封装为密文（`enc1:` 前缀）：账号 Cookie 行 + 凭据类设置键。

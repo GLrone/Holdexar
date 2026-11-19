@@ -27,10 +27,8 @@ from app.domains.crawl.events import (
     REMOVED,
 )
 
-# 偏好存 KV 的键（值是 JSON，结构见 DEFAULT_PREFS）
 PREFS_KEY = "notifications.prefs"
 
-# 用户类别：内部多个事件类型映射到同一类别，用户不必认识内部枚举
 CATEGORIES = ("price", "low", "availability", "lifecycle", "rules", "featured", "content", "system")
 
 CATEGORY_LABELS = {
@@ -66,7 +64,6 @@ TYPE_LABELS = {
     "PROXY_ALERT": "连接通道提醒", "SYSTEM_ALERT": "系统运行提醒",
 }
 
-# 候选状态
 PENDING = "pending"
 SUPPRESSED = "suppressed"
 SENDING = "sending"
@@ -74,15 +71,11 @@ UNKNOWN = "unknown"
 DELIVERED = "delivered"
 FAILED = "failed"
 
-# 未投递的基础状态（会进入下一次摘要）
 UNDELIVERED = (PENDING, SUPPRESSED)
 
-# 单条候选最多投递次数：超过即永久失败，不再重试（重试是为了扛临时故障，
-# 不是无限循环——授权码错、配置错这类必须一次就停）
 MAX_ATTEMPTS = 3
 
 DEFAULT_PREFS: dict = {
-    # 默认关：开启是用户动作，避免给已有 SMTP 配置的用户凭空多一类邮件
     "enabled": False,
     "categories": {c: True for c in CATEGORIES},
     "quietEnabled": False,
@@ -168,7 +161,6 @@ async def save_prefs(raw: dict) -> dict:
         else:
             row.value_json, row.updated_at = prefs, datetime.now()
         await session.commit()
-    # 本键不经 settings.service 收口（自有校验事务），变更广播在此对齐
     bus.publish("settings.changed", keys=[PREFS_KEY])
     return prefs
 

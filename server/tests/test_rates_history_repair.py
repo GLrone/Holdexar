@@ -35,7 +35,7 @@ from app.domains.rates.models import FxRateHistory  # noqa: E402
 from app.domains.rates.providers.frankfurter import ProviderError  # noqa: E402
 
 XTS = "XTS"  # 合成币种（ISO 测试码；白名单由夹具收窄为 {XTS}）
-TODAY = date(2026, 9, 8)  # 周二；horizon = 9/7
+TODAY = date(2026, 9, 8)
 
 
 @pytest_asyncio.fixture
@@ -50,7 +50,6 @@ async def db(monkeypatch):
                 " ON fx_rate_history(currency_code, rate_date)"
             )
         )
-    # 白名单收窄为合成币种（scan/repair 只处理白名单币种）
     monkeypatch.setattr(rates_service, "ALLOWED_CURRENCIES", frozenset({XTS}))
     return get_session_factory()
 
@@ -115,7 +114,6 @@ async def _seed_gap() -> None:
     )
 
 
-# ── 缺口扫描 ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -124,8 +122,8 @@ async def test_scan_finds_missing_and_carried(db):
     scan = await rates_history.scan_history_gaps(today=TODAY)
     assert scan["horizon"] == "2026-09-07"
     info = scan["currencies"][XTS]
-    assert info["missing"] == 4  # 9/3、9/4、9/6、9/7
-    assert info["carried"] == 1  # 9/2
+    assert info["missing"] == 4
+    assert info["carried"] == 1
     assert info["first"] == "2026-09-02"
     assert info["last"] == "2026-09-07"
     assert scan["totalPairs"] == 5
@@ -175,7 +173,6 @@ async def test_normal_history_maintenance_respects_fetch_toggle(db, monkeypatch)
     await scheduler._job_fx_history_repair()
 
 
-# ── 全新安装 bootstrap 入口 ─────────────────────────────
 
 
 
@@ -196,8 +193,8 @@ async def test_scan_treats_null_kind_by_source(db):
     await _add_history(XTS, [("2026-09-03", 6.52, None)], source="augmentedsteam")
     scan = await rates_history.scan_history_gaps(today=TODAY)
     info = scan["currencies"][XTS]
-    assert info["carried"] == 2  # 9/1、9/2 按 backfill 推导为 carried
-    assert info["missing"] == 4  # 9/4 ~ 9/7 缺行
+    assert info["carried"] == 2
+    assert info["missing"] == 4
     assert info["first"] == "2026-09-01"
 
 
@@ -223,9 +220,9 @@ async def test_scan_covers_legacy_rows_without_canonical_columns(db):
         await session.commit()
     scan = await rates_history.scan_history_gaps(today=TODAY)
     info = scan["currencies"][XTS]
-    assert info["first"] == "2026-09-01"  # 无 canonical 列的行也被识别
-    assert info["carried"] == 1  # backfill → carried（待修复）
-    assert info["missing"] == 5  # 9/3 ~ 9/7 缺行
+    assert info["first"] == "2026-09-01"
+    assert info["carried"] == 1
+    assert info["missing"] == 5
 
 
 @pytest.mark.asyncio
@@ -247,7 +244,7 @@ async def test_scan_prefers_observed_over_carried_same_day(db):
     scan = await rates_history.scan_history_gaps(today=TODAY)
     info = scan["currencies"][XTS]
     assert info["carried"] == 0
-    assert info["missing"] == 6  # 9/2 ~ 9/7
+    assert info["missing"] == 6
     assert info["first"] == "2026-09-02"
 
 
@@ -260,7 +257,6 @@ async def test_scan_window_split_over_365_days(db):
     assert all(w["days"] <= 365 for w in scan["windows"])
 
 
-# ── 修复 ────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -272,8 +268,8 @@ async def test_repair_writes_observed_and_replaces_carried(db, monkeypatch):
         date(2026, 9, 2): {XTS: 6.51},
         date(2026, 9, 3): {XTS: 6.52},
         date(2026, 9, 4): {XTS: 6.53},
-        date(2026, 9, 5): {XTS: 9.99},  # Provider 值不该覆盖已有 observed
-        date(2026, 9, 6): {XTS: 6.55},  # 周日（Provider 也返回）
+        date(2026, 9, 5): {XTS: 9.99},
+        date(2026, 9, 6): {XTS: 6.55},
         date(2026, 9, 7): {XTS: 6.56},
     }
     monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
@@ -284,12 +280,12 @@ async def test_repair_writes_observed_and_replaces_carried(db, monkeypatch):
     assert result["requests"] == 1
     assert calls == [(date(2026, 9, 2), date(2026, 9, 7))]
     got = await _rows()
-    assert got["2026-09-01"] == (6.50, "observed")  # 原 observed 不动
-    assert got["2026-09-02"] == (6.51, "derived")  # carried → derived
+    assert got["2026-09-01"] == (6.50, "observed")
+    assert got["2026-09-02"] == (6.51, "derived")
     assert got["2026-09-03"] == (6.52, "derived")
     assert got["2026-09-04"] == (6.53, "derived")
-    assert got["2026-09-05"] == (6.60, "observed")  # observed 永不重拉
-    assert got["2026-09-06"] == (6.55, "derived")  # 周日也有行（Provider 语义）
+    assert got["2026-09-05"] == (6.60, "observed")
+    assert got["2026-09-06"] == (6.55, "derived")
     assert got["2026-09-07"] == (6.56, "derived")
 
 
@@ -308,7 +304,7 @@ async def test_repair_idempotent_second_run(db, monkeypatch):
     second = await rates_history.repair_history_gaps(today=TODAY)
     assert second["status"] == "no_gaps"
     assert second["written"] == 0
-    assert len(calls) == 1  # 二跑未触网
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -321,9 +317,9 @@ async def test_repair_dry_run_no_network_no_write(db, monkeypatch):
 
     assert result["status"] == "dry_run"
     assert result["planned"][0]["start"] == "2026-09-02"
-    assert calls == []  # 未触网
+    assert calls == []
     got = await _rows()
-    assert got["2026-09-02"] == (6.50, "carried")  # 未写库
+    assert got["2026-09-02"] == (6.50, "carried")
 
 
 @pytest.mark.asyncio
@@ -367,7 +363,6 @@ async def test_provider_error_stops(db, monkeypatch):
 
 
 
-# ── 依赖方重估 ───────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -408,7 +403,7 @@ async def test_repair_revalues_bills(db, monkeypatch):
             text("SELECT fx_rate, cny_fen FROM bill_game_txs WHERE import_id = 1")
         )).one()
         assert float(tx[0]) == pytest.approx(0.05)
-        assert int(tx[1]) == round(100.0 * 0.05 * 100)  # 500 分
+        assert int(tx[1]) == round(100.0 * 0.05 * 100)
     from app.domains.bills.service import list_imports
 
     imp = (await list_imports())[0]
@@ -435,10 +430,9 @@ async def test_revalue_does_not_consume_carried(db, monkeypatch):
         tx = (await session.execute(
             text("SELECT fx_rate, cny_fen FROM bill_game_txs WHERE import_id = 1")
         )).one()
-        assert tx[0] is None and tx[1] is None  # carried 不参与 → 明示缺失
+        assert tx[0] is None and tx[1] is None
 
 
-# ── 调度门禁 ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -454,7 +448,7 @@ async def test_scheduler_job_skips_when_crawler_busy(db, monkeypatch):
     monkeypatch.setattr(sched_mod, "_crawler_idle", lambda: False)
 
     await sched_mod._job_fx_history_repair()
-    assert called == []  # 爬虫占线 → 修复不启动
+    assert called == []
 
 
 @pytest.mark.asyncio
@@ -490,7 +484,6 @@ async def test_scheduler_job_runs_when_all_gates_pass(db, monkeypatch):
     assert called and called[0]["max_windows"] == sched_mod._FX_REPAIR_MAX_WINDOWS
 
 
-# ── 修复链的边界行为：缺日整批不写 / 单币缺失 / 旧格式行收敛 ──────
 
 
 
@@ -509,19 +502,19 @@ async def test_missing_target_currency_writes_others_and_keeps_gap(db, monkeypat
             date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 4),
             date(2026, 9, 5), date(2026, 9, 6), date(2026, 9, 7),
         )
-    }  # 全程只有 XTS，没有 XTS2
+    }
     monkeypatch.setattr(rates_history, "_new_bing_provider", lambda: _fake_provider(rows, calls))
 
     result = await rates_history.repair_history_gaps(today=TODAY)
 
     assert result["status"] == "ok"
     got = await _rows()
-    assert got["2026-09-02"][1] == "derived"  # XTS 照写
+    assert got["2026-09-02"][1] == "derived"
     got2 = await _rows("XTS2")
-    assert got2 == {"2026-09-01": (0.5, "observed")}  # XTS2 一个都没写
+    assert got2 == {"2026-09-01": (0.5, "observed")}
     scan = await rates_history.scan_history_gaps(today=TODAY)
-    assert scan["currencies"]["XTS2"]["missing"] == 6  # 缺口保留
-    assert "XTS" not in scan["currencies"]  # XTS 已修满
+    assert scan["currencies"]["XTS2"]["missing"] == 6
+    assert "XTS" not in scan["currencies"]
 
 
 @pytest.mark.asyncio
@@ -546,7 +539,7 @@ async def test_legacy_rows_converge_to_observed_and_scan_clears(db, monkeypatch)
         )
         await session.commit()
     scan1 = await rates_history.scan_history_gaps(today=TODAY)
-    assert scan1["currencies"][XTS]["carried"] == 2  # 无 canonical 列也识别为待修复
+    assert scan1["currencies"][XTS]["carried"] == 2
 
     calls: list = []
     rows = {
@@ -561,8 +554,8 @@ async def test_legacy_rows_converge_to_observed_and_scan_clears(db, monkeypatch)
     assert result["written"] == 2
     scan2 = await rates_history.scan_history_gaps(today=TODAY)
     info2 = scan2["currencies"].get(XTS, {})
-    assert info2.get("carried", 0) == 0  # 旧行语义已被 observed 取代
-    assert info2.get("missing", 0) == 4  # 9/4 ~ 9/7 仍缺（未修区间）
+    assert info2.get("carried", 0) == 0
+    assert info2.get("missing", 0) == 4
 
 
 @pytest.mark.asyncio
@@ -574,7 +567,7 @@ async def test_bing_rows_upgraded_to_frankfurter_derived(db, monkeypatch):
         source="bing.currencyapi",
     )
     scan = await rates_history.scan_history_gaps(today=TODAY)
-    assert scan["currencies"][XTS]["carried"] == 1  # 识别为待修复
+    assert scan["currencies"][XTS]["carried"] == 1
 
     calls: list = []
     rows = {date(2026, 9, 2): {XTS: 7.25}}
@@ -591,10 +584,10 @@ async def test_bing_rows_upgraded_to_frankfurter_derived(db, monkeypatch):
 def test_pick_observed_rate_exact_15_days_boundary():
     """验证 pick_observed_rate 在 0、14、15、16 天的回溯边界。"""
     rows = [("2024-01-01", 7.0)]
-    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-01") == pytest.approx(7.0)  # 0 天
-    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-15") == pytest.approx(7.0)  # 14 天
-    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-16") == pytest.approx(7.0)  # 15 天（修复边界）
-    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-17") is None  # 16 天超窗
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-01") == pytest.approx(7.0)
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-15") == pytest.approx(7.0)
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-16") == pytest.approx(7.0)
+    assert rates_history.pick_observed_rate(rows, "USD", "2024-01-17") is None
 
 
 @pytest.mark.asyncio

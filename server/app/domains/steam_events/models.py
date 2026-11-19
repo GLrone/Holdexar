@@ -20,7 +20,6 @@ class SteamEvent(Base):
     __tablename__ = "steam_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # 稳定 slug：seasonal_2026_autumn / nextfest_2026_10 / themed_cooking_2026
     event_key: Mapped[str] = mapped_column(String(60), unique=True)
     category: Mapped[str] = mapped_column(String(20))
     name_en: Mapped[str] = mapped_column(String(120))

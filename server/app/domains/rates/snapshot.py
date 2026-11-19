@@ -34,10 +34,6 @@ from app.core.logging import log_event
 
 logger = logging.getLogger(__name__)
 
-# cny_fen = ROUND(price(分) × rate_to_cny)：与写库侧
-# （crawler/db_writer._compute_cny_fen、games/pricing.convert_minor_to_cny_fen）
-# 同一口径。UPPER() 兜脏行大小写（写库侧按原样匹配，旧行可能有小写币种）。
-# 不命中的行（无对应币种汇率/单价缺失）保留原值，不回写 NULL。
 _RECOMPUTE_GAMES_SQL = text(
     """
     UPDATE game_current_prices AS p

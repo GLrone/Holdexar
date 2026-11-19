@@ -30,9 +30,6 @@ logger = logging.getLogger(__name__)
 AUGSTEAM_URL = "https://api.augmentedsteam.com/rates/v1?to=CNY"
 ERAPI_URL = "https://open.er-api.com/v6/latest/CNY"
 
-# 41 区实际使用的货币白名单（由 CC_LIST 单点派生，41 区共 37 种唯一货币）。
-# 另永久保留 TRY / ARS：当前无区服使用（土/阿已改 USD 定价），但后续拓展业务需要。
-# 抓取落库、数据库清洗都只认这批；增减区服只改 CC_LIST，此处自动跟随。
 RESERVED_CURRENCIES: frozenset[str] = frozenset({"TRY", "ARS"})
 ALLOWED_CURRENCIES: frozenset[str] = frozenset(cur for _, _, cur in CC_LIST) | RESERVED_CURRENCIES
 
@@ -131,7 +128,6 @@ async def refresh_rates() -> dict:
         raise RuntimeError("所有汇率源均失败")
 
     rates["CNY"] = 1.0
-    # 只写白名单币种（41 区货币 + TRY/ARS 预留）；UI 自选追踪仅影响前端展示，不影响抓取范围
     rates = {code: rate for code, rate in rates.items() if code in ALLOWED_CURRENCIES}
     now = _naive(get_beijing_time_obj())
     today = now.date()
@@ -149,8 +145,6 @@ async def refresh_rates() -> dict:
                     set_={"rate_to_cny": stmt.excluded.rate_to_cny, "fetched_at": now},
                 )
             )
-            # 历史行 UPSERT（(currency_code, rate_date) 唯一）：同日多次刷新收敛为
-            # 最后一行——与日收语义的既有读值一致，表不再堆积同日多行
             hist = sqlite_insert(FxRateHistory).values(
                 currency_code=code,
                 rate_to_cny=rate,
@@ -176,7 +170,6 @@ async def refresh_rates() -> dict:
         # 白名单清洗并入同一事务（幂等）。排在 commit 之后会随会话关闭被
         # 静默回滚——只剩启动链的 cleanup_disallowed 兜底
         await _delete_disallowed(session)
-        # ── 原子刷新边界：cny_fen 重算 + 两域排序快照 ──
         recomputed = await snapshot_service.recompute_cny_fen_all(session)
         await snapshot_service.rebuild_sort_snapshots(session)
         await session.commit()
@@ -214,7 +207,7 @@ async def refresh_if_stale() -> bool:
     from app.domains.settings.service import get_value
 
     if not await get_value("crawl.auto_refresh_rates", True):
-        return False  # 「汇率更新」开关关闭：启动兜底与定时刷新同闸，手动刷新不受影响
+        return False
     async with get_session_factory()() as session:
         row = (await session.execute(select(func.max(FxRate.fetched_at)).where(
             FxRate.currency_code != "CNY"

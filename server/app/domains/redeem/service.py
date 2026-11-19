@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 REGISTER_KEY_URL = "https://store.steampowered.com/account/ajaxregisterkey/"
 
-# Steam 官方激活限制：30 分钟窗口内 10 次（无论成败）
 ACT_LIMIT = 10
 ACT_WINDOW_SECONDS = 30 * 60
 
@@ -41,7 +40,6 @@ _HEADERS = {
     "Referer": "https://store.steampowered.com/account/registerkey/",
 }
 
-# registerkey 错误码 → 中文语义。
 # ️ 该表按社区语义，勿按"官方文档"纠正——53=次数上限（30 分钟 10 次
 # 尝试窗口）不是锁区；配额用尽时 Steam 不查 key 直接返 53，任何码都一样。
 _ERROR_CODES: dict[int, str] = {
@@ -55,8 +53,6 @@ _ERROR_CODES: dict[int, str] = {
     53: "次数上限（30 分钟内最多 10 次激活尝试，请稍后再试）",
 }
 
-# ── 激活次数记账（按账号独立：Steam 的 10 次/30 分钟限制作用于单个账号，
-#    换绑 Cookie 即换号重计；非持久化——仅指引前端节奏，Steam 端才是真裁判）──
 import time as _time
 
 from app.domains.account.steam_wallet import steam_id_from_cookies
@@ -200,7 +196,6 @@ async def list_activations(limit: int = 50, offset: int = 0) -> dict:
         }
 
 
-# 检索窗：search_activations 经既有分页读取聚合的全量检索窗。
 # shortcut: 2000 条≈本地激活账本全量（账本增速约数十条/日）；
 # 账本超窗后把筛选下推为参数化 SQL（status/q/key），本函数契约不变。
 ACTIVATIONS_SEARCH_WINDOW = 2000
@@ -314,8 +309,6 @@ async def activate_key(product_key: str) -> dict:
                             code = int(receipt.get("result_detail") or 0)
                         except (TypeError, ValueError):
                             code = 0
-                    # 失败/已拥有回执若带 line_items（失败分支同样提取），一并展示
-                    # subId/版本名——"已拥有"能看到是哪个 sub 是原脚本一直有的信息。
                     sub_id, sub_name = _summary_from_receipt(receipt)
                     if code == 9:
                         result = {"status": "own", "detail": "已拥有", "subId": sub_id, "subName": sub_name, "raw": raw_text}

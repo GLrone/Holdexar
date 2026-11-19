@@ -40,7 +40,6 @@ async def test_scheduled_bills_sync_continues_after_one_account_fails(monkeypatc
     await scheduler._job_bills_sync()
     assert calls == [(False, A), (False, B)]
 
-# 与 steamLoginSecure 编码格式一致的 Cookie 串构造器
 def cookie(sid: str, token: str = "jwt-token") -> str:
     return f"sessionid=s-{sid[-4:]}; steamLoginSecure={sid}%7C%7C{token}"
 
@@ -64,7 +63,6 @@ async def _no_proxy(monkeypatch):
     monkeypatch.setattr(account_service, "strategy_proxy_or_direct", _none)
 
 
-# ── 绑定 upsert / active 语义 ─────────────────────────────
 
 @pytest.mark.asyncio
 async def test_bind_two_accounts_second_becomes_active(db):
@@ -74,10 +72,8 @@ async def test_bind_two_accounts_second_becomes_active(db):
     r2 = await account_service.save_cookies(cookie(B))
     assert r2["is_new"] is True and r2["steam_id"] == B
 
-    # 绑定即置 active：当前账号 = B，主账号仍 = A（第一个绑定）
     assert await account_service.get_active_steam_id() == B
     assert await account_service.get_primary_steam_id() == A
-    # get_cookies 跟随 active
     assert f"{B}%7C%7C" in await account_service.get_cookies()
 
 
@@ -88,7 +84,7 @@ async def test_rebind_same_account_updates_cookie_not_new(db):
     assert r["is_new"] is False
     raw = await account_service.get_cookies()
     assert "new" in raw and "old" not in raw
-    assert await account_service.get_primary_steam_id() == A  # 仍是唯一账号
+    assert await account_service.get_primary_steam_id() == A
 
 
 @pytest.mark.asyncio
@@ -98,7 +94,6 @@ async def test_set_active_switches_get_cookies(db):
     await account_service.set_active(A)
     assert await account_service.get_active_steam_id() == A
     assert f"{A}%7C%7C" in await account_service.get_cookies()
-    # 主账号不随切换变化（A 先绑定，恒为主账号）
     assert await account_service.get_primary_steam_id() == A
 
 
@@ -108,7 +103,6 @@ async def test_set_active_unknown_raises(db):
         await account_service.set_active("76561199999999999")
 
 
-# ── 删除 / 回退 ────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_remove_active_falls_back_to_first_remaining(db):
@@ -117,9 +111,7 @@ async def test_remove_active_falls_back_to_first_remaining(db):
     await account_service.save_cookies(cookie(C))
     await account_service.set_active(C)
     await account_service.remove_account(C)
-    # active 回退到剩余首个
     assert await account_service.get_active_steam_id() in (A, B)
-    # 主账号不变
     assert await account_service.get_primary_steam_id() == A
 
 
@@ -149,7 +141,6 @@ async def test_remove_unknown_raises(db):
         await account_service.remove_account(A)
 
 
-# ── 删除账号的监控追踪对称拆除 ────────────────────────────
 
 
 async def _seed_tracking(db, sid: str, appids: list[int]) -> None:
@@ -175,7 +166,7 @@ async def test_remove_account_tears_down_tracking(db):
     await account_service.save_cookies(cookie(A))
     await account_service.save_cookies(cookie(B))
     await _seed_tracking(db, A, [10, 11])
-    await _seed_tracking(db, C, [20])  # C 从未绑定凭据
+    await _seed_tracking(db, C, [20])
 
     r = await account_service.remove_account(A)
 
@@ -201,7 +192,7 @@ async def test_clear_cookies_tears_down_bound_tracking_only(db):
     await account_service.save_cookies(cookie(B))
     await _seed_tracking(db, A, [10])
     await _seed_tracking(db, B, [11])
-    await _seed_tracking(db, C, [20])  # 从未绑定
+    await _seed_tracking(db, C, [20])
 
     await account_service.clear_cookies()
 
@@ -213,7 +204,6 @@ async def test_clear_cookies_tears_down_bound_tracking_only(db):
     assert tracked == {C} and items == {(C, 20)}, "只拆绑定过的追踪，手动追踪原样"
 
 
-# ── status / list 载荷 ─────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_list_accounts_payload_shape(db):
@@ -225,13 +215,10 @@ async def test_list_accounts_payload_shape(db):
     first, second = accounts
     assert first["steam_id"] == A and first["is_primary"] is True
     assert second["steam_id"] == B and second["is_primary"] is False
-    assert second["is_active"] is True  # 刚绑定 = active
-    # 好友码换算（SteamID64 - 76561197960265728）
+    assert second["is_active"] is True
     assert first["friend_code"] == str(int(A) - 76561197960265728)
-    # 计数字段存在（未同步 = 0）
     assert first["wishlist_count"] == 0
     assert first["game_count"] == 0
-    # 不回传 Cookie 明文
     assert "cookies" not in first
 
 
@@ -243,12 +230,11 @@ async def test_get_status_accounts_and_primary(db):
 
     status = await account_service.get_status()
     assert status["primary_steam_id"] == A
-    assert status["cookie_steam_id"] == A  # active 的
+    assert status["cookie_steam_id"] == A
     assert len(status["accounts"]) == 2
     assert status["has_cookie"] is True
 
 
-# ── 激活计数隔离（redeem _ACT_LOG 按账号分桶）──────────────
 
 @pytest.mark.asyncio
 async def test_activation_usage_isolated_per_account(db):
@@ -265,14 +251,12 @@ async def test_activation_usage_isolated_per_account(db):
         redeem_service._ACT_LOG.clear()
 
 
-# ── 钱包轮转（每分钟任务；随机延时 mock 掉避免用例拖慢）────
 
 @pytest.mark.asyncio
 async def test_rotational_sync_refreshes_all_accounts(db, monkeypatch):
     import asyncio
 
     async def fake_fetch(cookies, *, verify=None, proxy_url=None):
-        # 从 Cookie 反解账号身份（steamLoginSecure 前段）
         from app.domains.account.steam_wallet import steam_id_from_cookies
 
         sid = steam_id_from_cookies(cookies)
@@ -309,15 +293,12 @@ async def test_rotational_backoff_skips_recently_failed(db, monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     await account_service.save_cookies(cookie(A))
-    # 第一次轮转：失败落库 wallet_error
     await account_service.sync_wallets_rotational()
-    # 第二次轮转：2 分钟退避窗口内跳过
     result = await account_service.sync_wallets_rotational()
     assert result["skipped"] == 1
     assert result["ok"] is False
 
 
-# ── 旧单账号 KV 迁移 ───────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_migrate_legacy_kv_moves_cookie_to_table(db):
@@ -330,12 +311,9 @@ async def test_migrate_legacy_kv_moves_cookie_to_table(db):
     migrated = await account_service.migrate_legacy_kv()
     assert migrated == 1
 
-    # KV 已清（表为唯一真源）
     assert await settings_service.get_value(account_service.KEY_COOKIES, "") == ""
-    # 表里有该账号，且置 active
     assert await account_service.get_active_steam_id() == A
     assert f"{A}%7C%7C" in await account_service.get_cookies()
-    # 旧钱包快照随迁
     accounts = await account_service.list_accounts()
     assert accounts[0]["wallet"]["balance_display"] == "¥10.00"
 
@@ -346,12 +324,10 @@ async def test_migrate_legacy_kv_idempotent(db):
         account_service.KEY_COOKIES, f"steamLoginSecure={A}%7C%7Ct"
     )
     assert await account_service.migrate_legacy_kv() == 1
-    # 再跑：KV 已清，不重复迁移
     assert await account_service.migrate_legacy_kv() == 0
     assert len(await account_service.list_accounts()) == 1
 
 
-# ── mismatch 校验保留 ─────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_save_cookies_flags_mismatch_vs_bound_steamid(db):
@@ -360,7 +336,6 @@ async def test_save_cookies_flags_mismatch_vs_bound_steamid(db):
     assert r["mismatch"] is True
 
 
-# ── Steam 真实在线状态（miniprofile 条件字段 / 官方批量映射）──
 
 def test_parse_miniprofile_offline_has_no_online_field():
     """离线形态（真机好友码，已脱敏）：只有等级/徽章等，无 online 字段 → 离线。"""
@@ -411,7 +386,7 @@ async def test_refresh_online_states_maps_personastate(db, monkeypatch):
         return {
             A: {"state": 1, "in_game": ""},
             B: {"state": 0, "in_game": ""},
-        }  # C 缺失 = 离线
+        }
 
     async def _none():
         return None
@@ -430,7 +405,7 @@ async def test_refresh_online_states_maps_personastate(db, monkeypatch):
     by_id = {a["steam_id"]: a for a in await account_service.list_accounts()}
     assert by_id[A]["is_online"] is True and by_id[A]["in_game"] == ""
     assert by_id[B]["is_online"] is False
-    assert by_id[C]["is_online"] is False  # 响应缺失 = 离线
+    assert by_id[C]["is_online"] is False
 
 
 @pytest.mark.asyncio
@@ -539,7 +514,6 @@ async def test_account_status_derives_bill_completion_from_owned_import(db):
     assert accounts[B]['bills_synced_at'] == '2026-01-01T00:00:00'
 
 
-# ── 6 账号容量 / 单账号聚合刷新 / 共享组删除回归 ────────────
 
 SIX = [f"7656119800000000{i}" for i in range(1, 7)]
 
@@ -560,7 +534,6 @@ async def test_six_accounts_bind_list_order_and_switch_each(db):
         await account_service.set_active(sid)
         assert await account_service.get_active_steam_id() == sid
         assert f"{sid}%7C%7C" in await account_service.get_cookies()
-    # 主账号不随切换变化
     assert await account_service.get_primary_steam_id() == SIX[0]
 
 
@@ -574,7 +547,7 @@ async def test_remove_one_of_six_shared_group_keeps_others_intact(db):
     from app.domains.bills.models import BillGameTx, BillImport
     from app.domains.family.models import FamilyGroup, FamilyLibrarySnapshot
 
-    d, e = SIX[3], SIX[4]  # d、e 同一真实家庭（共享组 777）
+    d, e = SIX[3], SIX[4]
     for sid in SIX:
         await account_service.save_cookies(cookie(sid))
     async with db() as session:
@@ -608,10 +581,10 @@ async def test_remove_one_of_six_shared_group_keeps_others_intact(db):
             (await session.execute(select(FamilyLibrarySnapshot.family_groupid))).all()
         }
         txs = (await session.execute(select(BillGameTx))).scalars().all()
-    assert d not in bill_owners  # 被删账号账单清，旧存量 NULL 归属不受影响
+    assert d not in bill_owners
     assert d not in group_owners and {e, SIX[0]} <= group_owners
-    assert snap_gids == {"111", "777"}  # 共享组 777 快照由 e 的组行继续持有
-    assert txs == []  # 被删账号的账单明细随导入一并清除
+    assert snap_gids == {"111", "777"}
+    assert txs == []
     assert len(await account_service.list_accounts()) == 5
 
 

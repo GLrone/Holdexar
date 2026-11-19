@@ -157,21 +157,16 @@ def _family_region_prices(
             "currency": (p.currency or "").upper() or None,
             "discountPercent": p.discount_percent or 0,
             "baseDiscount": p.bundle_base_discount or 0,
-            # cny_fen 是当前价快照的完整字段（爬取/导入写库时落值，
-            # 汇率变更由 recompute_cny_fen_all 重算）——不在这里现算
             "cnyFen": int(p.cny_fen) if p.cny_fen is not None else None,
             # 促销截止（Unix 秒，browse active_discounts 下发；NULL=无促销）。
             # 已过期行随展示层时间守卫隐藏——抓取间隙促销结束属正常滞留
             "discountEndsAt": int(p.discount_end_ts) if p.discount_end_ts else None,
             "appIds": aids,
         }
-        # 源数据存在大小写并存的同区行（如 jp/JP）：有价者优先，其余丢弃，
-        # 保证同一区键唯一且取到有效行
         existing = region_prices.get(code)
         if existing is None or (existing["cnyFen"] is None and entry["cnyFen"] is not None):
             region_prices[code] = entry
 
-    # 追踪区过滤（南亚 PK/BD 双区适配）→ 最低价/差价在过滤后的区内取
     return _filter_region_prices(region_prices, tracked), baseline_appids
 
 
@@ -235,13 +230,7 @@ def _aggregate(
         "lowestRegion": lowest_code,
         "lowestCnyFen": lowest_cny_fen,
         "diffFen": int(bundle.diff_fen or 0),
-        # smart 评分随载荷下发：前端选区时用「save(该区差价) + 评分余量」做
-        # 地区重锚排序（余量 = 评分 − save(快照差价)，与地区无关的三因子和）
         "smartScore": float(bundle.smart_score or 0.0),
-        # 价格数据状态（观察时刻/新鲜度分档）：观察时刻 = 该包全部价格行的
-        # MAX(crawled_at)，与 games 的 priceData 同口径（被观察过即算，不按
-        # 价格有无过滤）；无 coverage——捆绑包不属价格刷新 Cycle 的期望集，
-        # 不冒充覆盖率。
         "priceData": freshness_service.freshness_of(
             max(
                 (p.crawled_at for p in price_rows if p.crawled_at is not None),
@@ -582,7 +571,6 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
     bundle = bundles[0] if bundles else None
     if bundle is None:
         return None
-    # 详情同样按追踪区过滤（列表与抽屉同一口径）
     tracked = await _tracked_region_codes()
     summary = _aggregate(bundle, prices_by_bundle.get(bundle_id, []), tracked)
 
@@ -605,8 +593,6 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
         prices_by_appid: dict[int, dict[str, dict]] = {}
         for p in price_rows:
             code = (p.region_code or "").upper()
-            # cny_fen 直接读快照列：GET 不回算（缺失行由 recompute_cny_fen_all
-            # 在汇率刷新时补齐；无值即前端计算器自动排除该区）
             prices_by_appid.setdefault(p.appid, {})[code] = {
                 "priceMinor": int(p.price) if p.price is not None else None,
                 "currency": (p.currency or "").upper() or None,
@@ -628,7 +614,6 @@ async def get_bundle_detail(bundle_id: int) -> dict | None:
     return summary
 
 
-# ── 用户面动作：移除 / 恢复 / 关注（复用 monitoring 的 bundle 生命周期）──
 
 # 移除链路挂的排除 reason：恢复时只解除本链路所挂的排除，维护面板里
 # 用户显式设置的排除语义不被恢复动作洗掉
@@ -680,7 +665,6 @@ async def follow_bundle(bundle_id: int) -> dict:
     bid = int(bundle_id)
     from app.domains.monitoring import service as monitoring_service
 
-    # 关注 = 用户显式要求盯住它：解除「别再爬它」后挂来源（与游戏星标同语义）
     await monitoring_service.ensure_source("bundle", bid, "favorite", clear_exclusion=True)
     return {"bundleId": bid, "followed": True}
 

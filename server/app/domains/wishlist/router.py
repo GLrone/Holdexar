@@ -10,7 +10,7 @@ router = APIRouter(tags=["wishlist"])
 
 
 class AccountAdd(BaseModel):
-    steamid: str  # SteamID64 / 好友码 / 个人资料 URL / 自定义 URL
+    steamid: str
     label: str = ""
     kinds: dict | None = None
 
@@ -90,14 +90,12 @@ async def ownership(appids: str):
     return await service.ownership(ids[:200])
 
 
-# ── 监控池管理（监控条目的添加 / 移除；批量操作）──
 
 
 class PoolItemsRequest(BaseModel):
     """监控条目批量操作请求（单批上限 500，前端超出时分批调用）。"""
 
     appids: list[int] = Field(min_length=1, max_length=500)
-    # 导入文件来源仅在本机登记，不进入资产种子。
     source: str | None = Field(default=None, max_length=80)
 
 
@@ -120,7 +118,6 @@ async def remove_pool_items(req: PoolItemsRequest):
     return await service.remove_pool_items(req.appids)
 
 
-# ── 关注列表（游戏卡星标；favorite 来源语义，见 follows.py 模块注释）──
 
 
 @router.get("/follows")

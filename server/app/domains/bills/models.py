@@ -51,11 +51,10 @@ class BillGameTx(Base):
     payment: Mapped[str] = mapped_column(String(120), default="")
     discount_pct: Mapped[str] = mapped_column(String(20), default="")
     orig_price: Mapped[float | None] = mapped_column(Float)
-    # 新导出字段（与 Steam 消费历史分类器对齐）
-    wallet_balance: Mapped[str] = mapped_column(String(60), default="")  # 行余额列原文（钱包曲线用）
-    base_price: Mapped[str] = mapped_column(String(60), default="")  # 外区基准价原文（转区对比用）
+    wallet_balance: Mapped[str] = mapped_column(String(60), default="")
+    base_price: Mapped[str] = mapped_column(String(60), default="")
     payment_parts_json: Mapped[str | None] = mapped_column(Text)  # 混合支付拆分 [{pm, amount}]
-    gift_to_json: Mapped[str | None] = mapped_column(Text)  # 新 UI 礼物受赠人（含多个）
+    gift_to_json: Mapped[str | None] = mapped_column(Text)
     is_gift: Mapped[bool] = mapped_column(Boolean, default=False)
     is_refund: Mapped[bool] = mapped_column(Boolean, default=False)
     orig_is_gift: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -96,10 +95,8 @@ class BillCdkGame(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     import_id: Mapped[int] = mapped_column(Integer, index=True)
     name: Mapped[str] = mapped_column(String(300))
-    # 许可 appid（steam_fetch 从名称列商店链接提取；老快照/外部导出为 NULL
-    # → 前端命中关联退回名字粗匹配）
     appid: Mapped[int | None] = mapped_column(BigInteger)
     date: Mapped[str] = mapped_column(String(20), default="")
     acq: Mapped[str] = mapped_column(String(10))  # cdk | gift | free
     acq_label: Mapped[str] = mapped_column(String(40), default="")
-    manual_fen: Mapped[int | None] = mapped_column(BigInteger)  # 手动录入实付（分）
+    manual_fen: Mapped[int | None] = mapped_column(BigInteger)

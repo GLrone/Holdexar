@@ -84,7 +84,6 @@ def build_order_by(
     prefix = region_group_prefix(g, cn) if region_mode else []
 
     if region_mode and sr is not None:
-        # 地区模式组内默认：差价降序 → 好评率（global/cheaper/highdiff 共用）
         if sort == "rate":
             return prefix + [desc(g.review_count / 1000), desc(g.positive_rate), desc(g.appid)]
         if sort == "new2026":
@@ -101,11 +100,9 @@ def build_order_by(
         return prefix + [desc(g.release_date), desc(g.appid)]
 
     if sort == "updated":
-        # 最近变动优先（降价动态 feed 用；ix_games_updated 索引覆盖）
         return prefix + [desc(g.updated_at), desc(g.appid)]
 
     if sort == "diff":
         return prefix + [desc(g.diff_fen / 500)] + complex_sort(g, cn) + [desc(g.appid)]
 
-    # default：5 级复杂排序
     return prefix + complex_sort(g, cn) + [desc(g.appid)]

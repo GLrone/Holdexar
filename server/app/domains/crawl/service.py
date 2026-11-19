@@ -43,11 +43,8 @@ class JobHandle:
     cycle_id: int | None = None
 
 
-# 进程内活动任务表（单任务模型）
 _active: JobHandle | None = None
 
-# 链级停止位：在跑的 run_price_cycle（自动轮/手动全队列同源）登记，stop 端点
-# 置位后链不再推进后续段；单任务模型下同一时刻至多一条链在跑
 _chain_stop: asyncio.Event | None = None
 _chain_cycle_id: int | None = None
 
@@ -74,7 +71,6 @@ def chain_stop_requested() -> bool:
     return _chain_stop is not None and _chain_stop.is_set()
 
 
-# start_job 预取占用的 tag（经 config.occupancy_tag 传给 run_crawl 复用）
 JOB_OCCUPANCY_TAG = "crawl_job"
 
 
@@ -118,8 +114,6 @@ async def active_snapshot() -> dict:
     }
 
 
-# 进程启动时刻（模块导入即进程启动）：只用于识别「上一个进程遗留」的任务——
-# 后台收拾链可能晚于首个用户请求跑完，本进程监听后启动的任务不得被判为中断
 _PROCESS_STARTED_AT = get_beijing_time_obj().replace(tzinfo=None)
 
 
@@ -158,7 +152,6 @@ async def cleanup_orphan_jobs() -> None:
 # 窗一致对应关系才在窗内完整；price_cycles 整行归 crawl/retention.py 的周期
 # 保留窗，本函数一行不碰
 CRAWL_JOB_RETENTION_DAYS = 90
-# 分块删除（每块一个事务过写闸）：一次长 DELETE 会长时间持写锁；删不完留给下一轮
 _CRAWL_PRUNE_CHUNK = 5000
 _CRAWL_PRUNE_MAX_CHUNKS = 20
 
@@ -251,8 +244,6 @@ async def import_appids(appids: list[int]) -> dict:
                 results.append({"appid": appid, "status": "ok", "detail": "待首爬入库"})
                 ok += 1
 
-    # 目录层：导入不建立监控来源（无 active Monitoring source 是合法状态），
-    # 首爬由前端对「新导入」触发，这里不自动开爬
     return {
         "results": results,
         "ok": ok,
@@ -363,9 +354,6 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         ]
 
     if scope == "pool":
-        # 监控池：只取 Monitoring 层（有有效来源且未被排除）。永久免费
-        # 是业务状态，在 crawl 侧再过滤一层——它不写监控排除，
-        # 仍留在 monitor_targets 里。
         from app.domains.monitoring import service as monitoring_service
 
         ids = await monitoring_service.crawl_order("game")
@@ -375,11 +363,6 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         return [(a, "") for a in ids if a not in excluded]
 
     if scope == "catalog":
-        # 目录层：games 主档里未被业务状态摘除的行，减去 monitor_targets
-        # 全部在册对象——active 由 pool 段覆盖（同轮不重复爬，避免同价
-        # 重复快照）；released / excluded 按状态定义不进任何 crawl 段
-        # （排除门复用 monitoring.blocked_ids，不另立第二套排除账）。
-        # appid 稳定序。
         from app.domains.monitoring import service as monitoring_service
 
         async with get_session_factory()() as session:
@@ -397,10 +380,6 @@ async def resolve_scope_appids(scope: str, appids: list[int] | None) -> list[tup
         return [(int(a), "") for a in pool_rows if int(a) not in monitored]
 
     if scope == "specials":
-        # 特惠榜尾段：Steam 特惠+热门榜（翻页 5000 封顶）去重后垫在价格
-        # 轮最后——与 pool/catalog 两段重合的对象不重复爬，尾段只剩榜单
-        # 独有的差集（多为不在库的新面孔，爬取落库即完成目录发现）。
-        # 榜单内容走三级缓存（热 1h → miss 实时拉取 → stale 兜底）。
         from app.domains.games import boards as games_boards
         from app.domains.monitoring import service as monitoring_service
         from app.domains.settings.service import get_value as _kv
@@ -474,10 +453,6 @@ MISSING_RETRY_COOLDOWN_MINUTES = 24 * 60
 # 不设 0 是防同轮内重复拾取。
 REPAIR_RETRY_COOLDOWN_MINUTES = 4
 
-# 单轮补抓行数上限（按账本行计，非请求数）。补抓按区分组批量后一发可装
-# ≤300 行，请求量天然被压住；这个上限挡的是「积压账本一轮吃满」挤占
-# 关注层——老账先补，余量留给下一轮。8000 行 ≈ 单区 20 发，写入量与
-# 主轮常态持平。
 MISSING_BATCH_ROW_LIMIT = 8000
 
 
@@ -715,7 +690,6 @@ async def _finish_job(job_id: int, status: str, stats: dict | None = None, error
         bus.publish("job.status", job_id=job_id, status=status, error=error)
 
 
-# 后台标记链的强引用集：create_task 产物只有被持有时才不会被 GC
 
 
 def _crawled_appids(
@@ -788,7 +762,6 @@ async def _execute(
         )
 
         if stop_event.is_set():
-            # 手动停止：跳过提醒检查 / 史低刷新 / 排序缓存（对未爬完的数据无意义）
             return
 
         crawled = _crawled_appids(appid_pairs, pre_tasks)
@@ -802,8 +775,6 @@ async def _execute(
             detail={"任务": job_id},
         )
         await _finish_job(job_id, "failed", None, str(e))
-        # 系统异常告警：任务级失败（含定时价格网格轮）带 12h 冷却发一封，
-        # 连续失败不刷屏；告警自身异常不得影响任务状态收敛
         try:
             await alerts_service.send_system_alert(
                 kind="crawl",
@@ -836,7 +807,6 @@ async def _execute(
             bus.publish("crawl.idle")
 
 
-# 补抓层专用：定向小流量通道，低 worker 防 429 风暴（STT"稀缺配额单独通道"）
 MISSING_RECOVERY_WORKERS = 6
 
 # 直连形态的 worker 上限：单出口（用户本机网络环境），请求速率由全局滑动窗口闸
@@ -844,7 +814,6 @@ MISSING_RECOVERY_WORKERS = 6
 DIRECT_MODE_WORKERS = 4
 
 
-# 永久免费脱池：free_kind='f2p' 的 appid 集——价格事实已定，再爬是空转配额。
 
 
 async def _excluded_free_appids() -> set[int]:
@@ -893,7 +862,7 @@ async def _resolve_worker_count() -> int:
         from app.domains.proxies import service as proxies_service
 
         available = int((await proxies_service.pool_stats()).get("available") or 0)
-    except Exception as e:  # noqa: BLE001 —— 统计失败不阻断爬取
+    except Exception as e:  # noqa: BLE001
         log_event(
             logger,
             f"统计可用出口 IP 失败，回退使用默认并发 worker 数 {DEFAULT_WORKER_COUNT}",
@@ -994,7 +963,6 @@ async def start_job(
         # 受管爬取：**每次 run 只取一次**当前 Runtime 的入口集合，整个 run 固定用它
         # （重建会换端口并打断在途请求，所以 run 内不换）。拿不到就拒绝启动——
         # 绝不静默退回直连或旧订阅代理（那会把"池坏了"伪装成"爬取成功"）。
-        #
         # 容量单位是**独立出口 IP**：入口集合由 `crawl_lane_plan` 用**当前出口槽快照**
         # 校验后给出（池里有出口 + 有 lane + 两者逐位一致），任一不满足即拒绝启动——
         # **绝不**回退 GLOBAL / 直连 / 旧订阅代理。收敛结果即本次 run 的**快照**：
@@ -1048,8 +1016,6 @@ async def start_job(
         else:
             from app.domains.proxies import clash_manager as _cm
             async with get_session_factory()() as session:
-                # max_lanes 不传：run 拿走全部 active lane（≤MAX_LANES）——多出的
-                # 部分即待用出口池；worker 数由下面的 effective_workers 单独钳在 60
                 run_plan = await crawl_lane_plan(
                     session, data_dir, runtime=_cm.pool_runtime,
                 )
@@ -1078,9 +1044,6 @@ async def start_job(
                 exit_keys=run_plan["exit_keys"],
                 exit_nodes=run_plan["nodes"],
             )
-        # 任务行落库过写调度器：定时写者（体检台账/钱包轮转）密集时不过闸的
-        # commit 会在 SQLite 写锁上排队到超时——主轮建不出任务行，用户手动启动
-        # 的任务也迟迟建不出来。
         # 轮账本的初始批次：与 run_crawl 收尾统计同口径（total_target = 初始任务数）
         # —— browse 批量段是「区数 × 款数÷单发容量」的桶数，补抓段是 pre_tasks
         # 的发数（行数只是日志口径），口径错位会让进度条永远跑不满。
@@ -1118,13 +1081,11 @@ async def start_job(
             _execute(job_id, pairs, config, stop_event, pre_tasks=pre_tasks)
         )
         _active = JobHandle(id=job_id, task=task, stop_event=stop_event, cycle_id=cycle_id)
-    except BaseException:  # noqa: BLE001 — 清理后原样重抛
-        # 启动半途失败（无欠账/范围空/lane 规划拒绝等）：释放预取的占用
+    except BaseException:  # noqa: BLE001
         end_crawl()
         raise
 
 
-    # 事件与日志沿用「项数」口径（款数/行数），初始账本的桶口径见上
     pre_rows = sum(
         len(t["appids"]) if "appids" in t else 1 for t in (pre_tasks or [])
     )
@@ -1192,7 +1153,6 @@ async def start_full_queue() -> dict:
         _queue_chain_task is not None and not _queue_chain_task.done()
     ):
         raise RuntimeError("全量队列已在启动中")
-    # 检查与置位之间无 await（同 start_job 预取占用判例）
     _queue_accepting = True
     chain_stop = asyncio.Event()
     register_chain_stop(chain_stop)
@@ -1215,8 +1175,6 @@ async def start_full_queue() -> dict:
                 "没有可抓取的对象：关注与游戏库都是空的，先在游戏商店页添加游戏"
             )
 
-        # 无显式 kind 的 scope 段手动触发记 manual；missing / specials_backfill
-        # 是通道/段身份标签（任务页按此显示），保留
         specs = [
             {**spec, "kind": "manual"}
             if spec.get("scope") and "kind" not in spec
@@ -1228,8 +1186,6 @@ async def start_full_queue() -> dict:
         regions, expected = await price_cycle.freeze_expected(cycle_id, specs)
 
         async def _chain() -> None:
-            # 编排本体在 crawl 域内，与自动轮共用一份；链级停止位由 run_price_cycle
-            # 自行登记（stop 端点经它停整轮）。本函数只负责「后台跑 + 链级异常兜底」
             from app.domains.crawl import cycle_run
 
             try:
@@ -1240,7 +1196,7 @@ async def start_full_queue() -> dict:
                     logger,
                     "手动全队列执行已结束",
                 )
-            except Exception:  # noqa: BLE001 —— 链级异常只记日志，段内已各自兜底
+            except Exception:  # noqa: BLE001
                 log_event(
                     logger,
                     "手动全队列执行异常，段内已各自兜底",
@@ -1348,8 +1304,6 @@ async def run_sequential(
             if skip_reasons is not None:
                 skip_reasons.append(f"{spec.get('kind', spec.get('scope'))}：用户已停止")
             break
-        # 本机网络被接管时抓取只会堆失败记录与限流：当前段跑完（已爬数据照常
-        # 落库）后不再推进下一段，链按协作式停止收敛
         if _tun_mode_suspected():
             for remaining in specs[index:]:
                 await price_cycle.record_stage(cycle_id, remaining, "deferred", env_check.USER_MESSAGE)

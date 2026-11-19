@@ -22,19 +22,14 @@ class AchievementDef(Base):
     __tablename__ = "achievement_defs"
 
     appid: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
-    # 图标资产名（不含扩展名与 _BW 后缀），如 SURVIVE_CONTAINER_RIDE
     image_name: Mapped[str] = mapped_column(String(160), primary_key=True)
-    # 游戏内 API 名（GetGameAchievements 的 internal_name）：解锁态按它精确对上；
-    # 仅社区页爬虫通道补进来的定义为空
     apiname: Mapped[str | None] = mapped_column(String(160))
     name: Mapped[str | None] = mapped_column(String(400))
     description: Mapped[str | None] = mapped_column(String(800))
     icon_url: Mapped[str | None] = mapped_column(String(500))
-    # 锁定态灰图（个人页 `_BW` 资产；缺失时前端对彩图做灰度降级）
     icon_gray_url: Mapped[str | None] = mapped_column(String(500))
     # 全服解锁占比 0~100（公开成就页）
     global_percent: Mapped[float | None] = mapped_column(Float)
-    # 全局页展示序（按占比降序）
     display_order: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -65,9 +60,7 @@ class AchievementGame(Base):
     # 本号未拥有但有解锁）；manual=手动补录。库外行 playtime_min 恒为 0
     # （Steam 不提供非拥有游戏的时长），前端据此标注「库外·时长未知」。
     source: Mapped[str] = mapped_column(String(12), default="owned")
-    # 定义清单上次抓取时刻（社区页变更慢，按龄触发增量刷新）
     schema_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # 解锁态上次抓取时刻
     state_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

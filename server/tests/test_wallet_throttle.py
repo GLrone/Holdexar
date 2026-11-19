@@ -71,7 +71,6 @@ def _wallet_snapshot(balance_fen: int = 10000, minutes_ago: float = 0.0):
     }
 
 
-# ── 1. 活跃感知门禁 ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -86,35 +85,29 @@ async def test_active_heartbeat_keeps_minute_freshness(db, monkeypatch):
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
 
     await account_service.save_cookies(cookie(A))
-    # 第一轮真实抓一次建立成功快照
     await account_service.sync_wallets_rotational()
     assert len(calls) == 1
 
-    # 心跳：模拟前端 60s 轮询 GET /account
     account_service.mark_seen()
     assert account_service._freshness_threshold_minutes() == 2.0
 
-    # 第二轮：快照 0 分钟新鲜 + 阈值 2min → fresh_skip，不再打 Steam
     result = await account_service.sync_wallets_rotational()
     assert len(calls) == 1
-    assert result["ok_count"] == 1  # fresh_skip 计入 ok（数据新鲜即健康）
+    assert result["ok_count"] == 1
 
 
 @pytest.mark.asyncio
 async def test_idle_climbs_to_30min_freshness(db):
     """无人看（无心跳）：刚成功 1 分钟的快照也被 30min 阈值拦下——挂机降频。"""
     await account_service.save_cookies(cookie(A))
-    # 直接落一个 1 分钟前的成功快照（绕过 fetch）
     await account_service._save_wallet(
         A, snapshot=_wallet_snapshot(minutes_ago=1.0), now=account_service._naive_now()
     )
-    # 不调 mark_seen（进程刚启动 = 无人看）
     assert account_service._freshness_threshold_minutes() == 30.0
 
     result = await account_service.sync_wallets_rotational()
-    # 1min 快照 < 30min 阈值 → 本轮全部跳过
     assert result["total"] == 1
-    assert result["skipped"] == 0  # fresh_skip 不算 backoff
+    assert result["skipped"] == 0
     assert result["ok_count"] == 1
 
 
@@ -135,7 +128,7 @@ async def test_idle_stale_snapshot_still_refreshes(db, monkeypatch):
     )
 
     result = await account_service.sync_wallets_rotational()
-    assert len(calls) == 1  # 45min > 30min 阈值 → 真抓
+    assert len(calls) == 1
     assert result["ok_count"] == 1
 
 
@@ -151,22 +144,18 @@ async def test_heartbeat_recovery_triggers_refresh(db, monkeypatch):
     monkeypatch.setattr(account_service, "fetch_wallet", fake_fetch)
 
     await account_service.save_cookies(cookie(A))
-    # 无人看期间落了个 10 分钟前的快照（idle 下被 30min 阈值保护着）
     await account_service._save_wallet(
         A, snapshot=_wallet_snapshot(minutes_ago=10.0), now=account_service._naive_now()
     )
 
-    # 用户打开 App：心跳恢复
     account_service.mark_seen()
     assert account_service._freshness_threshold_minutes() == 2.0
 
-    # 10min 快照 > 2min 阈值 → 本轮立即真抓（UX 无感补上）
     result = await account_service.sync_wallets_rotational()
     assert len(calls) == 1
     assert result["ok_count"] == 1
 
 
-# ── 2. 失败递增退避 ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -184,11 +173,9 @@ async def test_backoff_escalates_by_level(db, monkeypatch):
     async def _row():
         return await account_service._get_row(A)
 
-    # 第一次失败 → level 1（2min 冷却）
     await account_service._sync_wallet_of(A)
     assert (await _row()).wallet_backoff_level == 1
 
-    # 模拟 3 分钟后（> 2min 冷却）：第二次失败 → level 2（5min 冷却）
     row = await _row()
     row.wallet_checked_at = get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=3)
     async with account_service.get_session_factory()() as session:
@@ -197,7 +184,6 @@ async def test_backoff_escalates_by_level(db, monkeypatch):
     await account_service._sync_wallet_of(A)
     assert (await _row()).wallet_backoff_level == 2
 
-    # 再过 6 分钟（> 5min 冷却）：第三次失败 → level 3（15min 冷却）
     row = await _row()
     row.wallet_checked_at = get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=6)
     async with account_service.get_session_factory()() as session:
@@ -206,7 +192,6 @@ async def test_backoff_escalates_by_level(db, monkeypatch):
     await account_service._sync_wallet_of(A)
     assert (await _row()).wallet_backoff_level == 3
 
-    # 级别 3 冷却内（15min）：轮转应跳过
     result = await account_service.sync_wallets_rotational()
     assert result["skipped"] == 1
 
@@ -229,14 +214,12 @@ async def test_backoff_resets_on_success(db, monkeypatch):
     row = await account_service._get_row(A)
     assert row.wallet_backoff_level == 2
 
-    # 网络恢复：成功 → 级别清零
     state["fail"] = False
     result = await account_service._sync_wallet_of(A)
     assert result["ok"] is True
     assert (await account_service._get_row(A)).wallet_backoff_level == 0
 
 
-# ── 3. 429/403 风控长冷却 ───────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -256,16 +239,15 @@ async def test_rate_limit_goes_long_cooldown(db, monkeypatch):
     await account_service.save_cookies(cookie(A))
     await account_service._sync_wallet_of(A)
     row = await account_service._get_row(A)
-    assert row.wallet_backoff_level == 1  # 级别照常 +1（供下次再失败升级）
+    assert row.wallet_backoff_level == 1
 
-    # 模拟 10 分钟后（> 普通 2min 冷却，但 < 30min 风控冷却）：轮转仍跳过
     row.wallet_checked_at = get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=10)
     async with account_service.get_session_factory()() as session:
         session.add(row)
         await session.commit()
 
     result = await account_service.sync_wallets_rotational()
-    assert result["skipped"] == 1  # 429 的 30min 长冷却在起作用，不是 2min
+    assert result["skipped"] == 1
 
 
 @pytest.mark.asyncio
@@ -278,7 +260,6 @@ async def test_rate_limit_error_message_identified():
     assert not account_service._is_rate_limited("")
 
 
-# ── 4. 熔断：慢车道 / 冻结终态 / 解锁 ───────────────────────
 
 
 async def _fail_times(db, monkeypatch, times: int) -> None:
@@ -308,19 +289,17 @@ async def test_breaker_slow_lane_after_five_failures(db, monkeypatch):
 
     row = await account_service._get_row(A)
     assert row.wallet_fail_streak == 5
-    assert not row.wallet_frozen  # 还没到冻结线
+    assert not row.wallet_frozen
 
     async def _put(r):
         async with account_service.get_session_factory()() as session:
             session.add(r)
             await session.commit()
 
-    # 慢车道 10min 未到（6min）：轮转跳过
     await _put(_wind_back(await account_service._get_row(A), 6))
     result = await account_service.sync_wallets_rotational()
     assert result["skipped"] == 1
 
-    # 过 11min：慢车道放行再试（仍失败 → 计数 6）
     await _put(_wind_back(await account_service._get_row(A), 11))
     result = await account_service.sync_wallets_rotational()
     assert result["ok_count"] == 0
@@ -350,7 +329,7 @@ async def test_breaker_freezes_after_ten_failures(db, monkeypatch):
         await session.commit()
 
     result = await account_service.sync_wallets_rotational()
-    assert len(calls) == account_service._WALLET_BREAKER_FREEZE_AFTER  # 冻结后零请求
+    assert len(calls) == account_service._WALLET_BREAKER_FREEZE_AFTER
     assert result["frozen"] == 1
     assert result["ok_count"] == 0
 
@@ -362,7 +341,7 @@ async def test_manual_refresh_unfreezes_even_on_failure(db, monkeypatch):
     assert (await account_service._get_row(A)).wallet_frozen is True
 
     sync = await account_service.sync_wallet(force=True)
-    assert sync["ok"] is False  # 手动这次也失败
+    assert sync["ok"] is False
     row = await account_service._get_row(A)
     assert row.wallet_frozen is False
     assert row.wallet_fail_streak == 0
@@ -392,7 +371,6 @@ async def test_manual_refresh_success_restores_rotation(db, monkeypatch):
     assert not row.wallet_frozen
     assert row.wallet_fail_streak == 0
 
-    # 轮转恢复正常：成功快照新鲜 → fresh_skip（不再是冻结/退避）
     result = await account_service.sync_wallets_rotational()
     assert result["ok_count"] == 1
     assert result["frozen"] == 0
@@ -427,7 +405,6 @@ async def test_breaker_slow_lane_keeps_rate_limit_floor(db, monkeypatch):
         await account_service._sync_wallet_of(A)
     assert (await account_service._get_row(A)).wallet_fail_streak == 5
 
-    # 过 11min（> 慢车道 10min，< 风控 30min）：风控冷却仍拦着
     row = await account_service._get_row(A)
     row.wallet_checked_at = (
         get_beijing_time_obj().replace(tzinfo=None) - timedelta(minutes=11)
@@ -441,7 +418,6 @@ async def test_breaker_slow_lane_keeps_rate_limit_floor(db, monkeypatch):
     assert (await account_service._get_row(A)).wallet_fail_streak == 5
 
 
-# ── 5. 失败归因二分 ───────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -466,7 +442,6 @@ async def test_frozen_reason_splits_by_last_failure(db, monkeypatch):
         "网络或代理通道不通，已停自动重试（手动刷新余额解锁）": 1
     }
 
-    # 换成真·登录过期：必须换分支（出路是重新登录，不是刷新余额）
     await account_service._save_wallet(
         A,
         error=account_service.SESSION_EXPIRED_MESSAGE,
@@ -532,7 +507,6 @@ async def test_fetch_wallet_head_splits_transport_from_http(monkeypatch):
     assert str(info.value).startswith(steam_wallet.WALLET_AUTH_ERROR_HEAD)
 
 
-# ── 6. 在线状态活跃感知门禁 ─────────────────────────────────
 
 
 async def _wallet_fail_path(monkeypatch):
@@ -583,18 +557,15 @@ async def test_online_states_active_gate_skips_fresh(db, monkeypatch):
     await settings_service.set_value("account.steam_api_key", "TESTKEY")
 
     await account_service.save_cookies(cookie(A))
-    # 首轮：NULL 时间戳视为过期 → 补查一次并落时间戳
     await account_service.refresh_online_states()
     assert len(calls) == 1
     assert (await _get_account(A)).online_checked_at is not None
 
-    # 心跳建立活跃阈值 2min：刚采集的时间戳 < 2min → 子集空，零出网
     account_service.mark_seen()
     assert account_service._freshness_threshold_minutes() == 2.0
     await account_service.sync_wallets_rotational()
     assert len(calls) == 1
 
-    # 拨回 3min 前（> 活跃阈值 2min）：下一轮补查一次，时间戳推进
     await _set_online_check(A, minutes_ago=3.0)
     await account_service.sync_wallets_rotational()
     assert len(calls) == 2
@@ -633,7 +604,7 @@ async def test_online_states_fetches_only_stale_subset(db, monkeypatch):
     b = await _get_account(B)
     assert b.is_online is True, "未查询账号不得被误写离线"
     assert b.in_game == "Elden Ring", "未查询账号的游戏名不得被清"
-    assert result["ok_count"] == 0  # 钱包通道全失败不影响在线断言
+    assert result["ok_count"] == 0
 
 
 @pytest.mark.asyncio

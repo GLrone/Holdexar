@@ -12,10 +12,8 @@ from app.domains.games.models import GameCurrentPrice
 
 logger = logging.getLogger(__name__)
 
-# 刷新网格步长（小时）；与 6h 锚点网格同口径
 FRESH_HOURS = 6.0
 
-# 陈旧阈值沿用 crawler/config（12h = 两个网格）
 LAGGING_HOURS = float(STALE_HOURS)
 
 # appid 分批宽度：避开 SQLite 变量上限，一条 IN 不装整池

@@ -33,12 +33,12 @@ from app.domains.games.models import (  # noqa: E402
 from app.domains.rates import service as rates_service  # noqa: E402
 from app.domains.rates.models import FxRate  # noqa: E402
 
-APPID = 998_101  # 主验收：CN + US 两区
-APPID_TRY = 998_102  # 无汇率币种：保留原值
+APPID = 998_101
+APPID_TRY = 998_102
 BID = 998_301
 
-OLD_USD_RATE = 8.0  # 种子汇率
-NEW_USD_RATE = 7.0  # 本轮刷新汇率
+OLD_USD_RATE = 8.0
+NEW_USD_RATE = 7.0
 
 
 @pytest.fixture
@@ -62,7 +62,6 @@ async def _seed(db):
         await session.execute(delete(FxRate))
         session.add(FxRate(currency_code="CNY", rate_to_cny=1.0))
         session.add(FxRate(currency_code="USD", rate_to_cny=OLD_USD_RATE))
-        # 旧快照：US 500 分 ×8 = 4000 → diff = 10000 − 4000 = 6000
         session.add(
             Game(
                 appid=APPID, name="快照游戏",
@@ -84,7 +83,6 @@ async def _seed(db):
                     price=500, original_price=500, discount_percent=0,
                     price_status="ok", attempt_outcome="success", cny_fen=4000,
                 ),
-                # 无对应汇率（TRY 不在本轮 fx_rates 里）：保留原值
                 GameCurrentPrice(
                     appid=APPID_TRY, region_code="TR", currency="TRY",
                     price=5000, original_price=5000, discount_percent=0,
@@ -137,7 +135,6 @@ async def test_refresh_rates_rebuilds_snapshot_in_one_transaction(db, monkeypatc
     """一次刷新把汇率 + 两域 cny_fen + 两域排序快照全部推进到新口径。"""
     _stub_rate_source(monkeypatch)
 
-    # 关键反证：重算不得依赖进程内汇率缓存（300s TTL 的「DB 新/cache 旧」）
     async def _boom():
         raise AssertionError("recompute 不应调用 get_rates()（进程内汇率缓存）")
 
@@ -145,7 +142,7 @@ async def test_refresh_rates_rebuilds_snapshot_in_one_transaction(db, monkeypatc
 
     result = await rates_service.refresh_rates()
     assert result["source"] == "augmentedsteam"
-    assert result["count"] == 2  # USD + 强制 CNY
+    assert result["count"] == 2
     # 两表都被重算（命中汇率的行；不依赖 driver 对「同值更新」是否计入 rowcount）
     assert result["recomputed"]["games"] >= 1
     assert result["recomputed"]["bundles"] >= 1
@@ -177,20 +174,15 @@ async def test_refresh_rates_rebuilds_snapshot_in_one_transaction(db, monkeypatc
             ).scalars()
         }
 
-    # ① 汇率快照
     assert rates["USD"] == NEW_USD_RATE
-    # ② cny_fen（500 × 7 = 3500）
     assert prices[(APPID, "US")] == 3500
     assert prices[(APPID, "CN")] == 10000
-    # ③ games 排序快照：min 3500 / diff = 10000 − 3500
     assert game.min_cny_fen == 3500
     assert game.diff_fen == 6500
-    # ④ bundles 排序快照：min 3500 / diff = 20000 − 3500
     assert bundle_prices["us"] == 3500
     assert bundle.min_cny_fen == 3500
     assert bundle.diff_fen == 16500
     assert bundle.is_lowest is False
-    # ⑤ 无汇率币种：保留原值，不回写 NULL、不被清零
     assert prices[(APPID_TRY, "TR")] == 1234
     assert game_try.min_cny_fen == 1234
 
@@ -222,6 +214,5 @@ async def test_refresh_rates_rolls_back_all_on_failure(db, monkeypatch):
                 )
             )
         ).scalar_one()
-    # 汇率与 cny_fen 都停在旧口径（同事务回滚），没有半态
     assert usd.rate_to_cny == OLD_USD_RATE
     assert price.cny_fen == 4000

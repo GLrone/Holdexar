@@ -21,18 +21,15 @@ from sqlalchemy.orm import Mapped, column_property, mapped_column
 
 from app.core.database import Base
 
-# 监控对象类型。只做 game / bundle 两种，不泛化到 DLC / 系列 / 发行商。
 TARGET_GAME = "game"
 TARGET_BUNDLE = "bundle"
 TARGET_TYPES = (TARGET_GAME, TARGET_BUNDLE)
 
-# 监控状态
-STATE_ACTIVE = "active"       # 有有效来源且未被排除 → 有资格进入 crawl
-STATE_RELEASED = "released"   # 没有任何有效来源 → 留在 Catalog，不进 crawl
-STATE_EXCLUDED = "excluded"   # 用户明确排除 → 无论来源如何都不进 crawl
+STATE_ACTIVE = "active"
+STATE_RELEASED = "released"
+STATE_EXCLUDED = "excluded"
 STATES = (STATE_ACTIVE, STATE_RELEASED, STATE_EXCLUDED)
 
-# 不进 crawl 的两个状态（refresh_bundles 的候选集过滤用）
 NON_CRAWL_STATES = (STATE_RELEASED, STATE_EXCLUDED)
 
 

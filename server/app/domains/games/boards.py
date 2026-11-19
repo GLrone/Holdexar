@@ -26,10 +26,10 @@ from app.domains.proxies.service import strategy_proxy_or_direct
 logger = logging.getLogger(__name__)
 
 SEARCH_URL = "https://store.steampowered.com/search/results"
-CACHE_TTL_SECONDS = 3600.0          # 热缓存 1 小时
-STALE_TTL_SECONDS = 86400.0         # stale 兜底保留 24 小时
+CACHE_TTL_SECONDS = 3600.0
+STALE_TTL_SECONDS = 86400.0
 BATCH_SIZE = 100
-BATCH_INTERVAL = 0.5                 # 批间隔 500ms 避免限流
+BATCH_INTERVAL = 0.5
 
 # 请求头：成人内容放行 + 中文语言（搜索结果需含 logo 字段）
 STEAM_HEADERS = {
@@ -50,24 +50,16 @@ class Board:
     """榜单源配置（各榜单的查询参数）。"""
 
     key: str
-    # search/results 附加查询参数（start/count/json 之外）
     params: dict = field(default_factory=dict)
-    max_records: int = 100            # 拉榜封顶（总条数，含已在库的）
-    max_requests: int = 5             # 最多批数（max_records / BATCH_SIZE 向上取整）
-    empty_tolerance: int = 1          # 连续 N 批零新增 → 终止
-    # 反哺语义：True=只补 games 无行的（特惠）；False=无行 or 挂名孤儿
-    # （updated_at NULL 且无价格行，topsellers 现行语义）
+    max_records: int = 100
+    max_requests: int = 5
+    empty_tolerance: int = 1
     uncrawled_only: bool = False
-    backfill_kind: str = ""           # 爬取 spec kind 标签
-    # 落池语义：True=本榜游戏轮询并入持久监控池（ensure_board_pool）；
-    # False=临时队列——只补游戏商店差集、不落监控池（specials 专用）
+    backfill_kind: str = ""
     pool: bool = False
 
 
 BOARDS: dict[str, Board] = {
-        # 热销榜：发现面拉满 5 页 = 500 条（初始游戏库的来源之一，预设池登记
-    # 见 games/preset.py）；前端「近期TOP100热榜」展示仍取榜序前 100；
-    # 本榜游戏轮询落持久监控池（board.pool）
     "topsellers": Board(
         key="topsellers",
         params={"filter": "topsellers", "hidef2p": 1, "category1": 998},
@@ -77,7 +69,6 @@ BOARDS: dict[str, Board] = {
         backfill_kind="top100_backfill",
         pool=True,
     ),
-    # 热门新品（filter=popularnew + Released_DESC）
     "popularnew": Board(
         key="popularnew",
         params={"filter": "popularnew", "sort_by": "Released_DESC",
@@ -88,20 +79,16 @@ BOARDS: dict[str, Board] = {
         backfill_kind="popularnew_backfill",
         pool=True,
     ),
-    # 特惠差集（对齐 check_steam_specials.py：specials=1 + Global_Topsellers + l=english）。
-    # 临时队列（pool 默认 False）：折扣全集只补游戏商店差集，不落监控池
     "specials": Board(
         key="specials",
         params={"specials": 1, "sort_by": "Global_Topsellers",
                 "hidef2p": 1, "category1": 998, "l": "english"},
-        max_records=5000,             # 封顶 5000（含在库）
+        max_records=5000,
         max_requests=50,
-        empty_tolerance=3,            # 连续 3 批零新增终止
-        uncrawled_only=True,          # 只补不在库的差集
+        empty_tolerance=3,
+        uncrawled_only=True,
         backfill_kind="specials_backfill",
     ),
-    # 即将推出（页面 filter=popularcomingsoon&os=win；与三源同走
-    # search/results?json=1 通道，items 结构一致，无需 HTML 解析）。
     # 该榜单 item 无价格字段，是否开放预购由爬取层判定（app_handler COMING_SOON
     # 暂缓语义）：无包游戏落 COMING_SOON 挂名行脱池，开放预购/上线后由
     # coming_soon 重探通道转正。
@@ -111,14 +98,13 @@ BOARDS: dict[str, Board] = {
         max_records=500,
         max_requests=5,
         empty_tolerance=1,
-        uncrawled_only=True,          # 在库（含 COMING_SOON 挂名行）不重复反哺
-        backfill_kind="comingsoon_backfill",  # 转正由重探通道负责
-        pool=True,                    # 即将推出同样落持久监控（上线后自动转正续刷）
+        uncrawled_only=True,
+        backfill_kind="comingsoon_backfill",
+        pool=True,
     ),
 }
 
 
-# ── 进程内缓存：热值 + stale 兜底，分板独立（每个板一组热值/stale 双 key）──
 _board_state: dict[str, dict] = {
     key: {"cache": None, "cache_ts": 0.0, "stale": None, "stale_ts": 0.0}
     for key in BOARDS
@@ -207,7 +193,6 @@ async def fetch_board(key: str) -> list[int]:
                     f"第 {request_no} 批拉榜新增 {added} 个",
                     detail={"榜单": board.key, "累计": len(collected)},
                 )
-            # 批间隔 500ms 避免限流（凑满即不再请求）
             if len(collected) < board.max_records:
                 await asyncio.sleep(BATCH_INTERVAL)
 
@@ -331,7 +316,6 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
                     )
                 )
             ).all()
-            # 库内行分类：appid → 是否需要反哺
             if board.uncrawled_only:
                 # 特惠/comingsoon 语义：有 games 行的一律不碰（含挂名孤儿——
                 # topsellers/popularnew 反哺语义负责），唯一例外 removed 复活（重新上榜）
@@ -339,15 +323,14 @@ async def backfill_specs(key: str, limit: int = 100) -> list[dict]:
                     int(a): (r is not None) for a, _, _, r in rows
                 }
             else:
-                # 现行语义：无行(True) 或 挂名孤儿(updated_at NULL 且无价格行)
                 needs = {
                     int(a): ((u is None) and (not p)) or (r is not None)
                     for a, u, p, r in rows
                 }
             for appid in appids:
-                if needs.get(appid, True):  # 库内无行 → True
+                if needs.get(appid, True):
                     pending.append(appid)
-    except Exception:  # noqa: BLE001 —— 库查询失败不阻塞榜单本身
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "榜单反哺查询失败，本轮不做反哺",

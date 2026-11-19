@@ -43,11 +43,8 @@ _HEADERS = {
 }
 
 _TIMEOUT = 30.0
-# 翻页安全上限（deep-form 一页即到底，正常远小于此值）
 _MAX_PAGES = 100
-_PAGE_DELAY = 0.15  # 温和限速（秒）
-
-# ── history 行提取（与 parseHistoryRows 同构）─────────────────
+_PAGE_DELAY = 0.15
 
 _CURSOR_RE = re.compile(r"g_historyCursor\s*=\s*(\{.*?\})\s*;", re.DOTALL)
 
@@ -73,7 +70,6 @@ class SteamReportData:
         }
 
 
-# ── 登录页守门────────────
 # Cookie 过期/失效时 account/* 会被 302 到登录页（follow_redirects 终点即登录页）。
 # 登录页没有账单/许可表格，照常解析会产出 0 行"空报告"——空 import 按 id
 # 倒序排最前，把真实的旧快照整个遮住，故登录页命中即中止。
@@ -90,8 +86,6 @@ def _is_login_page(resp: httpx.Response) -> bool:
 
 def _ensure_account_page(resp: httpx.Response, where: str) -> None:
     if _is_login_page(resp):
-        # 专型错误：调用方借此强制换发新会话重试（区别于 SteamFetchError 的
-        # 终态失败——令牌未过期时衰减的商店会话可以自愈）
         raise StoreSessionExpiredError(
             f"{where}返回登录页：商店会话已失效，Cookie 已过期/失效，"
             "请到「我」页重新绑定后再同步"
@@ -106,8 +100,6 @@ async def _get_html(
     return resp
 
 
-# ── history：DOM 行解析 ────────────────────────────────────────
-# 顶层 div 深度计数（wht_items 的顶层 div = 物品行；wth_payment/wth_item_refunded 排除）
 _TD_RE = {
     "date": re.compile(r'<td[^>]*class="wht_date[^"]*"[^>]*>(.*?)</td>', re.DOTALL),
     "items": re.compile(r'<td[^>]*class="wht_items[^"]*"[^>]*>(.*?)</td>', re.DOTALL),
@@ -199,7 +191,6 @@ def parse_history_rows_from_html(html_fragment: str) -> list[dict]:
         if not date:
             continue
 
-        # items 顶层 div（排除支付/退款标记 div）；受赠人 a[data-miniprofile]
         items_td_m = _TD_RE["items"].search(row_html)
         items: list[str] = []
         gift_recipients: list[str] = []
@@ -219,7 +210,6 @@ def parse_history_rows_from_html(html_fragment: str) -> list[dict]:
                 if text and text not in items:
                     items.append(text)
             if not items:
-                # 无有效顶层 div：直文本兜底。
                 # - 充值行：文本直接在 td（无 div），如「已购买 A$ 35.00 钱包资金」
                 # - 退款行：物品 div 之后只有 wth_item_refunded 块 → 剔除后取直文本
                 remaining = _remove_top_divs_by_class(
@@ -230,7 +220,6 @@ def parse_history_rows_from_html(html_fragment: str) -> list[dict]:
                     items.append(text)
         item_str = ", ".join(items)
 
-        # type：首个顶层 div；type_count（"6 市场交易" 批量行）
         type_td_m = _TD_RE["type"].search(row_html)
         type_text = ""
         payment_segs: list[str] = []
@@ -291,8 +280,6 @@ def parse_history_rows_from_html(html_fragment: str) -> list[dict]:
     return rows
 
 
-# ── licenses：DOM 行解析（分类器 markRows/getExportData 同构）────
-
 _LICENSE_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL)
 _LICENSE_DATE_RE = re.compile(
     r'<td[^>]*class="license_date_col"[^>]*>(.*?)</td>', re.DOTALL
@@ -327,8 +314,7 @@ def parse_license_rows_from_html(page_html: str) -> list[dict]:
             continue
         date = _strip_tags(date_m.group(1))
         if not date or not any(ch.isdigit() for ch in date):
-            continue  # 表头兜底（分类器 isHdr）
-        # 名称列：排除 date/acquisition/steamdb 的首个 td
+            continue
         name_html = ""
         for td_m in re.finditer(r"<td\b[^>]*>(.*?)</td>", row_html, re.DOTALL):
             cls_m = re.search(r'class="([^"]*)"', td_m.group(0))
@@ -340,7 +326,6 @@ def parse_license_rows_from_html(page_html: str) -> list[dict]:
                 continue
             name_html = td_m.group(1)
             break
-        # 剥「移除」按钮文字（分类器 free_license_remove_link 同款）
         name_html = re.sub(
             r'<a[^>]*free_license_remove_link[^>]*>.*?</a>', "", name_html, flags=re.DOTALL
         )
@@ -372,7 +357,6 @@ def extract_next_page_url(page_html: str) -> str | None:
     return m.group(1) if m else None
 
 
-# ── 抓取主体 ────────────────────────────────────────────────────
 
 _ACCOUNT_PULLDOWN_RE = re.compile(r'id="account_pulldown"[^>]*>([^<]*)<')
 
@@ -397,7 +381,6 @@ async def _fetch_account_identity(client: httpx.AsyncClient) -> tuple[str, str]:
         m = _ACCOUNT_PULLDOWN_RE.search(html)
         if m:
             nickname = _strip_tags(m.group(1))
-        # 头像：页内首个头像 img（即本人 full 尺寸）→ 下载转 base64
         avatar_url_m = _AVATAR_URL_RE.search(html)
         if avatar_url_m:
             avatar_url = avatar_url_m.group(1)
@@ -503,7 +486,6 @@ async def _fetch_history(
 
     # 不做行级去重：同日多笔相同交易（市场批量/连续充值）是真实数据，
     # 四元组合并会错杀页内真实重复。
-    # 翻页侧防重投喂由 cursor 链保证：响应 cursor 与请求相同 → 停（防死循环）。
     return rows
 
 
@@ -519,10 +501,10 @@ async def probe_history_first_screen(
     首行为空）时保守返回 True（宁可多拉不漏账）。
     """
     if not known_latest_date:
-        return True  # 库里没账单：首次拉取语义
+        return True
     try:
         resp = await _get_html(client, HISTORY_URL)
-    except Exception as exc:  # noqa: BLE001 探测失败不阻断主流程
+    except Exception as exc:  # noqa: BLE001
         log_event(
             logger,
             "账单首屏探测拉取失败，本轮按需全量处理",
@@ -535,10 +517,10 @@ async def probe_history_first_screen(
         r'<table[^>]*class="[^"]*wallet_history_table[^"]*"[^>]*>(.*?)</table>', resp.text, re.DOTALL
     )
     if not tb_m:
-        return True  # 页面结构异常：保守全量
+        return True
     rows = parse_history_rows_from_html(tb_m.group(1))
     if not rows:
-        return True  # 解析不到行（或库里有但 Steam 侧清空）：保守全量
+        return True
     from .parser import parse_date_cn
 
     first_date = parse_date_cn(rows[0].get("date", ""))
@@ -625,7 +607,6 @@ async def fetch_full_report(
             licenses = await _fetch_licenses(client)
             await _emit_progress(on_progress, stage="licenses")
             if not nickname:
-                # 身份兜底：history 页账户名（账户级 cookie 必有）
                 nickname = f"Steam 账户 {cookies.get('steamLoginSecure', '')[:17]}"[:40]
             return SteamReportData(
                 nickname=nickname or "Steam 账户",

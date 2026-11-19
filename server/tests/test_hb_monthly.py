@@ -30,9 +30,9 @@ MACHINE = "september_2026_choice"
 PRODUCT = "September 2026"
 LABEL = "HB慈善包26年9月包"
 
-APP_NEW = 990_401  # 缺行占位
-APP_EXISTING = 990_402  # 已有行（带旧月份标记，验证续写）
-APP_UNRESOLVED = 990_403  # storesearch 未命中（只进 unresolved）
+APP_NEW = 990_401
+APP_EXISTING = 990_402
+APP_UNRESOLVED = 990_403
 OLD_LABEL = "HB慈善包25年3月包"
 
 _RESOLVE_MAP = {
@@ -88,7 +88,6 @@ def _membership_html() -> str:
     )
 
 
-# ─── 纯逻辑 ────────────────────────────────────────────────────────
 
 
 def test_month_label_from_product_name():
@@ -108,9 +107,7 @@ def test_parse_choice_page_products_and_dedup():
     assert parsed["machineName"] == MACHINE
     assert parsed["productName"] == PRODUCT
     assert parsed["endDate"] == "2026-10-06T17:00:00"
-    # Steam 交付标题（保序去重）；重复 subscriptionProducts 首见生效
     assert parsed["steamTitles"] == ["Frosttest 2", "Keytest", "Missing Game"]
-    # 非 Steam 平台游戏：平台取交付方式原值，原价分取展示价（分，四舍五入）
     assert parsed["platformGames"] == [
         {"title": "GOGtest Odyssey", "platform": "gog",
          "thumbnail": "https://hb.test/gogtest-odyssey.jpg",
@@ -125,11 +122,10 @@ def test_pick_appid_matching_tiers():
     hits = [
         {"name": "Something Else", "id": "111"},
         {"name": "Keytest: Deluxe Edition", "id": "222"},
-        {"name": "KEYTEST", "id": "333"},  # 大小写归一命中
+        {"name": "KEYTEST", "id": "333"},
     ]
-    # exact 优先于清洗命中（Deluxe 副标题剥掉后同形，但不能抢先）
     assert hb._pick_appid("Keytest", hits) == 333
-    assert hb._pick_appid("keytest !", hits) == 222  # 无 exact，清洗层兜底
+    assert hb._pick_appid("keytest !", hits) == 222
     assert hb._pick_appid("Nothing", hits) is None
 
 
@@ -144,7 +140,6 @@ def test_month_page_url_from_machine_name():
         "https://www.humblebundle.com/membership/September-2026"
     assert hb._month_page_url("july_2026_choice") == \
         "https://www.humblebundle.com/membership/July-2026"
-    # 异形/缺失 machineName → 退回订阅主页（当月包同页可达）
     assert hb._month_page_url("whatever") == hb._MEMBERSHIP_URL
     assert hb._month_page_url(None) == hb._MEMBERSHIP_URL
 
@@ -202,7 +197,6 @@ async def test_offers_payload_and_empty_month(monkeypatch):
     empty = await hb.hb_choice_offers()
     assert empty["ok"] is False
 
-    # 平台游戏合并：状态记录里的非 Steam 游戏（appid=0）随清单下发
     await set_value(TEST_STATE_KEY, {
         "machineName": MACHINE, "productName": PRODUCT,
         "platformGames": [{"title": "GOGtest Odyssey", "platform": "gog",
@@ -219,7 +213,6 @@ async def test_offers_payload_and_empty_month(monkeypatch):
     assert platform_rows[0]["priceFen"] is None
 
 
-# ─── 链路（真实落库 + 合成数据）──────────────────────────────────
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -275,7 +268,7 @@ async def test_refresh_partial_unresolved_keeps_retrying(monkeypatch):
         return _membership_html()
 
     async def fake_resolve(session, title, proxy):
-        return _RESOLVE_MAP.get(title)  # Missing Game → None
+        return _RESOLVE_MAP.get(title)
 
     monkeypatch.setattr(hb, "_fetch_membership_page", fake_fetch)
     monkeypatch.setattr(hb, "_resolve_appid", fake_resolve)
@@ -293,14 +286,13 @@ async def test_refresh_partial_unresolved_keeps_retrying(monkeypatch):
         new_row = await session.get(Game, APP_NEW)
         assert new_row is not None and new_row.is_hb is True
         assert new_row.hb_data == LABEL
-        assert new_row.updated_at is None  # 占位行进回补池
+        assert new_row.updated_at is None
         assert new_row.name == "Frosttest 2"
 
         existing = await session.get(Game, APP_EXISTING)
         assert existing.hb_data == f"{OLD_LABEL}, {LABEL}"
         assert existing.is_hb is True
 
-    # 未记账 → 再次运行不跳过；打标幂等（hb_data 不重复续写）
     second = await hb.refresh_hb_choice()
     assert second["skipped"] is False
     async with get_session_factory()() as session:
@@ -334,19 +326,16 @@ async def test_refresh_records_state_and_skips_when_resolved(monkeypatch):
         assert state is not None
         assert state.value_json["machineName"] == MACHINE
         assert state.value_json["marked"] == 3
-        # 非 Steam 平台游戏随结案入状态记录（展示链合并下发）
         assert [pg["platform"] for pg in state.value_json["platformGames"]] == ["gog", "epic"]
 
     second = await hb.refresh_hb_choice()
     assert second["skipped"] is True
     assert second["lastMarked"] == 3
 
-    # 幂等跳过：二次运行不再触达条目，hb_data 保持单月标记不重复续写
     async with get_session_factory()() as session:
         row = await session.get(Game, APP_UNRESOLVED)
         assert row is not None and row.hb_data == LABEL
 
-    # force=True（手动强刷）：绕过判重重跑打标，标记按月续写不重复
     third = await hb.refresh_hb_choice(force=True)
     assert third.get("skipped") is not True
     assert third["recorded"] is True
@@ -360,7 +349,6 @@ async def test_unpriced_hb_appids_filters_priced():
     """候选查询两通道判据：无任何价格行的标记行进候选；已有价格行
     （missing 状态）的归补抓账本不进（合成 appid 断言，容忍库内真实行）。"""
     async with get_session_factory()() as session:
-        # 合成行重建（前序用例 teardown 会清掉）+ 清价格残留
         session.add(Game(appid=APP_NEW, name="Frosttest 2", is_hb=True,
                          hb_data=LABEL, created_at=datetime_now()))
         await session.execute(
@@ -368,7 +356,6 @@ async def test_unpriced_hb_appids_filters_priced():
                 GameCurrentPrice.appid.in_([APP_NEW, APP_EXISTING])
             )
         )
-        # APP_EXISTING 留一条 missing 状态价格行：归补抓账本，不进候选
         session.add(GameCurrentPrice(
             appid=APP_EXISTING, region_code="CN", currency="CNY",
             price=None, price_status="missing",

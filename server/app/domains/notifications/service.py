@@ -40,7 +40,6 @@ from app.domains.notifications.policy import (
 
 logger = logging.getLogger(__name__)
 
-# 临时故障：网络 / 连接 / 超时 / 服务端临时拒收（4xx）。这类才值得重试。
 # 判据优先用**异常类型名**（`send_mail_ex` 已带上），其次才是英文措辞；最后再
 # 兜一层中文措辞——中文 Windows 会把 socket 错误本地化，只认英文的话重试永远
 # 不会生效。
@@ -51,7 +50,6 @@ _RETRYABLE_HINTS = (
     "closed", "421", "450", "451", "452",
     "拒绝", "无法连接", "超时", "网络", "重置", "断开",
 )
-# 永久失败：凭据 / 地址 / 配置。重试只会把同一封邮件反复发出去。
 _PERMANENT_HINTS = (
     "smtpauthenticationerror", "authentication", "535", "534", "530",
     "username and password", "login", "未配置",
@@ -792,7 +790,7 @@ async def dispatch(cycle_id: int | None = None) -> dict:
             },
         )
         return result
-    except Exception:  # noqa: BLE001 —— 通知失败绝不影响 Cycle 收敛
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "通知投递失败，不影响本轮价格刷新结果",

@@ -50,7 +50,7 @@ async def _seed_bundle():
         session.add_all([
             _bundle_row(1, "CN", 6000, discount=98),
             _bundle_row(1, "AR", 3000, discount=98),
-            _bundle_row(2, "CN", 200, discount=97),   # ¥2 → 低于价格下限，排除
+            _bundle_row(2, "CN", 200, discount=97),
         ])
         await session.commit()
 
@@ -70,7 +70,6 @@ async def _release_discovery_gate():
     await alerts_service.settings_service.set_value(alerts_service.KEY_BUNDLE_DEAL_AT, 0)
 
 
-# ── 捆绑包精选：按「包 + 深度」事实落账 ─────────────────────────
 
 
 @pytest.mark.asyncio
@@ -79,7 +78,6 @@ async def test_bundle_deals_fact_and_candidate():
     await _seed_bundle()
     picks = await alerts_service.check_bundle_deals()
     assert [p["bundle_id"] for p in picks] == [1]
-    # 无号主区时按「折扣最深 → 价最低」选区：AR 同折扣更便宜 → 链接带 cc=ar
     assert picks[0]["region_code"] == "AR"
     assert picks[0]["url"].endswith("/bundle/1/?cc=ar")
 
@@ -89,7 +87,6 @@ async def test_bundle_deals_fact_and_candidate():
     assert cands[0].payload_json["title"] == "包一 -98%"
     assert cands[0].payload_json["priceText"].startswith("¥")
 
-    # 20h 发现闸内直接返回；放行后同深度事实幂等，不重复落账
     assert await alerts_service.check_bundle_deals() == []
     await _release_discovery_gate()
     assert await alerts_service.check_bundle_deals() == []
@@ -116,7 +113,6 @@ async def test_bundle_deals_only_reenlists_on_deeper_discount():
     assert sorted(f.fact_key for f in facts) == ["bundle:1:98", "bundle:1:99"]
 
 
-# ── Epic 喜加一：当期条目逐条落账，预告不记账 ───────────────────
 
 
 @pytest.mark.asyncio
@@ -141,7 +137,7 @@ async def test_epic_free_tracks_current_only(monkeypatch):
     assert len(cands) == 1 and cands[0].event_type == "EPIC_FREE"
     assert cands[0].payload_json["url"] == "https://epic/a"
 
-    assert await alerts_service.check_epic_free() == []  # 同条目幂等
+    assert await alerts_service.check_epic_free() == []
     facts, _ = await _facts()
     assert len(facts) == 1
 
@@ -159,7 +155,6 @@ async def test_epic_free_no_offers_when_channel_down(monkeypatch):
     assert facts == []
 
 
-# ── Humble Choice 当月包：同月幂等 ──────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -179,14 +174,12 @@ async def test_hb_choice_month_fact():
     assert len(cands) == 1 and cands[0].event_type == "HB_CHOICE"
     assert "G100" in cands[0].payload_json["games"]
 
-    assert await alerts_service.check_hb_choice(result) == []  # 同月幂等
-    # 未结案（有未解析条目）不落账
+    assert await alerts_service.check_hb_choice(result) == []
     assert await alerts_service.check_hb_choice({**result, "recorded": False}) == []
     facts, _ = await _facts()
     assert len(facts) == 1
 
 
-# ── 代理通道 / 系统告警：冷却与「未配置不算异常」────────────────
 
 
 @pytest.mark.asyncio
@@ -230,7 +223,7 @@ async def test_proxy_alert_records_then_cools_down(monkeypatch):
     assert "全部代理通道不可用" in cands[0].payload_json["title"]
     assert "https://secret/sub" not in str(cands[0].payload_json), "订阅 URL 是凭据，绝不进通知载荷"
 
-    assert await alerts_service.check_proxy_health() is False  # 12h 冷却
+    assert await alerts_service.check_proxy_health() is False
     facts, _ = await _facts()
     assert len(facts) == 1
 
@@ -246,12 +239,11 @@ async def test_system_alert_cooldown_per_kind():
     assert len(facts) == 1 and facts[0].fact_key.startswith("system_alert:backup:")
     assert len(cands) == 1 and cands[0].event_type == "SYSTEM_ALERT"
 
-    # 同 kind 冷却内不落新事实；不同 kind 互不影响
     assert await alerts_service.send_system_alert(
         kind="backup", title="自动备份失败", summary="未完成",
     ) is False
     store = await alerts_service.settings_service.get_value(alerts_service.KEY_SYS_ALERT_AT)
-    store["backup"] = time.time() - 25 * 3600  # 过冷却
+    store["backup"] = time.time() - 25 * 3600
     await alerts_service.settings_service.set_value(alerts_service.KEY_SYS_ALERT_AT, store)
     assert await alerts_service.send_system_alert(
         kind="backup", title="自动备份失败", summary="未完成",
@@ -260,7 +252,6 @@ async def test_system_alert_cooldown_per_kind():
     assert len(facts) == 2
 
 
-# ── 爬取任务失败告警：接线（任务状态仍要诚实收敛为 failed）────────
 
 
 @pytest.mark.asyncio

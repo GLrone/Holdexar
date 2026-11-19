@@ -166,7 +166,6 @@ async def _get_items(db, steamid=PRIMARY):
     return {int(r.appid): r for r in rows}
 
 
-# ── 通道选择 ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -235,7 +234,7 @@ async def test_no_cookie_no_key_raises(db, monkeypatch):
 
     _mock_account_cookies(monkeypatch, None)
     _mock_settings(monkeypatch, None)
-    _mock_jwt_channel(monkeypatch, games=GAMES)  # 不应被调用
+    _mock_jwt_channel(monkeypatch, games=GAMES)
 
     with pytest.raises(OwnedFetchError, match="未绑定"):
         await wishlist_service.fetch_owned_games(FRIEND)
@@ -254,7 +253,6 @@ async def test_empty_games_is_valid(db, monkeypatch):
     assert games == []
 
 
-# ── list_accounts 家庭组快照档案回填 ────────────────────────
 
 
 @pytest.mark.asyncio
@@ -271,7 +269,7 @@ async def test_list_accounts_backfills_persona_from_family_snapshot(db, monkeypa
             steamid=FRIEND,
             label=None,
             kinds_json={"wishlist": True, "owned": True},
-            persona_name="已有昵称",  # 账户行已有档案：不被快照覆盖
+            persona_name="已有昵称",
         ))
         session.add(WishlistItem(steamid=PRIMARY, appid=620, owned=True, active=True))
         session.add(WishlistItem(steamid=PRIMARY, appid=570, owned=True, active=True))
@@ -280,15 +278,12 @@ async def test_list_accounts_backfills_persona_from_family_snapshot(db, monkeypa
 
     accounts = {a["steamid"]: a for a in await wishlist_service.list_accounts()}
 
-    # 快照补齐：昵称/头像来自快照；ownedCount 只数 owned 行
     assert accounts[PRIMARY]["personaName"] == "主号快照昵称"
     assert accounts[PRIMARY]["avatarUrl"] == "https://avatars.fastly.steamstatic.com/p1_full.jpg"
     assert accounts[PRIMARY]["friendCode"] == str(int(PRIMARY) - 76561197960265728)
     assert accounts[PRIMARY]["ownedCount"] == 2
-    # 账户行已有档案优先，不被快照覆盖
     assert accounts[FRIEND]["personaName"] == "已有昵称"
 
-    # 落库自愈：下次查询直接从账户行读到（快照桩此时返回空）
     monkeypatch.setattr(wishlist_service, "_family_personas", _fake_family_snapshot())
     again = {a["steamid"]: a for a in await wishlist_service.list_accounts()}
     assert again[PRIMARY]["personaName"] == "主号快照昵称"
@@ -312,7 +307,6 @@ def _fake_family_snapshot(*steamids):
     return _get
 
 
-# ── sync_account 语义 ─────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -321,9 +315,9 @@ async def test_sync_channel_fail_keeps_owned_marks(db, monkeypatch):
     from app.domains.wishlist.service import OwnedFetchError
 
     await _seed_account(db, kinds={"wishlist": True, "owned": True})
-    await _seed_item(db, 620, owned=True)   # 已购专属（不在愿望单）
-    await _seed_item(db, 570, owned=False)  # 愿望单条目
-    _mock_wishlist(monkeypatch, [{"appid": 570, "added_at": None}])  # 620 不在愿望单
+    await _seed_item(db, 620, owned=True)
+    await _seed_item(db, 570, owned=False)
+    _mock_wishlist(monkeypatch, [{"appid": 570, "added_at": None}])
     _mock_fetch_owned(
         monkeypatch, raise_error=OwnedFetchError("两个通道均失败")
     )
@@ -333,8 +327,8 @@ async def test_sync_channel_fail_keeps_owned_marks(db, monkeypatch):
     assert result["ownedError"] is not None
     assert result["ownedCount"] == 0
     items = await _get_items(db)
-    assert items[620].owned is True   # 标记保留
-    assert items[620].active is True  # 已购行保守保留（不误判为愿望单移除）
+    assert items[620].owned is True
+    assert items[620].active is True
     assert items[570].active is True
 
 
@@ -352,11 +346,8 @@ async def test_sync_owned_disabled_falls_back(db, monkeypatch):
     result = await wishlist_service.sync_account(PRIMARY, auto_crawl=False)
 
     items = await _get_items(db)
-    # 620 不在愿望单：kinds.owned=False → owned_failed=False → 照常出池
     assert items[620].active is False
-    # 历史语义：覆写仅在 owned_synced=True 时执行，标记保留
     assert items[620].owned is True
-    # 通道失败信息仍然回报（kinds 关闭时无实际影响）
     assert result["ownedError"] is not None
 
 
@@ -377,7 +368,6 @@ async def test_sync_owned_new_split_accounting(db, monkeypatch):
     assert items[570].owned is False
 
 
-# ── list_items（监控条目名称/封面 JOIN）─────────────────
 
 
 @pytest.mark.asyncio
@@ -387,8 +377,8 @@ async def test_list_items_joins_game_name_and_cover(db):
 
     await _seed_account(db)
     await _seed_item(db, 620, active=True)
-    await _seed_item(db, 570, active=False)  # 停用条目不出列
-    await _seed_item(db, 99801, active=True)  # 未爬：games 无行
+    await _seed_item(db, 570, active=False)
+    await _seed_item(db, 99801, active=True)
     async with db() as session:
         session.add(Game(appid=620, name="传送门 2", name_en="Portal 2", header_image="https://x/620/header.jpg"))
         await session.commit()
@@ -399,11 +389,9 @@ async def test_list_items_joins_game_name_and_cover(db):
     assert by_appid[620]["name"] == "传送门 2"
     assert by_appid[620]["nameEn"] == "Portal 2"
     assert by_appid[620]["headerImage"] == "https://x/620/header.jpg"
-    # 新绑未爬：games 无行 → null（前端回落显示 appid）
     assert by_appid[99801]["name"] is None
     assert by_appid[99801]["nameEn"] is None
     assert by_appid[99801]["headerImage"] is None
-    # active=False 不出列
     assert 570 not in by_appid
 
 
@@ -428,8 +416,8 @@ async def test_sync_manual_item_immune_to_deactivation(db, monkeypatch):
     是已购时，同步反向核对不洗掉——15min 高频同步下手动监控的存续
     不取决于 Steam 愿望单。普通条目照常停用（对照语义不被稀释）。"""
     await _seed_account(db)
-    await _seed_item(db, 620, active=True)  # 手动导入
-    await _seed_item(db, 570, active=True)  # 普通条目（对照）
+    await _seed_item(db, 620, active=True)
+    await _seed_item(db, 570, active=True)
     async with db() as session:
         manual_row = await session.get(WishlistItem, (PRIMARY, 620))
         manual_row.manual = True
@@ -438,7 +426,6 @@ async def test_sync_manual_item_immune_to_deactivation(db, monkeypatch):
     _mock_account_cookies(monkeypatch, None)
     _mock_settings(monkeypatch, None)
     _mock_fetch_owned(monkeypatch, games=[], source="jwt")
-    # Steam 真实愿望单里只有 99801：620/570 都不在（非空单，停用分支生效）
     _mock_wishlist(monkeypatch, [{"appid": 99801, "added_at": None}])
 
     await wishlist_service.sync_account(PRIMARY, auto_crawl=False)

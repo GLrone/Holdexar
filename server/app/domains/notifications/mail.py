@@ -25,7 +25,6 @@ from app.domains.alerts.notify import (
 )
 from app.domains.games.pricing import format_minor_units
 
-# 事件类型 → 用户标签（与前端 priceEvent.type.* 同一套措辞）
 EVENT_LABELS = {
     "PRICE_DROP": "价格下降",
     "PRICE_INCREASE": "价格上涨",
@@ -40,7 +39,6 @@ EVENT_LABELS = {
     "REMOVED": "游戏下架",
 }
 
-# price_status → 用户用词（只出现在后端已判定出的状态跃迁里）
 STATE_WORDS = {
     "ok": "可购买",
     "locked": "锁区",
@@ -50,7 +48,6 @@ STATE_WORDS = {
 
 _CURRENCY_BY_REGION = {code.upper(): currency for code, _, currency in CC_LIST}
 
-# 摘要详情最多列出的行数：超出用一句收口，不为展示造分页
 MAX_DETAIL_ROWS = 12
 
 
@@ -113,7 +110,7 @@ def describe_event(
             STATE_WORDS.get(to_state, "") if to_state else "",
         )
     else:
-        pair = ("", "")  # 限时免费 / 下架：标签已说清，没有「之前 → 现在」
+        pair = ("", "")
 
     change = " → ".join(p for p in pair if p)
     if change:
@@ -130,7 +127,6 @@ def _price_text(amount, region_code: str | None) -> str:
     currency = region_currency(region_code)
     if currency:
         return format_minor_units(minor, currency)
-    # 区服表外的地区没有可靠货币：宁可空着，不编一个符号
     return ""
 
 

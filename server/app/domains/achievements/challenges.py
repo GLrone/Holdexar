@@ -24,10 +24,8 @@ STATUS_ACTIVE = "active"
 STATUS_COMPLETED = "completed"
 STATUS_CLAIMED = "claimed"
 
-# 档位奖励定值（铜 / 银 / 金）
 REWARD_BY_TIER: dict[str, int] = {"bronze": 80, "silver": 200, "gold": 500}
 
-# 进度来源全集（每项只读既有账本，禁止另立口径）
 PROGRESS_SOURCES: frozenset[str] = frozenset(
     {
         "states_count",
@@ -53,7 +51,6 @@ class ChallengeSpec(NamedTuple):
     reward_xp: int
 
 
-# 挑战目录；概念名文案由前端按 id 取词典，后端只出 id 与数值
 CHALLENGE_CATALOG: tuple[ChallengeSpec, ...] = (
     ChallengeSpec("first_trophy", "bronze", "milestone", 1, "states_count", REWARD_BY_TIER["bronze"]),
     ChallengeSpec("hunter_twelve", "bronze", "milestone", 12, "states_count", REWARD_BY_TIER["bronze"]),
@@ -93,7 +90,6 @@ class ChallengeProgress(Base):
     )
 
 
-# ─── 进度度量（全部只读既有账本）─────────────────────────────────
 
 
 async def _notes_count(session: AsyncSession, steamid: str) -> int:
@@ -105,7 +101,7 @@ async def _notes_count(session: AsyncSession, steamid: str) -> int:
                 {"sid": steamid},
             )
         ).scalar()
-    except Exception:  # noqa: BLE001 —— 表未建按零计，社交模块交付后自动可读
+    except Exception:  # noqa: BLE001
         return 0
     return int(row or 0)
 
@@ -133,7 +129,6 @@ async def _measure(session: AsyncSession, steamid: str) -> dict[str, int]:
         )
     ).all()
 
-    # 社交类来源：可切换账号清单（已绑 + 家庭成员）里有解锁记录的账号数，只读不回写
     roster = await service.available_accounts()
     roster_ids = [a["steamid"] for a in roster if a.get("steamid")]
     unlock_counts: dict[str, int] = {}
@@ -154,7 +149,6 @@ async def _measure(session: AsyncSession, steamid: str) -> dict[str, int]:
             1 for r in game_rows if r.total_achievements > 0 and r.unlocked >= r.total_achievements
         ),
         "games_with_unlocks": sum(1 for r in game_rows if r.unlocked > 0),
-        # shared 行时长恒 0（models 口径），求和天然不含库外时长
         "playtime_sum": sum(int(r.playtime_min or 0) for r in game_rows),
         "bucket_crossovers": sum(
             idx for r in game_rows if (idx := level.playtime_bucket_index(r.playtime_min)) > 0
@@ -166,7 +160,6 @@ async def _measure(session: AsyncSession, steamid: str) -> dict[str, int]:
     }
 
 
-# ─── 幂等重算与读数组装 ────────────────────────────────────────
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -333,7 +326,6 @@ async def challenges_overview(target: str | None = None) -> dict:
     return _assemble(steamid, await recompute_challenges(steamid))
 
 
-# ─── 领取（status 守卫 + xp_events 唯一键双保险）──────────────────
 
 
 async def claim(target: str | None, challenge_id: str) -> dict:

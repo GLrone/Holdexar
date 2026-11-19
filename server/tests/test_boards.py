@@ -113,7 +113,6 @@ def _patch_pool_landing(monkeypatch, recorded: list | None = None) -> list:
     return calls
 
 
-# ── 三源参数与终止条件 ────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -126,7 +125,7 @@ async def test_topsellers_params_and_dedup(monkeypatch):
 
     expected = [a for p in pages for a in p]
     assert appids == expected
-    assert len(session.calls) == 5  # 已凑满 500：第 6 批不再请求
+    assert len(session.calls) == 5
     p = session.calls[0]["params"]
     assert p["filter"] == "topsellers"
     assert p["hidef2p"] == 1
@@ -139,7 +138,7 @@ async def test_popularnew_params_and_batching(monkeypatch):
     session = _mock_fetch(monkeypatch, [
         _steam_page(list(range(1, 101))),
         _steam_page(list(range(101, 201))),
-        _steam_page([]),          # 第 3 批空 → 终止
+        _steam_page([]),
     ])
 
     appids = await boards_mod.fetch_board("popularnew")
@@ -154,7 +153,6 @@ async def test_popularnew_params_and_batching(monkeypatch):
 @pytest.mark.asyncio
 async def test_specials_params_and_5000_cap(monkeypatch):
     """specials：封顶 5000（含在库）。"""
-    # 每批 100 个新 appid；50 批给满 → 5000 封顶即停（不会发第 51 批）
     responses = [_steam_page(list(range(i * 100 + 1, (i + 1) * 100 + 1))) for i in range(60)]
     session = _mock_fetch(monkeypatch, responses)
 
@@ -176,16 +174,16 @@ async def test_specials_three_empty_batches_stop(monkeypatch):
     """
     batch = list(range(1, 101))
     session = _mock_fetch(monkeypatch, [
-        _steam_page(batch),        # 第 1 批 +100
-        _steam_page(batch),        # 第 2 批全重复 → 零新增 ×1
-        _steam_page(batch),        # 第 3 批全重复 → 零新增 ×2
-        _steam_page(batch),        # 第 4 批全重复 → 零新增 ×3 → 终止
+        _steam_page(batch),
+        _steam_page(batch),
+        _steam_page(batch),
+        _steam_page(batch),
     ])
 
     appids = await boards_mod.fetch_board("specials")
 
     assert appids == batch
-    assert len(session.calls) == 4  # 第 5 批不再请求
+    assert len(session.calls) == 4
 
 
 @pytest.mark.asyncio
@@ -208,7 +206,6 @@ async def test_unknown_board_raises():
         await boards_mod.fetch_board("nosuchboard")
 
 
-# ── 三级缓存（分板隔离）──────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -220,7 +217,6 @@ async def test_cache_hit_and_isolation(monkeypatch):
     second = await boards_mod.get_board("topsellers")
     assert first == second == [1, 2, 3]
 
-    # popularnew 独立缓存：不受 topsellers 命中影响
     _mock_fetch(monkeypatch, [_steam_page([9])])
     assert await boards_mod.get_board("popularnew") == [9]
 
@@ -233,8 +229,8 @@ async def test_cache_miss_refetches(monkeypatch):
     夹具须显式给空批切断，第二批留给过期后的重拉）。
     """
     _mock_fetch(monkeypatch, [
-        _steam_page([1]), _steam_page([]),   # 第 1 次拉取 → [1]
-        _steam_page([2]),                    # 过期后重拉 → [2]
+        _steam_page([1]), _steam_page([]),
+        _steam_page([2]),
     ])
 
     assert await boards_mod.get_board("topsellers") == [1]
@@ -246,16 +242,15 @@ async def test_cache_miss_refetches(monkeypatch):
 async def test_stale_fallback_on_fetch_failure(monkeypatch):
     """拉取失败 → stale 旧值兜底（24h 内）；完全失败（无 stale）返回空。"""
     _mock_fetch(monkeypatch, [
-        _steam_page([7, 8]),                      # 第一次成功
-        _FakeResponse({}, status=503),            # 过期后拉取失败
+        _steam_page([7, 8]),
+        _FakeResponse({}, status=503),
     ])
 
     assert await boards_mod.get_board("topsellers") == [7, 8]
     st = boards_mod._board_state["topsellers"]
     st["cache_ts"] -= boards_mod.CACHE_TTL_SECONDS + 1
-    assert await boards_mod.get_board("topsellers") == [7, 8]  # stale 兜底
+    assert await boards_mod.get_board("topsellers") == [7, 8]
 
-    # stale 也过期（>24h）→ 空集
     st["stale_ts"] -= boards_mod.STALE_TTL_SECONDS + 1
     st["cache_ts"] -= boards_mod.STALE_TTL_SECONDS + 1
     assert await boards_mod.get_board("topsellers") == []
@@ -266,7 +261,7 @@ async def test_refresh_keeps_cache_on_empty(monkeypatch):
     """定时预热拉到空结果：不动旧缓存（refresh 返回旧值兜底）。"""
     _mock_fetch(monkeypatch, [
         _steam_page([9]),
-        _steam_page([]),  # 预热拉到空
+        _steam_page([]),
     ])
 
     assert await boards_mod.get_board("topsellers") == [9]
@@ -274,7 +269,6 @@ async def test_refresh_keeps_cache_on_empty(monkeypatch):
     assert await boards_mod.get_board("topsellers") == [9]
 
 
-# ── 反哺差集语义（topsellers 补孤儿 vs specials 仅补无行）──────────
 
 
 @pytest.mark.asyncio
@@ -294,9 +288,7 @@ async def test_backfill_semantics_topsellers(monkeypatch):
         await session.execute(
             delete(Game).where(Game.appid.in_([900001, 900002, 900003]))
         )
-        # 900002 = 挂名孤儿（updated_at NULL 无价格行）→ topsellers 语义要补
         session.add(Game(appid=900002, name="orphan"))
-        # 900003 = 已爬（updated_at 有值）→ 不补
         session.add(Game(appid=900003, name="crawled", updated_at=datetime.now()))
         await session.commit()
 
@@ -304,7 +296,7 @@ async def test_backfill_semantics_topsellers(monkeypatch):
         specs = await boards_mod.backfill_specs("topsellers")
 
         appids = specs[0]["appids"] if specs else []
-        assert set(appids) == {900001, 900002}   # 900003 已爬排除
+        assert set(appids) == {900001, 900002}
         assert specs[0]["kind"] == "top100_backfill"
     finally:
         async with get_session_factory()() as session:
@@ -331,9 +323,7 @@ async def test_backfill_semantics_specials_uncrawled_only(monkeypatch):
         await session.execute(
             delete(Game).where(Game.appid.in_([900011, 900012, 900013]))
         )
-        # 900012 = 挂名孤儿——specials 语义不碰（回补层负责）
         session.add(Game(appid=900012, name="orphan"))
-        # 900013 = 已爬
         session.add(Game(appid=900013, name="crawled", updated_at=datetime.now()))
         await session.commit()
 
@@ -341,7 +331,7 @@ async def test_backfill_semantics_specials_uncrawled_only(monkeypatch):
         specs = await boards_mod.backfill_specs("specials")
 
         appids = specs[0]["appids"] if specs else []
-        assert set(appids) == {900011}            # 仅无行差集
+        assert set(appids) == {900011}
         assert specs[0]["kind"] == "specials_backfill"
     finally:
         async with get_session_factory()() as session:
@@ -362,7 +352,6 @@ async def test_backfill_limit_and_empty(monkeypatch):
     assert specs[0]["appids"] == [910001, 910002, 910003]
 
 
-# ── 反哺调度接线：发现源常开，不受自动价格总开关管 ──────────────
 
 
 @pytest.mark.asyncio
@@ -539,7 +528,6 @@ async def test_scheduler_board_job_pool_failure_does_not_block_backfill(monkeypa
     assert calls and calls[0][0]["kind"] == "top100_backfill", "落池失败不得阻断反哺"
 
 
-# ── list_games 集成（真实本地库只读 + mock 热榜）──────────────
 
 
 def _library_has_games() -> bool:
@@ -582,7 +570,6 @@ async def test_list_top100_order_and_pagination(monkeypatch):
     settings = get_settings()
     con = sqlite3.connect(str(settings.data_dir / settings.db_filename))
     try:
-        # 榜单取库里真实存在且有国区 ok 价的 12 款（乱序构造，验证重排）
         rows = con.execute(
             "SELECT g.appid FROM games g "
             "JOIN game_current_prices cn ON cn.appid = g.appid AND cn.region_code='CN' "

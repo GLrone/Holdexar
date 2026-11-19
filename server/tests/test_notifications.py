@@ -147,7 +147,6 @@ async def _cycle_status(db, cid) -> str:
         return cycle.status
 
 
-# ── 策略 ──
 
 
 @pytest.mark.asyncio
@@ -227,7 +226,6 @@ async def test_policy_unknown_event_type_is_not_notified(db):
     assert (await notification_service.dispatch(cid))["created"] == 0
 
 
-# ── 去重 ──
 
 
 @pytest.mark.asyncio
@@ -246,12 +244,10 @@ async def test_duplicate_processing_creates_one_candidate_only(db, delivery):
     assert second["created"] == 0
     rows = await _candidates(db)
     assert [r.event_id for r in rows] == [event_id]
-    # 第二次投递没有可发的未投递候选：不再发第二封
     assert second["sent"] == 0
     assert len(delivery) == 1
 
 
-# ── 静默期 ──
 
 
 @pytest.mark.asyncio
@@ -275,7 +271,6 @@ async def test_quiet_period_defers_instead_of_dropping(db, delivery):
     assert [r.status for r in rows] == ["suppressed"]
     assert len(delivery) == 0, "静默期不发送"
 
-    # 窗口移开（下一轮非静默）：顺延的候选随新批次一并投递，而不是被丢掉
     prefs["quietEnabled"] = False
     await save_prefs(prefs)
     second = await notification_service.dispatch(cid)
@@ -286,7 +281,6 @@ async def test_quiet_period_defers_instead_of_dropping(db, delivery):
     assert rows[0].delivered_at is not None
 
 
-# ── 聚合 ──
 
 
 @pytest.mark.asyncio
@@ -328,7 +322,6 @@ async def test_digest_without_details_still_sends_summary(db, delivery):
     assert "俄罗斯" not in delivery[0]["html"], "关掉明细就不该逐条列地区"
 
 
-# ── 失败隔离 ──
 
 
 @pytest.mark.asyncio
@@ -351,9 +344,7 @@ async def test_permanent_smtp_failure_marks_candidates_failed_only(db, delivery,
     assert [r.status for r in rows] == ["failed"]
     assert "smtp" in rows[0].reason
     assert rows[0].attempts == 1
-    # 事件事实与 Cycle 终态不被通知失败污染
     assert await _cycle_status(db, cid) == "completed"
-    # 授权码错不能循环重发：下一次摘要不再带上它
     again = await notification_service.dispatch(cid)
     assert again["sent"] == 0 and again["retried"] == 0
 
@@ -408,7 +399,6 @@ async def test_retry_is_bounded_by_max_attempts(db, delivery, monkeypatch):
     rows = await _candidates(db)
     assert rows[0].attempts == policy_mod.MAX_ATTEMPTS
 
-    # 到上限后不再重试
     again = await notification_service.dispatch(cid)
     assert again["sent"] == 0 and again["retried"] == 0
     rows = await _candidates(db)
@@ -424,7 +414,6 @@ async def test_retryable_classification(db):
     # 中文 Windows 会把 socket 错误本地化，必须也能认出来
     assert notification_service.retryable("ConnectionRefusedError: [WinError 10061] 由于目标计算机积极拒绝，无法连接。") is True
     assert notification_service.retryable("SMTPAuthenticationError: 535 Authentication failed") is False
-    # send_mail_ex 对认证拒绝的新格式 reason（类型名 + 535）必须落在永久失败
     assert notification_service.retryable(
         "SMTPAuthenticationError: 邮箱拒绝登录（535）：请核对授权码（服务器回复：Login fail）") is False
     assert notification_service.retryable("SMTPSenderRefused: 553 mailbox unavailable") is False
@@ -514,13 +503,11 @@ async def test_notification_failure_never_breaks_cycle_finalizing(db, monkeypatc
         raise RuntimeError("通知层炸了")
 
     monkeypatch.setattr(notification_service, "dispatch", _explode)
-    # 编排侧由 try/except 包住：通知挂了不能让 Cycle 变 failed
     await cycle_run.notify_events(cid)
 
     assert await _cycle_status(db, cid) == "completed"
 
 
-# ── 重启 ──
 
 
 @pytest.mark.asyncio
@@ -540,7 +527,6 @@ async def test_restart_does_not_resend_delivered(db, delivery):
     assert [r.status for r in rows] == ["delivered"]
 
 
-# ── 事实拼装（邮件正文的人话）──
 
 
 @pytest.mark.asyncio
@@ -564,7 +550,6 @@ async def test_describe_event_keeps_fact_granularity():
         region_names={},
     ) == "进入锁区 · UA · 可购买 → 锁区"
 
-    # 游戏级事件（促销免费）没有区码也没有前后值：不编造
     assert describe_event(
         event_type="FREE_PROMO", region_code=None,
         previous={"freeKind": None},
@@ -593,7 +578,6 @@ async def test_test_mail_does_not_touch_business_data(db, monkeypatch):
     monkeypatch.setattr(notifications_router, "send_test_mail", _bad)
     with pytest.raises(HTTPException) as excinfo:
         await notifications_router.send_test()
-    # 凭据错误必须是 HTTP 错误，不能显示成功
     assert excinfo.value.status_code == 400
     assert "535" in excinfo.value.detail
 

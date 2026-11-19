@@ -23,17 +23,12 @@ from app.domains.settings.models import AppSetting
 
 logger = logging.getLogger(__name__)
 
-# 已购游戏专用抓取区（app_settings KV）：
-# - None/缺省 = 跟随全局启用集（默认，行为与历史上完全一致）
-# - list     = 自定义子集（已购游戏与愿望单分道抓取）
 OWNED_REGIONS_KEY = "crawl.owned_regions"
 
 _LEGACY_KEY = "crawl.enabled_regions"
 
-# CC_LIST 展示名里的货币后缀（"印度（INR）" → "印度"）
 _CURRENCY_SUFFIX_RE = re.compile(r"（[A-Z]{3}）$")
 
-# 首启默认勾选区数：只取 CC_LIST 前 N 区（cn/ru/kz/ua），新手默认最小集省配额
 _DEFAULT_ENABLED_COUNT = 4
 
 
@@ -63,8 +58,6 @@ async def ensure_seeded() -> None:
                 session.add(
                     CrawlRegion(
                         code=code, name=display_name(name), currency=currency,
-                        # 首启默认只勾选前四区（新手默认最小
-                        # 勾选集，避免 41 区全开耗配额）；存量行不碰，用户可自行全选
                         enabled=idx < _DEFAULT_ENABLED_COUNT,
                         sort=idx, updated_at=now,
                     )
@@ -78,7 +71,6 @@ async def ensure_seeded() -> None:
                 refreshed += 1
                 changed = True
 
-        # 旧键迁移：按旧启用集重设 enabled（只在首次建表时生效一次）
         if isinstance(legacy_value, list) and legacy_value:
             wanted = {str(c).lower() for c in legacy_value}
             for row in (await session.execute(select(CrawlRegion))).scalars():

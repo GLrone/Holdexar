@@ -9,7 +9,6 @@ def resolve_region(*, explicit: str | None = None, prefs: dict | None = None,
     region = str(explicit or (prefs or {}).get("manualRegion") or "").strip().upper()
     source = "rule" if explicit else "manual"
     if not region:
-        # 回退区来自钱包快照（机器派生），不在区币映射内时不作数，而不是报错
         account_region = str(fallback or "").strip().upper()
         if account_region in REGION_TO_CURRENCY:
             region, source = account_region, "account"
@@ -36,6 +35,6 @@ async def effective_region(*, explicit: str | None = None, prefs: dict | None = 
     fallback = ""
     try:
         fallback = await account_service.primary_wallet_region()
-    except Exception:  # noqa: BLE001 — 账号域异常不阻断通知地区解析
+    except Exception:  # noqa: BLE001
         pass
     return resolve_region(explicit=explicit, prefs=prefs, fallback=fallback, observed=observed)

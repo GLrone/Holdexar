@@ -18,14 +18,10 @@ import html
 import re
 from datetime import date
 
-# ── 标题行识别 ──────────────────────────────────────────────────────────
-# 季节大促：英文章节词 + Sale，或中文「季节词 + 特卖」（标题年份可有可无，
-# 历史版本出现过带年份与不带年份两种形态）
 SEASON_NAME_RE = re.compile(
     r"(Spring|Summer|Autumn|Winter)\s+Sale|(春|夏|秋|冬)季?\s*特卖", re.IGNORECASE
 )
 NEXTFEST_NAME_RE = re.compile(r"Next\s*Fest|新品节", re.IGNORECASE)
-# 含数字才可能是活动行（排除导航与纯说明文字）
 _HAS_DIGIT_RE = re.compile(r"\d")
 
 H2_RE = re.compile(r"<h2\b[^>]*>(.*?)</h2>", re.IGNORECASE | re.DOTALL)
@@ -33,14 +29,11 @@ TABLE_RE = re.compile(r"<table\b[^>]*>(.*?)</table>", re.IGNORECASE | re.DOTALL)
 ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
 CELL_RE = re.compile(r"<td\b[^>]*>(.*?)</td>", re.IGNORECASE | re.DOTALL)
 SLUG_RE = re.compile(r"upcoming_events/(themed_sales/[a-z0-9_]+)", re.IGNORECASE)
-# 表格年份标题：英文「2026 Fests」/ 中文「2026 年各游戏节」
 YEAR_MARK_RE = re.compile(r"(\d{4})\s*年?\s*(?:Fests|各?游戏节)", re.IGNORECASE)
-# 中文页导航/表格的节名锚文本黑名单（「更多信息」等链接文本不是节名）
 _NAME_JUNK_RE = re.compile(
     r"^(?:更多信息|More info|View documentation|Registration details|注册详情)$", re.I
 )
 
-# ── 日期片段 ────────────────────────────────────────────────────────────
 # 按具体度排序：年月日 > 月-日(/年) > 日-月(/年) > 日,年 > 中文短尾「日」
 _MONTH_WORD = (
     r"(?:January|February|March|April|May|June|July|August"
@@ -65,7 +58,6 @@ MONTHS = {name: idx for idx, name in enumerate(_MONTH_NAMES, 1)}
 _MONTH_LOOKUP: dict[str, int] = {name.lower(): idx for name, idx in MONTHS.items()}
 _MONTH_LOOKUP.update({name[:3].lower(): idx for name, idx in _MONTH_LOOKUP.items()})
 
-# 表格日期单元格两种语序都收：「Oct 12<br>Oct 19」或「12 Oct<br>19 Oct」
 MD_RE = re.compile(
     rf"(?:(\d{{1,2}})\s+({_MONTH_WORD})|({_MONTH_WORD})\s+(\d{{1,2}}))",
     re.IGNORECASE,
@@ -98,11 +90,9 @@ def _frag_to_ymd(
         return (int(m.group(3) or year_hint or 0), month, int(m.group(2)))
     m = re.fullmatch(r"(\d{1,2}),?\s+(20\d\d)", frag)
     if m:
-        # 英文短尾「21, 2027」：日自带，月继承前文
         return (int(m.group(2)), carry_month or 0, int(m.group(1)))
     m = re.fullmatch(r"(\d{1,2})\s*日", frag)
     if m:
-        # 中文短尾「21 日」：月/年继承前文
         return (year_hint or 0, carry_month or 0, int(m.group(1)))
     return None
 
@@ -195,7 +185,6 @@ def parse_upcoming_events(raw: str) -> list[dict]:
              "info_slug": info_slug}
         )
 
-    # 标题行扫描（位置无关）：h2 内容命中季节词 / 新品节词且可解析出日期区间
     for m in H2_RE.finditer(raw):
         text = _strip_tags(m.group(1))
         if SEASON_NAME_RE.search(text):
@@ -207,7 +196,6 @@ def parse_upcoming_events(raw: str) -> list[dict]:
             if rng:
                 _add("next_fest", text.split("|")[0].strip(" |　"), *rng)
 
-    # 主题 Fest 表：年份取自表前的「YYYY Fests」标题
     marks = [(mm.start(), int(mm.group(1))) for mm in YEAR_MARK_RE.finditer(raw)]
     for tm in TABLE_RE.finditer(raw):
         year = max((y for pos, y in marks if pos < tm.start()), default=None)

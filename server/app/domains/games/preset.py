@@ -12,7 +12,6 @@ from app.domains.games.models import Game, PresetGame
 
 logger = logging.getLogger(__name__)
 
-# 榜单来源标记（与导出/并入侧约定同名）
 BOARD_SOURCE = "topsellers"
 MAX_SOURCE_LEN = 80
 IMPORT_SOURCE_PREFIX = "file:"

@@ -13,7 +13,6 @@ from app.domains.notifications.models import FactNotice
 
 logger = logging.getLogger(__name__)
 
-# 单次增量读取上限（轮询节拍 60s 下绰绰有余；防异常积压拖垮响应）
 FACTS_LIMIT = 50
 _CONTENT_TYPES = {("hb_choice", "bundle_changed"): "HB_CHOICE",
                   ("epic_free", "free_rotation"): "EPIC_FREE"}
@@ -57,7 +56,7 @@ async def record_fact(
                 }], session=session)
             await session.commit()
         return fact_id is not None
-    except Exception:  # noqa: BLE001 —— 事实落库失败不影响数据链路
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             "一条变化及其通知资格未能保存",

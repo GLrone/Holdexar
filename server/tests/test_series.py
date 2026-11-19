@@ -35,32 +35,23 @@ APP_NULLTYPE = 990_307
 ALL_APPS = [APP_PORTAL, APP_PORTAL2, APP_ALONE, APP_W3, APP_W2, APP_DLC, APP_NULLTYPE]
 
 
-# ─── 判定规则：正例 ────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(
     "n1,e1,n2,e2",
     [
-        # 规则 4：纯序号续作
         ("Portal", "Portal", "Portal 2", "Portal 2"),
         ("火炬之光", "Torchlight", "火炬之光2", "Torchlight II"),
-        # 规则 3：≥3 词公共前缀
         ("Grand Theft Auto IV", "Grand Theft Auto IV",
          "Grand Theft Auto: San Andreas", "Grand Theft Auto: San Andreas"),
-        # 规则 5：同前缀 + 尾部序号互异（年货）
         ("FIFA 22", "FIFA 22", "FIFA 23", "FIFA 23"),
         ("NBA 2K25", "NBA 2K25", "NBA 2K26", "NBA 2K26"),
-        # 规则 1b：分隔符前缀只差尾部序号
         ("The Witcher: Enhanced Edition", "The Witcher: Enhanced Edition",
          "The Witcher 3: Wild Hunt", "The Witcher 3: Wild Hunt"),
-        # 罗马数字归一
         ("Sid Meier's Civilization V", "Sid Meier's Civilization V",
          "Sid Meier's Civilization VI", "Sid Meier's Civilization VI"),
-        # 规则 6：中文严格前缀
         ("辐射4", "Fallout 4", "辐射：新维加斯", "Fallout: New Vegas"),
-        # 规则 7：中文一致 + 英文相似作保
         ("圣剑传说2 SECRET of MANA", "Secret of Mana",
          "圣剑传说3 TRIALS of MANA", "Trials of Mana"),
-        # 撇号归一：all's → alls 单词
         ("Tony Hawk's Pro Skater 1 + 2", "Tony Hawk's Pro Skater 1 + 2",
          "Tony Hawk's Pro Skater 3 + 4", "Tony Hawk's Pro Skater 3 + 4"),
     ],
@@ -69,35 +60,27 @@ def test_same_series_positive(n1, e1, n2, e2):
     assert is_same_series(n1, e1, n2, e2)
 
 
-# ─── 判定规则：负例（校准期真实踩过的误并形态） ────────────────────────
 
 @pytest.mark.parametrize(
     "n1,e1,n2,e2",
     [
-        # X of Y 前缀撞车（规则 3 的 2 词弱证据门槛）
         ("Call of Duty", "Call of Duty", "Call of Juarez", "Call of Juarez"),
         ("Call of Duty", "Call of Duty", "Call of Cthulhu", "Call of Cthulhu"),
         ("Age of Empires II", "Age of Empires II", "Age of Mythology", "Age of Mythology"),
         ("Tales of Zestiria", "Tales of Zestiria", "Tales of Symphonia", "Tales of Symphonia"),
         ("How to Survive", "How to Survive", "How to Raise a Wolf Girl", "How to Raise a Wolf Girl"),
-        # The X of Y 三词虚词框架（冠词剥离后落回 2 词门槛）
         ("The Legend of Heroes: Trails in the Sky", "The Legend of Heroes: Trails in the Sky",
          "The Legend of Bum-Bo", "The Legend of Bum-Bo"),
-        # 品牌伞不是系列
         ("Tom Clancy's Rainbow Six Vegas", "Tom Clancy's Rainbow Six Vegas",
          "Tom Clancy's Ghost Recon", "Tom Clancy's Ghost Recon"),
         ("Sid Meier's Civilization IV", "Sid Meier's Civilization IV",
          "Sid Meier's Pirates!", "Sid Meier's Pirates!"),
-        # I Am X / 我是 X 起手词
         ("I Am Alive", "I Am Alive", "I Am Bread", "I Am Bread"),
         ("我是小鱼儿", "I Am Fish", "我是未来：悠闲末日生活", None),
-        # 裸序号零证据：name_en 就是个 "2" 的行不得互连
         ("明星志愿2", "明星志願2", "铁道少女:梦想轨迹 2.0", "铁道少女:梦想轨迹 2.0 Railway To Dream"),
         ("懒人修仙传2", "懒人修仙传2", "幻想三国志2", "幻想三国志2"),
-        # 通用词系列名排除
         ("星际战甲", "Warframe", "星际公民", "Star Citizen"),
         ("模拟人生", "The Sims", "模拟山羊", "Goat Simulator"),
-        # 前缀后不是序号的续作证据不足
         ("Portal", "Portal", "Portal Stories: Mel", "Portal Stories: Mel"),
     ],
 )
@@ -105,7 +88,6 @@ def test_same_series_negative(n1, e1, n2, e2):
     assert not is_same_series(n1, e1, n2, e2)
 
 
-# ─── 聚类与命名 ────────────────────────────────────────────────────────
 
 def _cluster_of(clusters, appid):
     for name, appids in clusters:
@@ -227,7 +209,7 @@ async def _seed_and_clean(_series_db):
 @pytest.mark.asyncio
 async def test_refresh_series_writes_groups_and_sentinel(_seed_and_clean, _series_db):
     changed = await refresh_series()
-    assert changed == len(ALL_APPS) - 1  # 可聚类行首刷全动（DLC 行不参与）
+    assert changed == len(ALL_APPS) - 1
     async with _series_db() as session:
         portal = await session.get(Game, APP_PORTAL)
         portal2 = await session.get(Game, APP_PORTAL2)
@@ -238,11 +220,8 @@ async def test_refresh_series_writes_groups_and_sentinel(_seed_and_clean, _serie
         assert portal.series_id == "Portal" and portal2.series_id == "Portal"
         # 落单行写空串哨兵（NULL=未计算，空串=已算无系列）
         assert alone.series_id == ""
-        # 分隔符前缀去尾号：Witcher 2/3 归同簇
         assert w3.series_id == "Witcher" and w2.series_id == "Witcher"
-        # DLC 不参与聚类，series_id 保持 NULL
         assert dlc.series_id is None
-    # 幂等：无变化时零写入
     assert await refresh_series() == 0
 
 
@@ -257,16 +236,13 @@ async def test_series_members_payload(_seed_and_clean):
     assert len(self_members) == 1 and self_members[0]["appid"] == APP_PORTAL
     by_id = {m["appid"]: m for m in data["members"]}
     assert set(by_id) == {APP_PORTAL, APP_PORTAL2}
-    # CN 价格行直通；无价成员价格字段为 None
     assert by_id[APP_PORTAL]["cnPriceFen"] == 4800
     assert by_id[APP_PORTAL2]["cnPriceFen"] is None
 
-    # 落单 / 不存在 → None（路由层转 404）
     assert await series_members(APP_ALONE) is None
     assert await series_members(999_999_999) is None
 
 
-# ─── 系列覆盖文件（series_overrides.json） ─────────────────────────────
 
 def test_build_clusters_override_pins_and_absorbs():
     """覆盖键点名各碎片的代表 appid，名字相近的成员（重制版等）自动并入；
@@ -285,12 +261,9 @@ def test_build_clusters_override_pins_and_absorbs():
 
 
 def test_build_clusters_override_single_and_unknown_ids():
-    # 无启发式邻居的单成员键也如实成组（同组无兄弟时下游天然惰性）
     rows = [(1, "Alpha Alone", "Alpha Alone"), (2, "Beta Game", "Beta Game")]
     assert build_clusters(rows, {"孤品": [1]}) == [("孤品", [1])]
-    # 库外 appid 忽略
     assert build_clusters(rows, {"幽灵": [999]}) == []
-    # 列表成员的启发式邻居照常并入（Portal 点名 → Portal 2 吸收）
     rows2 = [(1, "Portal", "Portal"), (2, "Portal 2", "Portal 2")]
     assert build_clusters(rows2, {"传送门": [1]}) == [("传送门", [1, 2])]
 

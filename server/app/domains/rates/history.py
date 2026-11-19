@@ -37,13 +37,9 @@ from .providers.frankfurter import (
 
 logger = logging.getLogger(__name__)
 
-# 缺口日聚类阈值：相邻待修复日间隔 ≤ 该值并入同一窗口段（多拉几天数据零成本，
-# 换来更少的请求数）；超过则各自成段。
 _CLUSTER_GAP_DAYS = 7
 
-# 全新安装 bootstrap 起点 = Provider 全历史起点（frankfurter v2 自 2012
-# 年起）：种子不再携带汇率档案，无任何历史行的币种由扫描以该锚点建窗，
-# 交修复链现抓——否则新装库永远「无锚点跳过」，历史 CNY 换算无从建立。
+# 全新安装 bootstrap 起点 = Provider 全历史起点（frankfurter v2 自 2012 年起）
 FULL_HISTORY_START = date(2012, 1, 1)
 
 # 修复窗口上限：批次化单窗数据量（frankfurter 窗口大小控制单次响应体积，
@@ -62,7 +58,6 @@ def _as_date(value: object) -> date | None:
         return None
 
 
-# ── 查询（Bills / Games 的唯一入口）────────────────────────
 
 
 async def load_observed_series(
@@ -153,7 +148,6 @@ def pick_observed_rate(
     return None
 
 
-# ── 缺口扫描（纯本地）──────────────────────────────────────
 
 
 def _cluster_days(days: set[date]) -> list[tuple[date, date]]:
@@ -184,7 +178,6 @@ def _split_windows(start: date, end: date) -> list[tuple[date, date]]:
     return windows
 
 
-# 语义可信度：同一 (币种, 日) 多行并存时取更可信的一条
 _KIND_RANK = {"carried": 1, "derived": 2, "observed": 3}
 
 
@@ -275,10 +268,6 @@ async def scan_history_gaps(
     marks = await _load_marks()
     from .service import ALLOWED_CURRENCIES
 
-    # 全新安装 bootstrap：**全库零历史行**时以 Provider 全历史起点给每个
-    # 白名单币种建窗（种子不再带汇率档案，全史由修复链现抓）；存量库保持
-    # 旧语义——个别无行币种跳过，序列由实时刷新从当天起建立（不给老用户
-    # 突然排 2012 起的全量回填）。
     bootstrap = not marks
     per_currency: dict[str, dict] = {}
     pending_days: set[date] = set()
@@ -327,7 +316,6 @@ async def scan_history_gaps(
     }
 
 
-# ── 修复 ───────────────────────────────────────────────────
 
 
 async def _write_rates(data: dict[date, dict[str, float]]) -> tuple[int, dict[str, set[date]]]:
@@ -372,9 +360,9 @@ async def _write_rates(data: dict[date, dict[str, float]]) -> tuple[int, dict[st
             if cur_info is not None:
                 cur_kind, cur_source = cur_info
                 if cur_kind == "observed" and cur_source != "bing.currencyapi":
-                    continue  # observed 且非 Bing 永不覆盖
+                    continue
                 if cur_source == FRANKFURTER_PROVIDER_NAME:
-                    continue  # 已是当前新源无需重复写
+                    continue
             values.append(
                 {
                     "currency_code": code,
@@ -489,7 +477,7 @@ async def repair_history_gaps(
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
             break
-        except ValueError as e:  # 窗口参数非法（不应发生，防御）
+        except ValueError as e:
             result["status"] = "provider_error"
             result["error"] = str(e)[:200]
             break

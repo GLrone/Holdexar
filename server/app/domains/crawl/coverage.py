@@ -33,7 +33,6 @@ from app.domains.games.models import GameCurrentPrice
 
 logger = logging.getLogger(__name__)
 
-# 计数桶顺序即结果字段顺序
 BUCKETS = ("ok", "locked", "missing", "blocked", "unobserved")
 
 # appid 分批宽度：避开 SQLite 变量上限，一条 IN 不装整池
@@ -73,8 +72,6 @@ def _result(
         "cycleId": cycle_id,
         "status": status,
         "targetsTotal": targets_total,
-        # 「处理完」= 该对象的全部期望区服都拿到明确终态；missing / blocked
-        # 也算拿到结果，unobserved 不算——与「成功」是两件事
         "targetsDone": targets_done,
         "expectedUnits": expected_units,
         "ok": ok,
@@ -155,8 +152,6 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
     buckets_by_appid: dict[int, dict[str, int]] = {}
     async with get_session_factory()() as session:
         for start in range(0, len(appids), _CHUNK):
-            # 区服与窗口过滤下推 SQL，按 (对象, 状态) 预聚合——只传回窗口内
-            # 期望区的分桶计数，不拉全区全史行（region 小写比对对齐落库大写）
             conds = [
                 GameCurrentPrice.appid.in_(appids[start : start + _CHUNK]),
                 GameCurrentPrice.updated_at.is_not(None),
@@ -190,7 +185,6 @@ async def cycle_coverage(cycle_id: int) -> dict | None:
         for b in BUCKETS
     }
     counts["unobserved"] = expected_units - sum(counts.values())
-    # 「处理完」= 该对象的每个期望区服都拿到一条结果（每个单元最多一行）
     targets_done = sum(
         1 for a in appids if sum(buckets_by_appid.get(int(a), {}).values()) >= per_unit
     )

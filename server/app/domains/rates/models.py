@@ -27,9 +27,6 @@ class FxRate(Base):
 
 class FxRateHistory(Base):
     __tablename__ = "fx_rate_history"
-    # canonical 唯一日索引：新库由 create_all 落位；存量库由 v8 迁移链在
-    # 「同日合并」之后落位（同名同义，两库不分叉）。写入侧一律按
-    # (currency_code, rate_date) UPSERT。
     __table_args__ = (
         Index("ux_frh_currency_date", "currency_code", "rate_date", unique=True),
     )
@@ -39,9 +36,7 @@ class FxRateHistory(Base):
     rate_to_cny: Mapped[float] = mapped_column(Float)
     source: Mapped[str | None] = mapped_column(String(30))
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime)
-    # 汇率代表日（canonical 唯一键的一部分；业务查询唯一入口）
     rate_date: Mapped[date | None] = mapped_column(Date)
-    # observed / carried / derived
     source_kind: Mapped[str | None] = mapped_column(String(12))
     # Provider 有明确观察时刻时记录（EOD 源为数据日收盘时刻；无则 NULL）
     observed_at: Mapped[datetime | None] = mapped_column(DateTime)

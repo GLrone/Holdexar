@@ -75,7 +75,6 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(achievements_service, "_api_try", fake_try)
 
 
-# ─── 页面夹具（与真实社区页结构逐字段同构）────────────────────
 
 
 @pytest.mark.asyncio
@@ -166,7 +165,6 @@ def player_html(appid: int, items: list[tuple]) -> str:
     return rows
 
 
-# ─── 解析与桥接 ─────────────────────────────────────────────
 
 def test_parse_global_page():
     html = global_html(620, [
@@ -211,7 +209,6 @@ def test_merge_duplicate_icons_and_gray_fallback():
     assert merged["ALONE"]["achieved"] is False
 
 
-# ─── 同步链 ────────────────────────────────────────────────
 
 def _mock_pages(monkeypatch, appid: int, defs_items, player_items):
     async def fake_community(url, params):
@@ -286,7 +283,6 @@ async def test_start_sync_conflict(db, _creds, monkeypatch):
         await task
 
 
-# ─── Web API 明细通道（官方接口，替代社区页 HTML）──────────────
 
 @pytest.mark.asyncio
 async def test_fetch_defs_api_parses_and_keys(db, monkeypatch):
@@ -512,10 +508,10 @@ async def test_shared_pool_falls_back_to_family_snapshot(db, monkeypatch):
             owners_json=[friend], excluded=False))
         session.add(family_models.FamilyLibrarySnapshot(
             appid=239140, family_groupid="111", name="Dying Light",
-            owners_json=[PRIMARY], excluded=False))     # 自己也有 = 已购，不算库外
+            owners_json=[PRIMARY], excluded=False))
         session.add(family_models.FamilyLibrarySnapshot(
             appid=999001, family_groupid="111", name="已排除",
-            owners_json=[friend], excluded=True))       # 已排除出共享
+            owners_json=[friend], excluded=True))
         await session.commit()
 
     ids, names = await achievements_service.shared_pool_candidates(PRIMARY)
@@ -550,7 +546,6 @@ async def test_shared_pool_skips_non_member(db, monkeypatch):
     assert await achievements_service.shared_pool_candidates(other) == ([], {})
 
 
-# ─── 库外（家庭共享等）名册 ─────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_sync_collects_external_shared_games(db, _creds, monkeypatch):
@@ -575,12 +570,10 @@ async def test_sync_collects_external_shared_games(db, _creds, monkeypatch):
                 [("A", "成就一", "2024 年 11 月 2 日 上午 3:56 解锁")])
 
     async with db() as session:
-        # 上一轮留下的库外行，已不在共享池里
         session.add(AchievementGame(steamid=PRIMARY, appid=555, name="已不在共享池",
                                     total_achievements=5, unlocked=2, source="shared"))
         session.add(AchievementState(steamid=PRIMARY, appid=555, image_name="X",
                                      achieved=True, unlock_time=NOW))
-        # 已购行：任何情况下都不清理
         session.add(AchievementGame(steamid=PRIMARY, appid=730, name="已购保留",
                                     total_achievements=1, unlocked=1, source="owned"))
         await session.commit()
@@ -594,13 +587,13 @@ async def test_sync_collects_external_shared_games(db, _creds, monkeypatch):
         }
         assert rows[268910].source == "shared" and rows[268910].unlocked == 10
         assert rows[268910].name == "Cuphead"
-        assert 999001 not in rows       # 未拥有 + 0 解锁 = 共享池库存，不进殿堂
-        assert 555 not in rows          # 失效库外行被清
+        assert 999001 not in rows
+        assert 555 not in rows
         assert rows[730].source == "owned"
         left = (await session.execute(
             select(AchievementState).where(AchievementState.appid == 555)
         )).scalars().all()
-        assert left == []               # 解锁态随行一起清，不留孤儿
+        assert left == []
 
 
 @pytest.mark.asyncio
@@ -612,7 +605,7 @@ async def test_prune_external_keeps_zero_unlock_if_still_shared(db, _creds, monk
         await session.commit()
 
     removed = await achievements_service._prune_external(PRIMARY, {268910})
-    assert removed == 0  # 还有解锁：保留
+    assert removed == 0
 
     async with db() as session:
         row = (await session.execute(select(AchievementGame))).scalar_one()
@@ -625,7 +618,6 @@ async def test_prune_external_keeps_zero_unlock_if_still_shared(db, _creds, monk
         assert (await session.execute(select(AchievementGame))).scalars().all() == []
 
 
-# ─── 多账号隔离 ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_multi_account_isolation(db, _creds):
@@ -685,10 +677,8 @@ async def test_accounts_fill_family_profiles(db, monkeypatch):
 
     async with db() as session:
         session.add(FamilyGroup(steamid=PRIMARY, family_groupid="42", members_json=[
-            # 驼峰键：现行快照写入口径
             {"steamid": "76561198000000002", "role": "member",
              "personaName": "玩家甲", "avatarUrl": "http://a/k.jpg"},
-            # 两键都缺 → tracked_accounts 补
             {"steamid": "76561198000000003", "role": "member"},
         ]))
         session.add(TrackedAccount(
@@ -706,7 +696,6 @@ async def test_accounts_fill_family_profiles(db, monkeypatch):
     assert accounts[PRIMARY]["personaName"] == "主号"
 
 
-# ─── 读取端汇总 ─────────────────────────────────────────────
 
 async def _seed(db):
     async with db() as session:
@@ -762,7 +751,6 @@ async def test_summary_aggregates(db, _creds):
     assert s["nearCompletion"][0]["remaining"] == 2
 
     buckets = {b["tier"]: b["count"] for b in s["rarityBuckets"]}
-    # 已获得成就分档：C 0.5→传说 / B、T3 →极稀有 / A、T1 →常见（T2 未解锁不计）
     assert buckets["ultra"] == 1 and buckets["very_rare"] == 2
     assert buckets["rare"] == 0 and buckets["common"] == 2
     assert len(s["unlockTimeline"]) == 24
@@ -822,15 +810,14 @@ async def test_platinum_detail_has_perfect_date(db):
     assert detail["perfectDate"] == NOW - 3600
 
 
-# ─── 游戏生涯度量（career）────────────────────────────────────
 #
 # career 模块从 `app.core.database` 直接 import 了 get_session_factory，
 # 也直接持有 service.resolve_credentials 的引用（不是每次现查模块属性），
 # 所以 db / _creds 两个 fixture 在 service 命名空间里打的补丁管不到它——
 # 必须在 career 命名空间里再打一次，否则测试会去连真实库。
 
-CAREER_DAYS_EARLY = 45  # 早期解锁日（相对今天）
-CAREER_DAYS_LATE = 15   # 晚期解锁日；两者相差 30 天，用于最长空窗与前后的通关跨度
+CAREER_DAYS_EARLY = 45
+CAREER_DAYS_LATE = 15
 
 
 def _ts(days_ago: int, hour: int, minute: int = 0) -> int:
@@ -870,13 +857,12 @@ async def _seed_career(db):
                          release_date="2007-10-10", positive_rate=9000))
         session.add(Game(appid=730, name="CS2", release_date=f"{year}-01-15",
                          developers=["Valve"], publishers=["Valve"], chinese_support="official"))
-        # 热门标签（票重等权 → 时长在两标签间均分，与旧 genres 断言同值）
         # 模板库自带内置标签底座，tagid 撞 19/21 时用 merge 覆盖为本文件语义行
         await session.merge(Tag(tagid=19, name_zh="动作"))
         await session.merge(Tag(tagid=21, name_zh="冒险"))
-        session.add(GameTag(appid=620, tagid=19, weight=100))   # 动作
-        session.add(GameTag(appid=620, tagid=21, weight=100))   # 冒险
-        session.add(GameTag(appid=440, tagid=19, weight=100))   # 动作
+        session.add(GameTag(appid=620, tagid=19, weight=100))
+        session.add(GameTag(appid=620, tagid=21, weight=100))
+        session.add(GameTag(appid=440, tagid=19, weight=100))
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
                                     playtime_min=900, last_played=_ts(CAREER_DAYS_EARLY, 8),
                                     total_achievements=6, unlocked=6))
@@ -885,7 +871,6 @@ async def _seed_career(db):
                                     total_achievements=10, unlocked=5))
         session.add(AchievementGame(steamid=PRIMARY, appid=730, name="CS2", playtime_min=10))
 
-        # (appid, 图名, 成就名, 全服占比, 描述)
         defs = [
             (620, "P1", "首关", 0.5, "只用一把传送门枪通关全程"),
             (620, "P2", "速通", 3.0, "在二十分钟内完成任意一章"),
@@ -935,7 +920,6 @@ def test_tag_family_table_stays_inside_name_baseline(career):
     baseline = set(TAG_NAMES_ZH.values())
     unknown = {n for names in career.TAG_FAMILIES.values() for n in names} - baseline
     assert unknown == set(), f"族表里的名字不在标签名底座：{unknown}"
-    # 每个族 id 必须是 ASCII（前端 TS 里写不了中文字面量，只认族 id）
     assert all(f.isascii() for f in career.TAG_FAMILIES)
     assert all(n not in career.TAG_FAMILY_OF for n in ("裸露", ""))
 
@@ -949,7 +933,6 @@ async def test_career_playtime_and_trophy(career, db):
     assert p["totalMin"] == 970 and p["playedGames"] == 3
     assert p["avgMin"] == 323 and p["medianMin"] == 60 and p["maxMin"] == 900
     assert p["maxGame"]["appid"] == 620
-    # 900 分在 [300,1200) / 60 分在 [60,300) / 10 分在 [1,60)
     assert p["histogram"] == [0, 1, 1, 1, 0, 0]
     assert p["over10h"] == 1 and p["over20h"] == 0 and p["idleGames"] == 1
     assert p["untouchedGames"] == 0
@@ -958,7 +941,6 @@ async def test_career_playtime_and_trophy(career, db):
     assert t["total"] == 16 and t["unlocked"] == 11
     assert t["rate"] == 68.8 and t["gamesWithAchievements"] == 2
     assert t["perfect"] == 1 and t["platinumRate"] == 50.0
-    # 极稀有 = ultra + very_rare = 1 + 2（6.0% 已落 rare 档，档界是 <5%）
     assert t["rareCount"] == 3 and t["rareShare"] == 27.3
     assert t["avgRarity"] == 27.1
     assert t["perHour"] == 0.68
@@ -976,10 +958,8 @@ async def test_career_activity_heatmap(career, db):
     assert a["longestStreak"] == 1 and a["currentStreak"] == 1
     assert a["maxGapDays"] == 30
     assert a["spanDays"] == 31
-    # 早期日 6+1=7 枚，晚期日 4 枚 → 最忙日落在早期日（也就是首日）
     assert a["busiestDay"]["count"] == 7 and a["busiestDay"]["date"] == a["firstDate"]
 
-    # 时段直方图：03–09 各 1 枚，10 点 2 枚，11/12 点各 1 枚
     hh = a["hourHistogram"]
     assert len(hh) == 24 and sum(hh) == 11
     assert [hh[h] for h in (3, 4, 5, 6, 7, 8, 9)] == [1] * 7
@@ -987,16 +967,13 @@ async def test_career_activity_heatmap(career, db):
     assert a["nightUnlocks"] == 2 and a["morningUnlocks"] == 4 and a["dayUnlocks"] == 5
     assert a["eveningUnlocks"] == 0
 
-    # 星期×时段矩阵：168 格，星期为主序，总数与直方图一致
     hw = a["hourWeekday"]
     assert len(hw) == 168 and sum(hw) == 11
     assert sum(a["weekdayHistogram"]) == 11
     assert a["weekendUnlocks"] == a["weekdayHistogram"][5] + a["weekdayHistogram"][6]
 
-    # 月度是稀疏表，前端按最早→最晚补齐；两日口径下总数必须守恒
     assert sum(m["count"] for m in a["monthly"]) == 11
     assert sum(y["unlocks"] for y in (await career.get_career())["yearly"]) == 11
-    # 首枚解锁 = 最稀有那条（0.5%）
     assert a["firstUnlock"]["appid"] == 620 and a["firstUnlock"]["globalPercent"] == 0.5
 
 
@@ -1006,7 +983,6 @@ async def test_career_records_milestones_quotes(career, db):
     c = await career.get_career()
     r = c["records"]
 
-    # 620：6 枚解锁跨 5 小时（03:00–08:00）；440：5 枚跨「30 天 + 3 小时」
     assert r["fastestComplete"]["appid"] == 620 and r["fastestComplete"]["spanMin"] == 300
     assert r["fastestComplete"]["unlocks"] == 6
     assert r["slowestComplete"]["appid"] == 440
@@ -1017,7 +993,6 @@ async def test_career_records_milestones_quotes(career, db):
     assert r["mostUnlocksGame"]["appid"] == 620 and r["mostUnlocksGame"]["unlocked"] == 6
     assert r["biggestPlatinum"]["appid"] == 620 and r["biggestPlatinum"]["total"] == 6
 
-    # 里程碑：第 1 枚 + 第 10 枚 + 首枚稀有（0.5% 那条最早，与第 1 枚同一时刻）
     ms = c["milestones"]
     assert len(ms) == 3
     assert sorted(m["index"] for m in ms) == [0, 1, 10]
@@ -1031,7 +1006,6 @@ async def test_career_records_milestones_quotes(career, db):
     assert [m["at"] for m in ms] == sorted(m["at"] for m in ms)
 
     quotes = c["quotes"]
-    # 描述短于 8 字 / 为空的不入选；"工程师" 在 620 与 440 上同名且描述不同，均保留
     assert len(quotes) == 8
     assert quotes[0]["globalPercent"] == 0.5 and quotes[0]["gameName"] == "Portal 2"
     assert [q["globalPercent"] for q in quotes] == sorted(q["globalPercent"] for q in quotes)
@@ -1044,20 +1018,17 @@ async def test_career_taste_and_library(career, db):
     c = await career.get_career()
     taste = c["taste"]
 
-    # 标签按「票重分摊时长」计：等权 → 动作 450+60=510，冒险 450
     tags = {g["tag"]: g for g in taste["tags"]}
     assert set(tags) == {"动作", "冒险"}
     assert [g["tag"] for g in taste["tags"]] == ["动作", "冒险"]
     assert tags["动作"]["playtimeMin"] == 510 and tags["动作"]["games"] == 2
     assert tags["冒险"]["playtimeMin"] == 450 and tags["冒险"]["platinum"] == 1
 
-    # 风格族（前端画像词云只认这些 ASCII 族 id；中文归类只做在后端）
     fams = {f["family"]: f for f in taste["families"]}
     assert set(fams) == {"action", "adventure"}
     assert fams["action"]["playtimeMin"] == 510 and fams["action"]["games"] == 2
     assert fams["adventure"]["playtimeMin"] == 450 and fams["adventure"]["platinum"] == 1
 
-    # 厂牌/系列按 name 排序（曾误用 genre/tag 键导致 KeyError）
     assert taste["developers"][0]["name"] == "Valve"
     assert taste["developers"][0]["playtimeMin"] == 970 and taste["developers"][0]["games"] == 3
     assert taste["publishers"][0]["name"] == "Valve"
@@ -1084,14 +1055,11 @@ async def test_career_spotlight_unfinished_dormant(career, db):
     c = await career.get_career()
 
     assert [g["appid"] for g in c["spotlight"]] == [620, 440, 730]
-    # 未完待续：0 < unlocked < total，缺口小的在前
     assert c["unfinishedCount"] == 1
     assert [g["appid"] for g in c["unfinished"]] == [440]
     assert c["unfinished"][0]["remaining"] == 5
-    # 尘封角落：有实际时长且有最后启动时间，早者在前
     assert [g["appid"] for g in c["dormant"]] == [620, 440]
     assert c["dormant"][0]["lastPlayed"] < c["dormant"][1]["lastPlayed"]
-    # 440 没有 header_image，走 Steam CDN 兜底地址
     assert "440" in c["spotlight"][1]["headerImage"]
 
 
@@ -1113,29 +1081,21 @@ async def test_career_empty_without_account(career, monkeypatch):
     assert c["series"] == {"rows": [], "seriesTotal": 0, "taggedTotal": 0, "perfected": 0}
 
 
-# ─── 系列进度（career.series）──────────────────────────────────
-#
-# 独立种子：系列聚合要验的是「拥有/已玩/白金/完成度/展示名/排序/门槛」，
-# 塞进 _seed_career 会把那边已断言的时长与成就账全打乱。
 
 async def _seed_series(db):
     async with db() as session:
-        # 同一系列两款：一款白金（6/6），一款刷了一半（5/10）→ 有 nextGame
         session.add(Game(appid=620, name="Portal 2", series_id="Portal"))
         session.add(Game(appid=440, name="Team Fortress 2", series_id="Portal"))
         session.add(AchievementGame(steamid=PRIMARY, appid=620, name="Portal 2",
                                     playtime_min=900, total_achievements=6, unlocked=6))
         session.add(AchievementGame(steamid=PRIMARY, appid=440, name="Team Fortress 2",
                                     playtime_min=60, total_achievements=10, unlocked=5))
-        # 有系列但一款没碰（进度 0、无 nextGame、封面取任一款）
         session.add(Game(appid=800, name="Dota One", series_id="Dota"))
         session.add(Game(appid=801, name="Dota Two", series_id="Dota"))
         session.add(AchievementGame(steamid=PRIMARY, appid=800, name="Dota One", playtime_min=0))
         session.add(AchievementGame(steamid=PRIMARY, appid=801, name="Dota Two", playtime_min=0))
-        # 单款系列：不该进 rows，但要计入 taggedTotal
         session.add(Game(appid=802, name="Solo", series_id="Solo"))
         session.add(AchievementGame(steamid=PRIMARY, appid=802, name="Solo", playtime_min=0))
-        # 全白金系列 + 中文展示名（成员展示名的公共汉字前缀 ≥2 字才启用）
         session.add(Game(appid=810, name="英雄传说：闪之轨迹I", series_id="Legend Of Heroes"))
         session.add(Game(appid=811, name="英雄传说：闪之轨迹II", series_id="Legend Of Heroes"))
         session.add(AchievementGame(steamid=PRIMARY, appid=810, name="英雄传说：闪之轨迹I",
@@ -1150,27 +1110,24 @@ async def test_career_series_progress(career, db):
     await _seed_series(db)
     s = (await career.get_career())["series"]
 
-    # 门槛：单款系列不计入 rows，但仍计入「有系列标记」
     assert s["taggedTotal"] == 4
     assert s["seriesTotal"] == 3
-    assert s["perfected"] == 1          # 英雄传说（2 款全白金）
+    assert s["perfected"] == 1
     assert [r["seriesId"] for r in s["rows"]] == ["Legend Of Heroes", "Portal", "Dota"]
 
-    # 展示名：成员无公共汉字前缀 → 回落标识；有 → 用公共前缀
     assert s["rows"][0]["name"] == "英雄传说闪之轨迹"
     assert s["rows"][1]["name"] == "Portal"
 
     duo = s["rows"][0]
     assert duo["owned"] == 2 and duo["played"] == 2 and duo["platinum"] == 2
     assert duo["completed"] == 2 and duo["progress"] == 1.0
-    assert duo["topGame"]["appid"] == 810          # 100 分 > 50 分
-    assert duo["nextGame"] is None                 # 没有 0<unlocked<total 的成员
+    assert duo["topGame"]["appid"] == 810
+    assert duo["nextGame"] is None
 
     portal = s["rows"][1]
     assert portal["owned"] == 2 and portal["played"] == 2 and portal["platinum"] == 1
     assert portal["completed"] == 1
     assert portal["unlocked"] == 11 and portal["total"] == 16
-    # 进度条口径只算已玩成员（两款都已玩，故与整体口径一致）
     assert portal["playedUnlocked"] == 11 and portal["playedTotal"] == 16
     assert abs(portal["progress"] - 0.6875) < 0.001
     assert portal["topGame"]["appid"] == 620
@@ -1181,7 +1138,6 @@ async def test_career_series_progress(career, db):
     assert dota["played"] == 0 and dota["playedTotal"] == 0 and dota["progress"] == 0.0
     assert dota["nextGame"] is None
     assert dota["topGame"]["appid"] in (800, 801)
-    # 无 header_image 时封面走 Steam CDN 兜底地址（不为空）
     assert "800" in dota["topGame"]["headerImage"] or "801" in dota["topGame"]["headerImage"]
 
 
@@ -1189,7 +1145,6 @@ async def test_career_series_progress(career, db):
 async def test_career_series_sorted_by_engagement(career, db):
     await _seed_series(db)
     rows = (await career.get_career())["series"]["rows"]
-    # 排序键 (已玩, 白金, 时长) 全降序：没碰过的大系列不该压过在刷的
     keys = [(-r["played"], -r["platinum"], -r["playtimeMin"]) for r in rows]
     assert keys == sorted(keys)
     assert rows[0]["played"] >= rows[-1]["played"]

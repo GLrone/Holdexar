@@ -90,10 +90,6 @@ _ACCOUNT_STEAMID_RE = re.compile(
 # 这是账户真实商店区的权威信号（cookie 的 steamCountry 会被代理出口 IP 污染）。
 _REGION_NOTE_RE = re.compile(r"（([^，）]{2,6})、(\d{1,2})）")
 
-# 登录态 Steam Cookie 的最小集合（其余字段对余额查询无意义）。
-# steamRefresh_steam 是续期凭据：访问令牌（steamLoginSecure）寿命约 24 小时，
-# 丢掉它登录态就只能在一天内可用（续期见 session.py）；steamRememberLogin
-# 记录登录时是否勾选「记住我」，用于判断续期凭据为何缺席。
 _STEAM_COOKIE_KEYS = (
     "sessionid",
     "steamCountry",
@@ -103,8 +99,6 @@ _STEAM_COOKIE_KEYS = (
 )
 
 
-# 失败归因前缀：按「传输层失败 / 非传输层失败」二分，行内 wallet_error 与
-# 轮转其原因文案都靠它分辨——网络不通不能顶替成凭据问题
 WALLET_NETWORK_ERROR_HEAD = "无法连接 Steam（网络或代理出口不通）："
 WALLET_AUTH_ERROR_HEAD = "无法获取 Steam 钱包余额（登录态不符或服务端异常）："
 
@@ -146,7 +140,7 @@ class WalletInfo:
     currency_symbol: str
     currency_id: int
     country_code: str
-    steam_id: str = ""  # 页面归属账户（store account 通道填充；其余通道留空）
+    steam_id: str = ""
 
     @property
     def balance_display(self) -> str:
@@ -222,7 +216,7 @@ async def _region_from_history(
             return ""
         match = _REGION_NOTE_RE.search(resp.text)
         return match.group(1).strip() if match else ""
-    except Exception as exc:  # noqa: BLE001 地区名是增强信号，失败不阻断余额
+    except Exception as exc:  # noqa: BLE001
         log_event(
             logger,
             "账号历史页地区名抓取失败",
@@ -271,9 +265,6 @@ async def _fetch_store_account(
         raise WalletFetchError(
             f"余额符号与币种不一致：{raw_balance!r} vs {fmt_amount!r}（id={currency_id}）"
         )
-    # 账户商店区：steamCountry cookie 会被代理出口 IP 污染（如 US 出口），
-    # 不可信。改从 history 页「货币转换至 INR（印度、29）」取地区名（权威）；
-    # history 抓取失败时回退 cookie。
     country = await _region_from_history(client, cookies) or _normalize_country(
         cookies.get("steamCountry", "").split("|")[0]
     )
@@ -300,8 +291,6 @@ def _parse_money(text: str) -> float | None:
         return None
     s = re.sub(r"\s", "", match.group(0))
     if "," in s and "." in s:
-        # 两者都有：靠后的当小数点，靠前的当千分位剔除
-        # （1,234.56 → 1234.56；3.810,21 → 3810.21）
         dec, sep = (".", ",") if s.rfind(".") > s.rfind(",") else (",", ".")
         head, _, tail = s.rpartition(dec)
         s = head.replace(sep, "") + "." + tail
@@ -317,10 +306,6 @@ def _parse_money(text: str) -> float | None:
         return None
 
 
-# 进程级客户端缓存（键 = 出口代理 × 证书校验 × 超时）：代理连接的建立
-# （CONNECT + TLS 握手）是单次开销，复用后请求走已建隧道，延迟与失败率
-# 都从「每轮握手」级降为「偶发建连」级。客户端随进程存活；池中连接失效
-# 时由连接类失败路径丢弃重建（_try_channels 的自愈重试）。
 # 响应 Set-Cookie 一律不采用——每次取用前清空 jar，登录态始终以调用方
 # 显式传入的 Cookie 为准，不与 Steam 响应下发的会话字段串味。
 _client_cache: dict[tuple[str | None, bool, float], httpx.AsyncClient] = {}
@@ -399,7 +384,7 @@ async def _try_channels(
                     detail={"证书校验": verify_flag, "错误": errors[-1]},
                 )
                 retried = attempt == 0
-            except Exception as exc:  # noqa: BLE001 通道间容错，最后统一抛
+            except Exception as exc:  # noqa: BLE001
                 transport_only = False
                 errors.append(f"{channel.__name__}: {type(exc).__name__}: {exc}")
                 log_event(
@@ -457,7 +442,6 @@ async def fetch_wallet(cookies_raw: str, *, verify: bool | None = None, proxy_ur
         return await _try_channels(False, cookies, proxy_url)
 
 
-# ── 头像 URL 归一（CDN 域名轮换治理）──────────────────
 # Valve 头像 CDN 多域并存：akamaized.net（已死，DNS 不解析）、queniuqe.com /
 # eccdnx.com（完美世界国服）、fastly.steamstatic.com（现行，miniprofile 返回）。
 # 同一 hash 路径在所有域等价——统一归一到现行规范域，旧域 URL 同样归一，
@@ -601,7 +585,7 @@ async def fetch_profile(
                 detail={"证书校验": verify_flag, "原因": str(exc)},
             )
             if verify is None and is_ssl_error(exc):
-                continue  # 证书问题 → 降级重试一轮
+                continue
             return empty
         if result.get("persona_name") or result.get("avatar_url"):
             return result

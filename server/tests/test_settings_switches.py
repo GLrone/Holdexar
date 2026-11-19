@@ -56,11 +56,9 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
         "price_interval_hours": 6,
         # 目录层默认随策略：默认直连下目录段不随轮出网
         "catalog_refresh": False,
-        # 任务队列逐段开关：缺失即开
         "queue_missing": True,
         "queue_pool": True,
         "queue_discounts": True,
-        # 内容源节奏默认（与调度器注册同一套常量）
         "hb_schedule": {"time": "02:30", "days": 1},
         "epic_schedule": {"time": "23:05", "days": 1},
     }
@@ -70,11 +68,10 @@ async def test_fetch_settings_defaults_and_roundtrip(tmp_data_dir):
     updated = await get_fetch_settings()
     assert updated.epic_free is False
     assert updated.fx_auto is False
-    assert updated.boards is True  # 未传字段保持不变
+    assert updated.boards is True
 
     # fx_auto 沿用历史 KV key（原闸无写入点，本端点是第一个写入口）
     assert await settings_service.get_value("crawl.auto_refresh_rates", None) is False
-    # 调度器闸门读到同一份 KV
     assert await core_scheduler.content_fetch_enabled("fetch.epic_free") is False
     assert await core_scheduler.content_fetch_enabled("fetch.hb_choice") is True
 
@@ -103,11 +100,9 @@ async def test_content_schedule_roundtrip_validation_and_reschedule(tmp_data_dir
     assert await settings_service.get_value("fetch.hb_choice_schedule", None) == {
         "time": "04:00", "days": 3,
     }
-    # 调度在跑：保存即重排（days>1 走 cron 日步进，days=1 回每日）
     assert ("hb_choice", {"trigger": "cron", "hour": 4, "minute": 0, "day": "*/3"}) in rescheduled
     assert ("epic_free", {"trigger": "cron", "hour": 1, "minute": 5}) in rescheduled
 
-    # 校验：非法时刻拒绝（缺分钟位 / 超出当日范围），天数夹取 1..30
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
@@ -117,14 +112,12 @@ async def test_content_schedule_roundtrip_validation_and_reschedule(tmp_data_dir
     clamped = FetchSettingsUpdate(hb_schedule=ContentSchedule(time="04:00", days=99))
     assert clamped.hb_schedule.days == 30
 
-    # 脏 KV 逐项回落默认（读口归一化，与启动链同一套）
     await settings_service.set_value(
         "fetch.epic_free_schedule", {"time": "99:99", "days": 0}
     )
     reread = await get_fetch_settings()
     assert reread.epic_schedule.time == "23:05" and reread.epic_schedule.days == 1
 
-    # 启动链应用：KV 自定义值 → 同一重排入口（注册默认保持 02:30/23:05）
     rescheduled.clear()
     await settings_service.set_value(
         "fetch.hb_choice_schedule", {"time": "03:15", "days": 2}
@@ -150,7 +143,7 @@ async def test_backup_auto_roundtrip_and_job_gate(tmp_data_dir, monkeypatch):
     monkeypatch.setattr("app.core.backup.create_backup", _fake_create_backup)
 
     await core_scheduler._job_backup()
-    assert calls == []  # 开关关闭：定时与启动补备（内部调用 _job_backup）一并让路
+    assert calls == []
 
     await settings_service.set_value("backup.auto", True)
     await core_scheduler._job_backup()
@@ -184,7 +177,7 @@ async def test_strategy_switches_roundtrip(tmp_data_dir):
     strategy = await proxies_service.get_strategy()
     assert strategy["autostart"] is False
     assert strategy["healthAuto"] is False
-    assert strategy["strategy"] == "direct_only"  # 策略字段不受本次更新影响（默认直连）
+    assert strategy["strategy"] == "direct_only"
 
 
 @pytest.mark.asyncio
@@ -216,7 +209,6 @@ async def test_price_interval_roundtrip_and_clamp(tmp_data_dir):
     defaults = await get_fetch_settings()
     assert defaults.price_interval_hours == 6
 
-    # 正常写入 + 夹取：超界值落到 1..72
     await update_fetch_settings(FetchSettingsUpdate(price_interval_hours=2))
     assert (await get_fetch_settings()).price_interval_hours == 2
     await update_fetch_settings(FetchSettingsUpdate(price_interval_hours=999))
@@ -224,7 +216,6 @@ async def test_price_interval_roundtrip_and_clamp(tmp_data_dir):
     await update_fetch_settings(FetchSettingsUpdate(price_interval_hours=0))
     assert (await get_fetch_settings()).price_interval_hours == 1
 
-    # 调度器 helper 读到同一份 KV，脏值回落默认
     assert await core_scheduler.price_refresh_interval_hours() == 1
     await settings_service.set_value("crawl.price_interval_hours", "dirty")
     assert await core_scheduler.price_refresh_interval_hours() == 6
@@ -237,9 +228,7 @@ def test_next_grid_time_custom_step():
     from app.core.external_time import BEIJING_TZ, next_grid_time
 
     now = datetime(2026, 9, 26, 3, 0, tzinfo=BEIJING_TZ)
-    # 默认步长 6h：锚点 02:00 ≤ now → +6h = 08:00
     assert next_grid_time(now, 2) == datetime(2026, 9, 26, 8, 0, tzinfo=BEIJING_TZ)
-    # 自定义步长 12h：锚点 02:00 ≤ now → +12h = 14:00
     assert next_grid_time(now, 2, timedelta(hours=12)) == datetime(
         2026, 9, 26, 14, 0, tzinfo=BEIJING_TZ
     )
@@ -258,12 +247,10 @@ async def test_epic_offers_request_path_gate(tmp_data_dir, monkeypatch):
     monkeypatch.setattr(metadata_service, "_fetch_offers_payload", _fake_fetch)
     monkeypatch.setitem(metadata_service._epic_offers_cache, "payload", None)
 
-    # 无快照 + 开关关：直接空态返回，不触网
     result = await metadata_service.epic_free_offers()
     assert result["ok"] is False
     assert calls == []
 
-    # 有快照 + 开关关：回已有快照（stale 语义），仍不触网
     snapshot = {"source": "epic-offers", "ok": True, "offers": [{"a": 1}], "mobile": None,
                 "fetchedAt": "2026-01-01T00:00:00"}
     monkeypatch.setitem(metadata_service._epic_offers_cache, "payload", snapshot)
@@ -273,7 +260,6 @@ async def test_epic_offers_request_path_gate(tmp_data_dir, monkeypatch):
     assert calls == []
 
 
-# ── 设置变更广播（批次二）与内容源开启补拍（批次三）──────────────────────
 
 
 @pytest.mark.asyncio
@@ -301,9 +287,7 @@ def test_kick_job_ids_only_for_off_to_on():
         {"fetch.epic_free": False, "fetch.boards": True},
         {"fetch.epic_free": True, "fetch.boards": True},
     ) == ["epic_free"]
-    # 一直开着：不补
     assert _kick_job_ids_for_enabled_source({"fetch.epic_free": True}, {"fetch.epic_free": True}) == []
-    # 关闭方向：不补
     assert _kick_job_ids_for_enabled_source({"fetch.epic_free": True}, {"fetch.epic_free": False}) == []
 
 
@@ -331,7 +315,6 @@ async def test_kick_source_jobs_modifies_next_run(monkeypatch):
     assert [job for job, _ in stub.modified] == ["epic_free", "fx_refresh"]
     assert all(next_run is not None for _, next_run in stub.modified)
 
-    # 未注册任务跳过
     gone = _StubScheduler(existing=False)
     monkeypatch.setattr(core_scheduler, "scheduler", gone)
     await core_scheduler.kick_source_jobs(["epic_free"])
@@ -358,7 +341,6 @@ async def test_update_fetch_settings_kicks_enabled_source(tmp_data_dir, monkeypa
     assert stub.modified == []
 
 
-# ── P2 回归：访问密码最短 8 位（一字符口令让解锁防穷举形同虚设）──────────
 
 
 @pytest.mark.asyncio
@@ -371,7 +353,7 @@ async def test_lan_password_minimum_length(tmp_data_dir):
     assert short_exc.value.status_code == 422
     await update_settings(
         payload=SettingsUpdate(lan_access=LanAccessUpdate(password="x" * 8)),
-    )  # 合法长度不再拒绝
+    )
     # PHC 终态：哈希 KV 存验证器串，旧可逆密文键清账
     stored = await settings_service.get_value(settings_service.LAN_PASSWORD_HASH_KEY)
     assert isinstance(stored, str) and stored.startswith("$scrypt$")

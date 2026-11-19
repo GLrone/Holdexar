@@ -60,11 +60,7 @@ def get_session_factory():
 logger = logging.getLogger(__name__)
 
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
-# 符合 app 爬取标准的类型（只抓 game/dlc）
 _CRAWLABLE_TYPES = {"game", "dlc"}
-# 每轮预检上限：appdetails 礼貌限速 + 刷新时长兜底（141 级候选全部逐检会
-# 把刷新拖成数分钟长事务）。未预检候选自然顺延下轮——已结案的自动跳过，
-# 进度单调递减，不丢不重
 _PRECHECK_PER_RUN = 30
 
 # 南亚拆区：CC_LIST 的 pk 是聚合"南亚"追踪位，Steam 侧巴基斯坦（pk）与
@@ -76,10 +72,8 @@ _CC_CURRENCY = {cc: cur for cc, _, cur in CC_LIST}
 _CC_CURRENCY.update(
     {extra: _CC_CURRENCY["pk"] for extra in _SOUTH_ASIA_EXTRA["pk"]}
 )
-# 新接口请求参数（语言固定 english：名称与 app 链路同口径，区域价与语言无关）
 BROWSE_LANG = "english"
 
-# 单发请求条数上限与超时（关注集每区一发，超长由 plan_id_batches 自动再切）
 BROWSE_TIMEOUT = 20
 
 
@@ -114,9 +108,6 @@ def _headers() -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════
-# 抓取层：IStoreBrowseService/GetItems（单发 ≤300 条，DEFAULT_BATCH_SIZE）
-# ══════════════════════════════════════════════════════════════
 
 
 def _browse_kind(bundle_id: int, item_kind: int | None) -> str:
@@ -230,13 +221,13 @@ def _browse_row(
     # 语义票（mps=None）：逐区选项不一致时由落库层多数决归位，不能让
     # 锁区行伪装成「可补齐」的反对票
     if item_kind == 1:
-        mps = 1  # Sub 形态恒不可拆
+        mps = 1
     elif has_opt and bool(opt.get("must_purchase_as_set")):
         mps = 1
     elif item_kind == 0 and has_opt:
-        mps = 0  # 有真实选项且未标必须整包 → 可补齐
+        mps = 0
     else:
-        mps = None  # 锁区/无选项的 bundle：语义未知
+        mps = None
     return {
         "bundle_id": bundle_id,
         "region_code": cc,
@@ -376,11 +367,9 @@ async def _upsert_bundle_rows(
     是权威鉴别），这类整包删除既有行并跳过写入，防止发现链把单品灌进
     捆绑包表。手动导入（用户明确意图）传 allow_singleton=True 例外。
     """
-    # 主档取 appids 最多的行为基准（baseline 语义；锁区/包内游戏依据）
     baseline = max(regions, key=lambda r: len(r.get("app_ids") or []))
     baseline_appids = baseline.get("app_ids") or []
     if not allow_singleton and len(set(baseline_appids)) < 2:
-        # 单品：删净既有主档/区域价（发现桩经链尾刷新抓价后到此甄别）
         async with write_session(WritePriority.BACKGROUND) as db:
             await db.execute(
                 delete(BundleRegionPrice).where(
@@ -391,15 +380,8 @@ async def _upsert_bundle_rows(
             )
             await db.commit()
         return False
-    # 形态（链接/CDN 用）：item_type 1=Sub / 2=Bundle 是 Steam 权威答案。
-    # 逐区 item_type 理论恒定，但取多数决防单区脏值；无票（历史行/合成行）
-    # 时不改写库内既有形态
     kind_votes = [r.get("item_kind") for r in regions if r.get("item_kind") in (0, 1)]
     kind_value = _majority(kind_votes)
-    # 购买语义：Sub 形态恒不可拆；bundle 形态以选项级 must_purchase_as_set
-    # 为准（形态与语义解耦）。锁区行不投票（_browse_row 已滤），
-    # 有选项的区间偶发不一致由多数决归位。
-    # 全无票且库内 NULL/-1 时补 0（判据兜底）
     mps_votes = [r.get("mps") for r in regions if r.get("mps") in (0, 1)]
     mps_value = _majority(mps_votes)
 
@@ -498,14 +480,12 @@ async def refresh_bundles() -> dict:
     监控启用区（南亚 pk/bd 双发），全禁用时由 effective_regions 抛
     ValueError（链尾按跳过语义、手动导入转 400）。
     """
-    rates = await get_rates()  # {currency: rate_to_cny}
+    rates = await get_rates()
     rate_map = dict(rates) if isinstance(rates, dict) else {}
     rate_map.setdefault("CNY", 1.0)
 
     from app.domains.monitoring import service as monitoring_service
 
-    # 先看关注集再解析抓取区：无关注包时整轮跳过，不碰区域配置
-    # （全禁用区由 effective_regions 抛 ValueError，链尾按跳过语义处理）
     watched = await monitoring_service.active_ids("bundle")
     stmt = select(
         Bundle.bundle_id,
@@ -539,8 +519,6 @@ async def refresh_bundles() -> dict:
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=60)
     async with aiohttp.ClientSession(connector=connector) as session:
         rows_by_id = await _fetch_regions_batched(session, want, ccs=ccs)
-        # 形态兜底：按库内形态问不到真实条目的包，换另一形态再问一次
-        # （历史形态缺失/曾按错形态导入的包自愈；单区一发，代价可忽略）
         missing = [(bid, kind) for bid, kind in want if not rows_by_id.get(bid)]
         if missing:
             flipped = [
@@ -559,19 +537,18 @@ async def refresh_bundles() -> dict:
 
     failed: list[int] = [bid for bid, _kind in want if not rows_by_id.get(bid)]
     dropped_singletons = 0
-    touched: list[int] = []  # 本轮成功落库的包：链尾统一重建排序快照
+    touched: list[int] = []
     for bid, _kind in want:
         regions = rows_by_id.get(bid) or []
         if not regions:
             continue
         if not await _upsert_bundle_rows(bid, regions, rate_map, now):
-            dropped_singletons += 1  # 包内 appid<2：非捆绑，甄别删除
+            dropped_singletons += 1
             continue
         updated_bundles += 1
         updated_prices += len(regions)
         touched.append(bid)
 
-    # ── 排序快照增量重建（bundles.min_cny_fen/diff_fen/is_lowest）──
     # 写时算好、GET 只读：本轮价格变了哪些包就重建哪些包（按批，允许
     # 秒级短窗口——GET 最多看到旧快照，不会看到「价格新 / 差价旧」的半态）
     if touched:
@@ -605,7 +582,6 @@ async def refresh_bundles() -> dict:
         "failed": failed,
         "droppedSingletons": dropped_singletons,
     }
-    # ── 包内 appid 检测 → app 爬取队列联动 ──
     try:
         enqueued, skipped = await _enqueue_new_bundle_apps()
         result["appsEnqueued"] = enqueued
@@ -703,7 +679,6 @@ async def import_bundle(text: str) -> dict:
         "regionPrices": len(regions),
         "name": (max(regions, key=lambda r: len(r.get("app_ids") or []))).get("name", ""),
     }
-    # 排序快照重建（单包，写时算好、GET 只读）→ 再失效列表缓存
     try:
         await refresh_bundle_sort_cache([bundle_id])
     except Exception:  # noqa: BLE001
@@ -713,10 +688,6 @@ async def import_bundle(text: str) -> dict:
             level=logging.ERROR,
             exc_info=True,
         )
-    # 包内新 appid 即时进 app 爬取队列——后台跑：预检（每轮限量）+ 小批量
-    # 爬取是分钟级长事务，导入交互要求落库后立即回显（与全量刷新的同步
-    # 计数语义不同，失败只记日志不影响导入结果）
-
     async def _enqueue_bg() -> None:
         try:
             enqueued, skipped = await _enqueue_new_bundle_apps()
@@ -809,7 +780,6 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
 
     async with get_session_factory()() as session:
         bundles = (await session.execute(select(Bundle.app_ids))).scalars().all()
-        # 已有 type 的行全部结案（含 game/dlc 已爬与非游戏已标——防重检关键）
         typed = (
             await session.execute(
                 select(Game.appid).where(Game.type.is_not(None))
@@ -842,10 +812,9 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         for appid in candidates:
             app_type, name = await _fetch_app_type(session, appid)
             if app_type is None:
-                probe_failed += 1  # 预检失败：不标不记，下次刷新重试
+                probe_failed += 1
                 continue
             if app_type in _CRAWLABLE_TYPES:
-                # 占位行（updated_at NULL）→ ensure 语义；中文名由爬取回补
                 await db_writer.ensure_game_exists(appid, name)
                 crawl_pairs.append((appid, name))
                 log_event(
@@ -862,7 +831,6 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
                     tag="跳过",
                     detail={"AppID": appid, "名称": name[:30], "类型": app_type},
                 )
-            # appdetails 限速（封面图三级缓存同为 0.3s 间隔）
             await asyncio.sleep(0.3)
     if probe_failed:
         log_event(
@@ -873,15 +841,11 @@ async def _enqueue_new_bundle_apps() -> tuple[int, int]:
         )
 
     if crawl_pairs:
-        # 走「我」页生效区（与手动爬取同口径）；小批量低 worker 直跑
         from app.domains.regions.service import enabled_regions
 
         regions = await enabled_regions()
         if regions:
             try:
-                # 与 crawl 域同一条约束：走**爬取唯一取值口**（池有出口 + 有 lane +
-                # 逐位一致才交出地址），拿不到就**不启动**这次 run——
-                # 绝不退回直连/GLOBAL/旧订阅代理（占位行已落库，本轮未爬）。
                 from app.core.config import get_settings as _get_settings
                 from app.core.database import get_session_factory as _session_factory
                 from app.domains.proxypool.runtime import crawl_lane_plan
