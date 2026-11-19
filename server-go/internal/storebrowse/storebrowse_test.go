@@ -206,7 +206,17 @@ func TestEditionNamesAndLocalizedPriceTails(t *testing.T) {
 			}
 		})
 	}
-	for _, pair := range [][3]string{{"Game：Ultimate Edition", "Game", "Ultimate Edition"}, {"Game (English/Chinese/Japanese)", "Game", ""}, {"Game - 2026", "Game", "2026"}, {"Game <span>¥ 50</span><span>¥ 10</span>", "Game", ""}, {"Other complete edition", "Game", "Complete Edition"}} {
+	for _, pair := range [][3]string{
+		{"Game：Ultimate Edition", "Game", "Ultimate Edition"},
+		{"Game (English/Chinese/Japanese)", "Game", ""},
+		{"Game - 2026", "Game", "2026"},
+		{"Game <span>¥ 50</span><span>¥ 10</span>", "Game", ""},
+		{"Game <span><span>¥ 50</span></span>", "Game", ""},
+		{"Game<br/>Ultimate Edition", "Game", "Ultimate Edition"},
+		{"Game&nbsp;<b>Deluxe</b>&amp;More", "Game", "Deluxe&More"},
+		{"Game <3 Edition", "Game", "<3 Edition"},
+		{"Other complete edition", "Game", "Complete Edition"},
+	} {
 		if got := ExtractVersionSuffix(pair[0], pair[1]); got != pair[2] {
 			t.Fatal(pair, got)
 		}

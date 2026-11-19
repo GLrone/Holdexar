@@ -6,12 +6,11 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"golang.org/x/net/html"
 )
 
 var (
-	spanRE           = regexp.MustCompile(`(?i)<span[^>]*>.*?</span>`)
-	breakRE          = regexp.MustCompile(`(?i)<br\s*/?>`)
-	tagRE            = regexp.MustCompile(`<[^>]+>`)
 	languageTailRE   = regexp.MustCompile(`\s*\([A-Za-z]+(\s*/\s*[A-Za-z]+)+\)\s*$`)
 	currencyRE       = regexp.MustCompile(`(?i)руб\.?|р\.|kr|zł|Kč|Ft|дин|lei|лв|kn|ман\.?|Rp|KD|SR|QR|RM|S/\.?|\$U|CHF|USD|EUR|GBP|RUB|KZT|UAH|TRY|INR|BRL|IDR|JPY|TWD|HKD|SGD|CNY|CLP|COP|PEN|AED|SAR|QAR|KWD|BHD|OMR|JOD|ILS|ZAR|MYR|THB|PHP|VND|NZD|AUD|CAD|DKK|NOK|PLN|SEK|ARS|MXN|UYU|KRW|HUF`)
 	prefixCurrencyRE = regexp.MustCompile(`^[A-Za-z]{1,4}\$|^[A-Za-z]{1,2}[\s\d/]`)
@@ -52,11 +51,40 @@ func priceSegment(s string) bool {
 	return marked && priceDigitsRE.MatchString(cleaned)
 }
 
+func stripOptionHTML(option string) string {
+	if !strings.ContainsAny(option, "<&") {
+		return strings.TrimSpace(strings.ReplaceAll(option, "\u00a0", " "))
+	}
+	doc, err := html.Parse(strings.NewReader(option))
+	if err != nil {
+		return strings.TrimSpace(strings.ReplaceAll(option, "\u00a0", " "))
+	}
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		switch n.Type {
+		case html.TextNode:
+			b.WriteString(n.Data)
+			return
+		case html.ElementNode:
+			switch strings.ToLower(n.Data) {
+			case "span", "script", "style":
+				return
+			case "br":
+				b.WriteByte(' ')
+				return
+			}
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(doc)
+	return strings.TrimSpace(strings.ReplaceAll(b.String(), "\u00a0", " "))
+}
+
 func ExtractVersionSuffix(option, nameEn string) string {
-	cleaned := spanRE.ReplaceAllString(option, "")
-	cleaned = breakRE.ReplaceAllString(cleaned, " ")
-	cleaned = tagRE.ReplaceAllString(cleaned, "")
-	cleaned = strings.TrimSpace(strings.NewReplacer("\u00a0", " ", "&nbsp;", " ").Replace(cleaned))
+	cleaned := stripOptionHTML(option)
 	segments := strings.Split(cleaned, " - ")
 	for i := range segments {
 		segments[i] = strings.TrimSpace(segments[i])
