@@ -1,13 +1,18 @@
 #!/bin/sh
 # Holdexar 推送门禁 —— pre-push（配置：git config core.hooksPath .githooks）
 #
-# 只做全树敏感面检查（秒级）。全量 pytest 不在任何自动路径上：云端 CI 仅
-# 保留 Actions 页手动触发（.github/workflows/ci.yml，workflow_dispatch），
-# 常规验证由开发会话内的靶向测试与真实链路实测承担，发布前手动跑全量。
+# 快速全树敏感面与注释留痕扫描（秒级），全量测试归云端 CI 手动触发。
 
 echo "[pre-push] 敏感面检查（凭据 / 大文件 / 用户数据）..."
 if ! python scripts/check_secrets.py --all; then
   echo "✗ 敏感面检查未通过，推送止步。" >&2
+  exit 1
+fi
+echo "[pre-push] ✓ 通过"
+
+echo "[pre-push] 注释留痕全树检查（禁止开发过程 / 内部文档引用 / 外部溯源）..."
+if ! python scripts/check_dev_traces.py --all; then
+  echo "✗ 注释留痕全树检查未通过，推送止步。" >&2
   exit 1
 fi
 echo "[pre-push] ✓ 通过"

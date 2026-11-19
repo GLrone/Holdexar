@@ -47,6 +47,18 @@ def scan_js(text: str):
     )
 
 
+def scan_go(text: str):
+    return check_dev_traces.scan_comments(
+        "probe.go", check_dev_traces.extract_comments("probe.go", text)
+    )
+
+
+def scan_vue(text: str):
+    return check_dev_traces.scan_comments(
+        "probe.vue", check_dev_traces.extract_comments("probe.vue", text)
+    )
+
+
 # ── 必须命中 ──
 
 
@@ -168,7 +180,29 @@ def test_patterns_are_single_source_for_agents_md():
         "注释内开发日期",
         "外部供应商 / 服务名（溯源字样）",
         "实测性能数据术语",
+        "内部文档悬空引用",
+        "外部平台 / 工具溯源字样",
     }
+
+
+def test_detects_go_comments_even_after_raw_string_backslash():
+    src = 'const root = `E:\\work\\`\n// ' + MEASURED + '：Go 注释必须能抓到\n'
+    assert labels(scan_go(src)) == ["过程叙述（验证 / 决策经过）"]
+
+
+def test_detects_vue_script_comments_despite_template_apostrophe():
+    src = (
+        "<template><p>We don't drop quotes</p></template>\n"
+        "<script setup>\n// " + DECIDED + "：脚本注释不因模板单引号漏扫\n</script>\n"
+    )
+    assert labels(scan_vue(src)) == ["过程叙述（验证 / 决策经过）"]
+
+
+def test_detects_dangling_doc_and_external_platform_refs():
+    doc_ref = "AGENTS" + ".md"
+    assert labels(scan_go(f"// 见 {doc_ref}\n")) == ["内部文档悬空引用"]
+    plat = "小黑" + "盒"
+    assert labels(scan_py(f"# 来自{plat}\n")) == ["外部平台 / 工具溯源字样"]
 
 
 def test_allow_entries_carry_reason():
