@@ -72,6 +72,17 @@ def test_detects_github_token():
     assert labels(scan_one(line)) == ["GitHub 令牌"]
 
 
+def test_detects_external_platform_signature_patterns():
+    host = "https://api." + "xiaoheihe" + ".cn/game/history"
+    assert labels(scan_one(f'_HOST = "{host}"')) == ["外部平台接口域名"]
+    ident = '"' + "hey" + 'box"'
+    assert labels(scan_one(f'"app": {ident}')) == ["外部平台标识 / 防重放请求头"]
+    fn_hdr = "def " + "_h" + "key(path):"
+    assert labels(scan_one(fn_hdr)) == ["外部平台签名算法 / 密钥常量"]
+    charset = "AB45STUVWZEFGJ6CH01D" + "237IXYPQRKLMN89"
+    assert labels(scan_one(f'_CHARSET = "{charset}"')) == ["外部平台签名算法 / 密钥常量"]
+
+
 # ── 内容层：必须放过（每条都对应一个真实文件形态）──
 
 
@@ -127,6 +138,9 @@ def test_allows_bare_identifier_and_placeholder_mentions(line):
         "backup/creds.pem",
         ".env.local",
         "mail.ini",
+        "server/app/crawler/" + "community_" + "history.py",
+        "server/tests/" + "test_community_" + "history.py",
+        "server/scripts/" + "hey" + "box_monitor.py",
     ],
 )
 def test_path_deny_matches(path):

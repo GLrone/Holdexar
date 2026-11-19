@@ -14,8 +14,7 @@ SQLite 单写者约束下，应用与维护脚本写事务必须位于共享写�
 - 复合形态：write_gate 与 get_session_factory 同 with 复合 → FAIL（闸内新建
   会话必须走 write_session：事务起点显式取写锁；write_session 自身定义豁免）。
 - 豁免：调用点在闸内、本体是线程池同步函数或迁移机制等无法词法表达的形态，
-  逐条登记在 ALLOW（文件 + 函数 + 理由）；登记是豁免生效的前置条件，
-  与 docs/agent-context/CONSTRAINTS.md §八例外登记表同则。
+  逐条登记在 ALLOW（文件 + 函数 + 理由）；登记是豁免生效的前置条件。
 
 用法：`python scripts/check_write_paths.py`（全量扫描，pre-commit 调用）；
 `--verbose` 额外打印 PASS 明细。FAIL 存在时 exit 1。

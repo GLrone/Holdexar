@@ -42,6 +42,9 @@ PATH_DENY: list[tuple[str, str]] = [
     (r"(?:^|/)mail\.ini$", "邮件配置（含 SMTP 授权码）"),
     # secrets/ 作为目录名在业务代码里没有合法用途，故不锚定根。
     (r"(?:^|/)secrets(?:/|$)", "凭据目录"),
+    (r"(?:^|/)server/app/crawler/community_history\.py$", "已移除的外部社区历史采集模块"),
+    (r"(?:^|/)server/tests/test_community_history\.py$", "已移除的外部社区历史采集测试"),
+    (r"(?:^|/)server/scripts/(?:test_)?hey.*box.*", "外部平台本机脚本（禁止入库）"),
 ]
 
 # ── 内容层：只匹配「真实凭据的形状」，匹配到的值一律掩码输出 ──
@@ -65,6 +68,12 @@ CONTENT_PATTERNS: list[tuple[str, str]] = [
     (r"postgres(?:ql)?://[A-Za-z0-9._-]+:[!-~]{8,}@", "含密码的数据库连接串"),
     (r"\bgh[pousr]_[A-Za-z0-9]{36}\b", "GitHub 令牌"),
     (r"\bsk-[A-Za-z0-9]{20,}\b", "API 密钥"),
+    (r"https?://[^/\s]*x[i]aoheihe\.cn", "外部平台接口域名"),
+    (r"""["']hey[b]ox(?:_website)?["']|hey[b]ox_id|hey[b]ox-rnd""", "外部平台标识 / 防重放请求头"),
+    (
+        r"\bdef\s+_[h]key\b|[A]B45STUVWZEFGJ6CH01D237IXYPQRKLMN89|[H]FFSTsqmvG3uGxPNXDQW|[Z]7mFG4tQp9Ws2LxB8H",
+        "外部平台签名算法 / 密钥常量",
+    ),
 ]
 
 _COMPILED_PATHS = [(re.compile(p), label) for p, label in PATH_DENY]

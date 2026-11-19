@@ -38,10 +38,14 @@ TRACE_PATTERNS: list[tuple[str, str]] = [
     (r"^[ \t]*(?:[*/<>!\-#\"'\u201c\u201d·•][ \t]*){0,6}为什么", "问答式开发论证"),
     (r"背景[：:]|动机[：:]", "开发背景叙述"),
     (r"我们", "第一人称叙述"),
-    (r"20\d{2}-\d{2}-\d{2}", "注释内开发日期"),
+    (r"20\d{2}-\d{2}-\d{2}|202\d-(?:0[1-9]|1[0-2])(?=\s|[^\d-])", "注释内开发日期"),
     (r"云知声|u2-?flash|书生|智谱|硅基|bigmodel|siliconflow|moonshot|dashscope|deepseek|openrouter|通义|月之暗面|kimi",
      "外部供应商 / 服务名（溯源字样）"),
     (r"TTFT|首\s?token", "实测性能数据术语"),
+    (r"AGENTS\.md|DEV_LOG|CURRENT_STATE\.md|CONSTRAINTS\.md|docs/(?:agent-context|dev-log|analysis|audit|plans|reviews)|learnings/",
+     "内部文档悬空引用"),
+    (r"(?i)\b(?:heybox|xiaoheihe|astrbot|magpie|dsh|zcode)\b|小黑盒",
+     "外部平台 / 工具溯源字样"),
 ]
 
 # 例外登记：文件 → [(正则, 理由)]。命中行的注释文本匹配该正则即放行。
@@ -65,12 +69,12 @@ ALLOW: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-# ── 文件分类：注释形态决定提取器 ──
 PY_LIKE = {".py", ".spec"}
-C_LIKE = {".js", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".css", ".scss", ".html", ".htm"}
+C_LIKE = {".js", ".mjs", ".cjs", ".ts", ".tsx", ".css", ".scss", ".html", ".htm", ".go", ".rs"}
+RAW_BACKTICK_SUFFIXES = {".go"}
 HASH_LIKE = {".sh", ".ps1"}
 BAT_LIKE = {".bat", ".cmd"}
-SCANNABLE = PY_LIKE | C_LIKE | HASH_LIKE | BAT_LIKE
+SCANNABLE = PY_LIKE | C_LIKE | {".vue"} | HASH_LIKE | BAT_LIKE
 
 _COMPILED_TRACES = [(re.compile(p), label) for p, label in TRACE_PATTERNS]
 _COMPILED_ALLOW = {
@@ -79,8 +83,6 @@ _COMPILED_ALLOW = {
 }
 
 
-# ── 注释提取：返回 [(行号, 注释文本)]；字符串字面量一律不收 ──
-
 def _py_comments(text: str) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     try:
@@ -88,7 +90,6 @@ def _py_comments(text: str) -> list[tuple[int, str]]:
             if tok.type == tokenize.COMMENT:
                 out.append((tok.start[0], tok.string))
     except tokenize.TokenError:
-        # 语法不完整时退化为逐行前缀判定， # 注释仍可收
         out.extend(
             (i, line) for i, line in enumerate(text.splitlines(), 1)
             if line.lstrip().startswith("#")
@@ -119,7 +120,7 @@ def _py_docstrings(text: str) -> list[tuple[int, str]]:
     return out
 
 
-def _c_like_comments(text: str) -> list[tuple[int, str]]:
+def _c_like_comments(text: str, raw_backtick: bool = False) -> list[tuple[int, str]]:
     """状态机提取 // /* */ <!-- -->；字符串与模板串内容跳过。
 
     `//` 前一字符为 `:` 时不算注释头（URL 的 `https://`）；跨行块注释按行
@@ -191,13 +192,12 @@ def _c_like_comments(text: str) -> list[tuple[int, str]]:
             i += 1
             continue
 
-        # 字符串态：跳过内容（含模板串），不把其中的 // 或 /* 当注释
         if ch == "\n":
             line += 1
             prev = ""
             i += 1
             continue
-        if ch == "\\":
+        if ch == "\\" and not (state == "t_quote" and raw_backtick):
             i += 2
             continue
         if (state == "s_quote" and ch == "'") or (
@@ -207,7 +207,37 @@ def _c_like_comments(text: str) -> list[tuple[int, str]]:
             prev = ch
         i += 1
 
-    flush()  # EOF：未闭合注释（截断文件）也收
+    flush()
+    return out
+
+
+_VUE_BLOCK_RE = re.compile(r"<(script|style)\b[^>]*>([\s\S]*?)</\1>", re.IGNORECASE)
+_HTML_COMMENT_RE = re.compile(r"<!--([\s\S]*?)-->")
+
+
+def _vue_comments(text: str) -> list[tuple[int, str]]:
+    """Vue 单文件组件：template 只抽 <!-- -->（避开英文单引号误入串态），script/style 走 JS/CSS 提取。"""
+    out: list[tuple[int, str]] = []
+    pos = 0
+    for m in _VUE_BLOCK_RE.finditer(text):
+        outside = text[pos:m.start()]
+        out_base = text[:pos].count("\n")
+        for hm in _HTML_COMMENT_RE.finditer(outside):
+            start_ln = out_base + outside[:hm.start()].count("\n") + 1
+            for idx, part in enumerate(hm.group(1).split("\n")):
+                out.append((start_ln + idx, part))
+        body_start = m.start(2)
+        body_offset = text[:body_start].count("\n")
+        for rel_ln, cmt in _c_like_comments(m.group(2)):
+            out.append((body_offset + rel_ln, cmt))
+        pos = m.end()
+    tail = text[pos:]
+    tail_base = text[:pos].count("\n")
+    for hm in _HTML_COMMENT_RE.finditer(tail):
+        start_ln = tail_base + tail[:hm.start()].count("\n") + 1
+        for idx, part in enumerate(hm.group(1).split("\n")):
+            out.append((start_ln + idx, part))
+    out.sort(key=lambda item: item[0])
     return out
 
 
@@ -228,20 +258,27 @@ def _bat_comments(text: str) -> list[tuple[int, str]]:
     return out
 
 
+def _is_scannable(path: str) -> bool:
+    p = PurePosixPath(path)
+    return p.suffix.lower() in SCANNABLE or p.parts[:1] == (".githooks",)
+
+
 def extract_comments(path: str, text: str) -> list[tuple[int, str]]:
-    suffix = PurePosixPath(path).suffix.lower()
+    p = PurePosixPath(path)
+    suffix = p.suffix.lower()
     if suffix in PY_LIKE:
         return _py_comments(text) + _py_docstrings(text)
+    if suffix == ".vue":
+        return _vue_comments(text)
     if suffix in C_LIKE:
-        return _c_like_comments(text)
-    if suffix in HASH_LIKE:
+        return _c_like_comments(text, raw_backtick=suffix in RAW_BACKTICK_SUFFIXES)
+    if suffix in HASH_LIKE or p.parts[:1] == (".githooks",):
         return _hash_comments(text)
     if suffix in BAT_LIKE:
         return _bat_comments(text)
     return []
 
 
-# ── 扫描 ──
 
 class Finding:
     __slots__ = ("path", "label", "detail")
@@ -267,11 +304,10 @@ def scan_comments(path: str, comments: list[tuple[int, str]]) -> list[Finding]:
             findings.append(
                 Finding(path, label, f"第 {lineno} 行「{match.group(0)}」：{snippet}")
             )
-            break  # 一行只报第一条
+            break
     return findings
 
 
-# ── 范围解析 ──
 
 def _run_git(*args: str) -> str:
     proc = subprocess.run(
@@ -304,7 +340,7 @@ def staged_check() -> tuple[list[Finding], list[str]]:
     findings: list[Finding] = []
     checked = []
     for path in files:
-        if PurePosixPath(path).suffix.lower() not in SCANNABLE:
+        if not _is_scannable(path):
             continue
         blob = _run_git("show", f":{path}")
         comments = extract_comments(path, blob)
@@ -321,7 +357,7 @@ def explicit(paths: list[str]) -> tuple[list[Finding], list[str]]:
     for path in paths:
         rel = str(Path(path).resolve().relative_to(ROOT)) if Path(path).is_absolute() else path
         full = Path(path) if Path(path).is_absolute() else ROOT / path
-        if PurePosixPath(rel).suffix.lower() not in SCANNABLE or not full.is_file():
+        if not _is_scannable(rel) or not full.is_file():
             continue
         try:
             text = full.read_text(encoding="utf-8")
@@ -342,7 +378,7 @@ def whole_tree() -> tuple[list[Finding], list[str]]:
     findings: list[Finding] = []
     scanned = 0
     for path in files:
-        if PurePosixPath(path).suffix.lower() not in SCANNABLE:
+        if not _is_scannable(path):
             continue
         full = ROOT / path
         try:
