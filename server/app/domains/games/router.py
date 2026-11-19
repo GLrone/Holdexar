@@ -148,13 +148,8 @@ async def game_history_backfill(
     appid: int,
     region: str = Query("cn", max_length=5),
 ):
-    """派发一次社区历史源回填（同键在飞直接返回运行态，不重复派发）。
-
-    只改历史事实与同步状态，不动价格事件/告警管线；派发后由前端轮询
-    本地只读的 /history 拿新点。"""
-    from app.crawler.community_history import start_backfill
-
-    return await start_backfill(appid, region)
+    """触发外部社区历史源回填（需另装对应数据源插件）。"""
+    raise HTTPException(status_code=409, detail="社区历史数据源未安装")
 
 
 @router.get("/{appid}/price-context")

@@ -451,3 +451,48 @@ async def test_price_context_excludes_unknown_product_rows():
 
     ctx_with = await service.get_price_context(APPID, day, region="cn")
     assert ctx_with["lowest"] == ctx_without["lowest"]  # 未知行不拉低史低
+
+
+
+@pytest.mark.asyncio
+async def test_backfill_brief_reads_state_and_defaults_idle():
+    """无回填记录时默认 idle，有记录时按时间戳先后投影 ok / empty / error。"""
+    from app.domains.games.models import HistoryBackfillState
+
+    idle = await service._history_backfill_brief(APPID, "cn")
+    assert idle == {"state": "idle", "lastOkAt": None, "lastError": None}
+
+    t1 = datetime(2026, 6, 1, 12, 0, 0)
+    t2 = datetime(2026, 6, 2, 12, 0, 0)
+    async with get_session_factory()() as session:
+        session.add_all([
+            HistoryBackfillState(appid=APPID, region_code="CN", last_ok_at=t1),
+            HistoryBackfillState(appid=APPID, region_code="US", last_ok_at=t1, last_empty_at=t2),
+            HistoryBackfillState(
+                appid=APPID, region_code="JP", last_ok_at=t1, last_error_at=t2, last_error="boom"
+            ),
+        ])
+        await session.commit()
+    try:
+        assert (await service._history_backfill_brief(APPID, "cn"))["state"] == "ok"
+        assert (await service._history_backfill_brief(APPID, "us"))["state"] == "empty"
+        jp = await service._history_backfill_brief(APPID, "jp")
+        assert jp["state"] == "error" and jp["lastError"] == "boom"
+    finally:
+        async with get_session_factory()() as session:
+            await session.execute(
+                delete(HistoryBackfillState).where(HistoryBackfillState.appid == APPID)
+            )
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_backfill_endpoint_returns_409_when_unavailable():
+    """未安装社区历史数据源时回填入口返回 409，而非 500。"""
+    from fastapi import HTTPException
+    from app.domains.games.router import game_history_backfill
+
+    with pytest.raises(HTTPException) as exc:
+        await game_history_backfill(APPID, region="cn")
+    assert exc.value.status_code == 409
+    assert "未安装" in exc.value.detail

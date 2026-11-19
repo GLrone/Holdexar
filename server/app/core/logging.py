@@ -187,7 +187,6 @@ _MODULE_LABELS = {
     "app.crawler.browse_store": "爬取·商店页",
     "app.crawler.epic_free": "爬取·Epic 免费",
     "app.crawler.db_writer": "爬取·入库",
-    "app.crawler.community_history": "历史价格",
     "app.crawler.network_check": "爬取·网络自检",
     "app.crawler.rate_limit": "爬取·出网限流",
     "app.crawler.http_client": "爬取·HTTP 客户端",
