@@ -1,7 +1,5 @@
 //go:build windows
 
-// 进程句柄权限位的内核级测试：openProcessHandle 必须带等待+读退出码+终止三权限，
-// 否则退出码读取与超时强杀兜底静默失败（历史缺陷：只申请 SYNCHRONIZE）。
 package main
 
 import (
@@ -10,7 +8,6 @@ import (
 	"time"
 )
 
-// TestOpenProcessHandleTerminate 句柄必须能真实终止进程（PROCESS_TERMINATE 生效）。
 func TestOpenProcessHandleTerminate(t *testing.T) {
 	cmd := exec.Command("cmd", "/c", "ping", "-n", "30", "127.0.0.1")
 	if err := cmd.Start(); err != nil {
@@ -33,8 +30,7 @@ func TestOpenProcessHandleTerminate(t *testing.T) {
 	}
 }
 
-// TestPidExitCode 读退出码必须真实（PROCESS_QUERY_LIMITED_INFORMATION 生效）：
-// 先自持句柄再等待退出，进程对象保持可打开（真实用法都在存活期先开句柄）。
+// 先在存活期持句柄防进程对象提前销毁，再读退出码。
 func TestPidExitCode(t *testing.T) {
 	cmd := exec.Command("cmd", "/c", "exit", "7")
 	if err := cmd.Start(); err != nil {

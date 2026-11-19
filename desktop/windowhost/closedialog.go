@@ -1,7 +1,5 @@
 //go:build windows
 
-// 关窗意图弹窗：无边框自绘模态窗，二选一（最小化到托盘 / 退出程序），
-// 几何、配色、动效与页面幕布对齐原界面；问不出意图一律降级 minimize。
 package main
 
 import (
@@ -16,7 +14,7 @@ const (
 	dialogHeight = 240
 	cornerRadius = 12
 	animTickMS   = 15
-	animSteps    = 11 // 170ms/15ms
+	animSteps    = 11
 	animRise     = 16
 
 	closeRectLeft = 466
@@ -93,8 +91,8 @@ type closeDialog struct {
 	fontBody   uintptr
 	fontButton uintptr
 
-	hover      int  // 0 无 1 最小化 2 退出 3 关闭键
-	trackArmed bool // WM_MOUSELEAVE 一次性送达，重进客户区须重新挂 TrackMouseEvent
+	hover      int // 0 无 1 最小化 2 退出 3 关闭键
+	trackArmed bool
 	animIn     bool
 	animating  bool
 	step       int
@@ -139,12 +137,20 @@ func askCloseIntent(a *app) string {
 	return intent
 }
 
+func ownerAnchorable(hwnd uintptr) bool {
+	return hwnd != 0 && call(procIsWindowVisible, hwnd) != 0 && call(procIsIconic, hwnd) == 0
+}
+
 func (a *app) showCloseDialog() string {
 	theme := darkTheme()
 	if value, ok := a.theme.Load().(string); ok && value == "light" {
 		theme = lightTheme()
 	}
-	dialog := &closeDialog{owner: a.hwnd, app: a, theme: theme}
+	owner := a.hwnd
+	if !ownerAnchorable(owner) {
+		owner = 0
+	}
+	dialog := &closeDialog{owner: owner, app: a, theme: theme}
 	dialog.logo = a.loadDialogLogo(theme.logoFile)
 	dialog.fontTitle = makeFont(15, true)
 	dialog.fontHead = makeFont(17, true)
@@ -167,6 +173,12 @@ func (a *app) showCloseDialog() string {
 
 func (a *app) loadDialogLogo(name string) uintptr {
 	candidates := []string{}
+	if a.cfg.versionDir != "" {
+		candidates = append(candidates,
+			filePath(a.cfg.versionDir, "web", "dist", "assets", name),
+			filePath(a.cfg.versionDir, "assets", name),
+		)
+	}
 	if a.cfg.installRoot != "" {
 		candidates = append(candidates,
 			filePath(a.cfg.installRoot, "web", "public", "assets", name),
@@ -196,7 +208,6 @@ func makeFont(px int, bold bool) uintptr {
 		0, 0, clipCharacterPrecision, 0, defaultQuality, utf16Ptr("Microsoft YaHei UI"))
 }
 
-// runModal 模态运行：停用属主窗口，自持消息泵直到拿到意图。
 func (d *closeDialog) runModal() string {
 	d.result = "minimize"
 	registerDialogClass()
@@ -212,8 +223,10 @@ func (d *closeDialog) runModal() string {
 		call(procSetWindowRgn, d.hwnd, region, 1)
 	}
 	d.positionOverOwner()
-	call(procEnableWindow, d.owner, 0)
-	defer call(procEnableWindow, d.owner, 1)
+	if d.owner != 0 {
+		call(procEnableWindow, d.owner, 0)
+		defer call(procEnableWindow, d.owner, 1)
+	}
 	call(procSetForegroundWindow, d.hwnd)
 	call(procSetFocus, d.hwnd)
 
@@ -247,15 +260,25 @@ func (d *closeDialog) runModal() string {
 	return d.result
 }
 
+func centeredInRect(bounds rect, width, height int32) (int32, int32) {
+	return bounds.Left + ((bounds.Right-bounds.Left)-width)/2,
+		bounds.Top + ((bounds.Bottom-bounds.Top)-height)/2
+}
+
 func (d *closeDialog) positionOverOwner() {
 	var ownerRect rect
-	if d.owner == 0 || call(procGetWindowRect, d.owner, uintptr(unsafe.Pointer(&ownerRect))) == 0 {
-		call(procSetWindowPos, d.hwnd, 0, 0x8000, 0x8000, 0, 0, swpNoSize|swpNoZOrder)
+	var x, y int32
+	if !ownerAnchorable(d.owner) || call(procGetWindowRect, d.owner, uintptr(unsafe.Pointer(&ownerRect))) == 0 {
+		mon := call(procMonitorFromWindow, d.hwnd, monitorDefaultToNearest)
+		var mi monitorInfo
+		mi.Size = uint32(unsafe.Sizeof(mi))
+		if mon != 0 && call(procGetMonitorInfoW, mon, uintptr(unsafe.Pointer(&mi))) != 0 {
+			x, y = centeredInRect(mi.Work, dialogWidth, dialogHeight)
+		}
 	} else {
-		x := ownerRect.Left + ((ownerRect.Right-ownerRect.Left)-dialogWidth)/2
-		y := ownerRect.Top + ((ownerRect.Bottom-ownerRect.Top)-dialogHeight)/2
-		call(procSetWindowPos, d.hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder)
+		x, y = centeredInRect(ownerRect, dialogWidth, dialogHeight)
 	}
+	call(procSetWindowPos, d.hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder)
 	var self rect
 	if call(procGetWindowRect, d.hwnd, uintptr(unsafe.Pointer(&self))) != 0 {
 		d.baseX, d.baseY = self.Left, self.Top
@@ -266,10 +289,14 @@ func registerDialogClass() {
 	if dialogClassRegistered {
 		return
 	}
+	var instance syscall.Handle
+	if cur := activeApp.Load(); cur != nil {
+		instance = cur.instance
+	}
 	wc := wndClassEx{
 		Size:       uint32(unsafe.Sizeof(wndClassEx{})),
 		WndProc:    syscall.NewCallback(dialogProc),
-		Instance:   activeApp.Load().instance,
+		Instance:   instance,
 		Background: call(procCreateSolidBrush, uintptr(darkTheme().bg)),
 		ClassName:  utf16Ptr(dialogClassName),
 	}
@@ -288,7 +315,7 @@ func dialogProc(hwnd uintptr, message uint32, wParam uintptr, lParam uintptr) ui
 		inClose := client.X >= closeRectLeft && client.X <= closeRectLeft+closeRectSize &&
 			client.Y >= closeRectTop && client.Y <= closeRectTop+closeRectSize
 		if client.Y < 56 && !inClose {
-			return htCaption // 顶部条系统拖动
+			return htCaption
 		}
 		return htClient
 	case wmTimer:
@@ -311,7 +338,7 @@ func dialogProc(hwnd uintptr, message uint32, wParam uintptr, lParam uintptr) ui
 	case wmKeyDown:
 		switch wParam {
 		case vkReturn:
-			d.choose("minimize") // 回车交给安全侧
+			d.choose("minimize")
 		case vkEscape:
 			d.choose("stay")
 		}
@@ -347,7 +374,6 @@ func (d *closeDialog) updateHover(x, y int32) {
 	d.setHover(d.hitTest(x, y))
 }
 
-// eventTrack 官方 TRACKMOUSEEVENT 布局。
 type eventTrack struct {
 	Size      uint32
 	Flags     uint32
@@ -355,8 +381,7 @@ type eventTrack struct {
 	HoverTime uint32
 }
 
-// armMouseLeave 悬停高亮依赖 WM_MOUSELEAVE 清态，而该消息只在挂了
-// TrackMouseEvent 时送达一次——每次重进客户区都要重新挂。
+// armMouseLeave 每次重进客户区须重挂 TrackMouseEvent，WM_MOUSELEAVE 仅送达一次。
 func (d *closeDialog) armMouseLeave() {
 	if d.trackArmed {
 		return
@@ -404,13 +429,13 @@ func (d *closeDialog) tickAnimation() {
 	if t > 1 {
 		t = 1
 	}
-	k := t * t * (3 - 2*t) // smoothstep，近似网页 --ease-inout
+	k := t * t * (3 - 2*t)
 	var offset int32
 	var alpha uintptr
-	if d.animating { // 出场：下沉淡出
+	if d.animating {
 		offset = int32(float32(animRise) * k)
 		alpha = uintptr(255 * (1 - k))
-	} else { // 入场：自下方浮起淡入
+	} else {
 		offset = int32(float32(animRise) * (1 - k))
 		alpha = uintptr(255 * k)
 	}
@@ -439,7 +464,7 @@ func (d *closeDialog) paint() {
 	borderPen := call(procCreatePen, psSolid, 1, uintptr(d.theme.border))
 	oldBrush := call(procSelectObject, hdc, bgBrush)
 	oldPen := call(procSelectObject, hdc, borderPen)
-	call(procRectangleGdi, hdc, 0, 0, dialogWidth, dialogHeight) // 底色 + 1px 描边
+	call(procRectangleGdi, hdc, 0, 0, dialogWidth, dialogHeight)
 	call(procSelectObject, hdc, oldPen)
 	call(procSelectObject, hdc, oldBrush)
 	call(procDeleteObject, borderPen)
@@ -447,7 +472,6 @@ func (d *closeDialog) paint() {
 
 	call(procSetBkMode, hdc, 1) // TRANSPARENT
 
-	// 标题栏：logo + 标题
 	if d.logo != 0 {
 		call(procDrawIconEx, hdc, 22, 16, d.logo, 20, 20, 0, 0, 0x3)
 	}
@@ -456,7 +480,6 @@ func (d *closeDialog) paint() {
 	drawText(hdc, "关闭 "+appBrandName(), 52, 15, 372, 39, dtSingleLine|dtVCenter|dtNoprefix)
 	call(procSelectObject, hdc, titleFont)
 
-	// 正文
 	headFont := call(procSelectObject, hdc, d.fontHead)
 	call(procSetTextColor, hdc, uintptr(d.theme.head))
 	drawText(hdc, "要如何关闭 "+appBrandName()+"？", 28, 74, 492, 102, dtSingleLine|dtVCenter|dtNoprefix)
@@ -465,7 +488,6 @@ func (d *closeDialog) paint() {
 	drawText(hdc, "最小化到托盘后，应用仍在后台继续更新数据。", 28, 110, 492, 132, dtSingleLine|dtVCenter|dtNoprefix)
 	call(procSelectObject, hdc, headFont)
 
-	// 关闭键：悬停圆底 + 双斜线（画在右上角关闭键矩形内，与命中区同坐标）
 	closeHover := d.hover == 3
 	if closeHover {
 		brush := call(procCreateSolidBrush, uintptr(d.theme.closeHoverBG))
@@ -487,7 +509,6 @@ func (d *closeDialog) paint() {
 	call(procSelectObject, hdc, xOldPen)
 	call(procDeleteObject, pen)
 
-	// 双按钮：圆角纯色双色（两色分工动作性质）
 	d.drawButton(hdc, btnX0, "最小化", d.hover == 1, d.theme.accentFill, d.theme.accentHover, d.theme.onFill)
 	d.drawButton(hdc, btnX0+btnWidth+btnGap, "退出程序", d.hover == 2, d.theme.dangerFill, d.theme.dangerHover, d.theme.onDanger)
 }
@@ -500,7 +521,7 @@ func (d *closeDialog) drawButton(hdc uintptr, x int32, text string, hovered bool
 	brush := call(procCreateSolidBrush, uintptr(color))
 	oldBrush := call(procSelectObject, hdc, brush)
 	oldPen := call(procSelectObject, hdc, call(procGetStockObject, 8))
-	call(procRoundRect, hdc, uintptr(x), uintptr(btnY), uintptr(x+btnWidth), uintptr(btnY+btnHeight), 18, 18) // 圆角半径 9
+	call(procRoundRect, hdc, uintptr(x), uintptr(btnY), uintptr(x+btnWidth), uintptr(btnY+btnHeight), 18, 18)
 	call(procSelectObject, hdc, oldPen)
 	call(procSelectObject, hdc, oldBrush)
 	call(procDeleteObject, brush)

@@ -1,18 +1,17 @@
 //go:build windows
 
-// layout.go 安装目录状态账本：state/current.json、state/transaction.json、
-// 数据相容记录与版本目录 helpers。语义对齐 app/core/layout.py 与根启动器。
 package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
+
+	"holdexar/hostkit"
 )
 
 const (
@@ -40,38 +39,12 @@ func fileExists(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// isManagedVersionName 版本目录名合法性（对齐启动器：首字符数字或 legacy_version）。
 func isManagedVersionName(name string) bool {
-	text := name
-	if text == "" || text == "." || text == ".." {
-		return false
-	}
-	if strings.TrimSpace(text) != text || strings.HasSuffix(text, ".") {
-		return false
-	}
-	if strings.ContainsAny(text, `/\:`) {
-		return false
-	}
-	switch strings.ToLower(text) {
-	case "data", "holdexar", "app", "logs", "updater", "state", "versions",
-		"update-staging", "_internal", "__old__", "__legacy__", "cache", "temp", "tmp":
-		return false
-	}
-	if text == "legacy_version" {
-		return true
-	}
-	return text[0] >= '0' && text[0] <= '9'
+	return hostkit.IsManagedVersionName(name)
 }
 
 func versionDir(root, version string) (string, error) {
-	if !isManagedVersionName(version) {
-		return "", errors.New("版本目录名称无效")
-	}
-	target := filepath.Join(root, versionsDir, version)
-	if !trustedPath(target) {
-		return "", errors.New("版本目录超出受管安装位置")
-	}
-	return target, nil
+	return hostkit.VersionDir(root, version)
 }
 
 func getVersionDir(root, version string) string {
@@ -88,50 +61,12 @@ func getVersionExe(root, version string) (string, error) {
 }
 
 func isVersionValid(root, version string) bool {
-	if !isManagedVersionName(version) {
-		return false
-	}
-	dir, err := versionDir(root, version)
-	if err != nil {
-		return false
-	}
-	info, err := os.Stat(dir)
-	if err != nil || !info.IsDir() {
-		return false
-	}
-	exe := filepath.Join(dir, appName+".exe")
-	if !fileExists(exe) {
-		return false
-	}
-	internal := filepath.Join(dir, "_internal")
-	if resolved, err := filepath.EvalSymlinks(internal); err == nil {
-		dirResolved, err2 := filepath.EvalSymlinks(dir)
-		if err2 != nil || !strings.EqualFold(resolved, dirResolved+string(os.PathSeparator)+"_internal") {
-			return false
-		}
-		entries, err := os.ReadDir(internal)
-		if err != nil || len(entries) == 0 {
-			return false
-		}
-	}
-	return true
+	return hostkit.IsVersionValid(root, version)
 }
 
 func listInstalledVersions(root string) []string {
-	entries, err := os.ReadDir(filepath.Join(root, versionsDir))
-	if err != nil {
-		return nil
-	}
-	var found []string
-	for _, entry := range entries {
-		if entry.IsDir() && isVersionValid(root, entry.Name()) {
-			found = append(found, entry.Name())
-		}
-	}
-	return found
+	return hostkit.ListInstalledVersions(root)
 }
-
-// ───────────────────────── state/current.json ─────────────────────────
 
 func readCurrentState(root string) (map[string]any, error) {
 	raw, err := os.ReadFile(filepath.Join(root, stateDirName, currentStateFile))
@@ -156,7 +91,6 @@ func stateString(state map[string]any, key string) string {
 	return value
 }
 
-// writeCurrentState 原子落盘指向记录；extra 携带 previousVersion/pendingVersion/attemptId。
 func writeCurrentState(root, version string, lastKnownGood string, extra map[string]any) error {
 	previous, _ := readCurrentState(root)
 	payload := map[string]any{}
@@ -184,7 +118,6 @@ func writeCurrentState(root, version string, lastKnownGood string, extra map[str
 	return atomicJSON(filepath.Join(stateDir, currentStateFile), payload)
 }
 
-// confirmVersion 指针回正补齐「已验收」事实：清 pendingVersion、lastKnownGood 指源版本。
 func confirmVersion(root, version string) error {
 	state, _ := readCurrentState(root)
 	if state == nil {
@@ -201,7 +134,6 @@ func confirmVersion(root, version string) error {
 	return atomicJSON(filepath.Join(root, stateDirName, currentStateFile), state)
 }
 
-// abortVersion 撤下未通过验收的版本，指针交还 lastKnownGood/previousVersion。
 func abortVersion(root, attempted string) bool {
 	state, _ := readCurrentState(root)
 	fallback := ""
@@ -225,8 +157,6 @@ func abortVersion(root, attempted string) bool {
 	os.RemoveAll(getVersionDir(root, attempted))
 	return true
 }
-
-// ───────────────────────── state/transaction.json ─────────────────────────
 
 func readTransaction(root string) map[string]any {
 	raw, err := os.ReadFile(filepath.Join(root, stateDirName, transactionF))
@@ -287,13 +217,10 @@ func updateTransaction(root, stage string, kwargs map[string]any) error {
 	return atomicJSON(filepath.Join(root, stateDirName, transactionF), tx)
 }
 
-// clearTransaction 事务终态清场：提交与恢复收尾后指针与相容记录已落 current.json，
-// 事务档案使命结束（缺失即无事务，不报错）。
+// clearTransaction 终态清场；缺失不报错。
 func clearTransaction(root string) {
 	_ = os.Remove(filepath.Join(root, stateDirName, transactionF))
 }
-
-// ───────────────────────── 数据相容记录 ─────────────────────────
 
 func readDataCompatibility(root string) (map[string]any, error) {
 	state, err := readCurrentState(root)
@@ -323,8 +250,6 @@ func writeDataCompatibility(root string, compatibility map[string]any) error {
 	return atomicJSON(filepath.Join(root, stateDirName, currentStateFile), state)
 }
 
-// ───────────────────────── 版本维护 ─────────────────────────
-
 func confirmablePrune(root string, minKeep int) []string {
 	all := listInstalledVersions(root)
 	state, _ := readCurrentState(root)
@@ -334,13 +259,13 @@ func confirmablePrune(root string, minKeep int) []string {
 	}
 	delete(protected, "")
 	if len(protected) < minKeep && len(all) > 0 {
-		sort.Slice(all, func(i, j int) bool {
-			first, _ := os.Stat(getVersionDir(root, all[i]))
-			second, _ := os.Stat(getVersionDir(root, all[j]))
+		slices.SortFunc(all, func(a, b string) int {
+			first, _ := os.Stat(getVersionDir(root, a))
+			second, _ := os.Stat(getVersionDir(root, b))
 			if first == nil || second == nil {
-				return false
+				return 0
 			}
-			return first.ModTime().After(second.ModTime())
+			return second.ModTime().Compare(first.ModTime())
 		})
 		for _, version := range all {
 			if len(protected) >= minKeep {

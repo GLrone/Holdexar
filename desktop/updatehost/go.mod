@@ -4,8 +4,11 @@ go 1.27.0
 
 require (
 	golang.org/x/sys v0.49.0
+	holdexar/hostkit v0.0.0
 	modernc.org/sqlite v1.61.0
 )
+
+replace holdexar/hostkit => ../../shared/hostkit
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect

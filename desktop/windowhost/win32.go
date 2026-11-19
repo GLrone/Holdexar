@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"holdexar/hostkit"
 )
 
 var (
@@ -71,15 +72,14 @@ var (
 	procShellNotifyIconW       = modShell32.NewProc("Shell_NotifyIconW")
 	procExtractAssociatedIconW = modShell32.NewProc("ExtractAssociatedIconW")
 
-	procOpenProcess               = modKernel32.NewProc("OpenProcess")
-	procWaitForSingleObject       = modKernel32.NewProc("WaitForSingleObject")
-	procGetExitCodeProcess        = modKernel32.NewProc("GetExitCodeProcess")
-	procTerminateProcess          = modKernel32.NewProc("TerminateProcess")
-	procCloseHandle               = modKernel32.NewProc("CloseHandle")
-	procOpenMutexW                = modKernel32.NewProc("OpenMutexW")
-	procReleaseMutex              = modKernel32.NewProc("ReleaseMutex")
-	procCreateFileW               = modKernel32.NewProc("CreateFileW")
-	procGetFinalPathNameByHandleW = modKernel32.NewProc("GetFinalPathNameByHandleW")
+	procOpenProcess         = modKernel32.NewProc("OpenProcess")
+	procWaitForSingleObject = modKernel32.NewProc("WaitForSingleObject")
+	procGetExitCodeProcess  = modKernel32.NewProc("GetExitCodeProcess")
+	procTerminateProcess    = modKernel32.NewProc("TerminateProcess")
+	procCloseHandle         = modKernel32.NewProc("CloseHandle")
+	procCreateMutexW        = modKernel32.NewProc("CreateMutexW")
+	procOpenMutexW          = modKernel32.NewProc("OpenMutexW")
+	procReleaseMutex        = modKernel32.NewProc("ReleaseMutex")
 
 	procCreateRoundRectRgn = modGdi32.NewProc("CreateRoundRectRgn")
 	procCreateSolidBrush   = modGdi32.NewProc("CreateSolidBrush")
@@ -108,9 +108,7 @@ var (
 	procDrawTextW = modUser32.NewProc("DrawTextW")
 )
 
-// Win32 常量（仅本工程用到的子集）。
 const (
-	// 窗口样式
 	wsOverlappedWindow = 0x00CF0000 | 0x00080000 // WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN
 	wsPopup            = 0x80000000
 	wsVisible          = 0x10000000
@@ -119,7 +117,6 @@ const (
 	wsExToolWindow     = 0x00000080
 	wsExAppWindow      = 0x00040000
 
-	// 消息
 	wmDestroy       = 0x0002
 	wmSize          = 0x0005
 	wmClose         = 0x0010
@@ -137,18 +134,15 @@ const (
 	htCaption       = 0x0002
 	htClient        = 0x0001
 
-	// ShowWindow
 	swHide     = 0
 	swShow     = 5
 	swMinimize = 6
 	swRestore  = 9
 
-	// LoadImage
 	imageIcon      = 1
 	lrLoadFromFile = 0x00000010
 	lrDefaultSize  = 0x00000040
 
-	// Shell_NotifyIcon
 	nimAdd     = 0x0
 	nimModify  = 0x1
 	nimDelete  = 0x2
@@ -156,11 +150,9 @@ const (
 	nifIcon    = 0x2
 	nifTip     = 0x4
 
-	// TrackPopupMenu
 	tpmRightButton = 0x0002
 	tpmReturnCmd   = 0x0100
 
-	// MessageBox
 	mbIconError       = 0x10
 	mbIconInformation = 0x40
 	mbYesNo           = 0x4
@@ -176,13 +168,11 @@ const (
 	csHredraw   = 0x0002
 	csVredraw   = 0x0001
 
-	// 分层窗口 / SetWindowPos
 	lwaAlpha      = 0x2
 	swpNoSize     = 0x1
 	swpNoZOrder   = 0x4
 	swpNoActivate = 0x10
 
-	// GDI
 	psSolid                = 0
 	fwBold                 = 700
 	fwNormal               = 400
@@ -213,8 +203,7 @@ type rect struct {
 	Left, Top, Right, Bottom int32
 }
 
-// minMaxInfo MINMAXINFO 全量 5×POINT 40 字节：写偏移必须落在系统结构正确槽位
-// （MinTrack 在偏移 24/28），缺 ptMaxPosition 会让后续写 MaxTrack 静默写错段。
+// minMaxInfo 必须保留完整 5×POINT（40 字节）布局，MinTrack 位于偏移 24/28。
 type minMaxInfo struct {
 	ReservedX, ReservedY       int32
 	MaxX, MaxY                 int32
@@ -263,8 +252,7 @@ type monitorInfo struct {
 	Flags   uint32
 }
 
-// paintStruct 官方 PAINTSTRUCT x64 布局：BOOL 系字段全部 4 字节
-// （Restore 曾误用 8 字节 uintptr，把 FIncUpdate/Reserved 整体顶后）。
+// paintStruct 按 Win64 PAINTSTRUCT 布局：BOOL 字段须为 4 字节 int32，不可用 uintptr。
 type paintStruct struct {
 	HDC        uintptr
 	FErase     int32
@@ -305,50 +293,8 @@ func portFree(port int) bool {
 	return true
 }
 
-// sameDirPath 目录一致性：真实路径解析后大小写不敏感比较，解析失败退回字面比较。
 func sameDirPath(first, second string) bool {
-	resolvedFirst, err1 := finalPathName(first)
-	resolvedSecond, err2 := finalPathName(second)
-	if err1 == nil && err2 == nil {
-		return strings.EqualFold(resolvedFirst, resolvedSecond)
-	}
-	return strings.EqualFold(first, second)
-}
-
-// finalPathName 解析符号链接与 NTFS junction 的真实路径（对齐 Path.resolve）。
-func finalPathName(path string) (string, error) {
-	ptr, err := syscall.UTF16PtrFromString(path)
-	if err != nil {
-		return "", err
-	}
-	handle, _, callErr := call3(procCreateFileW,
-		uintptr(unsafe.Pointer(ptr)),
-		0,
-		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
-		0, syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if handle == uintptr(syscall.InvalidHandle) || handle == 0 {
-		return "", callErr
-	}
-	defer call(procCloseHandle, handle)
-	buf := make([]uint16, 1024)
-	n, _, callErr := call3(procGetFinalPathNameByHandleW, handle, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
-	if n == 0 || n > uintptr(len(buf)) {
-		if n > uintptr(len(buf)) {
-			buf = make([]uint16, n)
-			n, _, callErr = call3(procGetFinalPathNameByHandleW, handle, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0)
-			if n == 0 {
-				return "", callErr
-			}
-		} else {
-			return "", callErr
-		}
-	}
-	resolved := syscall.UTF16ToString(buf[:n])
-	resolved = strings.TrimPrefix(resolved, `\\?\`)
-	if strings.HasPrefix(resolved, `UNC\`) {
-		resolved = `\\` + strings.TrimPrefix(resolved, `UNC\`)
-	}
-	return resolved, nil
+	return hostkit.SamePath(first, second)
 }
 
 // call3 允许返回错误值（CreateFileW 失败返回 INVALID_HANDLE_VALUE 而非 0）。
@@ -371,18 +317,41 @@ func exePath() string {
 	return exe
 }
 
-// rgb COLORREF（0x00BBGGRR）。
 func rgb(r, g, b uint32) uint32 { return r | g<<8 | b<<16 }
 
+func showFatalDialog(args []string) bool {
+	for _, arg := range args {
+		if arg == "--server" || arg == "-server" {
+			return false
+		}
+	}
+	if os.Getenv(envPrefix+"UPDATE_ATTEMPT_ID") != "" {
+		return false
+	}
+	return os.Getenv("HOLDEXAR_NO_DIALOG") != "1" && os.Getenv("CI") != "1"
+}
+
+func showFatal(message string) {
+	fatalMessageForArgs(os.Args[1:], message)
+}
+
 func fatalMessage(message string) {
+	fatalMessageForArgs(os.Args[1:], message)
+}
+
+func fatalMessageForArgs(args []string, message string) {
 	fmt.Fprintln(os.Stderr, message)
-	if os.Getenv("HOLDEXAR_NO_DIALOG") == "1" || os.Getenv("CI") == "1" {
+	if !showFatalDialog(args) {
 		return
 	}
 	call(procMessageBoxW, 0, utf16Ptr(message), utf16Ptr(appBrandName()+" 启动失败"), mbIconError)
 }
 
 func infoMessage(owner uintptr, message string) {
+	if !showFatalDialog(os.Args[1:]) {
+		fmt.Fprintln(os.Stderr, message)
+		return
+	}
 	call(procMessageBoxW, owner, utf16Ptr(message), utf16Ptr(appBrandName()), mbIconInformation)
 }
 
@@ -393,7 +362,6 @@ func appBrandName() string {
 	return defaultAppName
 }
 
-// waitPIDExit 等待进程退出；仅确认退出才返回 true，超时或权限不足均失败。
 func waitPIDExit(pid int, timeout time.Duration) bool {
 	handle := openProcessHandle(pid)
 	if handle == 0 {
@@ -419,22 +387,18 @@ func pidExitCode(pid int, timeout time.Duration) (int, bool) {
 }
 
 func openProcessHandle(pid int) uintptr {
-	// SYNCHRONIZE 等待 + QUERY_LIMITED 读退出码 + TERMINATE 强杀兜底：
-	// 只申请等待权限时，退出码读取与超时强杀会静默失败
+	// 须同时申请 SYNCHRONIZE|QUERY_LIMITED|TERMINATE，否则读退出码或强杀静默失败。
 	const rights = 0x00100000 | 0x1000 | 0x0001
 	handle, _, _ := call3(procOpenProcess, rights, 0, uintptr(pid))
 	return handle
 }
 
-// waitInfinite WaitForSingleObject 无限期等待。
 const waitInfinite = 0xFFFFFFFF
 
-// waitHandleInfinite 无限期等待进程句柄触发（启动器孤儿防线监视用）。
 func waitHandleInfinite(handle uintptr) {
 	call(procWaitForSingleObject, handle, waitInfinite)
 }
 
-// windowVisible 窗口可见性判定（可注入面：关窗守卫「隐形窗先亮再问」双案测试）。
 var windowVisible = func(hwnd uintptr) bool {
 	return call(procIsWindowVisible, hwnd) != 0
 }
@@ -443,7 +407,6 @@ func terminateProcess(handle uintptr) {
 	call(procTerminateProcess, handle, 1)
 }
 
-// focusWindowByTitle 置前已运行实例窗口：还原最小化/隐藏态并抢前台。
 func focusWindowByTitle(title string) bool {
 	hwnd := call(procFindWindowW, 0, utf16Ptr(title))
 	if hwnd == 0 {
@@ -472,7 +435,6 @@ func keybdAlt() {
 	call(procKeybdEvent, vkMenu, 0, keyUp, 0)
 }
 
-// supportsDataProtocol 能力探针：--update-protocol 应答 updateDataProtocol=1。
 func supportsDataProtocol(exe string) bool {
 	result := filepath.Join(os.TempDir(), "holdexar-update-protocol-"+randomHex(6)+".json")
 	defer os.Remove(result)

@@ -1,9 +1,11 @@
 """发布链脚本校验：版本号解析、空提交拦截、发布说明四段式、产物一致性及 dry-run 安全。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -218,7 +220,8 @@ def test_pick_zip_accepts_matching_version(tmp_path: Path, monkeypatch) -> None:
 def test_build_manifest_assets_coverage(tmp_path: Path, monkeypatch) -> None:
     """清单声明 app 资产且哈希与体积一致；无预置数据库时清单不含种子角色。"""
     app_zip = tmp_path / f"{build_manifest.APP_NAME}-win64-v0.3.1-beta.zip"
-    app_zip.write_bytes(b"app-data" * 10)
+    with zipfile.ZipFile(app_zip, "w") as archive:
+        archive.writestr(f"{build_manifest.APP_NAME}/Holdexar.exe", b"app-data" * 10)
 
     notes_file = tmp_path / "RELEASE_NOTES.md"
     notes_file.write_text("新增：\n- 功能\n更新：\n优化：\n修复：\n", encoding="utf-8")
@@ -231,6 +234,7 @@ def test_build_manifest_assets_coverage(tmp_path: Path, monkeypatch) -> None:
     assert "app" in roles
     assert "seed" not in roles and "seed-archive" not in roles
     assert roles["app"]["sha256"] == build_manifest.sha256_of(app_zip)
+    assert roles["app"]["files"]["Holdexar.exe"] == hashlib.sha256(b"app-data" * 10).hexdigest()
     assert manifest["notes"] == notes_file.read_text(encoding="utf-8").strip()
 
 

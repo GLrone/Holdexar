@@ -33,8 +33,9 @@ def test_go_build_locks_dependencies_and_windows_target(tmp_path, monkeypatch):
 
     command, options = calls[0]
     assert command[:3] == ["go.exe", "build", "-mod=readonly"]
+    assert "-ldflags=-s -w -H=windowsgui -X main.buildVersion=0.3.8" in command
     assert command[-2:] == [str(result), "."]
-    assert options["cwd"] == str(build.DESKTOP / "go_launcher")
+    assert options["cwd"] == str(build.DESKTOP / "windowhost")
     assert {key: options["env"][key] for key in ("GOOS", "GOARCH", "CGO_ENABLED", "GOTOOLCHAIN", "GOWORK")} == {
         "GOOS": "windows", "GOARCH": "amd64", "CGO_ENABLED": "0", "GOTOOLCHAIN": "local", "GOWORK": "off",
     }

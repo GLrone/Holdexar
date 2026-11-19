@@ -171,30 +171,30 @@ func TestReadTicketOnce(t *testing.T) {
 }
 
 func TestResolveDataDirPrecedence(t *testing.T) {
-	t.Setenv("HOLDEXAR_DATA_DIR", "E:\\some\\dir")
-	if got := resolveDataDir(""); got != `E:\some\dir` {
-		t.Fatalf("显式数据目录优先：%q", got)
+	explicitDir := filepath.Join(t.TempDir(), "explicit")
+	t.Setenv("HOLDEXAR_DATA_DIR", explicitDir)
+	if !sameDirPath(resolveDataDir(""), explicitDir) {
+		t.Fatalf("显式数据目录优先：%q != %q", resolveDataDir(""), explicitDir)
 	}
 	t.Setenv("HOLDEXAR_DATA_DIR", "")
-	// 可写安装根（开发态）：开发候选 holdexar-dev 先于 data/
+	t.Setenv("LOCALAPPDATA", filepath.Join(t.TempDir(), "localappdata"))
 	root := t.TempDir()
-	if got := resolveDataDir(root); got != filepath.Join(root, "holdexar-dev") {
-		t.Fatalf("可写根应取开发候选：%q", got)
+	if !sameDirPath(resolveDataDir(root), filepath.Join(root, "holdexar-dev")) {
+		t.Fatalf("可写根应取开发候选：%q", resolveDataDir(root))
 	}
 	pointed := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "holdexar-dev-home.txt"), []byte(pointed+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveDataDir(root); got != pointed {
-		t.Fatalf("开发指针未生效：%q", got)
+	if !sameDirPath(resolveDataDir(root), pointed) {
+		t.Fatalf("开发指针未生效：%q", resolveDataDir(root))
 	}
 	if err := os.WriteFile(filepath.Join(root, "portable.flag"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveDataDir(root); got != filepath.Join(root, "data") {
-		t.Fatalf("便携标记优先于开发指针：%q", got)
+	if !sameDirPath(resolveDataDir(root), filepath.Join(root, "data")) {
+		t.Fatalf("便携标记优先于开发指针：%q", resolveDataDir(root))
 	}
-	// 既有库的 data/ 优先于开发指针（存量接管）
 	root2 := t.TempDir()
 	pointed2 := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root2, "holdexar-dev-home.txt"), []byte(pointed2+"\n"), 0o644); err != nil {
@@ -206,8 +206,8 @@ func TestResolveDataDirPrecedence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root2, "data", dbName), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveDataDir(root2); got != filepath.Join(root2, "data") {
-		t.Fatalf("既有库目录优先于开发指针：%q", got)
+	if !sameDirPath(resolveDataDir(root2), filepath.Join(root2, "data")) {
+		t.Fatalf("既有库目录优先于开发指针：%q", resolveDataDir(root2))
 	}
 }
 
@@ -244,6 +244,27 @@ func TestServerExecutableResolution(t *testing.T) {
 	if err != nil || got != exe {
 		t.Fatalf("相邻服务程序解析失败：%q %v", got, err)
 	}
+
+	verDir := t.TempDir()
+	legacy := filepath.Join(verDir, "_internal", "serverd.exe")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacy, []byte("MZ-legacy"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err = serverExecutable(&options{versionDir: verDir})
+	if err != nil || !sameDirPath(got, legacy) {
+		t.Fatalf("回退 _internal/serverd.exe 解析失败：%q %v", got, err)
+	}
+	flat := filepath.Join(verDir, "serverd.exe")
+	if err := os.WriteFile(flat, []byte("MZ-flat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err = serverExecutable(&options{versionDir: verDir})
+	if err != nil || !sameDirPath(got, flat) {
+		t.Fatalf("扁平 serverd.exe 应优先于 _internal：%q %v", got, err)
+	}
 }
 
 func TestURLPathWithQueryAndOrigin(t *testing.T) {
@@ -259,8 +280,6 @@ func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
 }
 
-// TestWatchLauncherOrphanGuard 假启动器三案（wait/open 双注入）：死→触发退出、
-// 后台豁免、PID 无效/句柄打不开→不设防。
 func TestWatchLauncherOrphanGuard(t *testing.T) {
 	dir := t.TempDir()
 	log := openLog(dir)
@@ -270,7 +289,6 @@ func TestWatchLauncherOrphanGuard(t *testing.T) {
 	origOpen, origWait := openLauncherHandle, waitLauncherExit
 	t.Cleanup(func() { openLauncherHandle, waitLauncherExit = origOpen, origWait })
 
-	// 案一：假启动器死亡 → 触发退出（触发走 performQuit/直接退出，退出码 0）
 	t.Setenv("HOLDEXAR_LAUNCHER_PID", "4321")
 	died := make(chan struct{})
 	triggered := make(chan struct{})
@@ -288,7 +306,6 @@ func TestWatchLauncherOrphanGuard(t *testing.T) {
 		t.Fatal("启动器死亡未触发本实例退出")
 	}
 
-	// 案二：运行期已转后台（托盘化常驻）→ 照常监视，触发时刻豁免不退
 	app := newApp(cfg, log, nil)
 	activeApp.Store(app)
 	defer activeApp.Store(nil)
@@ -305,26 +322,21 @@ func TestWatchLauncherOrphanGuard(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // 豁免判定在等待返回后进行；误触发会走 t.Error
 	app.background.Store(false)
 
-	// 案三：后台旗标（--background/--server）→ 启动即豁免，根本不监视
 	backgroundCfg := &options{appName: "Holdexar", dataDir: dir, background: true, portFree: portFree}
 	openLauncherHandle = func(int) uintptr { t.Fatal("后台模式不得监视启动器"); return 0 }
 	watchLauncher(backgroundCfg, log, func() { t.Error("后台实例不得随启动器退出") })
 
-	// 案四：PID 无效（非数字/自身）→ 不设防
 	t.Setenv("HOLDEXAR_LAUNCHER_PID", "not-a-pid")
 	openLauncherHandle = func(int) uintptr { t.Fatal("无效 PID 不得打开句柄"); return 0 }
 	watchLauncher(cfg, log, func() { t.Error("无效 PID 不得触发退出") })
 	t.Setenv("HOLDEXAR_LAUNCHER_PID", strconv.Itoa(os.Getpid()))
 	watchLauncher(cfg, log, func() { t.Error("自身 PID 不得触发退出") })
 
-	// 案五：句柄打不开（启动器已不在）→ 无孤儿风险，不设防
 	t.Setenv("HOLDEXAR_LAUNCHER_PID", "4321")
 	openLauncherHandle = func(int) uintptr { return 0 }
 	watchLauncher(cfg, log, func() { t.Error("句柄打不开不得触发退出") })
 }
 
-// TestCloseGuardRevealsHiddenWindow 关窗守卫双案（可见性注入）：
-// 托盘态点 X → 先亮再问；可见态 → 行为不变。
 func TestCloseGuardRevealsHiddenWindow(t *testing.T) {
 	dir := t.TempDir()
 	log := openLog(dir)
@@ -353,8 +365,6 @@ func TestCloseGuardRevealsHiddenWindow(t *testing.T) {
 	}
 }
 
-// TestBrowserFallbackKeepsServiceAlive 渲染层缺失兜底：系统浏览器打开本地
-// 服务 URL，宿主转无窗口服务模式保活（服务生命周期独立于 webview）。
 func TestBrowserFallbackKeepsServiceAlive(t *testing.T) {
 	t.Setenv("HOLDEXAR_NO_DIALOG", "1")
 	dir := t.TempDir()
@@ -378,19 +388,102 @@ func TestBrowserFallbackKeepsServiceAlive(t *testing.T) {
 	}
 }
 
-// TestLocalServiceHostsShape 局域网地址投影：回环齐备、滤链路本地段、端口入 URL。
 func TestLocalServiceHostsShape(t *testing.T) {
 	hosts := localServiceHosts(28765)
-	found := 0
+	if len(hosts) == 0 || hosts[0] != "http://127.0.0.1:28765" {
+		t.Fatalf("回环首地址缺失或端口未拼入：%v", hosts)
+	}
 	for _, h := range hosts {
 		if strings.HasPrefix(h, "http://169.254.") {
 			t.Fatalf("链路本地段不得进入展示集：%s", h)
 		}
-		if h == "http://127.0.0.1:28765" || h == "http://localhost:28765" {
-			found++
+		if strings.Contains(h, "[[") || strings.Contains(h, "]]") {
+			t.Fatalf("IPv6 括号重复：%s", h)
 		}
 	}
-	if found != 2 {
-		t.Fatalf("回环地址缺失或端口未拼入：%v", hosts)
+}
+
+func TestHelpFlagExitsZero(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		if code := run([]string{arg}); code != 0 {
+			t.Fatalf("run(%q) = %d, want 0", arg, code)
+		}
+	}
+}
+
+func TestSingleInstanceMutexAndPortFileNeverTouchesForeignListener(t *testing.T) {
+	dataDir := t.TempDir()
+	foreign, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer foreign.Close()
+	foreignPort := foreign.Addr().(*net.TCPAddr).Port
+	foreignTouched := make(chan struct{}, 1)
+	go func() {
+		conn, aerr := foreign.Accept()
+		if aerr == nil {
+			_ = conn.Close()
+			select {
+			case foreignTouched <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
+	held, release, err := acquireInstanceMutex(dataDir)
+	if err != nil || !held {
+		t.Fatalf("首次获取实例互斥失败：held=%v err=%v", held, err)
+	}
+	defer release()
+
+	held2, release2, err2 := acquireInstanceMutex(dataDir)
+	if err2 != nil || held2 {
+		if release2 != nil {
+			release2()
+		}
+		t.Fatalf("同数据目录第二次获取实例互斥必须返回未持有：held=%v err=%v", held2, err2)
+	}
+
+	log := &hostLog{}
+	cfg := &options{appName: "Holdexar", dataDir: dataDir, serverPort: foreignPort + 50, lockPort: foreignPort}
+	listener, boundPort, err := bindActivationListener(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if boundPort == foreignPort {
+		t.Fatal("外来端口已被占用，不得绑定同一端口")
+	}
+	if err := writeActivationPort(dataDir, boundPort); err != nil {
+		t.Fatal(err)
+	}
+	defer removeActivationPort(dataDir)
+
+	commands := make(chan string, 2)
+	go listenActivation(listener, commands)
+
+	code := activateExistingInstance(&options{
+		appName:     "Holdexar",
+		windowTitle: "NonExistentHoldexarTestTitle",
+		dataDir:     dataDir,
+		serverPort:  foreignPort + 50,
+		lockPort:    foreignPort,
+	}, log)
+	if code != 0 {
+		t.Fatalf("activateExistingInstance = %d, want 0", code)
+	}
+	select {
+	case cmd := <-commands:
+		if cmd != "show" {
+			t.Fatalf("唤醒命令 = %q, want show", cmd)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("主实例未收到 show 唤醒命令")
+	}
+	select {
+	case <-foreignTouched:
+		t.Fatal("唤醒逻辑向占用 lockPort 的无关程序发送了连接")
+	default:
 	}
 }

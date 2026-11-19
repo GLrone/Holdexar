@@ -1,9 +1,5 @@
 //go:build windows
 
-// dataprotocol.go 升级验收期的数据保护协议：prepare（原始快照+update 保护标记）、
-// rollback（四阶段回退，失败数据留档）、finish_rollback（释放保护）、
-// abort_preparation（准备期中止）、accept（验收提交+相容记录）。
-// 标记/事务语义对齐 app/core/update_data.py 与 db_safety.py。
 package main
 
 import (
@@ -108,7 +104,6 @@ func releaseRestoreLock(dataDir, token string) error {
 	return os.Remove(path)
 }
 
-// updateRestoreMarker 原子改写保护记录（保留 token 所有权校验）。
 func updateRestoreMarker(dataDir, token string, mutate func(map[string]any)) error {
 	marker, err := readMarker(dataDir)
 	if err != nil {
@@ -131,7 +126,6 @@ func updateRestoreMarker(dataDir, token string, mutate func(map[string]any)) err
 	return nil
 }
 
-// matchingMarker 校验保护记录与本事务逐字段匹配。
 func matchingMarker(root string, tx map[string]any) error {
 	dataDir := txString(tx, "dataDir")
 	marker, err := readMarker(dataDir)
@@ -220,7 +214,6 @@ func fileSHA256Sum(path string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// prepare 升级原始快照与保护标记（dataPrepared）。
 func prepareData(root, dataDir, attempt string) error {
 	tx, err := transactionOrError(root)
 	if err != nil {

@@ -52,6 +52,12 @@ if ! (cd web && npm run --silent check:i18n); then
   echo "  拼错的 key 不会让构建失败，只会在界面上静默渲染成 key 原文——所以在这里拦。" >&2
   exit 1
 fi
+echo "[pre-commit] 浮层 z-index 阶梯（清单外魔数拦截，幕布/弹层防压）..."
+if ! (cd web && npm run --silent check:zindex); then
+  echo "✗ 浮层 z-index 越档：对照主树 docs/agent-context/learnings/frontend.md 阶梯表选档，" >&2
+  echo "  新档位先登记再同步 web/scripts/check-zindex.mjs 的 ALLOWED 清单。" >&2
+  exit 1
+fi
 echo "[pre-commit] 旗帜素材完整性（CC_LIST 新区必须先下载 /flags/{code}.png）..."
 if ! (cd server && { .venv/Scripts/python.exe -m pytest tests/test_flags_integrity.py -q --no-header 2>/dev/null || python -m pytest tests/test_flags_integrity.py -q --no-header; }); then
   echo "✗ 旗帜素材检查未通过：CC_LIST 加新区须先下载 web/public/flags/{code}.png。" >&2

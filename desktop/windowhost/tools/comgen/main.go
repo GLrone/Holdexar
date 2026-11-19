@@ -1,12 +1,6 @@
 //go:build windows
 
-// comgen 从官方 WebView2.h（MIDL 生成头）机械抽取接口方法序，产出
-// com_generated.go：槽位由脚本按头文件声明序计算（IUnknown 占 0-2），
-// 人手不再数槽。用法：
-//
-//	go run ./tools/comgen -header WebView2.h -out com_generated.go
-//
-// 头文件来源与摘要写进产物头注释；COM 接口一经发布不可变，重跑可复现。
+// comgen 从 WebView2.h 抽取接口槽位并生成 com_generated.go（IUnknown 占 0-2）。
 package main
 
 import (
@@ -18,9 +12,7 @@ import (
 	"strings"
 )
 
-// emitRules 产物范围：接口 → 要产出的官方方法名。未列出的方法只参与槽位
-// 计算，不产出包装。每一条都必须成功产出，否则生成器报错退出（防头文件
-// 漂移时产物悄悄缺方法）。
+// emitRules 指定产出包装的方法；未列出方法仍参与槽位计数，缺失即报错退出。
 var emitRules = map[string]map[string]bool{
 	"ICoreWebView2": {
 		"add_NavigationStarting": true,
@@ -38,10 +30,6 @@ var emitRules = map[string]map[string]bool{
 	},
 }
 
-// shapeMap 官方方法（含 propget/propput 前缀）→ Go 方法名与调用形状。
-// stringOut：LPWSTR* 出参读回；boolOut：BOOL* 出参读回；boolIn：[in] BOOL
-// 按值传；uint32Out：枚举出参；uint64Out：UINT64 出参；register：事件注册
-// （handler 入参 + EventRegistrationToken 出参）。
 var shapeMap = map[string]struct {
 	goName string
 	shape  string
@@ -65,8 +53,8 @@ var methodRe = regexp.MustCompile(
 	`(?s)virtual\s+(?:/\*\s*\[(propget|propput)\]\s*\*/\s*)?HRESULT\s+STDMETHODCALLTYPE\s+(\w+)\s*\(([^)]*)\)`)
 
 type method struct {
-	slot int    // 绝对 vtable 下标（IUnknown 0-2 起算）
-	key  string // "propget:get_Uri" 形态
+	slot int
+	key  string
 }
 
 func main() {
@@ -116,7 +104,6 @@ func main() {
 	}
 	fmt.Fprintf(&b, "}\n\n")
 
-	// 槽位常量（由上表次序产出）。
 	fmt.Fprintf(&b, "const (\n")
 	for iface, methods := range emitRules {
 		for i, mm := range methodRe.FindAllStringSubmatch(ifaceBlocks[iface], -1) {
@@ -137,7 +124,6 @@ func main() {
 	}
 	fmt.Fprintf(&b, ")\n\n")
 
-	// 类型化包装：体只调 com.go 里的通用出/入参助手，槽位取上方常量。
 	fmt.Fprintf(&b, "// CoreWebView2 主接口注册面（其余方法走 edge 库既有绑定，不在本层重复）。\n")
 	fmt.Fprintf(&b, "type CoreWebView2 struct{ raw unsafe.Pointer }\n\n")
 	fmt.Fprintf(&b, "func newCoreWebView2(raw unsafe.Pointer) *CoreWebView2 { return &CoreWebView2{raw: raw} }\n\n")

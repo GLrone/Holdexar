@@ -1,6 +1,5 @@
 //go:build windows
 
-// swap.go 换装文件机械：暂存载荷安装、运行期 EXE 安全覆盖、旧临时件清理。
 package main
 
 import (
@@ -12,32 +11,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"holdexar/hostkit"
 )
 
 func absPath(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return path
-	}
-	return abs
+	return hostkit.CanonicalPath(path)
 }
 
 func trustedPath(path string) bool {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return false
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		// 不存在的路径逐级回溯解析
-		parent := filepath.Dir(absolute)
-		resolvedParent, perr := filepath.EvalSymlinks(parent)
-		if perr != nil {
-			return false
-		}
-		resolved = filepath.Join(resolvedParent, filepath.Base(absolute))
-	}
-	return strings.EqualFold(filepath.Clean(resolved), filepath.Clean(absolute))
+	_, err := hostkit.TrustedPath(path)
+	return err == nil
 }
 
 func copyTree(source, target string) error {
@@ -78,11 +62,11 @@ func copyFile(source, target string) error {
 		return err
 	}
 	if _, err = io.Copy(out, in); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	if err = out.Sync(); err != nil {
-		out.Close()
+		_ = out.Close()
 		return err
 	}
 	return out.Close()
@@ -100,8 +84,8 @@ func safeReplaceExecutable(src, dest string) error {
 		return err
 	}
 	if file, err := os.OpenFile(temporary, os.O_RDWR, 0); err == nil {
-		file.Sync()
-		file.Close()
+		_ = file.Sync()
+		_ = file.Close()
 	}
 	if err := os.Rename(temporary, dest); err == nil {
 		return nil
@@ -114,7 +98,7 @@ func safeReplaceExecutable(src, dest string) error {
 		return err
 	}
 	if err := os.Rename(temporary, dest); err != nil {
-		os.Rename(oldDest, dest)
+		_ = os.Rename(oldDest, dest)
 		return err
 	}
 	return nil
@@ -127,7 +111,7 @@ func cleanupOldExecutables(directory string) {
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() && strings.Contains(entry.Name(), ".old_") {
-			os.Remove(filepath.Join(directory, entry.Name()))
+			_ = os.Remove(filepath.Join(directory, entry.Name()))
 		}
 	}
 }
@@ -138,8 +122,7 @@ func randomHex(bytes int) string {
 	return hex.EncodeToString(buf)
 }
 
-// installVersionPayload 暂存载荷 → versions/<target>/；多版本布局时同步
-// 刷新根启动器与 updater/UpdateHost.exe（唯一使用运行期安全覆盖的位置）。
+// installVersionPayload 仅将目标版本装入 versions/<target>/，验收前不改写根入口与更新宿主。
 func installVersionPayload(root, stagingDir, targetVersion string) error {
 	if !isManagedVersionName(targetVersion) {
 		return fmt.Errorf("目标版本号不可用作目录名：%q", targetVersion)
@@ -156,12 +139,12 @@ func installVersionPayload(root, stagingDir, targetVersion string) error {
 	if !directoryExists(payload) {
 		return errors.New("更新载荷目录不存在")
 	}
-	dest := getVersionDir(root, targetVersion)
-	os.RemoveAll(dest)
-	if err := os.MkdirAll(dest, 0o755); err != nil {
+	dest, err := versionDir(root, targetVersion)
+	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	_ = os.RemoveAll(dest)
+	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
 	versionsSub := filepath.Join(payload, versionsDir)
@@ -181,21 +164,50 @@ func installVersionPayload(root, stagingDir, targetVersion string) error {
 	if !isVersionValid(root, targetVersion) {
 		return fmt.Errorf("安装到 %s 失败：缺少主可执行程序", dest)
 	}
-	if directoryExists(versionsSub) {
-		srcUpdater := filepath.Join(payload, "updater", "UpdateHost.exe")
-		if fileExists(srcUpdater) {
-			os.MkdirAll(filepath.Join(root, "updater"), 0o755)
-			if err := safeReplaceExecutable(srcUpdater, filepath.Join(root, "updater", "UpdateHost.exe")); err != nil {
-				return err
-			}
+	return nil
+}
+
+// refreshRootArtifacts 在健康、页面与数据验收全部通过后刷新根入口、更新宿主及随包许可资产，并清理遗留根级 web/dist。
+func refreshRootArtifacts(root, stagingDir string) error {
+	if stagingDir != "" {
+		payload := filepath.Join(stagingDir, appName)
+		if !fileExists(payload) && !directoryExists(payload) {
+			payload = stagingDir
 		}
-		srcLauncher := filepath.Join(payload, appName+".exe")
-		if fileExists(srcLauncher) {
-			if err := safeReplaceExecutable(srcLauncher, filepath.Join(root, appName+".exe")); err != nil {
-				return err
+		if directoryExists(payload) {
+			srcUpdater := filepath.Join(payload, "updater", "UpdateHost.exe")
+			if fileExists(srcUpdater) {
+				if err := os.MkdirAll(filepath.Join(root, "updater"), 0o755); err != nil {
+					return err
+				}
+				if err := safeReplaceExecutable(srcUpdater, filepath.Join(root, "updater", "UpdateHost.exe")); err != nil {
+					return err
+				}
+			}
+			srcLauncher := filepath.Join(payload, appName+".exe")
+			if fileExists(srcLauncher) {
+				if err := safeReplaceExecutable(srcLauncher, filepath.Join(root, appName+".exe")); err != nil {
+					return err
+				}
+			}
+			srcIcon := filepath.Join(payload, "app.ico")
+			if fileExists(srcIcon) {
+				_ = copyFile(srcIcon, filepath.Join(root, "app.ico"))
+			}
+			srcClash := filepath.Join(payload, "assets", "clash")
+			if directoryExists(srcClash) {
+				dstClash := filepath.Join(root, "assets", "clash")
+				if err := os.MkdirAll(dstClash, 0o755); err != nil {
+					return err
+				}
+				if err := copyTree(srcClash, dstClash); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	_ = os.RemoveAll(filepath.Join(root, "web", "dist"))
+	_ = os.Remove(filepath.Join(root, "web"))
 	return nil
 }
 

@@ -1,8 +1,5 @@
 //go:build windows
 
-// 生成绑定的固定地真测试：槽位期望值逐条抄自官方 WebView2.h（COM 接口一经
-// 发布不可变，这组数字是外部锚点）。生成器或人工误改 com_generated.go 时，
-// 本测试先红于任何运行时崩溃。
 package main
 
 import "testing"
@@ -34,8 +31,6 @@ func TestGeneratedSlotGroundTruth(t *testing.T) {
 	}
 }
 
-// TestGeneratedSlotsTable 产物表与常量同源一致：把关键方法在表中的位置
-// （槽 = 3 + 序号）再对一遍，防表和常量单边漂移。
 func TestGeneratedSlotsTable(t *testing.T) {
 	check := func(iface string, slot int, method string) {
 		t.Helper()

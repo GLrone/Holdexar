@@ -1,7 +1,7 @@
 r"""Holdexar 发布构建：npm build → Go Launcher + PyInstaller 应用/更新宿主 → 消毒 → zip。
 
 用法（发布机，建议用 server/.venv 的解释器运行）：
-    Go 工具链版本须满足 desktop/go_launcher/go.mod，依赖按 go.sum 锁定。
+    Go 工具链版本须满足 desktop/windowhost/go.mod，依赖按 go.sum 锁定。
     python scripts/build_release.py                    # 常规出包
     python scripts/build_release.py --skip-web         # 跳过前端构建（dist 已是最新）
     python scripts/build_release.py --output-dir <目录> # 隔离出包，不覆盖 release/
@@ -136,18 +136,19 @@ def run_pyinstaller(python: Path) -> None:
 
 
 def build_go_launcher(version: str, python: Path) -> Path:
-    """编译唯一生产启动器，并复用发行资源生成与校验链。"""
+    """编译统一桌面宿主作为根启动器，并复用发行资源生成与校验链。"""
     go = shutil.which("go")
     if not go:
-        raise RuntimeError("构建 Go Launcher 需要安装与 desktop/go_launcher/go.mod 匹配的 Go 工具链")
+        raise RuntimeError("构建 Go Launcher 需要安装与 desktop/windowhost/go.mod 匹配的 Go 工具链")
     destination = DIST_DIR / "_launcher_build" / f"{APP_NAME}.exe"
     destination.parent.mkdir(parents=True, exist_ok=True)
     environment = {**os.environ, "GOOS": "windows", "GOARCH": "amd64",
                    "CGO_ENABLED": "0", "GOTOOLCHAIN": "local", "GOWORK": "off"}
     subprocess.check_call([
-        go, "build", "-mod=readonly", "-trimpath", "-ldflags=-s -w -H=windowsgui",
+        go, "build", "-mod=readonly", "-trimpath",
+        f"-ldflags=-s -w -H=windowsgui -X main.buildVersion={version}",
         "-o", str(destination), ".",
-    ], cwd=str(DESKTOP / "go_launcher"), env=environment)
+    ], cwd=str(DESKTOP / "windowhost"), env=environment)
     subprocess.check_call([
         str(python), str(DESKTOP / "version_resource.py"),
         "--stamp-launcher", str(destination), "--version", version,
@@ -350,7 +351,7 @@ def write_release_body(version: str) -> Path:
         "**方式二 · 便携包升级**\n"
         f"1. 下载下方资产中的 `Holdexar-win64-v{version}.zip`。\n"
         "2. 解压到新目录，并将原程序目录中的 `data/` 文件夹复制到新目录中。\n"
-        "3. 双击新目录下的 `Holdexar.exe` 启动即可（历史 AppData 数据会在首次启动时自动安全迁移）。\n\n"
+        "3. 双击新目录下的 `Holdexar.exe` 启动即可。\n\n"
         "## 资产说明\n\n"
         "| 资产 | 用途 |\n"
         "|---|---|\n"

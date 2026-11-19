@@ -225,7 +225,7 @@ python run.py --port N   # 指定端口
 
 发布机(建议用 `server/.venv` 的解释器):
 
-Windows x64 发行构建还需安装符合 [`desktop/go_launcher/go.mod`](desktop/go_launcher/go.mod) 的 Go 工具链。根目录启动器只构建 Go 版本，主应用和独立 UpdateHost 仍由 PyInstaller 打包；Go 依赖按 `go.sum` 锁定。
+Windows x64 发行构建还需安装符合 [`desktop/windowhost/go.mod`](desktop/windowhost/go.mod) 的 Go 工具链。Go 依赖按 `go.sum` 锁定。
 
 ```bash
 python scripts/build_release.py          # npm build → Go Launcher + PyInstaller 应用/更新宿主 → 消毒 → zip

@@ -1,40 +1,49 @@
 //go:build windows
 
-// Holdexar 原生窗口宿主：自有 Win32 主窗内嵌 WebView2，承载本地 Go 服务子进程。
-// 单实例（锁端口+探活身份校验）、一次性引导票据、托盘、关闭意图、退出回收链
-// 行为对齐现役桌面壳；版本与更新事实沿用既有 state/ 与 data/ 账本。
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"holdexar/hostkit"
 )
 
+// buildVersion 构建期由 -ldflags "-X main.buildVersion=..." 注入。
+var buildVersion string
+
 const (
-	envPrefix        = "HOLDEXAR_"
-	defaultAppName   = "Holdexar"
-	defaultPort      = 28765
-	defaultLockPort  = 28965
-	lockFallbackBase = 28966
-	portScanSpan     = 20
-	healthTimeout    = 90 * time.Second
-	// 迁移总预算：受保护验收实例的等待上限（健康验收窗归宿主管，本地不按
-	// 验收窗自尽，仅服务死亡或本预算耗尽自退）
+	envPrefix            = "HOLDEXAR_"
+	defaultAppName       = "Holdexar"
+	defaultPort          = 28765
+	defaultLockPort      = 28965
+	portScanSpan         = 20
+	healthTimeout        = 90 * time.Second
 	migrationMaxDuration = 1800 * time.Second
 	ticketName           = "server-bootstrap.ticket"
+	activationPortFile   = "windowhost.port"
 	windowClassName      = "HoldexarHostWindow"
 	dbName               = "holdexar.db"
 )
 
-var lockFallbacks = []int{28966, 28967, 28968, 29965, 29966}
+var (
+	lockFallbacks = []int{28966, 28967, 28968, 29965, 29966}
+	staleEnvKeys  = []string{
+		"UPDATE_ATTEMPT_ID", "UPDATE_DATA_TOKEN", "LAUNCHER_PID",
+		"DEV_URL", "UPDATE_RESTART", "PREV_PID",
+	}
+)
 
 type options struct {
 	appName     string
@@ -44,11 +53,14 @@ type options struct {
 	lockPort    int
 	dataDir     string
 	installRoot string
+	versionDir  string
 	serverExe   string
 	devURL      string
+	devMode     bool
 	devWatch    bool
 	serverMode  bool
 	background  bool
+	isManaged   bool
 	portFree    func(int) bool
 }
 
@@ -92,60 +104,28 @@ func envFlag(name string) bool {
 	return strings.TrimSpace(os.Getenv(envPrefix+name)) != ""
 }
 
-// resolveDataDir 与服务端同源：显式数据目录 → 便携 data/ → 既有库 → 开发指针
-// → 开发候选。两侧各自判定必然漂移，票据与健康身份校验都依赖同一路径。
+// resolveDataDir 委托 hostkit.ResolveDataDir 解析活动数据目录（无机器级用户目录回退）。
 func resolveDataDir(installRoot string) string {
-	if explicit := strings.TrimSpace(os.Getenv(envPrefix + "DATA_DIR")); explicit != "" {
-		return absPath(explicit)
+	explicit := strings.TrimSpace(os.Getenv(envPrefix + "DATA_DIR"))
+	dir, err := hostkit.ResolveDataDir(hostkit.DataDirOptions{
+		ExplicitDir: explicit,
+		InstallRoot: installRoot,
+	})
+	if err == nil && dir != "" {
+		return dir
 	}
-	if installRoot == "" {
-		if base := os.Getenv("LOCALAPPDATA"); base != "" {
-			return filepath.Join(base, "holdexar")
-		}
-		return absPath(".")
+	dir, err = hostkit.ResolveDataDir(hostkit.DataDirOptions{
+		ExplicitDir:        explicit,
+		InstallRoot:        installRoot,
+		SkipEnsureWritable: true,
+	})
+	if err == nil && dir != "" {
+		return dir
 	}
-	dataDir := filepath.Join(installRoot, "data")
-	if fileExists(filepath.Join(installRoot, "portable.flag")) || fileExists(filepath.Join(dataDir, dbName)) {
-		return dataDir
+	if installRoot != "" {
+		return filepath.Join(hostkit.CanonicalPath(installRoot), "data")
 	}
-	if pointed := readDevPointer(installRoot); pointed != "" && dirWritable(pointed) {
-		return pointed
-	}
-	if dev := filepath.Join(installRoot, "holdexar-dev"); dirWritable(dev) {
-		return dev
-	}
-	return dataDir
-}
-
-func readDevPointer(root string) string {
-	raw, err := os.ReadFile(filepath.Join(root, "holdexar-dev-home.txt"))
-	if err != nil {
-		return ""
-	}
-	text := strings.TrimPrefix(string(raw), "\uFEFF")
-	for _, line := range strings.Split(text, "\n") {
-		entry := strings.TrimSpace(line)
-		if entry == "" || strings.HasPrefix(entry, "#") {
-			continue
-		}
-		if filepath.IsAbs(entry) {
-			return entry
-		}
-		return ""
-	}
-	return ""
-}
-
-func dirWritable(path string) bool {
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		return false
-	}
-	probe := filepath.Join(path, ".host-write-probe")
-	if err := os.WriteFile(probe, []byte("1"), 0o644); err != nil {
-		return false
-	}
-	_ = os.Remove(probe)
-	return true
+	return absPath("data")
 }
 
 func absPath(path string) string {
@@ -168,24 +148,117 @@ func openLog(dataDir string) *hostLog {
 	return &hostLog{file: file}
 }
 
-// waitPreviousExit 更新重启链：旧实例退场（释放端口与单实例锁）后再继续，
-// 否则端口探活会把交接截胡成一次普通唤醒。
-func waitPreviousExit(log *hostLog) {
+func captureRestartPrevPID() int {
 	raw := strings.TrimSpace(os.Getenv(envPrefix + "PREV_PID"))
 	if raw == "" || os.Getenv(envPrefix+"UPDATE_RESTART") != "1" {
-		return
+		return 0
 	}
 	pid, err := strconv.Atoi(raw)
-	if err != nil || pid == os.Getpid() {
+	if err != nil || pid <= 0 || pid == os.Getpid() {
+		return 0
+	}
+	return pid
+}
+
+func waitPreviousPID(pid int, log *hostLog) {
+	if pid <= 0 || pid == os.Getpid() {
 		return
 	}
-	if waitPIDExit(pid, 15*time.Second) {
+	if waitPIDExit(pid, 15*time.Second) && log != nil {
 		log.write("前一实例已退出，继续更新重启")
 	}
 }
 
-// negotiatePorts 服务端口被外来占用时自动扫描备位；锁端口被占依次换备位。
-// 探活命中本应用另一实例则保留原值，由唤醒分支处理。
+func instanceMutexName(dataDir string) string {
+	canon := strings.ToLower(filepath.Clean(hostkit.CanonicalPath(dataDir)))
+	sum := sha256.Sum256([]byte(canon))
+	return fmt.Sprintf(`Local\Holdexar-WindowHost-%x`, sum[:12])
+}
+
+func acquireInstanceMutex(dataDir string) (bool, func(), error) {
+	return acquireNamedMutex(instanceMutexName(dataDir))
+}
+
+func activationPortPath(dataDir string) string {
+	return filepath.Join(dataDir, activationPortFile)
+}
+
+func writeActivationPort(dataDir string, port int) error {
+	target := activationPortPath(dataDir)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(target), "windowhost.port.*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.WriteString(strconv.Itoa(port) + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, target)
+}
+
+func removeActivationPort(dataDir string) {
+	_ = os.Remove(activationPortPath(dataDir))
+}
+
+func readActivationPortOnce(dataDir string) int {
+	raw, err := os.ReadFile(activationPortPath(dataDir))
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || port <= 0 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
+func waitActivationPort(dataDir string, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		if port := readActivationPortOnce(dataDir); port > 0 {
+			return port
+		}
+		if time.Now().After(deadline) {
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func bindActivationListener(cfg *options, log *hostLog) (net.Listener, int, error) {
+	candidates := append([]int{cfg.lockPort}, lockFallbacks...)
+	for _, port := range candidates {
+		if port <= 0 || port == cfg.serverPort {
+			continue
+		}
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err == nil {
+			if port != cfg.lockPort {
+				log.write(fmt.Sprintf("唤醒端口 %d 被占用，改用 %d", cfg.lockPort, port))
+			}
+			cfg.lockPort = port
+			return listener, port, nil
+		}
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, 0, err
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	cfg.lockPort = port
+	log.write(fmt.Sprintf("唤醒端口自动分配为 %d", port))
+	return listener, port, nil
+}
+
+// negotiatePorts 端口被外来占用时换备位；若为同库实例则保留原值。
 func negotiatePorts(cfg *options, log *hostLog) {
 	isFree := cfg.portFree
 	if !isFree(cfg.serverPort) {
@@ -211,16 +284,55 @@ func negotiatePorts(cfg *options, log *hostLog) {
 	if !isFree(cfg.lockPort) {
 		for _, candidate := range lockFallbacks {
 			if candidate != cfg.serverPort && isFree(candidate) {
-				log.write(fmt.Sprintf("锁端口 %d 被占用，改用 %d", cfg.lockPort, candidate))
+				log.write(fmt.Sprintf("唤醒端口 %d 被占用，改用 %d", cfg.lockPort, candidate))
 				cfg.lockPort = candidate
 				return
 			}
 		}
-		log.write("锁端口与备位全被占用，单实例保护降级为探活判定")
 	}
 }
 
-// healthIsOurs 健康身份校验：应用名一致且数据目录一致才算本应用同库实例。
+func findHealthyOurs(cfg *options, timeout time.Duration) *healthSnapshot {
+	deadline := time.Now().Add(timeout)
+	for {
+		for candidate := cfg.serverPort; candidate < cfg.serverPort+portScanSpan; candidate++ {
+			if payload := healthIsOurs(candidate, cfg, 800*time.Millisecond); payload != nil {
+				return payload
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+func activateExistingInstance(cfg *options, log *hostLog) int {
+	actPort := waitActivationPort(cfg.dataDir, 5*time.Second)
+	if cfg.serverMode {
+		if actPort <= 0 || !activateRunning(actPort, true) {
+			return 1
+		}
+		payload := findHealthyOurs(cfg, 8*time.Second)
+		if payload == nil {
+			return 1
+		}
+		log.write(fmt.Sprintf("已有同库实例在运行（PID %d）", payload.PID))
+		return waitForPIDExit(payload.PID)
+	}
+	log.write("已有同库实例在运行，唤醒现有窗口")
+	if actPort > 0 && activateRunning(actPort, false) {
+		return 0
+	}
+	if focusWindowByTitle(cfg.windowTitle) {
+		return 0
+	}
+	if payload := findHealthyOurs(cfg, 2*time.Second); payload != nil {
+		shellOpen(fmt.Sprintf("http://127.0.0.1:%d", payload.Port))
+	}
+	return 0
+}
+
 func healthIsOurs(port int, cfg *options, timeout time.Duration) *healthSnapshot {
 	payload := probeHealth(port, timeout)
 	if !identityMatches(payload, cfg) {
@@ -229,7 +341,6 @@ func healthIsOurs(port int, cfg *options, timeout time.Duration) *healthSnapshot
 	return payload
 }
 
-// identityMatches 身份判定：应用名一致，数据目录一致（并行隔离目录互不唤醒）。
 func identityMatches(payload *healthSnapshot, cfg *options) bool {
 	if payload == nil || payload.App != cfg.appName {
 		return false
@@ -245,60 +356,335 @@ func runUIOnce(cfg *options, log *hostLog, srv *serverProcess) int {
 	return app.run()
 }
 
-func run(args []string) int {
-	if err := setDPIAware(); err != nil {
-		// 低版本系统无此入口：忽略，走系统默认缩放
-		_ = err
+func launcherRoot() (string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", err
 	}
-	reportDataProtocol(args)
+	resolved := hostkit.CanonicalPath(executable)
+	if resolved == "" {
+		return "", errors.New("无法解析程序所在目录")
+	}
+	return filepath.Dir(resolved), nil
+}
+
+func cleanupOldExecutables(directory string) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.Contains(entry.Name(), ".old_") {
+			_ = os.Remove(filepath.Join(directory, entry.Name()))
+		}
+	}
+}
+
+func regularFileExists(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func recoverInterruptedUpdate(root string) error {
+	release, err := acquireUpdateMutex()
+	if err != nil {
+		return err
+	}
+	tx, txErr := hostkit.ReadTransaction(root)
+	if txErr != nil {
+		release()
+		return errors.New("更新事务无法读取，已停止启动并保留数据")
+	}
+	if tx != nil {
+		if attempt, ok := tx["attemptId"].(string); !ok || attempt == "" {
+			release()
+			return errors.New("更新事务缺少有效标识，已停止启动并保留数据")
+		}
+	}
+	if !hostkit.UpdateRecoveryNeeded(tx) {
+		release()
+		return nil
+	}
+	state, stateErr := hostkit.ReadCurrentState(root)
+	if stateErr != nil {
+		release()
+		return stateErr
+	}
+	complete := hostkit.UpdateRecoveryCompleteForRoot(root, tx, state)
+	release()
+	if complete {
+		return nil
+	}
+	host := filepath.Join(root, "updater", "UpdateHost.exe")
+	if !regularFileExists(host) {
+		return errors.New("独立更新宿主缺失或被重定向，已停止启动以保护数据")
+	}
+	if _, err := hostkit.TrustedPath(host); err != nil {
+		return errors.New("独立更新宿主缺失或被重定向，已停止启动以保护数据")
+	}
+	command := exec.Command(host, "--recover-only", "--target", root)
+	command.Dir = root
+	command.Env = append(os.Environ(), envPrefix+"INSTALL_ROOT="+root)
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("上次更新恢复未完成，数据已保留：%w", err)
+	}
+	return nil
+}
+
+func activeManagedDataDir(root string, compat *hostkit.DataCompat) string {
+	if compat != nil && compat.DataDir != "" {
+		return hostkit.CanonicalPath(compat.DataDir)
+	}
+	if tx, err := hostkit.ReadTransaction(root); err == nil && tx != nil {
+		if dataDir, ok := tx["dataDir"].(string); ok && dataDir != "" {
+			return hostkit.CanonicalPath(dataDir)
+		}
+	}
+	if explicit := strings.TrimSpace(os.Getenv(envPrefix + "DATA_DIR")); explicit != "" {
+		return hostkit.CanonicalPath(explicit)
+	}
+	return hostkit.CanonicalPath(filepath.Join(root, "data"))
+}
+
+func sanitizedVersionEnv(root, dataDir string) []string {
+	env := make([]string, 0, len(os.Environ())+3)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		skip := strings.EqualFold(key, envPrefix+"INSTALL_ROOT") ||
+			strings.EqualFold(key, envPrefix+"DATA_DIR") ||
+			strings.EqualFold(key, "WEBVIEW2_USER_DATA_FOLDER")
+		for _, stale := range staleEnvKeys {
+			skip = skip || strings.EqualFold(key, envPrefix+stale)
+		}
+		if !skip {
+			env = append(env, entry)
+		}
+	}
+	return append(env,
+		envPrefix+"INSTALL_ROOT="+root,
+		envPrefix+"DATA_DIR="+dataDir,
+		"WEBVIEW2_USER_DATA_FOLDER="+filepath.Join(dataDir, "cache", "webview"),
+	)
+}
+
+func launchVersion(root, targetVersion string, args []string) (int, error) {
+	exe := filepath.Join(root, "versions", targetVersion, hostkit.AppName+".exe")
+	if !regularFileExists(exe) {
+		return 1, fmt.Errorf("启动 %s 失败：版本主程序不存在：%s", targetVersion, exe)
+	}
+	if _, err := hostkit.TrustedPath(exe); err != nil {
+		return 1, fmt.Errorf("启动 %s 失败：版本主程序路径不受信任：%s", targetVersion, exe)
+	}
+	compat, err := hostkit.ReadDataCompatibility(root)
+	if err != nil {
+		return 1, err
+	}
+	dataDir := activeManagedDataDir(root, compat)
+	env := sanitizedVersionEnv(root, dataDir)
+
+	foreground := false
+	for _, arg := range args {
+		if arg == "--server" || arg == "-server" {
+			foreground = true
+			break
+		}
+	}
+	fullArgs := append([]string{exe}, args...)
+	attr := &os.ProcAttr{Dir: filepath.Dir(exe), Env: env, Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}}
+	if foreground {
+		process, err := os.StartProcess(exe, fullArgs, attr)
+		if err != nil {
+			return 1, fmt.Errorf("启动 %s 失败：%w", targetVersion, err)
+		}
+		state, err := process.Wait()
+		if err != nil {
+			return 1, fmt.Errorf("启动 %s 失败：%w", targetVersion, err)
+		}
+		return state.ExitCode(), nil
+	}
+	attr.Sys = &syscall.SysProcAttr{
+		CreationFlags: 0x00000008 | 0x00000200,
+	}
+	process, err := os.StartProcess(exe, fullArgs, attr)
+	if err != nil {
+		return 1, fmt.Errorf("启动 %s 失败：%w", targetVersion, err)
+	}
+	_ = process.Release()
+	return 0, nil
+}
+
+func prepareManagedRoot(root, buildVer string, argv []string) (string, string, string, int, bool, error) {
+	if !probeSwapMutexHeld(swapMutexName) {
+		if err := recoverInterruptedUpdate(root); err != nil {
+			return "", "", "", 1, false, err
+		}
+		for _, dir := range []string{"state", "data", "logs", "versions", "updater", "update-staging"} {
+			if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+				return "", "", "", 1, false, err
+			}
+		}
+		cleanupOldExecutables(filepath.Join(root, "updater"))
+		cleanupOldExecutables(root)
+	}
+
+	state, err := hostkit.ReadCurrentState(root)
+	if err != nil {
+		return "", "", "", 1, false, err
+	}
+	targetVersion, err := hostkit.SelectTargetVersion(root, state)
+	if err != nil {
+		return "", "", "", 1, false, err
+	}
+	if targetVersion == "" {
+		return "", "", "", 1, false, fmt.Errorf("未能在 %s 找到任何可运行的有效版本。\n请检查安装目录或重新解压完整发行包。",
+			filepath.Join(root, "versions"))
+	}
+	compat, err := hostkit.ReadDataCompatibility(root)
+	if err != nil {
+		return "", "", "", 1, false, err
+	}
+	managedDataDir := activeManagedDataDir(root, compat)
+
+	normBuild := hostkit.VersionFromTag(buildVer)
+	if normBuild != "" && hostkit.VersionFromTag(targetVersion) == normBuild {
+		verDir, verr := hostkit.VersionDir(root, targetVersion)
+		if verr != nil {
+			return "", "", "", 1, false, verr
+		}
+		return verDir, targetVersion, managedDataDir, 0, false, nil
+	}
+	code, lerr := launchVersion(root, targetVersion, argv)
+	return "", targetVersion, managedDataDir, code, true, lerr
+}
+
+func runLauncher(argv []string, root string) (int, error) {
+	_, _, _, code, _, err := prepareManagedRoot(root, "", argv)
+	return code, err
+}
+
+func clearStaleEnvInProcess() {
+	for _, key := range staleEnvKeys {
+		_ = os.Unsetenv(envPrefix + key)
+	}
+}
+
+func run(args []string) int {
+	if handled, err := reportProtocol(args); handled {
+		if err != nil {
+			fatalMessageForArgs(args, err.Error())
+			return 1
+		}
+		return 0
+	}
 
 	cfg := &options{portFree: portFree}
 	var dataDirFlag string
-	flags := flag.NewFlagSet("windowhost", flag.ContinueOnError)
+	var portFlag int
+	flags := flag.NewFlagSet("Holdexar", flag.ContinueOnError)
+	flags.SetOutput(os.Stdout)
 	flags.BoolVar(&cfg.serverMode, "server", false, "无窗口模式，仅启动本地服务")
 	flags.BoolVar(&cfg.background, "background", false, "关闭窗口后继续运行，重新打开应用可显示原窗口")
 	flags.StringVar(&dataDirFlag, "data-dir", "", "显式数据目录")
+	flags.IntVar(&portFlag, "port", 0, "指定本地服务端口")
+	flags.BoolVar(&cfg.devMode, "dev", false, "启动前端热更新开发服务")
 	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 1
 	}
-	cfg.installRoot = strings.TrimSpace(os.Getenv(envPrefix + "INSTALL_ROOT"))
+	if portFlag < 0 || portFlag > 65535 {
+		fatalMessageForArgs(args, fmt.Sprintf("无效端口：%d", portFlag))
+		return 1
+	}
+
+	if err := setDPIAware(); err != nil {
+		_ = err
+	}
+
+	prevPID := captureRestartPrevPID()
+	exeRoot, exeVersionDir, exeManaged := hostkit.InstallRootFromExe("")
+
+	if exeManaged && exeVersionDir == "" && !cfg.devMode {
+		clearStaleEnvInProcess()
+		waitPreviousPID(prevPID, nil)
+		prevPID = 0
+		if swapMutexHeld() {
+			if cfg.background {
+				return yieldExitCode
+			}
+			return 0
+		}
+		verDir, targetVer, managedDataDir, chainCode, chainExited, err := prepareManagedRoot(exeRoot, buildVersion, args)
+		if err != nil {
+			fatalMessageForArgs(args, err.Error())
+			return 1
+		}
+		if chainExited {
+			return chainCode
+		}
+		cfg.installRoot = exeRoot
+		cfg.versionDir = verDir
+		cfg.isManaged = true
+		cfg.appVersion = targetVer
+		cfg.dataDir = managedDataDir
+		_ = os.Setenv(envPrefix+"INSTALL_ROOT", exeRoot)
+		if dataDirFlag == "" {
+			_ = os.Setenv(envPrefix+"DATA_DIR", managedDataDir)
+		}
+	} else if exeManaged && exeVersionDir != "" && !cfg.devMode {
+		cfg.installRoot = exeRoot
+		cfg.versionDir = exeVersionDir
+		cfg.isManaged = true
+		cfg.appVersion = filepath.Base(exeVersionDir)
+	} else {
+		cfg.installRoot = strings.TrimSpace(os.Getenv(envPrefix + "INSTALL_ROOT"))
+		if cfg.installRoot == "" {
+			cfg.installRoot = exeRoot
+		}
+		cfg.appVersion = hostkit.VersionFromTag(os.Getenv(envPrefix + "VERSION"))
+		if cfg.appVersion == "" {
+			cfg.appVersion = hostkit.VersionFromTag(buildVersion)
+		}
+		cfg.devWatch = envFlag("DEV_WATCH")
+		cfg.devURL = strings.TrimSpace(os.Getenv(envPrefix + "DEV_URL"))
+	}
+
 	cfg.appName = defaultAppName
 	if name := strings.TrimSpace(os.Getenv(envPrefix + "APP_NAME")); name != "" {
 		cfg.appName = name
 	}
-	cfg.appVersion = strings.TrimPrefix(strings.TrimSpace(os.Getenv(envPrefix+"VERSION")), "v")
-	if runningFromVersions() {
-		// 发行布局：版本号以版本目录名为准（交接比较的事实源）
-		exe, e := os.Executable()
-		if e == nil {
-			cfg.appVersion = filepath.Base(filepath.Dir(exe))
-		}
-	}
-	cfg.devWatch = envFlag("DEV_WATCH")
 	cfg.windowTitle = cfg.appName
-	if cfg.devWatch {
+	if cfg.devWatch || cfg.devMode {
 		cfg.windowTitle = cfg.appName + " Go (dev)"
 	}
-	cfg.devURL = strings.TrimSpace(os.Getenv(envPrefix + "DEV_URL"))
 	cfg.serverPort = envInt("PORT", defaultPort)
+	if portFlag > 0 {
+		cfg.serverPort = portFlag
+	}
 	cfg.lockPort = envInt("LOCK_PORT", defaultLockPort)
 	cfg.serverExe = strings.TrimSpace(os.Getenv(envPrefix + "SERVER_EXE"))
 	if dataDirFlag != "" {
-		os.Setenv(envPrefix+"DATA_DIR", absPath(dataDirFlag))
+		absExplicit := hostkit.CanonicalPath(dataDirFlag)
+		_ = os.Setenv(envPrefix+"DATA_DIR", absExplicit)
+		cfg.dataDir = absExplicit
 	}
-	cfg.dataDir = resolveDataDir(cfg.installRoot)
+	if cfg.dataDir == "" {
+		cfg.dataDir = resolveDataDir(cfg.installRoot)
+	}
 	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
-		fatalMessage("数据目录不可用：" + err.Error())
+		fatalMessageForArgs(args, "数据目录不可用："+err.Error())
 		return 1
 	}
+
 	log := openLog(cfg.dataDir)
 	defer log.close()
-	log.write(fmt.Sprintf("启动 │ 应用=%s，数据目录=%s，服务端口=%d，锁端口=%d",
-		cfg.appName, cfg.dataDir, cfg.serverPort, cfg.lockPort))
+	log.write(fmt.Sprintf("启动 │ 应用=%s，版本=%s，数据目录=%s，服务端口=%d",
+		cfg.appName, cfg.appVersion, cfg.dataDir, cfg.serverPort))
 
-	// 孤儿实例防线最早挂上：换装/端口协商/服务启动任何阶段包装进程死亡，
-	// 本进程都不应存活成无主实例（窗口未建时直接退出，服务子进程经 stdin
-	// EOF 自行优雅收尾）
 	watchLauncher(cfg, log, func() {
 		if a := activeApp.Load(); a != nil && a.hwnd != 0 {
 			call(procPostMessageW, a.hwnd, wmAppQuit, 0, 0)
@@ -307,30 +693,39 @@ func run(args []string) int {
 		os.Exit(0)
 	})
 
-	waitPreviousExit(log)
-	negotiatePorts(cfg, log)
+	waitPreviousPID(prevPID, log)
 
-	lock := acquireLock(cfg.lockPort)
-	if lock == nil {
-		if payload := healthIsOurs(cfg.serverPort, cfg, 8*time.Second); payload != nil {
-			log.write(fmt.Sprintf("已有同库实例在运行（PID %d）", payload.PID))
-			if cfg.serverMode {
-				if !activateRunning(cfg.lockPort, true) {
-					return 1
-				}
-				return waitForPIDExit(payload.PID)
-			}
-			if focusWindowByTitle(cfg.windowTitle) {
-				return 0
-			}
-			if activateRunning(cfg.lockPort, false) {
-				return 0
-			}
-			shellOpen(fmt.Sprintf("http://127.0.0.1:%d", cfg.serverPort))
+	held, releaseInstance, mutexErr := acquireInstanceMutex(cfg.dataDir)
+	if mutexErr != nil {
+		fatalMessageForArgs(args, "单实例互斥体创建失败："+mutexErr.Error())
+		return 1
+	}
+	if !held {
+		return activateExistingInstance(cfg, log)
+	}
+	defer releaseInstance()
+	removeActivationPort(cfg.dataDir)
+
+	if swapMutexHeld() {
+		log.write("检测到换装进程进行中，本实例退出等待其完成")
+		if cfg.background {
+			return yieldExitCode
+		}
+		return 0
+	}
+
+	if handoffPending(cfg, func(reason string) { log.write(reason) }) {
+		if ok := spawnUpdateHost(cfg, log); ok {
 			return 0
 		}
-		log.write("锁端口被其他程序占用，单实例保护降级为探活判定")
-	} else {
+	}
+
+	negotiatePorts(cfg, log)
+
+	lock, actPort, listenErr := bindActivationListener(cfg, log)
+	if listenErr == nil && lock != nil {
+		_ = writeActivationPort(cfg.dataDir, actPort)
+		defer removeActivationPort(cfg.dataDir)
 		defer lock.Close()
 		activation := make(chan string, 4)
 		go listenActivation(lock, activation)
@@ -344,42 +739,33 @@ func run(args []string) int {
 				}
 			}
 		}()
+	} else {
+		log.write("唤醒监听绑定失败，仅保留互斥体单实例保护")
 	}
 
-	// 换装互斥让位：换装进程进行中本实例退出等待其完成（换装完成会拉起新版
-	// 或回滚现装），不带「程序目录即将被搬空」继续起服务
-	if swapMutexHeld() {
-		log.write("检测到换装进程进行中，本实例退出等待其完成")
-		if cfg.background {
-			return yieldExitCode
+	if cfg.devMode && !cfg.serverMode && cfg.devURL == "" {
+		devSrv, derr := startDevFrontend(cfg, log)
+		if derr != nil {
+			log.write("前端开发服务启动失败：" + derr.Error())
+			fatalMessageForArgs(args, "前端开发服务启动失败："+derr.Error())
+			return 1
 		}
-		return 0
-	}
-
-	// 更新交接：暂存包就绪且未失败过时交给暂存包内的更新宿主，本进程退出
-	// （对齐桌面壳 _handoff_pending_update；仅发行布局——运行目录在 versions/ 内——启用）
-	if handoffPending(cfg, func(reason string) { log.write(reason) }) {
-		if ok := spawnUpdateHost(cfg, log); ok {
-			return 0
-		}
+		defer devSrv.stop()
+		cfg.devURL = devSrv.url
 	}
 
 	srv, err := startServer(cfg, log)
 	if err != nil {
 		log.write("本地服务启动失败：" + err.Error())
-		// 验收探针子进程与无窗口模式没有可交互用户：快速失败，不弹致命框
 		if os.Getenv(envPrefix+"UPDATE_ATTEMPT_ID") == "" && !cfg.serverMode {
-			fatalMessage("本地服务启动失败：" + err.Error())
+			fatalMessageForArgs(args, "本地服务启动失败："+err.Error())
 		}
 		return 1
 	}
 	defer srv.cleanup()
 
 	if cfg.serverMode {
-		// 服务端启动含数据准备，健康就绪需轮询等待；进程先退则快速失败
 		deadline := time.Now().Add(healthTimeout)
-		// 受保护验收实例：等宿主预算归宿的验收循环，仅服务死亡或迁移总预算
-		// 耗尽自退，不与宿主的迁移存活信号抢判定
 		protected := os.Getenv(envPrefix+"UPDATE_ATTEMPT_ID") != ""
 		budget := time.Now().Add(migrationMaxDuration)
 		ready := false
@@ -414,13 +800,11 @@ func run(args []string) int {
 	return runUIOnce(cfg, log, srv)
 }
 
-// 可注入面（假启动器测试）：启动器进程句柄的打开与退出等待。
 var (
 	openLauncherHandle = openProcessHandle
 	waitLauncherExit   = waitHandleInfinite
 )
 
-// isDigits ASCII 数字串判定（对齐 Python str.isdigit：拒绝正负号与空白）。
 func isDigits(s string) bool {
 	if s == "" {
 		return false
@@ -433,7 +817,6 @@ func isDigits(s string) bool {
 	return true
 }
 
-// launcherPID 从环境读启动器 PID：非数字、非正数或等于自身返回 0（不设防）。
 func launcherPID() int {
 	raw := strings.TrimSpace(os.Getenv(envPrefix + "LAUNCHER_PID"))
 	if !isDigits(raw) {
@@ -446,8 +829,6 @@ func launcherPID() int {
 	return pid
 }
 
-// launcherExempt 触发时刻的豁免判定：启动旗标（--background/--server）+
-// 运行期后台切换（托盘化常驻）。普通实例随启动器退出，后台实例继续服务。
 func launcherExempt(cfg *options) bool {
 	if cfg.background || cfg.serverMode {
 		return true
@@ -458,10 +839,7 @@ func launcherExempt(cfg *options) bool {
 	return false
 }
 
-// watchLauncher 启动器监视（孤儿实例防线，对齐桌面壳 _watch_launcher）：
-// HOLDEXAR_LAUNCHER_PID 数字且 ≠ 自身 → 打开 SYNCHRONIZE 句柄等待；启动器
-// 终止且非后台模式 → 触发退出。句柄打不开（包装进程已不在/权限不足）视为
-// 无孤儿风险，不设防。监视失败不阻断正常启动。
+// watchLauncher 监视父启动器 PID，非后台实例随其退出；句柄打不开不阻塞启动。
 func watchLauncher(cfg *options, log *hostLog, onGone func()) {
 	if cfg.background || cfg.serverMode {
 		return
@@ -485,15 +863,6 @@ func watchLauncher(cfg *options, log *hostLog, onGone func()) {
 	}()
 }
 
-// acquireLock 占用锁端口实现单实例；占用失败返回 nil，真伪由探活判定。
-func acquireLock(port int) net.Listener {
-	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if err != nil {
-		return nil
-	}
-	return listener
-}
-
 func listenActivation(listener net.Listener, out chan<- string) {
 	for {
 		conn, err := listener.Accept()
@@ -509,7 +878,7 @@ func listenActivation(listener net.Listener, out chan<- string) {
 				return
 			}
 			command := strings.TrimSpace(string(buf[:n]))
-			if command == "background" {
+			if command == "background" || command == "show" {
 				_, _ = conn.Write([]byte("ok"))
 			}
 			select {
@@ -521,6 +890,9 @@ func listenActivation(listener net.Listener, out chan<- string) {
 }
 
 func activateRunning(port int, background bool) bool {
+	if port <= 0 {
+		return false
+	}
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
 	if err != nil {
 		return false
@@ -534,15 +906,11 @@ func activateRunning(port int, background bool) bool {
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		return false
 	}
-	if !background {
-		return true
-	}
 	buf := make([]byte, 16)
 	n, err := conn.Read(buf)
 	return err == nil && strings.TrimSpace(string(buf[:n])) == "ok"
 }
 
-// waitForPIDExit 返回已退出进程的退出码；等待失败按失败计。
 func waitForPIDExit(pid int) int {
 	code, ok := pidExitCode(pid, time.Hour)
 	if !ok {
@@ -551,18 +919,18 @@ func waitForPIDExit(pid int) int {
 	return code
 }
 
-func reportDataProtocol(args []string) {
+func reportProtocol(args []string) (bool, error) {
 	for _, arg := range args {
 		if arg == "--update-protocol" {
 			payload := []byte(`{"updateDataProtocol":1}`)
 			if path := os.Getenv(envPrefix + "UPDATE_PROTOCOL_RESULT"); path != "" {
-				_ = os.WriteFile(path, payload, 0o600)
-			} else {
-				_, _ = fmt.Fprintln(os.Stdout, string(payload))
+				return true, os.WriteFile(path, payload, 0o600)
 			}
-			os.Exit(0)
+			_, err := fmt.Fprintln(os.Stdout, string(payload))
+			return true, err
 		}
 	}
+	return false, nil
 }
 
 func serverExecutable(cfg *options) (string, error) {
@@ -572,14 +940,17 @@ func serverExecutable(cfg *options) (string, error) {
 		}
 		return "", fmt.Errorf("外部服务程序不存在：%s", cfg.serverExe)
 	}
+	if cfg.versionDir != "" {
+		return hostkit.ResolveVersionServerExe(cfg.versionDir)
+	}
 	candidates := []string{
 		filepath.Join(exeDir(), "serverd.exe"),
 		filepath.Join(exeDir(), "_internal", "serverd.exe"),
 	}
 	if cfg.installRoot != "" {
 		candidates = append(candidates,
-			filepath.Join(cfg.installRoot, "_internal", "serverd.exe"),
 			filepath.Join(cfg.installRoot, "serverd.exe"),
+			filepath.Join(cfg.installRoot, "_internal", "serverd.exe"),
 		)
 	}
 	for _, candidate := range candidates {

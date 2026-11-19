@@ -1,6 +1,5 @@
 //go:build windows
 
-// win32.go UpdateHost 的 Win32 基元：换装互斥体、弹窗、分离拉起、能力探针。
 package main
 
 import (
@@ -8,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -45,20 +46,42 @@ func messageBox(owner uintptr, message, title string, flags uintptr) {
 	callUH(procMessageBoxWUH, owner, utf16ptrUH(message), utf16ptrUH(title), flags)
 }
 
-// acquireSwapMutex 换装互斥体：0 超时单次尝试，0x80（弃置）算取得。
+// acquireSwapMutex 换装互斥体：0 超时单次尝试并绑定所属 OS 线程释放，0x80（弃置）算取得。
 func acquireSwapMutex() (func(), error) {
-	handle, _, _ := procCreateMutexWUH.Call(0, 0, utf16ptrUH(updateMutexName()))
-	if handle == 0 {
-		return nil, fmt.Errorf("无法创建换装互斥体")
-	}
-	status, _, _ := procWaitSingleUH.Call(handle, 0)
-	if status != 0 && status != 0x80 {
-		callUH(procCloseHandleUH, handle)
-		return nil, fmt.Errorf("已有更新正在进行或无法核对更新权限")
-	}
-	return func() {
+	errCh := make(chan error, 1)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		handle, _, _ := procCreateMutexWUH.Call(0, 0, utf16ptrUH(updateMutexName()))
+		if handle == 0 {
+			errCh <- fmt.Errorf("无法创建换装互斥体")
+			close(done)
+			return
+		}
+		status, _, _ := procWaitSingleUH.Call(handle, 0)
+		if status != 0 && status != 0x80 {
+			callUH(procCloseHandleUH, handle)
+			errCh <- fmt.Errorf("已有更新正在进行或无法核对更新权限")
+			close(done)
+			return
+		}
+		errCh <- nil
+		<-stop
 		callUH(procReleaseMutexUH, handle)
 		callUH(procCloseHandleUH, handle)
+		close(done)
+	}()
+	if err := <-errCh; err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
 	}, nil
 }
 
@@ -67,7 +90,6 @@ func newDetachedCommand(exe string, args []string, root string) *exec.Cmd {
 	cmd.Dir = filepath.Dir(exe)
 	cmd.Env = append(os.Environ(), envPrefix+"INSTALL_ROOT="+root)
 	env := cmd.Env
-	// 分离拉起剥离更新/开发态残留变量
 	cleaned := env[:0]
 	for _, entry := range env {
 		key, _, _ := strings.Cut(entry, "=")
@@ -91,7 +113,6 @@ func newDetachedCommand(exe string, args []string, root string) *exec.Cmd {
 	return cmd
 }
 
-// supportsDataProtocol 能力探针：--update-protocol 应答 updateDataProtocol=1。
 func supportsDataProtocol(exe string) bool {
 	result := filepath.Join(os.TempDir(), "holdexar-update-protocol-"+randomHex(6)+".json")
 	defer os.Remove(result)

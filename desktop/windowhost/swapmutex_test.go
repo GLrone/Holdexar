@@ -1,7 +1,5 @@
 //go:build windows
 
-// swapmutex_test.go 换装互斥探测行为：不存在/空闲=不进行中、被持有=进行中、
-// 更新事务上下文豁免（对齐桌面壳 _swap_mutex_held 三分支）。
 package main
 
 import (
@@ -25,7 +23,6 @@ func uniqueMutexName(t *testing.T) string {
 	return fmt.Sprintf("Holdexar-update-swap-test-%d-%s", os.Getpid(), t.Name())
 }
 
-// holdMutex 在锁定线程上创建并（可选）持有互斥体，返回释放函数。
 func holdMutex(t *testing.T, name string, acquire bool) (release func()) {
 	t.Helper()
 	acquired := make(chan error, 1)

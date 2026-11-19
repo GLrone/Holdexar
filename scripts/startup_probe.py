@@ -694,9 +694,12 @@ def probe(args) -> dict:
             worker.join(timeout=1)
     artifacts = {str(path.relative_to(root)): sha256(path) for path in
                  [launcher, *sorted((root / "versions").glob("*/Holdexar.exe")),
+                  *sorted((root / "versions").glob("*/serverd.exe")),
+                  *sorted((root / "versions").glob("*/web/dist/index.html")),
                   *sorted((root / "versions").glob("*/_internal/web/index.html"))] if path.is_file()}
     frontend = {}
-    for directory in sorted((root / "versions").glob("*/_internal/web")):
+    for directory in sorted([*(root / "versions").glob("*/web/dist"),
+                             *(root / "versions").glob("*/_internal/web")]):
         manifest = [(str(path.relative_to(directory)), sha256(path)) for path in sorted(directory.rglob("*"))
                     if path.is_file() and path.suffix in {".html", ".js", ".css"}]
         frontend[str(directory.relative_to(root))] = {

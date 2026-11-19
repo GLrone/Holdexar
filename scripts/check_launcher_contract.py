@@ -1,4 +1,4 @@
-"""Exercise packaged launchers against isolated Windows files and a version fixture."""
+"""Exercise packaged unified windowhost launcher against isolated Windows files and a version fixture."""
 import argparse
 from contextlib import ExitStack, contextmanager
 import ctypes
@@ -18,15 +18,19 @@ import uuid
 VECTORS = (
     "current", "fallback", "forbidden_fallback", "corrupt_pointer",
     "relative_version", "absolute_version", "wal_schema", "internal_junction",
-    "external_junction", "database_conflict", "active_wal_migration",
+    "external_junction", "ignores_localappdata",
     "pointer_replace_locked", "arguments_background_server",
     "previous_fallback", "runtime_junction", "versions_root_junction",
-    "invalid_compatibility", "migration_resume", "migration_key_conflict",
-    "update_guard", "update_accepted", "mixed_case_migration", "external_data",
-    "missing_version", "empty_version", "numeric_version", "floating_schema", "sparse_rowid_migration", "case_alias_data",
+    "invalid_compatibility",
+    "update_guard", "update_accepted", "external_data",
+    "missing_version", "empty_version", "numeric_version", "floating_schema", "case_alias_data",
     "terminal_committed", "terminal_marker", "terminal_wal_schema",
     "aborted_preparation", "aborted_switching", "aborted_marker",
 )
+
+PRIMARY_VER = "99.0.8"
+FALLBACK_VER = "99.0.7"
+NEXT_VER = "99.0.9"
 
 
 def sha256(path):
@@ -106,6 +110,7 @@ def invoke(entry, arguments, environment):
             raise RuntimeError(f"cleanup failed for owned process {process.pid}; stop without retry")
         process.communicate(timeout=15)
         raise TimeoutError("packaged launcher exceeded 90 seconds")
+
     def decoded(data):
         try:
             return data.decode("utf-8")
@@ -133,17 +138,17 @@ def run_vector(name, options, destination, row):
         TEMP=str(case / "temp"), TMP=str(case / "temp"),
     )
     environment.pop("WEBVIEW2_USER_DATA_FOLDER", None)
-    state = {"version": "0.3.8", "lastKnownGood": None}
+    state = {"version": PRIMARY_VER, "lastKnownGood": None}
     state["dataCompatibility"] = {
         "dataDir": str(root / "data"), "schemaVersion": 32,
-        "versions": ["0.3.8", "0.3.7"],
+        "versions": [PRIMARY_VER, FALLBACK_VER],
         "contractExtension": {"largeInteger": 9007199254740993, "nested": {"sentinel": "keep"}},
     }
     pointer = root / "state" / "current.json"
     pointer.parent.mkdir()
     database = root / "data" / "holdexar.db"
     make_database(database, "current")
-    expected_version, expected_code = "0.3.8", 37
+    expected_version, expected_code = PRIMARY_VER, 37
     expected_data = root / "data"
     arguments = ["--server"]
     preserved = [database]
@@ -151,41 +156,42 @@ def run_vector(name, options, destination, row):
     def version(directory):
         directory.mkdir(parents=True)
         shutil.copy2(options.version_fixture, directory / "Holdexar.exe")
+        (directory / "serverd.exe").write_bytes(b"MZ-serverd-fixture")
 
     with ExitStack() as stack:
         if name in {"fallback", "forbidden_fallback", "pointer_replace_locked", "previous_fallback"}:
-            version(root / "versions" / "0.3.7")
-            state["lastKnownGood"] = "0.3.7"
+            version(root / "versions" / FALLBACK_VER)
+            state["lastKnownGood"] = FALLBACK_VER
             if name == "previous_fallback":
-                state.update(lastKnownGood=None, previousVersion="0.3.7")
-            expected_version = "0.3.7"
+                state.update(lastKnownGood=None, previousVersion=FALLBACK_VER)
+            expected_version = FALLBACK_VER
             if name == "fallback":
-                state.update(pendingVersion="0.3.8", attemptId="obsolete")
+                state.update(pendingVersion=PRIMARY_VER, attemptId="obsolete")
             if name == "forbidden_fallback":
-                state["dataCompatibility"]["versions"] = ["0.3.8"]
+                state["dataCompatibility"]["versions"] = [PRIMARY_VER]
                 expected_code = 1
         elif name in {"relative_version", "absolute_version", "external_junction"}:
             outside = case / "outside"
             version(outside)
             if name == "external_junction":
-                junction(root / "versions" / "0.3.8", outside)
+                junction(root / "versions" / PRIMARY_VER, outside)
             else:
                 state.pop("dataCompatibility")
                 state["version"] = "../../outside" if name == "relative_version" else str(outside)
             expected_code = 1
         elif name == "internal_junction":
-            version(root / "versions" / "0.3.7")
-            junction(root / "versions" / "0.3.8", root / "versions" / "0.3.7")
-            state["dataCompatibility"]["versions"] = ["0.3.8"]
+            version(root / "versions" / FALLBACK_VER)
+            junction(root / "versions" / PRIMARY_VER, root / "versions" / FALLBACK_VER)
+            state["dataCompatibility"]["versions"] = [PRIMARY_VER]
             expected_code = 1
         else:
-            version(root / "versions" / "0.3.8")
+            version(root / "versions" / PRIMARY_VER)
 
         if name == "runtime_junction":
             outside = case / "runtime"
             outside.mkdir()
             (outside / "present.dll").write_bytes(b"fixture")
-            junction(root / "versions" / "0.3.8" / "_internal", outside)
+            junction(root / "versions" / PRIMARY_VER / "_internal", outside)
             expected_code = 1
         if name == "versions_root_junction":
             outside = case / "versions"
@@ -199,7 +205,7 @@ def run_vector(name, options, destination, row):
             state["dataCompatibility"]["schemaVersion"] = 32.0
             expected_code = 1
         if name in {"missing_version", "empty_version", "numeric_version"}:
-            state["dataCompatibility"]["versions"] = ["0.3.7"]
+            state["dataCompatibility"]["versions"] = [FALLBACK_VER]
             if name == "missing_version":
                 state.pop("version")
             else:
@@ -216,12 +222,19 @@ def run_vector(name, options, destination, row):
             make_database(outside / "holdexar.db", "unaccepted")
             state["dataCompatibility"]["datadir"] = str(outside)
             preserved.append(outside / "holdexar.db")
+        if name == "ignores_localappdata":
+            state.pop("dataCompatibility")
+            database.unlink()
+            preserved.remove(database)
+            legacy_db = case / "local" / "holdexar" / "holdexar.db"
+            make_database(legacy_db, "legacy-ignored")
+            preserved.append(legacy_db)
         if name in {"update_guard", "update_accepted"}:
             (root / "updater").mkdir()
             shutil.copy2(options.updater, root / "updater" / "UpdateHost.exe")
             transaction = {
                 "stage": "verifying", "attemptId": "contract-interrupted",
-                "sourceVersion": "0.3.7", "targetVersion": "0.3.8",
+                "sourceVersion": FALLBACK_VER, "targetVersion": PRIMARY_VER,
                 "dataDir": str(root / "data"), "dataPrepared": True,
             }
             if name == "update_accepted":
@@ -236,22 +249,21 @@ def run_vector(name, options, destination, row):
         if name.startswith("terminal_") or name.startswith("aborted_"):
             transaction = {
                 "attemptId": "contract-terminal", "stage": "committed",
-                "sourceVersion": "0.3.7", "targetVersion": "0.3.8",
-                "currentVersion": "0.3.8", "dataDir": str(database.parent),
+                "sourceVersion": FALLBACK_VER, "targetVersion": PRIMARY_VER,
+                "currentVersion": PRIMARY_VER, "dataDir": str(database.parent),
                 "dataDbPath": str(database), "dataPrepared": True, "dataAccepted": True,
                 "dataRecoveryPhase": "accepted", "dataSchemaVersion": 32,
             }
             if name.startswith("aborted_"):
                 state["attemptId"] = "previous-successful-attempt"
                 transaction = {"attemptId": "contract-aborted", "stage": "rolled_back",
-                               "sourceVersion": "0.3.8", "targetVersion": "0.3.9",
+                               "sourceVersion": PRIMARY_VER, "targetVersion": NEXT_VER,
                                "dataDir": str(database.parent)}
                 if name == "aborted_switching":
                     transaction["stage"] = "switching"
             transaction_path = root / "state" / "transaction.json"
             transaction_path.write_text(json.dumps(transaction), encoding="utf-8")
             preserved.append(transaction_path)
-            # No UpdateHost is installed: success must use the completed native path.
             if name in {"terminal_marker", "aborted_marker"}:
                 marker = database.parent / "backups" / ".restore.lock"
                 marker.parent.mkdir()
@@ -269,57 +281,13 @@ def run_vector(name, options, destination, row):
             preserved.append(Path(str(database) + "-wal"))
             row["walSchema"] = {"mainHeader": 32, "committedSql": 33}
             expected_code = 1
-        if name in {"database_conflict", "active_wal_migration", "migration_resume", "migration_key_conflict", "mixed_case_migration", "sparse_rowid_migration"}:
-            state.pop("dataCompatibility")
-            source = case / "local" / "holdexar"
-            source_database = source / "holdexar.db"
-            make_database(source_database, "legacy")
-            if name == "sparse_rowid_migration":
-                connection = sqlite3.connect(source_database)
-                try:
-                    connection.execute("CREATE TABLE legacy_records (payload TEXT)")
-                    connection.executemany("INSERT INTO legacy_records(rowid,payload) VALUES (?,?)", [(101, "first"), (909, "second")])
-                    connection.commit()
-                finally:
-                    connection.close()
-            keys = ("SECRET.KEY", "Secret.MASTER", "SECRET.salt") if name == "mixed_case_migration" else ("secret.key", "secret.master", "secret.salt")
-            for key in keys:
-                (source / key).write_bytes(f"sandbox-{key}".encode())
-                preserved.append(source / key)
-            preserved.append(source_database)
-            if name == "database_conflict":
-                expected_code = 1
-            elif name in {"migration_resume", "migration_key_conflict"}:
-                (source / "config").mkdir()
-                (source / "config" / "settings.json").write_text('{"fixture":true}', encoding="utf-8")
-                preserved.append(source / "config" / "settings.json")
-                meta = {"status": "incomplete", "completed": False,
-                        "sourceDir": str(source.resolve()), "targetDir": str(database.parent.resolve()),
-                        "database": "holdexar.db", "requiredKeys": ["secret.master", "secret.salt"],
-                        "requiredDirs": ["config"]}
-                (database.parent / "migration.json").write_text(json.dumps(meta), encoding="utf-8")
-                if name == "migration_key_conflict":
-                    target_key = database.parent / "secret.master"
-                    target_key.write_bytes(b"independent target key")
-                    preserved.append(target_key)
-                    expected_code = 1
-            else:
-                database.unlink()
-                preserved.remove(database)
-                connection = hold_wal(source_database)
-                stack.callback(connection.close)
-                connection.execute("INSERT INTO facts VALUES (2, 'committed-wal')")
-                connection.commit()
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute("INSERT INTO facts VALUES (3, 'uncommitted')")
-                preserved.append(Path(str(source_database) + "-wal"))
         if name == "arguments_background_server":
-            arguments += ["--background", "--data-dir", "", "--data-dir", '中文 two words "quoted"\\']
+            arguments += ["--background", "", "中文 two words", 'a\\"b', "C:\\space path\\"]
             for key in ("UPDATE_ATTEMPT_ID", "UPDATE_DATA_TOKEN", "LAUNCHER_PID", "DEV_URL", "UPDATE_RESTART", "PREV_PID"):
                 environment[f"HOLDEXAR_{key}"] = "contract-stale"
         pointer.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         if name == "corrupt_pointer":
-            pointer.write_bytes(b'{"version": "0.3.8", invalid')
+            pointer.write_bytes(b'{"version": "99.0.8", invalid')
             expected_code = 1
         original_pointer = pointer.read_bytes()
         original_hashes = {str(path): sha256(path) for path in preserved}
@@ -348,32 +316,15 @@ def run_vector(name, options, destination, row):
                 assert after["version"] == expected_version
                 assert after["dataCompatibility"] == state["dataCompatibility"]
                 assert "pendingVersion" not in after and "attemptId" not in after
-            if name in {"active_wal_migration", "mixed_case_migration"}:
-                migrated = sqlite3.connect(database)
-                try:
-                    assert migrated.execute("SELECT * FROM facts ORDER BY id").fetchall() == [(1, "legacy"), (2, "committed-wal")]
-                    assert migrated.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-                finally:
-                    migrated.close()
-                for key in keys:
-                    assert (root / "data" / key).read_bytes() == (source / key).read_bytes()
-            if name == "migration_resume":
-                meta = json.loads((database.parent / "migration.json").read_text(encoding="utf-8"))
-                assert meta["completed"] is True and meta["status"] == "completed"
-                for relative in ("secret.master", "secret.salt", "config/settings.json"):
-                    assert (database.parent / relative).read_bytes() == (source / relative).read_bytes()
+            if name == "ignores_localappdata":
+                assert not database.exists(), "retired AppData database was unexpectedly migrated"
             if name == "update_accepted":
-                transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
-                assert transaction["stage"] == "committed" and transaction["dataAccepted"] is True
-            if name == "sparse_rowid_migration":
-                connection = sqlite3.connect(database)
-                try:
-                    assert connection.execute("SELECT rowid,payload FROM legacy_records ORDER BY rowid").fetchall() == [(101, "first"), (909, "second")]
-                finally:
-                    connection.close()
+                assert not transaction_path.exists(), "completed recovery must clear state/transaction.json"
+                diagnosis = json.loads((root / "logs" / "update-diagnosis.json").read_text(encoding="utf-8"))
+                assert diagnosis["stage"] == "committed" and diagnosis["success"] is True
         assert {str(path): sha256(path) for path in preserved} == original_hashes, "source/database/key content changed"
         row["preservedSha256"] = original_hashes
-        if name in {"wal_schema", "active_wal_migration"}:
+        if name == "wal_schema":
             row["preservationScope"] = "DB/WAL sampled while fixture writer remains open; test cleanup may checkpoint SQLite"
 
 
@@ -391,7 +342,7 @@ def main():
     destination = options.output / f"contract-{uuid.uuid4().hex}"
     destination.mkdir(parents=True)
     report = {
-        "scope": "packaged launcher protection contracts; excludes GUI latency and UpdateHost upgrade/rollback",
+        "scope": "packaged unified windowhost protection contracts; excludes GUI latency and UpdateHost upgrade/rollback",
         "inputs": {name: {"path": str(value), "sha256": sha256(value), "bytes": value.stat().st_size}
                    for name, value in vars(options).items() if isinstance(value, Path) and name != "output"},
         "results": [],

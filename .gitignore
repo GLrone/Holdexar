@@ -216,6 +216,7 @@ server/.vite/
 /.zcodeignore
 
 # ── Go 迁移树本地产物 ──
+.mimosa/
 release-go/
 *.exe
 g620.json

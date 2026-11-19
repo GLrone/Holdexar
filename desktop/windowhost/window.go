@@ -7,7 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"sort"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/wailsapp/go-webview2/pkg/edge"
+	"holdexar/hostkit"
 )
 
 // 窗口内部消息：跨 goroutine 的动作全部编组到 UI 线程执行。
@@ -57,24 +58,24 @@ type app struct {
 	trayAdded bool
 	trayIcon  uintptr
 
-	quitting       bool
-	restartPending bool
+	quitting       atomic.Bool
+	restartPending atomic.Bool
 	background     atomic.Bool
 	webDead        atomic.Bool
-	browserMode    atomic.Bool // 渲染层不可用：系统浏览器兜底，宿主转无窗口服务模式
+	browserMode    atomic.Bool
 
-	openExternal func(string) // 外链出口；测试注入收集器
+	openExternal func(string)
 
 	theme atomic.Value // "dark" / "light"
 
 	navMu       sync.Mutex
-	navOrigin   string // 唯一允许的实例本机源
+	navOrigin   string
 	appURL      string
-	currentPath string // 最近一次同源导航路径+查询+片段（开发热更回跳用）
+	currentPath string // 仅由 onNavigationStarting 写入，热更实际读 webview.GetSource（本字段未消费）
 	pendingNav  string
 
 	replyMu        sync.Mutex
-	pendingReplies []string // 桥接回复队列：后台线程查完经消息泵回投 UI 线程发送
+	pendingReplies []string
 }
 
 func newApp(cfg *options, log *hostLog, srv *serverProcess) *app {
@@ -96,6 +97,9 @@ func requestForeground() {
 }
 
 func (a *app) run() int {
+	runtime.LockOSThread() // Win32 消息队列与 WebView2 STA 必须绑定同一 OS 线程
+	defer runtime.UnlockOSThread()
+
 	activeApp.Store(a)
 	defer activeApp.Store(nil)
 
@@ -104,7 +108,6 @@ func (a *app) run() int {
 	}
 	a.setupWebview()
 	if a.cfg.background || a.browserMode.Load() {
-		// 后台常驻 / 浏览器兜底：先不露窗，等单实例唤醒或托盘唤起
 		call(procShowWindow, a.hwnd, swHide)
 	} else {
 		call(procShowWindow, a.hwnd, swShow)
@@ -113,7 +116,6 @@ func (a *app) run() int {
 	}
 	a.addTray()
 
-	// 健康等待与窗口初始化并行：窗口先呈现本地等待页
 	go a.bootstrapSession()
 	go a.watchServerProcess(a.srv)
 
@@ -165,6 +167,12 @@ func (a *app) loadAppIcon() uintptr {
 		filePath(exeDir(), "app.ico"),
 		filePath(exeDir(), "_internal", "app.ico"),
 	}
+	if a.cfg.versionDir != "" {
+		paths = append(paths,
+			filePath(a.cfg.versionDir, "app.ico"),
+			filePath(a.cfg.versionDir, "_internal", "app.ico"),
+		)
+	}
 	if a.cfg.installRoot != "" {
 		paths = append(paths,
 			filePath(a.cfg.installRoot, "desktop", "app.ico"),
@@ -186,7 +194,6 @@ func filePath(parts ...string) string {
 	return strings.Join(parts, `\`)
 }
 
-// setupWebview 嵌入 WebView2 并导航到本地等待页；失败给可行动的桌面提示。
 func (a *app) setupWebview() {
 	chromium := edge.NewChromium()
 	chromium.SetErrorCallback(func(err error) {
@@ -226,12 +233,10 @@ func webviewUserDataDir(cfg *options) string {
 	return filePath(cfg.dataDir, "cache", "webview")
 }
 
-// serviceURL 本地服务地址（浏览器兜底与局域网展示共用）。
 func (a *app) serviceURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", a.cfg.serverPort)
 }
 
-// fallbackAlert 兜底告知框：与致命错误同走可静默环境（验收/CI 不弹框）。
 func fallbackAlert(message string) {
 	fmt.Fprintln(os.Stderr, message)
 	if os.Getenv("HOLDEXAR_NO_DIALOG") == "1" || os.Getenv("CI") == "1" {
@@ -240,9 +245,7 @@ func fallbackAlert(message string) {
 	call(procMessageBoxW, 0, utf16Ptr(message), utf16Ptr(appBrandName()), mbIconError)
 }
 
-// enterBrowserFallback 渲染层不可用时的兜底（对齐桌面壳 _browser_fallback）：
-// 系统浏览器打开本地服务，宿主转入无窗口服务模式继续跑——服务生命周期独立
-// 于 webview，托盘「退出」正常收尾（托盘不可用时结束本进程即退出服务）。
+// enterBrowserFallback 渲染层不可用时转无窗口服务模式并拉起系统浏览器。
 func (a *app) enterBrowserFallback(reason string) {
 	if a.browserMode.Swap(true) {
 		return
@@ -278,8 +281,7 @@ func (a *app) dispatchBridgeCall(method string, payload map[string]any) {
 		response(bridgeResult(id, map[string]any{"ok": true}))
 		go a.performRestart()
 	case "lan_hosts":
-		// 局域网地址投影含 DNS 解析与出口探测：坏网环境会卡数秒，必须后台查
-		// （COM 回调在 UI 线程上，同步做网络 IO 会冻结整个界面）
+		// 不可在 COM UI 线程同步做 DNS/UDP 探测，否则冻结界面。
 		go func() {
 			response(bridgeResult(id, map[string]any{"hosts": localServiceHosts(a.cfg.serverPort)}))
 		}()
@@ -288,8 +290,7 @@ func (a *app) dispatchBridgeCall(method string, payload map[string]any) {
 	}
 }
 
-// queueBridgeReply 回复排队并唤醒消息泵：PostWebMessageAsString 只能在
-// UI 线程调，后台线程只投递唤醒消息。
+// PostWebMessageAsString 仅限 UI 线程调用，后台经消息泵唤醒发送。
 func (a *app) queueBridgeReply(body string) {
 	a.replyMu.Lock()
 	a.pendingReplies = append(a.pendingReplies, body)
@@ -299,7 +300,6 @@ func (a *app) queueBridgeReply(body string) {
 	}
 }
 
-// flushBridgeReplies 消息泵侧取队发送；渲染层不可用时直接丢弃。
 func (a *app) flushBridgeReplies() {
 	a.replyMu.Lock()
 	replies := a.pendingReplies
@@ -313,38 +313,18 @@ func (a *app) flushBridgeReplies() {
 	}
 }
 
-// localServiceHosts 本机可直达服务的地址集（滤链路本地段）：回环 + 主机名
-// 解析 + 默认出口源地址，拼上服务端口成完整 URL。
 func localServiceHosts(port int) []string {
-	hosts := map[string]struct{}{"127.0.0.1": {}, "localhost": {}}
-	if host, err := os.Hostname(); err == nil {
-		if addrs, err := net.LookupHost(host); err == nil {
-			for _, addr := range addrs {
-				if addr != "" && !strings.HasPrefix(addr, "169.254.") {
-					hosts[addr] = struct{}{}
-				}
-			}
-		}
-	}
-	if conn, err := net.DialTimeout("udp", "223.5.5.5:53", 500*time.Millisecond); err == nil {
-		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil && !strings.HasPrefix(addr.IP.String(), "169.254.") {
-			hosts[addr.IP.String()] = struct{}{}
-		}
-		_ = conn.Close()
-	}
-	out := make([]string, 0, len(hosts))
-	for host := range hosts {
-		out = append(out, fmt.Sprintf("http://%s:%d", host, port))
-	}
-	sort.Strings(out)
-	return out
+	return hostkit.LocalServiceURLs(port)
 }
 
-// performRestart 更新换装重启：先回收本实例服务，再拉起新进程交棒。
 func (a *app) performRestart() {
-	a.restartPending = true
+	if a.restartPending.Swap(true) {
+		return
+	}
 	self := exePath()
-	a.srv.stop(a.log)
+	if a.srv != nil {
+		a.srv.stop(a.log)
+	}
 	pid, err := execDetached(self, append(os.Environ(),
 		envPrefix+"UPDATE_RESTART=1",
 		envPrefix+"PREV_PID="+strconv.Itoa(os.Getpid()),
@@ -354,7 +334,9 @@ func (a *app) performRestart() {
 	} else {
 		a.log.write(fmt.Sprintf("重启已交接：新进程 PID %d", pid))
 	}
-	a.performQuit()
+	if a.hwnd != 0 {
+		call(procPostMessageW, a.hwnd, wmAppQuit, 0, 0)
+	}
 }
 
 func execDetached(exe string, env []string) (int, error) {
@@ -397,7 +379,6 @@ func (a *app) handleWebFailed(kind uintptr) {
 	a.performQuit()
 }
 
-// bootstrapSession 等健康身份→读一次性票据→导航进应用；超时仅提示不杀进程。
 func (a *app) bootstrapSession() {
 	payload := a.waitHealthyIdentified()
 	if payload == nil {
@@ -448,19 +429,17 @@ func (a *app) currentAppURL() string {
 
 func (a *app) watchServerProcess(srv *serverProcess) {
 	code, ok := srv.waitExit()
-	if !ok || a.quitting || a.restartPending {
+	if !ok || a.quitting.Load() || a.restartPending.Load() {
 		return
 	}
 	if code == restartExitCode {
-		// 数据库恢复换库：重启服务并按当前路由重载
 		call(procPostMessageW, a.hwnd, wmAppServerRestart, 0, 0)
 		return
 	}
 	call(procPostMessageW, a.hwnd, wmAppServerDied, uintptr(code), 0)
 }
 
-// handleServerRestart 恢复后的服务重启：同参拉起新进程，健康就绪后凭
-// 新引导票据按当前路由重载（会话随重启失效，必须重取）。
+// handleServerRestart 重启后会话失效，须待健康就绪重取引导票据重载。
 func (a *app) handleServerRestart() {
 	a.log.write("本地服务请求重启（数据库恢复），正在重启")
 	next, err := a.srv.restart(a.log)
@@ -474,7 +453,6 @@ func (a *app) handleServerRestart() {
 	go a.rebindSession()
 }
 
-// rebindSession 健康就绪后取新票据，按当前路由重进应用。
 func (a *app) rebindSession() {
 	payload := a.waitHealthyIdentified()
 	if payload == nil {
@@ -497,10 +475,9 @@ func (a *app) handleServerDied(code uintptr) {
 	a.performQuit()
 }
 
-// watchServerReload 开发热更：服务重建后新票据出现即按当前路由重进应用。
 func (a *app) watchServerReload(seenNonce string) {
 	ticket := ticketPath(a.cfg)
-	for a.srv.alive() && !a.quitting {
+	for a.srv.alive() && !a.quitting.Load() {
 		time.Sleep(300 * time.Millisecond)
 		nonce, err := readTicketOnce(ticket)
 		if err != nil || nonce == "" || nonce == seenNonce {
@@ -597,7 +574,6 @@ func (a *app) removeTray() {
 	a.trayAdded = false
 }
 
-// trayMenu 托盘菜单：显示主窗口 / 退出；返回 0 表示未选择。
 func (a *app) trayMenu() int {
 	call(procSetForegroundWindow, a.hwnd)
 	menu := call(procCreatePopupMenu)
@@ -620,16 +596,16 @@ func (a *app) hasTray() bool {
 	return a.trayAdded
 }
 
-// performQuit 退出链：先收窗撤托盘，等本地服务与其代理子进程回收、端口释放。
 func (a *app) performQuit() {
-	if a.quitting {
+	if a.quitting.Swap(true) {
 		return
 	}
-	a.quitting = true
 	a.log.write("开始退出：回收本地服务")
-	call(procShowWindow, a.hwnd, swHide)
+	if a.hwnd != 0 {
+		call(procShowWindow, a.hwnd, swHide)
+	}
 	a.removeTray()
-	if !a.restartPending {
+	if !a.restartPending.Load() && a.srv != nil {
 		a.srv.stop(a.log)
 		if waitPortFree(a.cfg.serverPort, 5*time.Second) {
 			a.log.write("本地服务已退出，端口已释放")
@@ -658,15 +634,11 @@ func waitPortFree(port int, timeout time.Duration) bool {
 	}
 }
 
-// closeGuardNeedsReveal 关窗守卫重亮判定：非后台模式下关闭事件落在不可见
-// 主窗上（托盘态的杂散关闭，如任务栏预览的点 X）——意图无从判断，须先亮窗
-// 再询问；后台模式走隐藏分支不经过询问，无窗口句柄不重亮。
+// 非后台且主窗不可见时收到关闭请求须先亮窗再询问，防弹出孤儿框或静默放行。
 func (a *app) closeGuardNeedsReveal() bool {
 	return !a.background.Load() && a.hwnd != 0 && !windowVisible(a.hwnd)
 }
 
-// revealBeforeCloseIntent 亮窗再问：先显示主窗并抢前台，再进入意图询问
-// （对齐桌面壳：绝不给隐形窗口弹孤儿确认框，也不无声放行或无声取消）。
 func (a *app) revealBeforeCloseIntent() {
 	call(procShowWindow, a.hwnd, swShow)
 	if a.chromium != nil {
@@ -676,7 +648,7 @@ func (a *app) revealBeforeCloseIntent() {
 }
 
 func (a *app) handleClose() {
-	if a.quitting {
+	if a.quitting.Load() {
 		call(procDestroyWindow, a.hwnd)
 		return
 	}
@@ -685,7 +657,7 @@ func (a *app) handleClose() {
 		return
 	}
 	if activeDialog.Load() != nil {
-		return // 意图弹窗进行中：忽略重复关窗请求
+		return
 	}
 	if a.closeGuardNeedsReveal() {
 		a.revealBeforeCloseIntent()
@@ -696,8 +668,7 @@ func (a *app) handleClose() {
 		call(procShowWindow, a.hwnd, swHide)
 		a.performQuit()
 	case "stay":
-		// 原地不动
-	default: // minimize
+	default:
 		if !a.hasTray() {
 			// 托盘不可用时不能隐藏：任务栏仍要点得回来
 			call(procShowWindow, a.hwnd, swMinimize)
@@ -743,7 +714,7 @@ func windowProc(hwnd uintptr, message uint32, wParam uintptr, lParam unsafe.Poin
 		}
 		focusHwnd(a.hwnd)
 		if a.chromium != nil {
-			_ = a.chromium.Show() // 唤醒路径同样要显式点亮控制器
+			_ = a.chromium.Show()
 		}
 		return 0
 	case wmAppServerDied:

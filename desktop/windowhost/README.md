@@ -1,41 +1,19 @@
-# windowhost —— Holdexar 原生窗口宿主（Go）
+# windowhost —— Holdexar 原生桌面宿主（Go）
 
-自有 Win32 主窗内嵌 WebView2，承载本地 Go 服务子进程 `serverd.exe`，替代
-Python 桌面壳。发行形态：`versions/<版本>/Holdexar.exe`（本程序）+
-`_internal/serverd.exe`，根启动器 `desktop/go_launcher` 负责版本选择与
-数据目录注入；本程序消费 `HOLDEXAR_INSTALL_ROOT` / `HOLDEXAR_DATA_DIR` /
-`WEBVIEW2_USER_DATA_FOLDER` 环境变量。
+自有 Win32 主窗内嵌 WebView2，承载本地 Go 服务子进程 `serverd.exe`，同时兼任受管安装目录的根入口 `Holdexar.exe`。
 
-## 行为契约（对齐现役桌面壳）
+## 发行布局与启动模式
 
-- 单实例：锁端口（`HOLDEXAR_LOCK_PORT`，缺省 28965，备位 28966/28967/28968/29965/29966）
-  + 健康探活身份校验（应用名 + 数据目录一致才算同库实例）；同库重复启动唤醒原窗口，
-  不同隔离目录并行互不唤醒。激活协议沿锁端口：`show` 置前 / `background` 转后台常驻。
-- 会话：服务端健康就绪后把一次性引导票据写入 `<数据目录>/server-bootstrap.ticket`，
-  窗口读取后导航 `/api/v1/session/bootstrap?nonce=…`；票据不进日志（查询串脱敏）。
-- 导航白名单：仅放行本实例确切本机源；外链（含 target=_blank 新窗）一律转交系统浏览器。
-- 桌面桥：`window.pywebview.api.restart_app`（更新换装重启），由文档创建即注入的脚本合成。
-- 托盘：显示主窗口 / 退出；双击唤起。关闭意图弹窗：最小化到托盘 / 退出程序 / 取消，
-  页面侧幕布经 `window.__hlxCloseCurtain` 联动，主题跟随网页 dark/light。
-- 退出链：收窗撤托盘 → 关闭子进程标准输入（EOF → 服务端优雅关闭，回收调度/推流/
-  代理子进程）→ 等端口释放；宿主被硬杀时子进程凭同一 EOF 自动退出。
+- 受管发行态：`<root>/Holdexar.exe` 与 `<root>/versions/<版本>/Holdexar.exe` 由同一 `windowhost` 模块编译（注入 `-X main.buildVersion=<版本>`），本地服务位于 `<root>/versions/<版本>/serverd.exe`，前端产物位于 `<root>/versions/<版本>/web/dist/`。
+- 原地运行与回退链启：`<root>/Holdexar.exe` 启动时经 `hostkit` 校验 `state/transaction.json` 与 `state/current.json`（纯 Go 读取 SQLite 头与 WAL 的 `user_version`）；当选中版本等于 `buildVersion` 时直接在当前进程内挂载 `versions/<版本>/` 运行，仅在回滚导致版本不一致时链式拉起 `versions/<目标版本>/Holdexar.exe`。
+- 单实例保护：按规范化 `dataDir` 派生确定性命名互斥体 `Local\Holdexar-WindowHost-<hex>`，唤醒监听端口写入 `<dataDir>/windowhost.port`，同库重复启动精准唤醒原窗口，多隔离数据目录可并行双开。
+- 会话与安全：服务端就绪后写入 `<dataDir>/server-bootstrap.ticket`，窗口经 `/api/v1/session/bootstrap?nonce=…` 建立会话；导航仅放行本实例确切源，外链转交系统浏览器；`serverd.exe` 绑定独立 `KILL_ON_JOB_CLOSE` Job 对象。
 
-## 开发
+## 开发与构建
 
-- `dev-go-native.bat`（仓库根）：从当前源码构建两件到 `desktop/windowhost/bin/`，
-  以开发指针数据目录与 28767/28966 端口启动；`HOLDEXAR_DEV_WATCH` 使 serverd
-  监视源码自动重建，窗口按当前路由重载。
-- 与 Python 版双开对照：`dev.bat`（Python 壳 + Go 后端）与本入口使用不同数据
-  目录与端口，可同时运行。
-- 测试：`go test ./...`（纯逻辑层：端口协商、身份校验、导航白名单、票据、桥协议、
-  数据目录优先级，外链出口可注入）。
+- `dev-go.bat`（仓库根）：纯原生 Go 构建 `serverd.exe` 与 `Holdexar.exe` 至按次隔离的 `%TEMP%\holdexar-dev-bin-*` 临时目录，支持 `--server` / `--dev` / `--port` / `--data-dir` 参数透传并在退出时自动清理。
+- 构建命令：
 
-## 构建
-
+```powershell
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.buildVersion=0.4.0" -o Holdexar.exe .
 ```
-go build -ldflags "-H=windowsgui" -o windowhost.exe .
-```
-
-依赖 `github.com/wailsapp/go-webview2`（MIT），WebView2Loader 以资源内嵌，
-无随包 DLL；运行时依赖系统 WebView2 Runtime（Evergreen），缺失时弹窗给出
-官方安装指引。

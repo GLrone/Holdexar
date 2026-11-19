@@ -1,7 +1,5 @@
 //go:build windows
 
-// Holdexar 独立更新宿主（Go 原生 UpdateHost）：换装事务、数据保护协议、
-// 健康验收与回滚。CLI 与恢复语义对齐原实现；退出码 0=成功 1=失败。
 package main
 
 import (
@@ -13,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"holdexar/hostkit"
 )
 
 const (
@@ -53,11 +53,7 @@ func reportDataProtocol(argv []string) bool {
 }
 
 func versionFromTag(tag string) string {
-	text := strings.TrimSpace(tag)
-	if len(text) > 1 && (text[0] == 'v' || text[0] == 'V') && text[1] >= '0' && text[1] <= '9' {
-		return text[1:]
-	}
-	return text
+	return hostkit.VersionFromTag(tag)
 }
 
 func logUpdate(root, message string) {

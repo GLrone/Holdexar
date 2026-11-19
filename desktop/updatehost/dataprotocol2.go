@@ -1,6 +1,5 @@
 //go:build windows
 
-// dataprotocol2.go 数据回退、验收提交与保护释放（协议后半）。
 package main
 
 import (
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+	"holdexar/hostkit"
 )
 
 func attemptHash(attempt string) string {
@@ -21,10 +21,8 @@ func attemptHash(attempt string) string {
 	return hex.EncodeToString(sum[:])[:24]
 }
 
-// crossProcessWriteLockPath 临时目录按库路径哈希命名的独占锁文件。
 func crossProcessWriteLockPath(db string) string {
-	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(absPath(db)))))
-	return filepath.Join(os.TempDir(), fmt.Sprintf("holdexar-write-%x.lock", sum[:12]))
+	return hostkit.ProcessWriteLockPath(db)
 }
 
 // acquireCrossProcessWriteLock OS 级字节段独占锁：持有进程死亡即自动释放。
@@ -58,7 +56,6 @@ func acquireCrossProcessWriteLock(db string) (func(), error) {
 	}, nil
 }
 
-// assertFilesIdle 数据库三件套独占打开尝试（有占用即拒）。
 func assertFilesIdle(db string) error {
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		path := db + suffix
@@ -88,7 +85,6 @@ func requireChildrenStopped(tx map[string]any, childrenStopped bool) error {
 	return nil
 }
 
-// rollbackData 四阶段数据回退；失败数据保留为 update-<h>.failed.db。
 func rollbackData(root string, childrenStopped bool) error {
 	tx, err := transactionOrError(root)
 	if err != nil {
@@ -238,7 +234,6 @@ func releaseCompletedRollback(root string, tx map[string]any) error {
 	return releaseRestoreLock(filepath.Dir(db), txString(tx, "dataToken"))
 }
 
-// finishRollback 终态确认后释放保护（dataRollbackReleased）。
 func finishRollback(root string) error {
 	tx, err := transactionOrError(root)
 	if err != nil {
@@ -291,7 +286,6 @@ func finishRollback(root string) error {
 	return releaseRestoreLock(filepath.Dir(db), txString(tx, "dataToken"))
 }
 
-// abortPreparation 准备期中止（尚未 prepare 成功时安全释放）。
 func abortPreparation(root string, dataDir string) error {
 	tx, err := transactionOrError(root)
 	if err != nil {
@@ -325,7 +319,6 @@ func abortPreparation(root string, dataDir string) error {
 	return releaseRestoreLock(dataDir, markerString(marker, "token"))
 }
 
-// acceptData 验收提交：dataAccepted + 结构版本相容记录 + 释放保护。
 func acceptData(root string) error {
 	tx, err := transactionOrError(root)
 	if err != nil {

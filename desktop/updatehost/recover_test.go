@@ -1,11 +1,13 @@
 //go:build windows
 
-// recover_test.go 恢复器残壳区分、终态即清事务、升级资格裁决与迁移分阶段计时的语义测试。
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -14,9 +16,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"holdexar/hostkit"
 )
 
-// seedUserVersion 建立带指定结构版本的占位数据库（迁移信号与相容记录用）。
 func seedUserVersion(t *testing.T, path string, version int) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
@@ -29,7 +32,6 @@ func seedUserVersion(t *testing.T, path string, version int) {
 	}
 }
 
-// seedVersionDir 建立可被 isVersionValid 认可的版本目录。
 func seedVersionDir(t *testing.T, root, version string) {
 	t.Helper()
 	dir := filepath.Join(root, versionsDir, version)
@@ -55,8 +57,6 @@ func mustWriteMarker(t *testing.T, dataDir string, marker map[string]any) {
 	}
 }
 
-// TestHuskResidueWithoutMarkerClearsDespitePointerDrift 无准备标记的残壳事务
-// （数据从未进入保护）+指针漂移=直接清场，不走 fail-closed 中止。
 func TestHuskResidueWithoutMarkerClearsDespitePointerDrift(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
@@ -80,8 +80,6 @@ func TestHuskResidueWithoutMarkerClearsDespitePointerDrift(t *testing.T) {
 	}
 }
 
-// TestResidueWithLiveMarkerKeepsFailClosedOnPointerDrift 有准备标记且指针漂移=
-// 保护状态存疑：维持阻断，保留现场。
 func TestResidueWithLiveMarkerKeepsFailClosedOnPointerDrift(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
@@ -111,8 +109,6 @@ func TestResidueWithLiveMarkerKeepsFailClosedOnPointerDrift(t *testing.T) {
 	}
 }
 
-// TestReleasedResidueWithDriftedPointerClearsAndProceeds 终态已释放+指针漂移=
-// 事务已完结，清场放行（指针归属由启动链相容校验管）。
 func TestReleasedResidueWithDriftedPointerClearsAndProceeds(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
@@ -140,8 +136,6 @@ func TestReleasedResidueWithDriftedPointerClearsAndProceeds(t *testing.T) {
 	}
 }
 
-// TestReleasedResidueWithIncompletePhaseStaysFailClosed 相位无法证明恢复完整
-// 时保持阻断（保留现场）。
 func TestReleasedResidueWithIncompletePhaseStaysFailClosed(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
@@ -168,8 +162,6 @@ func TestReleasedResidueWithIncompletePhaseStaysFailClosed(t *testing.T) {
 	}
 }
 
-// TestAcceptedRecoveryClearsTransaction 已验收恢复收尾（指针与相容记录落
-// current.json）后必须清事务。
 func TestAcceptedRecoveryClearsTransaction(t *testing.T) {
 	root := t.TempDir()
 	data := filepath.Join(root, "data")
@@ -200,8 +192,6 @@ func TestAcceptedRecoveryClearsTransaction(t *testing.T) {
 	}
 }
 
-// TestUnpreparedResidueRecoveryClearsAndAllowsUpgrade 未准备残留恢复清场后
-// 升级资格按最新事务裁决（事务已清场即放行），完整换装走到提交终态并清事务。
 func TestUnpreparedResidueRecoveryClearsAndAllowsUpgrade(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "app")
@@ -219,7 +209,7 @@ func TestUnpreparedResidueRecoveryClearsAndAllowsUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := map[string]any{}
-	for _, name := range []string{appName + ".exe", filepath.Join("_internal", "payload.txt")} {
+	for _, name := range []string{appName + ".exe", "_internal/payload.txt"} {
 		body := []byte("binary:" + name)
 		if err := os.WriteFile(filepath.Join(payload, filepath.FromSlash(name)), body, 0o644); err != nil {
 			t.Fatal(err)
@@ -227,8 +217,30 @@ func TestUnpreparedResidueRecoveryClearsAndAllowsUpgrade(t *testing.T) {
 		sum := sha256.Sum256(body)
 		files[name] = hex.EncodeToString(sum[:])
 	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const keyID = "recover-test"
+	restore := hostkit.SetTrustedPubkey(keyID, hex.EncodeToString(pub))
+	t.Cleanup(restore)
+	release := map[string]any{
+		"schema":  json.Number("2"),
+		"app":     appName,
+		"version": "9.9.9",
+		"tag":     "v9.9.9",
+		"assets": []any{map[string]any{
+			"role": "app", "name": appName + "-win64-v9.9.9.zip",
+			"size": json.Number("1024"), "sha256": strings.Repeat("a", 64), "files": files,
+		}},
+	}
+	sigPayload, _ := hostkit.CanonicalManifestBytes(release)
+	release[hostkit.SignatureField] = map[string]any{
+		"alg": "ed25519", "keyId": keyID,
+		"sig": base64.StdEncoding.EncodeToString(ed25519.Sign(priv, sigPayload)),
+	}
 	manifest, _ := json.MarshalIndent(map[string]any{
-		"tag": "v9.9.9", "ready": true, "source_version": "0.3.5", "files": files,
+		"tag": "v9.9.9", "ready": true, "source_version": "0.3.5", "files": files, "release_manifest": release,
 	}, "", "  ")
 	if err := os.WriteFile(filepath.Join(staging, "manifest.json"), manifest, 0o644); err != nil {
 		t.Fatal(err)
@@ -257,8 +269,6 @@ func TestUnpreparedResidueRecoveryClearsAndAllowsUpgrade(t *testing.T) {
 	}
 }
 
-// TestReadMigrationSignalReportsVersionAndSnapshot 迁移存活信号读数：
-// 库结构版本 + 迁移前快照字节数；读不到按无信号处理。
 func TestReadMigrationSignalReportsVersionAndSnapshot(t *testing.T) {
 	base := t.TempDir()
 	empty := readMigrationSignal(filepath.Join(base, "no-data"))
@@ -288,8 +298,6 @@ func bytesOfLength(n int) []byte {
 	return body
 }
 
-// TestMigrationWatchExtendsDeadlineOnSignalAdvance 迁移信号推进刷新空闲窗
-// （只延长不缩短），总上限兜底裁决回滚。
 func TestMigrationWatchExtendsDeadlineOnSignalAdvance(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "app")
@@ -299,15 +307,13 @@ func TestMigrationWatchExtendsDeadlineOnSignalAdvance(t *testing.T) {
 	}
 	t0 := time.Now()
 	watch := newMigrationWatch(t0, 400*time.Millisecond)
-	// 首轮无信号：空闲窗维持原验收窗
 	if watch.observe(root, data, t0) {
 		t.Fatal("无信号推进不得触发总上限")
 	}
 	if watch.deadline.After(t0.Add(400 * time.Millisecond)) {
 		t.Fatal("无信号推进不得续期")
 	}
-	// 快照出现=信号推进（信号读取受轮询间隔节流，合成时钟按节流窗排布）：
-	// 空闲窗延至 now+迁移空闲窗
+	// 信号读取受 2s 轮询节流，合成时钟需跨节流窗才续期空闲窗。
 	bak := filepath.Join(data, "holdexar.db.pre-migration.bak")
 	if err := os.WriteFile(bak, bytesOfLength(8), 0o644); err != nil {
 		t.Fatal(err)
@@ -319,7 +325,6 @@ func TestMigrationWatchExtendsDeadlineOnSignalAdvance(t *testing.T) {
 	if !watch.deadline.After(t0.Add(migrationIdleWindow)) {
 		t.Fatalf("信号推进未刷新空闲窗：%v", watch.deadline.Sub(t0))
 	}
-	// 持续推进：空闲窗随最新信号继续延长
 	if err := os.WriteFile(bak, bytesOfLength(16), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -330,14 +335,11 @@ func TestMigrationWatchExtendsDeadlineOnSignalAdvance(t *testing.T) {
 	if watch.deadline.Before(secondAdvance.Add(migrationIdleWindow)) {
 		t.Fatalf("空闲窗未随最新信号延长：%v", watch.deadline.Sub(t0))
 	}
-	// 越过迁移总上限：裁决回滚
 	if !watch.observe(root, data, t0.Add(migrationMaxDuration+time.Second)) {
 		t.Fatal("总上限耗尽应裁决回滚")
 	}
 }
 
-// TestStalledMigrationWatchKeepsOriginalDeadline 无迁移信号推进时不得凭进程
-// 存在续期：验收窗维持原值。
 func TestStalledMigrationWatchKeepsOriginalDeadline(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "app")
@@ -354,5 +356,149 @@ func TestStalledMigrationWatchKeepsOriginalDeadline(t *testing.T) {
 	}
 	if watch.deadline.After(t0.Add(400 * time.Millisecond)) {
 		t.Fatalf("无信号推进不得延长验收窗：%v", watch.deadline.Sub(t0))
+	}
+}
+
+func TestFailedProbeLeavesRootBinariesUntouchedAndCommitRefreshesRoot(t *testing.T) {
+	priv := installTestTrustKeyUH(t, "commit-root-k")
+	selfExe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeBytes, err := os.ReadFile(selfExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	if err := os.MkdirAll(filepath.Join(root, "updater"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "web", "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedVersionDir(t, root, "0.3.5")
+	seedUserVersion(t, dbPathOf(data), 17)
+	if err := writeCurrentState(root, "0.3.5", "0.3.5", nil); err != nil {
+		t.Fatal(err)
+	}
+	origRootExe := []byte("original-root-launcher")
+	origUpdaterExe := []byte("original-updater-host")
+	if err := os.WriteFile(filepath.Join(root, appName+".exe"), origRootExe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "updater", "UpdateHost.exe"), origUpdaterExe, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "web", "dist", "index.html"), []byte("legacy-root-dist"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staging := t.TempDir()
+	payload := filepath.Join(staging, appName)
+	newRootExe := []byte("new-root-launcher-v036")
+	newUpdaterExe := []byte("new-updater-host-v036")
+	newClashLicense := []byte("GPL-3.0-license-v036")
+	filesToWrite := map[string][]byte{
+		appName + ".exe":                     newRootExe,
+		"updater/UpdateHost.exe":             newUpdaterExe,
+		"assets/clash/LICENSE-mihomo.txt":    newClashLicense,
+		"versions/0.3.6/" + appName + ".exe": probeBytes,
+		"versions/0.3.6/serverd.exe":         []byte("MZ-serverd"),
+		"versions/0.3.6/web/dist/index.html": []byte("<html>v036</html>"),
+	}
+	filesHashes := map[string]any{}
+	for rel, content := range filesToWrite {
+		full := filepath.Join(payload, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, content, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		filesHashes[rel] = sha256BytesHex(content)
+	}
+	release := signReleaseManifestUH(t, priv, "commit-root-k", map[string]any{
+		"schema":  json.Number("2"),
+		"app":     appName,
+		"version": "0.3.6",
+		"tag":     "v0.3.6",
+		"assets": []any{map[string]any{
+			"role":   "app",
+			"name":   appName + "-win64-v0.3.6.zip",
+			"size":   json.Number("4096"),
+			"sha256": strings.Repeat("b", 64),
+			"files":  filesHashes,
+		}},
+	})
+	writeManifestFileUH(t, staging, map[string]any{
+		"tag":              "v0.3.6",
+		"ready":            true,
+		"attempt_id":       "att-probe-fail",
+		"source_version":   "0.3.5",
+		"files":            filesHashes,
+		"release_manifest": release,
+	})
+
+	t.Setenv("HOLDEXAR_UH_TEST_PROBE_FAIL", "1")
+	ok := executeUpdateLocked(root, &options{
+		staging:       staging,
+		targetVersion: "0.3.6",
+		sourceVersion: "0.3.5",
+		dataDir:       data,
+		noLaunch:      true,
+	})
+	if ok {
+		t.Fatal("expected executeUpdateLocked to fail when probeVersionHealth fails")
+	}
+
+	gotRootExe, err := os.ReadFile(filepath.Join(root, appName+".exe"))
+	if err != nil || string(gotRootExe) != string(origRootExe) {
+		t.Fatalf("failed probeVersionHealth overwrote <root>/Holdexar.exe: got %q, want %q", string(gotRootExe), string(origRootExe))
+	}
+	gotUpdaterExe, err := os.ReadFile(filepath.Join(root, "updater", "UpdateHost.exe"))
+	if err != nil || string(gotUpdaterExe) != string(origUpdaterExe) {
+		t.Fatalf("failed probeVersionHealth overwrote <root>/updater/UpdateHost.exe: got %q, want %q", string(gotUpdaterExe), string(origUpdaterExe))
+	}
+	if _, err := os.Stat(filepath.Join(root, "web", "dist", "index.html")); err != nil {
+		t.Fatalf("failed probeVersionHealth deleted legacy <root>/web/dist before commit: %v", err)
+	}
+
+	// Now verify commit() refreshes root binaries, clash assets, and removes legacy <root>/web/dist.
+	_ = os.RemoveAll(data)
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = writeCurrentState(root, "0.3.5", "0.3.5", nil)
+	_ = os.RemoveAll(filepath.Join(root, versionsDir, "0.3.6"))
+	clearTransaction(root)
+	if !executeUpdateLocked(root, &options{
+		staging:         staging,
+		targetVersion:   "0.3.6",
+		sourceVersion:   "0.3.5",
+		dataDir:         data,
+		skipHealthCheck: true,
+		noLaunch:        true,
+	}) {
+		t.Fatal("expected commit path to succeed on clean DB-less upgrade")
+	}
+	gotRootExe, err = os.ReadFile(filepath.Join(root, appName+".exe"))
+	if err != nil || string(gotRootExe) != string(newRootExe) {
+		t.Fatalf("commit did not update <root>/Holdexar.exe: got %q, want %q", string(gotRootExe), string(newRootExe))
+	}
+	gotUpdaterExe, err = os.ReadFile(filepath.Join(root, "updater", "UpdateHost.exe"))
+	if err != nil || string(gotUpdaterExe) != string(newUpdaterExe) {
+		t.Fatalf("commit did not update <root>/updater/UpdateHost.exe: got %q, want %q", string(gotUpdaterExe), string(newUpdaterExe))
+	}
+	gotClash, err := os.ReadFile(filepath.Join(root, "assets", "clash", "LICENSE-mihomo.txt"))
+	if err != nil || string(gotClash) != string(newClashLicense) {
+		t.Fatalf("commit did not update <root>/assets/clash: got %q, err %v", string(gotClash), err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "web", "dist")); !os.IsNotExist(err) {
+		t.Fatal("commit did not remove legacy <root>/web/dist directory")
 	}
 }

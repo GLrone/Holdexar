@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-// splashHTML 本地等待页（零网络依赖）：后端就绪前窗口呈现的启动画面。
 func splashHTML(appName string) string {
 	return "<!doctype html><html><head><meta charset='utf-8'>" +
 		"<title>" + appName + "</title>" +
@@ -26,8 +25,7 @@ func splashHTML(appName string) string {
 		appName + " 启动中，请稍候…</div></body></html>"
 }
 
-// bridgeBootstrapScript 文档创建即注入：合成前端依赖的 window.pywebview 桥
-// （restart_app）并回报主题；宿主经 postMessage 应答。
+// bridgeBootstrapScript 文档创建即注入：合成 window.pywebview 桥（restart_app/lan_hosts）并监听主题变化。
 const bridgeBootstrapScript = `(function () {
   if (window.__hlxHostBridge) return;
   window.__hlxHostBridge = 1;
@@ -73,7 +71,6 @@ const bridgeBootstrapScript = `(function () {
   new MutationObserver(sendTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
 })();`
 
-// onNavigationStarting 导航白名单：仅放行本实例确切本机源；外链交系统浏览器。
 func (a *app) onNavigationStarting(uri string) bool {
 	if uri == "" || strings.HasPrefix(uri, "data:") || uri == "about:blank" {
 		return true
@@ -100,15 +97,13 @@ func (a *app) onNavigationStarting(uri string) bool {
 	return false
 }
 
-// buildAppURL 应用地址：开发显式 DEV_URL（Vite）优先，否则本机服务端口。
 func buildAppURL(cfg *options) string {
-	if cfg.devWatch && cfg.devURL != "" {
+	if cfg.devURL != "" {
 		return strings.TrimRight(cfg.devURL, "/")
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d", cfg.serverPort)
 }
 
-// buildEntryURL 引导入口：票据换会话 Cookie；next 仅同源路径且非首页时携带。
 func buildEntryURL(appURL, nonce, next string) string {
 	entry := appURL + "/api/v1/session/bootstrap?nonce=" + url.QueryEscape(nonce)
 	if next != "" && strings.HasPrefix(next, "/") && !strings.HasPrefix(next, "//") && next != "/" {
@@ -133,7 +128,6 @@ func urlOrigin(raw string) string {
 	return scheme + "://" + host
 }
 
-// urlPathWithQuery 取路径+查询+片段（同源回跳目标）。
 func urlPathWithQuery(raw string) string {
 	parsed, err := url.Parse(raw)
 	if err != nil {

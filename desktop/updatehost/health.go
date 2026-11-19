@@ -1,12 +1,9 @@
 //go:build windows
 
-// health.go 健康验收探针：只认本次拉起、目标版本、目标数据目录的进程。
-// 监听端口经 GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER) 归属核对。
 package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,10 +18,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
-)
-
-const (
-	tcpTableOwnerPIDListener = 3 // TCP_TABLE_OWNER_PID_LISTENER
+	"holdexar/hostkit"
 )
 
 var (
@@ -37,19 +31,17 @@ var (
 	procAssignProcessToJobObject = modKernelJob.NewProc("AssignProcessToJobObject")
 )
 
-// allListeningPorts 本机全部 TCP 监听端口（网络序端口 → 主机序）。
-// 验收进程树是「窗口宿主 → 本地服务」两层，监听者属孙进程，按宿主 PID
-// 过滤会永久漏配，故候选池取全量监听位，身份由健康载荷逐一核对。
+// allListeningPorts 枚举全量 TCP 监听端口：HTTP 监听者属孙进程 serverd，归属由健康载荷与镜像路径核对。
 func allListeningPorts() []int {
-	const query = 3 // TCP_TABLE_OWNER_PID_LISTENER
+	const query = 3
 	var size uint32
-	ret, _, _ := procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2 /* AF_INET */, query, 0)
-	if ret != 122 /* ERROR_INSUFFICIENT_BUFFER */ && ret != 0 {
+	ret, _, _ := procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2, query, 0)
+	if ret != 122 && ret != 0 {
 		return nil
 	}
 	buf := make([]byte, size)
 	ret, _, _ = procGetExtendedTcpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, 2 /* AF_INET */, query, 0)
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, 2, query, 0)
 	if ret != 0 {
 		return nil
 	}
@@ -59,24 +51,23 @@ func allListeningPorts() []int {
 	ports := make([]int, 0, count)
 	for i := uint32(0); i < count; i++ {
 		row := (*[6]uint32)(unsafe.Pointer(uintptr(base) + uintptr(i)*rowSize))
-		port := uint16(row[2]>>8&0xFF) | uint16(row[2]&0xFF)<<8 // 网络序（row[2]=dwLocalPort）
+		port := uint16(row[2]>>8&0xFF) | uint16(row[2]&0xFF)<<8
 		ports = append(ports, int(port))
 	}
 	return ports
 }
 
-// listeningPortsOf 进程监听中的 TCP 端口（网络序端口 → 主机序）。
 func listeningPortsOf(pid int) []int {
-	const query = 3 // TCP_TABLE_OWNER_PID_LISTENER
+	const query = 3
 	var size uint32
-	procGetExtendedTcpTable.Find()
-	ret, _, _ := procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2 /* AF_INET */, query, 0)
-	if ret != 122 /* ERROR_INSUFFICIENT_BUFFER */ && ret != 0 {
+	_ = procGetExtendedTcpTable.Find()
+	ret, _, _ := procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, 2, query, 0)
+	if ret != 122 && ret != 0 {
 		return nil
 	}
 	buf := make([]byte, size)
 	ret, _, _ = procGetExtendedTcpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, 2 /* AF_INET */, query, 0)
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, 2, query, 0)
 	if ret != 0 {
 		return nil
 	}
@@ -89,13 +80,13 @@ func listeningPortsOf(pid int) []int {
 		if int(row[5]) != pid {
 			continue
 		}
-		port := uint16(row[2]>>8&0xFF) | uint16(row[2]&0xFF)<<8 // 网络序（row[2]=dwLocalPort）
+		port := uint16(row[2]>>8&0xFF) | uint16(row[2]&0xFF)<<8
 		ports = append(ports, int(port))
 	}
 	return ports
 }
 
-// answersHTTP 端口秒级探活过滤（单实例锁端口 accepts 不应答，便宜地跳过）。
+// answersHTTP 端口秒级探活过滤（单实例唤醒端口不应答 HTTP，快速跳过）。
 func answersHTTP(port int) bool {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), answerHTTPTimeout)
 	if err != nil {
@@ -131,10 +122,13 @@ func httpGetJSON(port int, path string, timeout time.Duration) (int, map[string]
 }
 
 func samePath(first, second string) bool {
-	return strings.EqualFold(filepath.Clean(absPath(first)), filepath.Clean(absPath(second)))
+	return hostkit.SamePath(first, second)
 }
 
-// processImage 运行中进程的映像路径（未知返回空串）。
+func isUnderPath(child, parent string) bool {
+	return hostkit.IsUnderPath(child, parent)
+}
+
 func processImage(pid int) string {
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
@@ -159,20 +153,12 @@ func pidAlive(pid int) bool {
 	}
 	defer windows.CloseHandle(handle)
 	event, _ := windows.WaitForSingleObject(handle, 0)
-	return event == uint32(windows.WAIT_TIMEOUT) // WAIT_TIMEOUT(0x102)=仍在运行；0=已退出；0xFFFFFFFF=调用失败
+	return event == uint32(windows.WAIT_TIMEOUT)
 }
 
-// probeTree Job 对象：宿主被硬杀时验收进程树一并终止。
+// probeTree 验收期进程树 Job 对象：未验收通过或宿主崩溃时随句柄关闭终止；验收通过后先解除标志再关句柄以保持存活。
 type probeTree struct {
 	job windows.Handle
-}
-
-func processHandleForJob(proc *os.Process) uintptr {
-	handle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(proc.Pid))
-	if err != nil {
-		return 0
-	}
-	return uintptr(handle)
 }
 
 func assignProbeTree(proc *os.Process) *probeTree {
@@ -180,26 +166,62 @@ func assignProbeTree(proc *os.Process) *probeTree {
 	if job == 0 {
 		return nil
 	}
-	// JOBOBJECT_EXTENDED_LIMIT_INFORMATION { LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE }：
-	// LimitFlags 在结构偏移 16（Basic 段第 3 个字段），手写偏移曾是 32=MaximumWorkingSetSize，静默失效
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	procSetInformationJobObject.Call(job, 9, uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Sizeof(info)))
-	procAssignProcessToJobObject.Call(job, uintptr(processHandleForJob(proc)))
+	ret, _, _ := procSetInformationJobObject.Call(
+		job,
+		uintptr(windows.JobObjectExtendedLimitInformation),
+		uintptr(unsafe.Pointer(&info)),
+		uintptr(unsafe.Sizeof(info)),
+	)
+	if ret == 0 {
+		_ = windows.CloseHandle(windows.Handle(job))
+		return nil
+	}
+	procHandle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(proc.Pid))
+	if err != nil || procHandle == 0 {
+		_ = windows.CloseHandle(windows.Handle(job))
+		return nil
+	}
+	defer windows.CloseHandle(procHandle)
+	assigned, _, _ := procAssignProcessToJobObject.Call(job, uintptr(procHandle))
+	if assigned == 0 {
+		_ = windows.CloseHandle(windows.Handle(job))
+		return nil
+	}
 	return &probeTree{job: windows.Handle(job)}
+}
+
+func (t *probeTree) disarm() error {
+	if t == nil || t.job == 0 {
+		return nil
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = 0
+	ret, _, callErr := procSetInformationJobObject.Call(
+		uintptr(t.job),
+		uintptr(windows.JobObjectExtendedLimitInformation),
+		uintptr(unsafe.Pointer(&info)),
+		uintptr(unsafe.Sizeof(info)),
+	)
+	if ret == 0 {
+		return callErr
+	}
+	return nil
 }
 
 func (t *probeTree) detach() {
 	if t != nil && t.job != 0 {
-		windows.CloseHandle(t.job)
+		_ = t.disarm()
+		_ = windows.CloseHandle(t.job)
 		t.job = 0
 	}
 }
 
 func (t *probeTree) stop(proc *os.Process) {
 	if t != nil && t.job != 0 {
-		windows.TerminateJobObject(t.job, 1)
-		windows.CloseHandle(t.job)
+		_ = windows.TerminateJobObject(t.job, 1)
+		_ = windows.CloseHandle(t.job)
 		t.job = 0
 	}
 	if proc != nil {
@@ -207,11 +229,7 @@ func (t *probeTree) stop(proc *os.Process) {
 	}
 }
 
-var _ = errors.New
-
-// 健康验收窗与迁移分阶段预算：验收窗只管「迁移完成后服务可用」；迁移进行中的
-// 存活判定走只读信号（结构版本推进/迁移前快照增长），信号每推进一次即刷新空闲
-// 窗；空闲窗兜「真卡死」，总上限兜「无限慢」，都不放宽验收判据。var 供测试收缩。
+// 验收窗管迁移后就绪；迁移期由只读信号推进刷新空闲窗（var 供测试收缩），总上限兜底。
 var (
 	healthTimeout           = 90 * time.Second
 	migrationSignalInterval = 2 * time.Second
@@ -219,14 +237,12 @@ var (
 	migrationMaxDuration    = 1800 * time.Second
 )
 
-// migrationSignal 只读迁移存活信号：库结构版本与迁移前快照字节数。
 type migrationSignal struct {
 	schemaKnown bool
 	schema      int64
 	snapshot    int64
 }
 
-// differsFrom 与上次信号比对：任一成分变化即迁移推进。
 func (s migrationSignal) differsFrom(other migrationSignal) bool {
 	if s.snapshot != other.snapshot {
 		return true
@@ -244,8 +260,7 @@ func (s migrationSignal) schemaDisplay() string {
 	return strconv.FormatInt(s.schema, 10)
 }
 
-// readMigrationSignal 只读探测迁移存活信号；读不到的成分按无信号处理，
-// 迁移写事务中的瞬时锁冲突不算故障。
+// readMigrationSignal 只读探测迁移推进，瞬时写锁冲突按无信号忽略。
 func readMigrationSignal(dataDir string) migrationSignal {
 	signal := migrationSignal{snapshot: -1}
 	if matches, _ := filepath.Glob(filepath.Join(dataDir, "*.pre-migration.bak")); len(matches) > 0 {
@@ -259,7 +274,6 @@ func readMigrationSignal(dataDir string) migrationSignal {
 	return signal
 }
 
-// migrationWatch 迁移分阶段计时状态：只读信号推进刷新空闲窗，总上限兜底。
 type migrationWatch struct {
 	deadline        time.Time
 	migrationCap    time.Time
@@ -276,8 +290,6 @@ func newMigrationWatch(started time.Time, timeout time.Duration) *migrationWatch
 	}
 }
 
-// observe 每轮验收轮询调用一次：越过迁移总上限返回 true；信号推进时把空闲窗
-// 延至 now+迁移空闲窗（只延长不缩短）。
 func (w *migrationWatch) observe(root, dataDir string, now time.Time) bool {
 	if now.After(w.migrationCap) {
 		return true
@@ -301,8 +313,6 @@ type probeOptions struct {
 	requireGuard  *bool
 }
 
-// probeVersionHealth 健康验收：身份四要素（版本/事务/数据目录/进程镜像）+
-// 保护模式附加（writeProtected/updateDataProtocol）+ 页面就绪（pageReady）。
 func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, opts probeOptions) (bool, string) {
 	exe, err := getVersionExe(root, targetVersion)
 	if err != nil || !fileExists(exe) {
@@ -323,7 +333,6 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 	childEnv[envPrefix+"INSTALL_ROOT"] = root
 	childEnv[envPrefix+"DATA_DIR"] = dataDir
 	childEnv[envPrefix+"UPDATE_ATTEMPT_ID"] = attemptID
-	// 目标版本号经环境注入：健康响应版本身份直接可比（打包版以构建时版本为准）
 	childEnv[envPrefix+"VERSION"] = targetVersion
 	if protected {
 		childEnv[envPrefix+"UPDATE_DATA_TOKEN"] = txString(tx, "dataToken")
@@ -355,31 +364,49 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 	cmd := exec.Command(exe, cmdArgs...)
 	cmd.Dir = filepath.Dir(exe)
 	cmd.Env = envList
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x08000000}
 	if err := cmd.Start(); err != nil {
 		return false, "拉起新版本失败：" + err.Error()
 	}
+	probePID := cmd.Process.Pid
 	tree := assignProbeTree(cmd.Process)
+
+	waitDone := make(chan struct{})
+	var waitExitCode int
+	go func() {
+		waitErr := cmd.Wait()
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			waitExitCode = exitErr.ExitCode()
+		} else if waitErr != nil {
+			waitExitCode = 1
+		}
+		close(waitDone)
+	}()
+
 	if protected {
 		children := txChildren(tx)
 		children = append(children, map[string]any{
-			"pid": cmd.Process.Pid, "image": processImage(cmd.Process.Pid), "stopped": false,
+			"pid": probePID, "image": processImage(probePID), "stopped": false,
 		})
 		_ = updateTransaction(root, stageVerifying, map[string]any{
 			"children": children, "launchPending": false, "launchImage": absPath(exe),
 		})
 	}
-	expectedImage := processImage(cmd.Process.Pid)
+	expectedImage := processImage(probePID)
 	preserved := false
 	defer func() {
 		if !preserved {
 			tree.stop(cmd.Process)
+			select {
+			case <-waitDone:
+			case <-time.After(2 * time.Second):
+			}
 			if protected {
 				current := readTransaction(root)
 				if current != nil {
 					children := txChildren(current)
 					for _, child := range children {
-						if entry, ok := child.(map[string]any); ok && int(entry["pid"].(float64)) == cmd.Process.Pid {
+						if entry, ok := child.(map[string]any); ok && int(entry["pid"].(float64)) == probePID {
 							entry["stopped"] = true
 						}
 					}
@@ -393,21 +420,20 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 	watch := newMigrationWatch(started, healthTimeout)
 	lastReason := "健康验收未绑定本事务：无可用健康响应"
 	for time.Now().Before(watch.deadline) {
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return false, fmt.Sprintf("新版本进程已退出，退出码 %d", cmd.ProcessState.ExitCode())
-		}
-		if done, code := tryWaitProbe(cmd); done {
-			return false, fmt.Sprintf("新版本进程已退出，退出码 %d", code)
+		select {
+		case <-waitDone:
+			return false, fmt.Sprintf("新版本进程已退出，退出码 %d", waitExitCode)
+		default:
 		}
 		if expectedImage != "" {
-			if current := processImage(cmd.Process.Pid); current != "" && !samePath(current, expectedImage) {
+			if current := processImage(probePID); current != "" && !samePath(current, expectedImage) {
 				return false, "健康验收未绑定本事务：进程镜像被替换为 " + current
 			}
 		}
 		if watch.observe(root, dataDir, time.Now()) {
 			return false, fmt.Sprintf("数据库迁移超出总预算（%.0fs），执行回滚", migrationMaxDuration.Seconds())
 		}
-		candidates := listeningPortsOf(cmd.Process.Pid)
+		candidates := listeningPortsOf(probePID)
 		candidates = append(candidates, allListeningPorts()...)
 		for _, port := range candidates {
 			if !answersHTTP(port) {
@@ -421,8 +447,6 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 			if appName2 != appName {
 				continue
 			}
-			// 响应者进程绑定：监听者是验收树孙进程（本地服务），验其存活且
-			// 映像位于目标版本目录内；attemptId 为本次事务独有凭据兜底
 			if pidValue, ok := data["pid"].(float64); ok && int(pidValue) > 0 {
 				image := processImage(int(pidValue))
 				if image == "" || !isUnderPath(image, filepath.Dir(exe)) {
@@ -442,9 +466,11 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 					continue
 				}
 			}
-			if opts.keepRunning && protected {
-				if err := acceptData(root); err != nil {
-					return false, "数据验收提交失败：" + err.Error()
+			if opts.keepRunning {
+				if protected {
+					if err := acceptData(root); err != nil {
+						return false, "数据验收提交失败：" + err.Error()
+					}
 				}
 				tree.detach()
 				preserved = true
@@ -460,37 +486,18 @@ func probeVersionHealth(root, targetVersion, attemptID string, dataDir string, o
 	return false, fmt.Sprintf("健康验收超时（%s）：%s", budget, lastReason)
 }
 
-// serverdExeOf 窗口宿主 exe → 同版本目录内的本地服务 exe（健康载荷的
-// executable 由服务端自身报告，身份比对以其为准）。
 func serverdExeOf(windowhostExe string) string {
-	return filepath.Join(filepath.Dir(windowhostExe), "_internal", "serverd.exe")
-}
-
-// isUnderPath 子路径判定（大小写不敏感，防跨目录冒充）。
-func isUnderPath(child, parent string) bool {
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
+	verDir := filepath.Dir(windowhostExe)
+	if resolved, err := hostkit.ResolveVersionServerExe(verDir); err == nil {
+		return resolved
 	}
-	rel = filepath.ToSlash(rel)
-	return rel == "." || (!strings.HasPrefix(rel, "../") && rel != "..")
-}
-
-func tryWaitProbe(cmd *exec.Cmd) (bool, int) {
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true, cmd.ProcessState.ExitCode()
-	default:
-		return false, 0
+	flat := filepath.Join(verDir, "serverd.exe")
+	if fileExists(flat) {
+		return flat
 	}
+	return filepath.Join(verDir, "_internal", "serverd.exe")
 }
 
-// verifyHealthResponse 健康响应身份校验；不匹配返回原因，全部匹配返回空串。
 func verifyHealthResponse(data map[string]any, targetVersion, attemptID, exe, dataDir, processImage string, requireGuard bool) string {
 	if requireGuard {
 		for _, key := range []string{"pid", "dataDir", "executable"} {
@@ -521,7 +528,3 @@ func verifyHealthResponse(data map[string]any, targetVersion, attemptID, exe, da
 	}
 	return ""
 }
-
-var errProbeUnused = errors.New("unused")
-var _ = io.Discard
-var _ = errProbeUnused

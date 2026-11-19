@@ -28,9 +28,11 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import zipfile
 
 
 # 输出统一 UTF-8：管道场景 stdout 编码跟随 ANSI 代码页，西欧环境编不了中文
@@ -82,6 +84,40 @@ def sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+def zip_file_hashes(zip_path: Path) -> dict[str, str]:
+    """Return a safe, complete hash map for files rooted in the application folder."""
+    files: dict[str, str] = {}
+    folded: set[str] = set()
+    with zipfile.ZipFile(zip_path) as archive:
+        for item in archive.infolist():
+            if item.is_dir():
+                continue
+            name = item.filename
+            path = PurePosixPath(name)
+            mode = item.external_attr >> 16
+            if (
+                "\\" in name
+                or path.is_absolute()
+                or len(path.parts) < 2
+                or path.parts[0] != APP_NAME
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or stat.S_ISLNK(mode)
+            ):
+                raise ValueError(f"unsafe application archive member: {name!r}")
+            relative = "/".join(path.parts[1:])
+            if relative.casefold() in folded:
+                raise ValueError(f"duplicate application archive member: {relative!r}")
+            folded.add(relative.casefold())
+            digest = hashlib.sha256()
+            with archive.open(item) as source:
+                for chunk in iter(lambda: source.read(1 << 20), b""):
+                    digest.update(chunk)
+            files[relative] = digest.hexdigest()
+    if not files:
+        raise ValueError("application archive contains no files")
+    return files
+
+
 def pick_zip(explicit: str | None, version: str) -> Path:
     """应用包：显式路径优先，否则取 release/ 内与目标版本精确匹配的包。"""
     if explicit:
@@ -116,6 +152,7 @@ def build_manifest(version: str, zip_path: Path) -> dict:
             "name": zip_path.name,
             "size": zip_path.stat().st_size,
             "sha256": sha256_of(zip_path),
+            "files": zip_file_hashes(zip_path),
         }
     ]
 

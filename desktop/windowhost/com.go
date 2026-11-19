@@ -1,9 +1,6 @@
 //go:build windows
 
-// WebView2 COM 事件接线。槽位与参数封装全部来自 com_generated.go（tools/comgen
-// 从官方头机械产出，槽位不再手数）；本文件只剩与接口无关的固定形状面：
-// 事件处理器 COM 对象（IUnknown+Invoke 标准形状）与通用出/入参助手。
-// 约定：所有 self/raw 参数都是 COM 对象指针，对象首 8 字节即 vtable 地址。
+// 约定：self/raw 均为 COM 对象指针，首指针字为 vtable 地址。
 package main
 
 import (
@@ -15,11 +12,9 @@ import (
 	"github.com/wailsapp/go-webview2/pkg/edge"
 )
 
-// comRaw COM 对象指针视图：首 8 字节即 vtable 地址。
 type comRaw struct{ vtbl unsafe.Pointer }
 
-// comProc COM 对象指针 + 槽位 → 方法入口。槽位来自生成常量（com_generated.go），
-// 视图定界 4096 只是声明，实际访问的槽号永远落在真实 vtable 内。
+// comProc 按 COM 对象首字段 vtable + 槽号取方法入口（4096 仅作数组视图上界）。
 func comProc(self unsafe.Pointer, slot int) uintptr {
 	return (*[4096]uintptr)((*comRaw)(self).vtbl)[slot]
 }
@@ -36,14 +31,12 @@ func comArgsString(self unsafe.Pointer, slot int) string {
 	return text
 }
 
-// comArgsBool 读 BOOL* 出参。
 func comArgsBool(self unsafe.Pointer, slot int) bool {
 	var value int32
 	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
 	return value != 0
 }
 
-// comArgsUint32 读枚举出参；comArgsUint64 读 UINT64 出参。
 func comArgsUint32(self unsafe.Pointer, slot int) uint32 {
 	var value uint32
 	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(unsafe.Pointer(&value)))
@@ -56,8 +49,7 @@ func comArgsUint64(self unsafe.Pointer, slot int) uint64 {
 	return value
 }
 
-// comArgsSetBool 调 [in] BOOL 属性写入口：参数按值传，不取地址
-// （取地址等价把本地变量地址塞给按值槽位）。
+// comArgsSetBool 写 [in] BOOL 属性：按值传递，不可传指针。
 func comArgsSetBool(self unsafe.Pointer, slot int, on bool) {
 	var value int32
 	if on {
@@ -66,7 +58,6 @@ func comArgsSetBool(self unsafe.Pointer, slot int, on bool) {
 	syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(value))
 }
 
-// comRegister 注册事件处理器：(this, handler, token*)；HRESULT 非 0 报错。
 func comRegister(self unsafe.Pointer, slot int, handler unsafe.Pointer) error {
 	var token int64
 	hr, _, _ := syscall.SyscallN(comProc(self, slot), uintptr(self), uintptr(handler), uintptr(unsafe.Pointer(&token)))
@@ -76,9 +67,7 @@ func comRegister(self unsafe.Pointer, slot int, handler unsafe.Pointer) error {
 	return nil
 }
 
-// comEventHandler 事件处理器 COM 对象：WebView2 注册后只走 AddRef/Release/
-// Invoke（无身份查询），QI 按契约回 E_NOINTERFACE 不填出参；生命周期由 Go 侧
-// navEventHandlers 持引用，引用计数恒 1。
+// comEventHandler QI 返回 E_NOINTERFACE；生命周期由 Go 侧 navEventHandlers 持引用，AddRef/Release 恒返回 1。
 type comEventHandler struct {
 	vtbl   *handlerVtbl
 	onFire func(sender, args unsafe.Pointer)

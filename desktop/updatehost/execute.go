@@ -1,6 +1,5 @@
 //go:build windows
 
-// execute.go 换装事务编排：execute_update / _commit / _fail / recover_interrupted_update。
 package main
 
 import (
@@ -14,11 +13,12 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"holdexar/hostkit"
 )
 
 func updateMutexName() string { return "Holdexar-update-swap" }
 
-// stagingPayloadDir 暂存载荷根（staging/Holdexar/）。
 func stagingPayloadDir(staging string) string {
 	payload := filepath.Join(staging, appName)
 	if directoryExists(payload) {
@@ -28,22 +28,25 @@ func stagingPayloadDir(staging string) string {
 }
 
 func readManifest(staging string) map[string]any {
-	raw, err := os.ReadFile(filepath.Join(staging, "manifest.json"))
+	file, err := os.Open(filepath.Join(staging, "manifest.json"))
 	if err != nil {
 		return nil
 	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	decoder.UseNumber()
 	var manifest map[string]any
-	if json.Unmarshal(raw, &manifest) != nil {
+	if decoder.Decode(&manifest) != nil {
 		return nil
 	}
 	return manifest
 }
 
-// verifyStagingPayload 逐文件哈希核验（清单缺 files 表时跳过——跨版本配对兼容）。
+// verifyStagingPayload 逐文件哈希核验（fail-closed：清单缺 files 表时明确拒绝）。
 func verifyStagingPayload(staging string, manifest map[string]any) string {
 	expected, ok := manifest["files"].(map[string]any)
 	if !ok || len(expected) == 0 {
-		return ""
+		return "暂存清单缺少文件校验表，拒绝执行"
 	}
 	payload := stagingPayloadDir(staging)
 	if !directoryExists(payload) {
@@ -75,7 +78,7 @@ func manifestString(manifest map[string]any, keys ...string) string {
 	return ""
 }
 
-// executeUpdate 换装事务主流程（持换装互斥体）。
+// executeUpdate 换装事务主流程（调用方须已持换装互斥体）。
 func executeUpdate(root string, opts *options) bool {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -101,6 +104,26 @@ func executeUpdateLocked(root string, opts *options) bool {
 		}
 	}
 	manifest := readManifest(opts.staging)
+	if manifest == nil {
+		logUpdate(root, "暂存清单缺失或不可读，拒绝换装")
+		return false
+	}
+	dataDir := opts.dataDir
+	if dataDir == "" {
+		dataDir = filepath.Join(root, "data")
+	}
+	tag := manifestString(manifest, "tag")
+	targetVersion := opts.targetVersion
+	if targetVersion == "" {
+		targetVersion = versionFromTag(tag)
+	}
+	if targetVersion == "" {
+		targetVersion = tag
+	}
+	if err := verifyStagedTrust(opts.staging, dataDir, targetVersion); err != nil {
+		logUpdate(root, "暂存包信任锚复核未通过："+err.Error()+"，拒绝换装并保留现装")
+		return false
+	}
 	if payloadError := verifyStagingPayload(opts.staging, manifest); payloadError != "" {
 		logUpdate(root, "暂存包完整性核验未通过："+payloadError+"，拒绝换装并保留现装")
 		return false
@@ -111,14 +134,6 @@ func executeUpdateLocked(root string, opts *options) bool {
 	}
 	if attemptID == "" {
 		attemptID = randomHex(16)
-	}
-	tag := manifestString(manifest, "tag")
-	targetVersion := opts.targetVersion
-	if targetVersion == "" {
-		targetVersion = versionFromTag(tag)
-	}
-	if targetVersion == "" {
-		targetVersion = tag
 	}
 	if targetVersion == "" || !isManagedVersionName(targetVersion) {
 		logUpdate(root, fmt.Sprintf("错误：无法识别目标版本：%q", targetVersion))
@@ -156,14 +171,14 @@ func executeUpdateLocked(root string, opts *options) bool {
 	if sourceVersion == "" {
 		sourceVersion = "legacy_version"
 	}
-	dataDir := opts.dataDir
-	if dataDir == "" {
-		dataDir = filepath.Join(root, dataDirName)
+	if !versionGT(targetVersion, sourceVersion) {
+		logUpdate(root, fmt.Sprintf("更新方向不符：目标 %s 不新于来源 %s，拒绝降级换装", targetVersion, sourceVersion))
+		return false
 	}
+
 	activeVersion := stateString(state, "version")
 	pendingSelf := stateString(state, "pendingVersion")
-	// 沿用已落盘文件仅限暂存包已消失的真中断；暂存包在位时以其载荷为准重装
-	// （上次尝试可能用旧载荷安装过，直接沿用会让过期二进制参与验收）
+	// 仅暂存载荷已消失时才沿用已落盘文件，防止暂存包在位时用旧安装产物参与验收
 	recovering := pendingSelf == targetVersion && isVersionValid(root, targetVersion) &&
 		!directoryExists(stagingPayloadDir(opts.staging))
 	if activeVersion != "" && (strings.EqualFold(getVersionDir(root, targetVersion), getVersionDir(root, activeVersion)) ||
@@ -224,16 +239,13 @@ func executeUpdateLocked(root string, opts *options) bool {
 	return commit(root, opts.staging, targetVersion, &diagnosis, !opts.noLaunch)
 }
 
-// commit 页面验收与指针提交。
 func commit(root, staging, targetVersion string, diagnosis *diagnosis, launchOnFinish bool) bool {
 	tx := readTransaction(root)
 	protected := txBool(tx, "dataPrepared")
 	launched := !protected
 	if protected {
-		var healthy bool
-		var reason string
-		healthy, reason = probeVersionHealth(root, targetVersion, diagnosis.AttemptID, diagnosis.DataDir,
-			probeOptions{requireWindow: true, keepRunning: true})
+		healthy, reason := probeVersionHealth(root, targetVersion, diagnosis.AttemptID, diagnosis.DataDir,
+			probeOptions{requireWindow: true, keepRunning: launchOnFinish})
 		if !healthy {
 			return failPath(root, diagnosis, "页面验收失败："+reason, targetVersion)
 		}
@@ -243,7 +255,11 @@ func commit(root, staging, targetVersion string, diagnosis *diagnosis, launchOnF
 				return failPath(root, diagnosis, "数据验收提交失败："+err.Error(), targetVersion)
 			}
 		}
-	} else if launchOnFinish {
+	}
+	if err := refreshRootArtifacts(root, staging); err != nil {
+		return failPath(root, diagnosis, "刷新根目录组件失败："+err.Error(), targetVersion)
+	}
+	if !protected && launchOnFinish {
 		logUpdate(root, "健康验收通过，拉起正式界面")
 		launched = launchGUI(root)
 	}
@@ -251,10 +267,10 @@ func commit(root, staging, targetVersion string, diagnosis *diagnosis, launchOnF
 		return failPath(root, diagnosis, "拉起新版本失败：新版未能拉起", targetVersion)
 	}
 	_ = confirmVersion(root, targetVersion)
-	if isInside(staging, selfExePath()) {
-		os.Remove(filepath.Join(staging, "manifest.json"))
-	} else {
-		os.RemoveAll(staging)
+	if staging != "" && isInside(staging, selfExePath()) {
+		_ = os.Remove(filepath.Join(staging, "manifest.json"))
+	} else if staging != "" {
+		_ = os.RemoveAll(staging)
 	}
 	cleanupOldExecutables(filepath.Join(root, "updater"))
 	cleanupOldExecutables(root)
@@ -268,8 +284,7 @@ func commit(root, staging, targetVersion string, diagnosis *diagnosis, launchOnF
 }
 
 func isInside(parent, child string) bool {
-	rel, err := filepath.Rel(parent, child)
-	return err == nil && !strings.HasPrefix(rel, "..")
+	return hostkit.IsUnderPath(child, parent)
 }
 
 func selfExePath() string {
@@ -300,7 +315,6 @@ func spawnDetached(exe string, args []string, root string) {
 	_ = cmd.Start()
 }
 
-// relaunchPrevious 健康探针旧版本并拉起（失败回滚后的用户界面恢复）。
 func relaunchPrevious(root, version string) {
 	logUpdate(root, "尝试拉起旧版本")
 	candidates := []string{}
@@ -321,7 +335,6 @@ func relaunchPrevious(root, version string) {
 	}
 }
 
-// failPath 统一失败出口：撤目标版本、指针交还、数据回退、保护释放、留痕。
 func failPath(root string, diagnosis *diagnosis, errorText string, launchedVersion string) bool {
 	logUpdate(root, "换装故障："+errorText+"，执行回滚...")
 	tx := readTransaction(root)
@@ -400,7 +413,6 @@ func txDataDir(root string) string {
 	return filepath.Join(root, dataDirName)
 }
 
-// recoverInterruptedUpdate 恢复中断事务（--recover-only）。
 func recoverInterruptedUpdate(root string) error {
 	tx := readTransaction(root)
 	if tx == nil {
@@ -480,7 +492,6 @@ func recoverInterruptedUpdate(root string) error {
 	return nil
 }
 
-// findCompatibleVersion 相容记录允许范围内的可用版本定位。
 func findCompatibleVersion(root string) string {
 	compatibility, err := readDataCompatibility(root)
 	if err != nil || compatibility == nil {
