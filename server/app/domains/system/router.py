@@ -150,7 +150,6 @@ async def info() -> dict:
         "data_dir": str(settings.data_dir),
         "web_dist_ready": settings.web_dist_dir.exists(),
         "uptime_seconds": round(time.time() - _STARTED_AT, 1),
-        # 发布仓库（owner/repo）：前端拼发布页/问题反馈链接的唯一来源
         "repo": GITHUB_REPO,
     }
 
@@ -166,7 +165,7 @@ async def write_scheduler() -> dict:
 
 
 class LegacyImport(BaseModel):
-    path: str  # 旧爬虫 steam-price.db 路径
+    path: str
 
 
 def _fetch_legacy_snapshot(src: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], int]:
@@ -318,13 +317,12 @@ async def export_delete(name: str) -> dict:
     return {"removed": True}
 
 
-# ─────────────────────────── 密钥保护（凭据加密的密钥托管）────────────────────
 
 
 class SecurityModeRequest(BaseModel):
     mode: str  # legacy（关闭）| dpapi（系统凭据）| passphrase（口令）
-    passphrase: str | None = None  # 设为口令模式时的新口令
-    current_passphrase: str | None = None  # 从口令模式切换出去时的当前口令
+    passphrase: str | None = None
+    current_passphrase: str | None = None
 
 
 class SecurityUnlock(BaseModel):
@@ -379,7 +377,6 @@ async def security_lock(response: Response) -> dict:
     return {"ok": True, "security": keyring.status(get_settings().data_dir)}
 
 
-# ─────────────────────────── 数据备份（VACUUM INTO 在线快照）────────────────────
 
 
 class BackupCreate(BaseModel):
@@ -479,7 +476,6 @@ async def backup_download(name: str) -> FileResponse:
     return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
 
-# ─────────────────────────── 运行日志（日志页）───────────────────────────
 
 
 @router.get("/system/logs")
@@ -520,7 +516,6 @@ async def logs_stream(request: Request) -> StreamingResponse:
     )
 
 
-# ─────────────────────────── 应用更新（GitHub Releases）────────────────────
 
 
 @router.get("/system/update-check")
@@ -533,10 +528,10 @@ async def update_check() -> dict:
 
 class UpdateDownload(BaseModel):
     tag: str
-    sha256: str | None = None  # 清单内的校验值；缺失即拒绝下载（无无校验放行）
-    asset: str | None = None  # 清单给出的确切资产名（省掉一次 API 反查）
-    size: int | None = None  # 清单体积：通道不给 Content-Length 时兜底百分比
-    notes: str | None = None  # 更新说明（供换装后首次启动展示）
+    sha256: str | None = None
+    asset: str | None = None
+    size: int | None = None
+    notes: str | None = None
 
 
 # tag/asset 进 GitHub URL 路径段：白名单字符，堵路径注入（../、?、#）
@@ -547,8 +542,7 @@ _RELEASE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 async def update_download(req: UpdateDownload) -> dict:
     """下载 release zip → data/update-staging/ 解包校验；重启后由桌面壳换装。
 
-    校验值必填：缺失即 400 拒绝——清单路径的值来自验签清单，API 路径
-    来自 GitHub 资产 digest，缺它就没有可信完整性锚点。
+    客户端只选择目标 tag；下载校验值与文件清单由服务端重新验签取得。
     """
     from app.core import updater
 
@@ -556,11 +550,8 @@ async def update_download(req: UpdateDownload) -> dict:
         req.asset and not _RELEASE_NAME_RE.fullmatch(req.asset)
     ):
         raise HTTPException(status_code=400, detail="更新标识包含非法字符")
-    if not (req.sha256 or "").strip():
-        raise HTTPException(status_code=400, detail="更新源未提供校验值，已拒绝下载")
-    if not updater.mark_download_starting(req.tag, req.size):
+    if not updater.mark_download_starting(req.tag, None):
         raise HTTPException(status_code=409, detail="已有更新下载进行中")
-    # fire-and-forget：下载在后台跑，前端轮询 /system/update-progress
     asyncio.get_running_loop().create_task(
         updater.download_update(req.tag, req.sha256, req.asset, req.size, req.notes)
     )
@@ -605,13 +596,11 @@ async def update_cancel() -> dict:
         return {**updater.cancel_download(), "cleared": False}
     return updater.clear_staging()
 
-# ─────────────────────── 结构化诊断（机器排障读证据面）───────────────────────
 
 # 写账等写锁预警阈值（毫秒）：BACKGROUND 持闸进入饥饿区间的经验线，
 # 超过它才值得把「写锁竞争」列为嫌疑
 _WRITE_LOCK_WAIT_WARN_MS = 30_000
 
-# 写账样本条数：环形缓冲里最近 N 条「写库分段完成」
 _WRITE_LEDGER_SAMPLES = 8
 
 
@@ -622,7 +611,7 @@ def _parse_write_ledger(lines: list[str], limit: int) -> list[dict]:
     解析只取诊断要用的三个数：款数 / 总计 / 等写锁（值形如 "12毫秒"）。
     """
     out: list[dict] = []
-    for line in reversed(lines):  # 旧→新扫，取最近 limit 条
+    for line in reversed(lines):
         if "写库分段完成" not in line:
             continue
         entry: dict = {"time": line[:8], "message": None, "entries": None, "total_ms": None, "lockwait_ms": None}
@@ -644,7 +633,7 @@ async def _diagnostics_section(name: str, fn):
     """单面故障不拖垮整体：一面异常就降级为 {"error": 原文}。"""
     try:
         return await fn() if asyncio.iscoroutinefunction(fn) else fn()
-    except Exception as e:  # noqa: BLE001 —— 诊断面自身必须可用
+    except Exception as e:  # noqa: BLE001
         return {"error": str(e)[:200]}
 
 
@@ -684,11 +673,11 @@ async def diagnostics() -> dict:
         pool = await proxies_service.pool_stats()
         try:
             system_proxy = await proxies_service.resolve_system_proxy_url()
-        except Exception:  # noqa: BLE001 —— 探活失败按无系统代理记
+        except Exception:  # noqa: BLE001
             system_proxy = None
         try:
             env_hijacked = env_check.tun_mode_suspected()
-        except Exception:  # noqa: BLE001 —— 判定失败按未接管记
+        except Exception:  # noqa: BLE001
             env_hijacked = False
         return {
             "app_version": settings.version,
@@ -725,7 +714,6 @@ async def diagnostics() -> dict:
     write_ledger = _write_ledger()
     backlog = await _diagnostics_section("backlog", _backlog)
 
-    # ── 派生信号：机器可读的嫌疑清单（有证据才产信号，不臆测）──
     signals: list[dict] = []
     last_cycle = (cycles.get("last") or {}) if isinstance(cycles, dict) else {}
     if last_cycle.get("status") == "failed":

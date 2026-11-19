@@ -7,92 +7,73 @@ per-IP 解锁限速、主机文件触点回环收容、更新标识校验。
 from __future__ import annotations
 
 import asyncio
-import secrets
+import time
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
 from app.core import access, lan_access
-from app.domains.system.router import router as system_router
 from app.domains.system.session_router import (
     create_bootstrap,
     reset_bootstrap,
-    router as session_router,
 )
-
-_TEST_PASSWORD = "pw-" + secrets.token_hex(8)
-_LAN_PEER = ("192.168.1.5", 43210)
-_LAN_HOST = "192.168.1.5:28765"
-
-
-def _setup():
-    access.reset_token()
-    reset_bootstrap()
-    lan_access.reset_unlock_state()
-    lan_access.set_enabled(False)
-    access.set_extra_hosts(())
-
-
-@pytest.fixture(autouse=True)
-def _fresh_state():
-    _setup()
-    yield
-    _setup()
-
-
-def _app() -> FastAPI:
-    app = FastAPI()
-    app.add_middleware(access.LocalAccessMiddleware)
-    app.include_router(system_router, prefix="/api/v1")
-    app.include_router(session_router, prefix="/api/v1")
-    return app
-
-
-def _lan_client(app: FastAPI, *, host: str = _LAN_HOST) -> AsyncClient:
-    return AsyncClient(
-        transport=ASGITransport(app=app, client=_LAN_PEER),
-        base_url=f"http://{host}",
-    )
-
-
-def _local_client(app: FastAPI, *, host: str = "127.0.0.1:28765") -> AsyncClient:
-    return AsyncClient(transport=ASGITransport(app=app), base_url=f"http://{host}")
-
-
-def _enable_lan():
-    lan_access.set_enabled(True)
-    access.set_extra_hosts([*lan_access.local_ips(), "192.168.1.5"])
-
+from lan_test_support import (
+    LAN_HOST,
+    LAN_IP,
+    LAN_PEER_IP,
+    LOOPBACK_IP,
+    access_app,
+    attack_cases,
+    enable_lan,
+    isolate_lan_state,
+    peer_client,
+)
 
 async def _run(client: AsyncClient, method: str, path: str, **kw):
     async with client:
         return await client.request(method, path, **kw)
 
 
+@pytest.mark.parametrize("case", attack_cases(), ids=lambda case: str(case["id"]))
+def test_shared_lan_access_contract(case):
+    if case["lan_enabled"]:
+        enable_lan()
+    app = access_app()
+    headers = {"Host": case["host"], **case["headers"]}
+    r = asyncio.run(_run(
+        peer_client(app, peer_ip=case["peer_ip"], host="127.0.0.1:28765"),
+        case["method"],
+        case["path"],
+        headers=headers,
+    ))
+    assert r.status_code == case["want_status"], case["id"]
+
+
 def test_lan_no_session_root_serves_lock_page():
     """局域网无会话对端访问 / ：内联锁定页（非完整 SPA），带 nonce CSP。"""
-    _enable_lan()
+    enable_lan()
     access.session_token()
-    r = asyncio.run(_run(_lan_client(_app()), "GET", "/"))
+    app = access_app()
+    r = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/"))
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "访问密码" in r.text and "session/unlock" in r.text
     assert "nonce-" in r.headers["content-security-policy"]
     assert r.headers["cache-control"] == "no-store"
     # 完整应用资产不再随锁定页外泄：静态资源 401
-    assets = asyncio.run(_run(_lan_client(_app()), "GET", "/assets/app.js"))
+    assets = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/assets/app.js"))
     assert assets.status_code == 401
 
 
 def test_lan_with_session_serves_static_paths():
     """持会话局域网对端过闸（测试应用无静态路由 → 404 表示已过闸）。"""
-    _enable_lan()
+    enable_lan()
+    app = access_app()
     token = access.session_token()
-    r = asyncio.run(_run(_lan_client(_app()), "GET", "/assets/app.js",
+    r = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/assets/app.js",
                          headers={access.SESSION_HEADER: token}))
     assert r.status_code == 404  # 闸放行，路由不存在
-    root = asyncio.run(_run(_lan_client(_app()), "GET", "/",
+    root = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/",
                             headers={access.SESSION_HEADER: token}))
     assert root.status_code == 404  # 无 SPA 回退路由，非锁定页
 
@@ -100,21 +81,23 @@ def test_lan_with_session_serves_static_paths():
 def test_default_mode_lan_peer_gets_nothing_unauthenticated():
     """默认模式（未开局域网）绑 0.0.0.0：局域网对端连页面也拿不到（421）。"""
     access.session_token()
+    app = access_app()
     for path in ("/", "/assets/app.js", "/api/v1/health"):
-        r = asyncio.run(_run(_lan_client(_app()), "GET", path))
+        r = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", path))
         assert r.status_code == 421, path
 
 
 def test_options_requires_loopback_or_session():
     """OPTIONS 不再先于会话闸短路：无凭据局域网对端 403，方法表不可探测。"""
-    _enable_lan()
+    enable_lan()
     access.session_token()
-    r = asyncio.run(_run(_lan_client(_app()), "OPTIONS", "/api/v1/health"))
+    app = access_app()
+    r = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "OPTIONS", "/api/v1/health"))
     assert r.status_code == 403
-    local = asyncio.run(_run(_local_client(_app()), "OPTIONS", "/api/v1/health"))
+    local = asyncio.run(_run(peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765"), "OPTIONS", "/api/v1/health"))
     assert local.status_code == 405  # 回环预检放行到路由（开发工作流）
     token = access.session_token()
-    with_session = asyncio.run(_run(_lan_client(_app()), "OPTIONS", "/api/v1/health",
+    with_session = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "OPTIONS", "/api/v1/health",
                                     headers={access.SESSION_HEADER: token}))
     assert with_session.status_code == 405
 
@@ -133,14 +116,16 @@ def test_bootstrap_next_rejects_control_chars():
     reset_bootstrap()
     access.session_token()
     nonce = create_bootstrap()
-    r = asyncio.run(_run(_local_client(_app()), "GET",
+    app = access_app()
+    local = lambda: peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765")
+    r = asyncio.run(_run(local(), "GET",
                          f"/api/v1/session/bootstrap",
                          params={"nonce": nonce, "next": "/\t/evil.example"}))
     assert r.status_code == 303
     assert r.headers["location"] == "/"
     reset_bootstrap()
     nonce = create_bootstrap()
-    r = asyncio.run(_run(_local_client(_app()), "GET",
+    r = asyncio.run(_run(local(), "GET",
                          f"/api/v1/session/bootstrap",
                          params={"nonce": nonce, "next": "/dashboard"}))
     assert r.headers["location"] == "/dashboard"
@@ -149,31 +134,32 @@ def test_bootstrap_next_rejects_control_chars():
 
 def test_health_face_split():
     """health：无会话局域网对端只见 status；回环与持会话对端见完整快照。"""
-    _enable_lan()
+    enable_lan()
     token = access.session_token()
-    anon = asyncio.run(_run(_lan_client(_app()), "GET", "/api/v1/health")).json()
+    app = access_app()
+    anon = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/api/v1/health")).json()
     assert anon == {"status": "ok"}
-    held = asyncio.run(_run(_lan_client(_app()), "GET", "/api/v1/health",
+    held = asyncio.run(_run(peer_client(app, peer_ip=LAN_PEER_IP, host=LAN_HOST), "GET", "/api/v1/health",
                             headers={access.SESSION_HEADER: token})).json()
     assert held["version"] and held["app"]
-    local = asyncio.run(_run(_local_client(_app()), "GET", "/api/v1/health")).json()
+    local = asyncio.run(_run(peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765"), "GET", "/api/v1/health")).json()
     assert local["version"] and "dataDir" in local
 
 
 def test_update_ready_empty_body_400():
     """update-ready 空体 400（公开端点健壮性，不再 500）。"""
     access.session_token()
-    _enable_lan()
-    r = asyncio.run(_run(_lan_client(_app()), "POST", "/api/v1/system/update-ready",
+    enable_lan()
+    r = asyncio.run(_run(peer_client(access_app(), peer_ip=LAN_PEER_IP, host=LAN_HOST), "POST", "/api/v1/system/update-ready",
                          content=b"", headers={"content-type": "application/json"}))
     assert r.status_code == 400
 
 
 def test_import_legacy_loopback_only():
     """旧库导入是主机文件触点：局域网对端（即使持会话）403。"""
-    _enable_lan()
+    enable_lan()
     token = access.session_token()
-    r = asyncio.run(_run(_lan_client(_app()), "POST", "/api/v1/import-legacy",
+    r = asyncio.run(_run(peer_client(access_app(), peer_ip=LAN_PEER_IP, host=LAN_HOST), "POST", "/api/v1/import-legacy",
                          json={"path": "C:/nope/legacy.db"},
                          headers={access.SESSION_HEADER: token}))
     assert r.status_code == 403
@@ -184,8 +170,9 @@ def test_update_download_tag_shape():
     access.session_token()
     token = access.session_token()
     headers = {access.SESSION_HEADER: token}
+    app = access_app()
     for bad in ("v0.0.0/../../evil", "v1?x=1", "v1#frag", ""):
-        r = asyncio.run(_run(_local_client(_app()), "POST",
+        r = asyncio.run(_run(peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765"), "POST",
                              "/api/v1/system/update-download",
                              json={"tag": bad, "sha256": "a" * 64}, headers=headers))
         assert r.status_code == 400, bad
@@ -241,8 +228,59 @@ def test_password_source_surface(monkeypatch):
 def test_security_lock_rotates_session():
     """security/lock 是安全动作：响应重签会话 Cookie，旧令牌全量吊销。"""
     token = access.session_token()
-    r = asyncio.run(_run(_local_client(_app()), "POST", "/api/v1/system/security/lock",
+    r = asyncio.run(_run(peer_client(access_app(), peer_ip=LOOPBACK_IP, host="127.0.0.1:28765"), "POST", "/api/v1/system/security/lock",
                          headers={access.SESSION_HEADER: token}))
     assert r.status_code == 200
     new_token = r.cookies.get(access.SESSION_COOKIE)
     assert new_token and new_token != token
+
+
+def test_login_sessions_are_distinct_and_logout_revokes_only_one():
+    """每次登录有独立可吊销令牌，退出一台设备不影响另一台。"""
+    app = access_app()
+    local = lambda: peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765")
+    first = asyncio.run(_run(local(), "GET", "/api/v1/session/dev"))
+    second = asyncio.run(_run(local(), "GET", "/api/v1/session/dev"))
+    first_cookie = first.cookies.get(access.SESSION_COOKIE)
+    second_cookie = second.cookies.get(access.SESSION_COOKIE)
+    assert first_cookie and second_cookie and first_cookie != second_cookie
+
+    first_headers = {"Cookie": f"{access.SESSION_COOKIE}={first_cookie}"}
+    second_headers = {"Cookie": f"{access.SESSION_COOKIE}={second_cookie}"}
+    logout = asyncio.run(_run(
+        local(), "POST", "/api/v1/session/logout", headers=first_headers
+    ))
+    assert logout.status_code == 204
+
+    first_after = asyncio.run(_run(
+        local(), "GET", "/api/v1/system/security", headers=first_headers
+    ))
+    second_after = asyncio.run(_run(
+        local(), "GET", "/api/v1/system/security", headers=second_headers
+    ))
+    assert first_after.status_code == 401
+    assert second_after.status_code == 200
+
+
+def test_session_expires_after_its_lifetime(monkeypatch):
+    """会话最长 12 小时，不能随进程长期有效。"""
+    now = 1000.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    response = __import__("starlette.responses", fromlist=["Response"]).Response()
+    access.issue_session(response)
+    token = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
+    scope = {"headers": [(b"cookie", f"{access.SESSION_COOKIE}={token}".encode())]}
+    assert access._authorized(scope)
+
+    now += 12 * 60 * 60 + 1
+    assert not access._authorized(scope)
+
+
+def test_expired_sessions_are_pruned_when_new_session_is_issued(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+    first = access._new_session()
+    now += access._SESSION_TTL_S + 1
+    second = access._new_session()
+    assert first not in access._sessions
+    assert set(access._sessions) == {second}

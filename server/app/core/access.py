@@ -15,9 +15,9 @@
 """
 from __future__ import annotations
 
-import hmac
 from ipaddress import ip_address
 import secrets
+import time
 from typing import Callable
 
 from starlette.responses import HTMLResponse, JSONResponse
@@ -36,11 +36,19 @@ PUBLIC_PATHS = frozenset(
         "/api/v1/session/bootstrap",
         "/api/v1/session/dev",
         "/api/v1/session/unlock",
+        # 忘记密码找回（Steam 登录验证身份）：锁定态公开通道，共用解锁限速
+        "/api/v1/session/recovery/login/start",
+        "/api/v1/session/recovery/login/code",
+        "/api/v1/session/recovery/login/status",
+        "/api/v1/session/recovery/cancel",
+        "/api/v1/session/recovery/complete",
     }
 )
 
 _API_PREFIX = "/api/"
 
+_SESSION_TTL_S = 12 * 60 * 60
+_sessions: dict[str, float] = {}
 _token: str | None = None
 
 # 局域网模式放行的本机地址集合（字面量、小写、无端口）；空＝默认回环-only。
@@ -60,20 +68,35 @@ def register_mcp_gate(path_prefix: str, gate: Callable[[Scope], bool | None]) ->
 
 
 def session_token() -> str:
-    """当前进程的会话令牌（首次调用时生成，进程退出即失效）。
-
-    不落盘、不进日志、不进任何响应体——它只存在于进程内存与 `HttpOnly`
-    Cookie 里。桌面壳与后端同进程，直接调用本函数取用。
-    """
+    """Return the active compatibility session used by local callers."""
     global _token
+    _prune_sessions()
     if _token is None:
-        _token = secrets.token_urlsafe(32)
+        _token = _new_session()
     return _token
 
 
-def reset_token() -> None:
-    """丢弃当前令牌（测试隔离 / 换数据目录用）。"""
+def _new_session() -> str:
+    _prune_sessions()
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = time.monotonic() + _SESSION_TTL_S
+    return token
+
+
+def _prune_sessions() -> None:
     global _token
+    now = time.monotonic()
+    for token, expiry in tuple(_sessions.items()):
+        if expiry <= now:
+            _sessions.pop(token, None)
+    if _token not in _sessions:
+        _token = None
+
+
+def reset_token() -> None:
+    """Revoke every active session (security reset and test isolation)."""
+    global _token
+    _sessions.clear()
     _token = None
 
 
@@ -93,11 +116,19 @@ def _cookie_value(scope: Scope) -> str:
 
 
 def _authorized(scope: Scope) -> bool:
-    expected = session_token()
+    _prune_sessions()
     candidates = (_cookie_value(scope), _header_value(scope, SESSION_HEADER.encode()))
-    return any(
-        candidate and hmac.compare_digest(candidate, expected) for candidate in candidates
-    )
+    return any(candidate in _sessions for candidate in candidates if candidate)
+
+
+def revoke_session(scope: Scope) -> None:
+    global _token
+    candidates = (_cookie_value(scope), _header_value(scope, SESSION_HEADER.encode()))
+    for candidate in candidates:
+        if candidate:
+            _sessions.pop(candidate, None)
+            if candidate == _token:
+                _token = None
 
 
 def host_allowed(host: str) -> bool:
@@ -370,7 +401,7 @@ def issue_session(response, *, secure: bool = False) -> None:
     """
     response.set_cookie(
         SESSION_COOKIE,
-        session_token(),
+        _new_session(),
         httponly=True,
         samesite="strict",
         secure=secure,
@@ -388,6 +419,7 @@ __all__ = [
     "origin_allowed",
     "issue_session",
     "request_authorized",
+    "revoke_session",
     "reset_token",
     "session_token",
     "set_extra_hosts",

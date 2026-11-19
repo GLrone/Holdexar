@@ -80,8 +80,6 @@ async def set_values(values: dict, *, secret_values: dict | None = None) -> None
             )
         )
         await session.commit()
-    # KV 写口唯一收口处的变更广播：前端经 SSE settings.changed 静默重读，
-    # 覆盖另一端/另一标签页/后端内部改动（无订阅者时发布为空操作）。
     bus.publish("settings.changed", keys=sorted(values.keys()))
 
 

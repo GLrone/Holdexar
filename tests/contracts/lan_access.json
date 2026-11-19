@@ -1,0 +1,110 @@
+{
+  "cases": [
+    {
+      "id": "loopback_reaches_session_gate",
+      "lan_enabled": false,
+      "peer_ip": "127.0.0.1",
+      "host": "127.0.0.1:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {},
+      "want_status": 401
+    },
+    {
+      "id": "remote_peer_cannot_claim_loopback_host",
+      "lan_enabled": false,
+      "peer_ip": "192.168.1.25",
+      "host": "127.0.0.1:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {},
+      "want_status": 421
+    },
+    {
+      "id": "forwarded_headers_cannot_claim_loopback_peer",
+      "lan_enabled": false,
+      "peer_ip": "192.168.1.25",
+      "host": "127.0.0.1:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+        "Forwarded": "for=127.0.0.1;host=127.0.0.1"
+      },
+      "want_status": 421
+    },
+    {
+      "id": "lan_peer_with_registered_host_reaches_session_gate",
+      "lan_enabled": true,
+      "peer_ip": "192.168.1.25",
+      "host": "192.168.1.5:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {
+        "Origin": "http://192.168.1.5:28765"
+      },
+      "want_status": 401
+    },
+    {
+      "id": "lan_forwarded_headers_do_not_replace_remote_peer",
+      "lan_enabled": true,
+      "peer_ip": "192.168.1.25",
+      "host": "192.168.1.5:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+        "Forwarded": "for=127.0.0.1;host=127.0.0.1"
+      },
+      "want_status": 401
+    },
+    {
+      "id": "lan_peer_cannot_use_unregistered_host",
+      "lan_enabled": true,
+      "peer_ip": "192.168.1.25",
+      "host": "rebound.attacker.example",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {},
+      "want_status": 421
+    },
+    {
+      "id": "lan_peer_cross_origin_is_rejected",
+      "lan_enabled": true,
+      "peer_ip": "192.168.1.25",
+      "host": "192.168.1.5:28765",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {
+        "Origin": "http://attacker.invalid:28765"
+      },
+      "want_status": 403
+    },
+    {
+      "id": "lan_peer_options_is_rejected_without_session",
+      "lan_enabled": true,
+      "peer_ip": "192.168.1.25",
+      "host": "192.168.1.5:28765",
+      "method": "OPTIONS",
+      "path": "/api/v1/private",
+      "headers": {
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+        "Forwarded": "for=127.0.0.1;host=127.0.0.1"
+      },
+      "want_status": 403
+    },
+    {
+      "id": "malformed_loopback_host_port_is_rejected",
+      "lan_enabled": false,
+      "peer_ip": "127.0.0.1",
+      "host": "127.0.0.1:evil",
+      "method": "GET",
+      "path": "/api/v1/private",
+      "headers": {},
+      "want_status": 421
+    }
+  ]
+}

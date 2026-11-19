@@ -46,31 +46,19 @@ class LanAccessState(BaseModel):
 
 class SettingsUpdate(BaseModel):
     account: AccountPayload | None = None
-    # 新手教程完成标志（首次启动自动弹出；完成后落 KV 不再弹）
     onboarding_done: bool | None = None
-    # 自动价格链总开关（False=关停定时爬价+失败修复，只留手动爬取）
     auto_price: bool | None = None
-    # 每日自动备份开关（False=只留手动备份；启动补备同闸）
     backup_auto: bool | None = None
-    # 已主动提示过的版本号（启动告知「一次一版本」的去重锚点）
     update_notified: str | None = None
-    # 用户明确跳过的版本号（严格等值匹配：跳过 A 不拦 A 之后的 B；
-    # 手动检查不受它限制——用户主动查就该看到结果）
     update_skipped: str | None = None
-    # 新版本提示总开关（False=有新版也不弹窗/不亮侧栏红点，只留手动检查）
     update_notify: bool | None = None
-    # 静默自动更新开关（True=检测到新版本后台自动下载校验，不打扰；
-    # 下次启动应用时桌面壳消费暂存目录自动换装）
     update_auto: bool | None = None
-    # 直连模式加速器建议弹窗已看过（首次使用直连自动弹一次）
     direct_notice_seen: bool | None = None
     # 主题镜像（dark/light）：网页主题存 localStorage，桌面壳读不到——
     # 前端 apply() 每次 apply/toggle 都镜像一份到这里，关闭弹窗（独立
     # WinForms 窗）按它跟随主题。
     theme: str | None = None
-    # MCP 服务开关（外部 AI 接入面；写入即运行时启停，非重启生效）
     mcp_enabled: bool | None = None
-    # 局域网访问模式（开关 + 访问密码；写入即生效，运行状态见 LanAccessState）
     lan_access: LanAccessUpdate | None = None
 
 
@@ -81,13 +69,10 @@ class SettingsPayload(BaseModel):
     backup_auto: bool = True
     update_notified: str = ""
     update_skipped: str = ""
-    # 提示默认开（有新版该告诉用户）；静默自动更新默认关——后台悄悄
-    # 下载 100MB+ 属于「用户没同意就不该做」的事，必须显式开启
     update_notify: bool = True
     update_auto: bool = False
     direct_notice_seen: bool = False
     theme: str = "dark"
-    # MCP 面：KV 开关值 + 运行态（running=会话管理器在役；error 为空串=无故障）
     mcp_enabled: bool = False
     mcp_running: bool = False
     mcp_error: str = ""
@@ -95,9 +80,6 @@ class SettingsPayload(BaseModel):
     lan_access: LanAccessState
 
 
-# 「自动抓取」页的六个内容源开关：payload 字段 → app_settings KV。
-# fx_auto 沿用历史 key `crawl.auto_refresh_rates`（该闸原无任何写入点，
-# 本端点是它的第一个写入口）。
 _FETCH_SETTING_KEYS: dict[str, str] = {
     "epic_free": "fetch.epic_free",
     "hb_choice": "fetch.hb_choice",
@@ -107,8 +89,8 @@ _FETCH_SETTING_KEYS: dict[str, str] = {
     "fx_history": "fetch.fx_history",
 }
 
-# 开启内容源即补一拍首跑：键 → 对应的主拍任务。热门新品/即将推出是每日档
-# 大抓取，不由本开关逐次补拍，跟随各自日节奏；榜单即时需求由每小时热销榜覆盖。
+# 热门新品/即将推出是每日档大抓取，不由本开关逐次补拍，跟随各自日节奏；
+# 榜单即时需求由每小时热销榜覆盖。
 _SOURCE_KICK_JOBS: dict[str, tuple[str, ...]] = {
     "fetch.epic_free": ("epic_free",),
     "fetch.hb_choice": ("hb_choice",),
@@ -164,18 +146,11 @@ class FetchSettingsPayload(BaseModel):
     bundle_counts: bool = True
     fx_auto: bool = True
     fx_history: bool = True
-    # 价格刷新网格步长（小时）；夹取 1..72，默认 6
     price_interval_hours: int = 6
-    # 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏
-    # （特惠榜尾段恒随轮）；改动从下一轮生效，不打断在跑的轮
     catalog_refresh: bool = False
-    # 任务队列逐段开关（任务中心队列组成卡）：False = 该段不随轮组队，
-    # 改动从下一轮组队生效；catalog 段沿用 catalog_refresh（特惠榜尾段
-    # 跟随它，不设独立开关）
     queue_missing: bool = True
     queue_pool: bool = True
     queue_discounts: bool = True
-    # 内容源自定义刷新节奏（自动抓取页；改动即时重排对应定时拍）
     hb_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("hb_choice"))
     epic_schedule: ContentSchedule = Field(default_factory=lambda: _default_schedule("epic_free"))
 
@@ -297,7 +272,6 @@ async def update_settings(
         await service.set_value("ui.direct_notice_seen", bool(payload.direct_notice_seen))
 
     if payload.theme is not None:
-        # 主题镜像只认两值：异常值忽略（防脏数据把弹窗配色带歪）
         if payload.theme in ("dark", "light"):
             await service.set_value("ui.theme", payload.theme)
 
@@ -384,9 +358,6 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
         )
     except (TypeError, ValueError):
         pass
-    # 与 crawl.default_queue_specs 同一有效默认：直连形态下目录段默认不随
-    # 价格轮出网，未显式设置时开关如实显示「关」（默认 direct_only，
-    # 初次打开即直连）
     catalog_default = (
         False
         if (await service.get_value("proxy.strategy", "direct_only")) == "direct_only"
@@ -395,10 +366,8 @@ async def _read_fetch_settings() -> FetchSettingsPayload:
     payload.catalog_refresh = bool(
         await service.get_value("crawl.catalog_refresh", catalog_default)
     )
-    # 任务队列逐段开关：与 crawl.default_queue_specs 同源（KV 缺失默认开）
     for field in ("queue_missing", "queue_pool", "queue_discounts"):
         setattr(payload, field, bool(await service.get_value(f"crawl.{field}", True)))
-    # 内容源自定义节奏：KV 缺失/非法逐项回落注册默认（同一套默认）
     from app.core.scheduler import CONTENT_SCHEDULE_KEYS, normalize_schedule
 
     for field, job_id in (("hb_schedule", "hb_choice"), ("epic_schedule", "epic_free")):
@@ -415,7 +384,6 @@ async def get_fetch_settings() -> FetchSettingsPayload:
 
 @router.put("/fetch")
 async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPayload:
-    # off→on 补拍判定要用旧值：先按「缺省=开」口径读一轮有效旧值再写
     old_effective = {
         key: bool(await service.get_value(key, True))
         for key in set(_FETCH_SETTING_KEYS.values())
@@ -433,7 +401,6 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
         },
     )
     if kicks:
-        # 开源即补一拍首跑：不等下一个定时拍（改排失败不阻塞保存）
         try:
             from app.core import scheduler as core_scheduler
 
@@ -444,8 +411,6 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
     if payload.price_interval_hours is not None:
         hours = max(1, min(72, int(payload.price_interval_hours)))
         await service.set_value("crawl.price_interval_hours", hours)
-        # 立即生效：后台重锚下一格（网络探测不阻塞响应；调度器未跑时静默，
-        # 首轮 job 的轮转重锚会按新步长收敛）
         try:
             from app.core import scheduler as core_scheduler
 
@@ -453,17 +418,14 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
                 asyncio.create_task(
                     core_scheduler._reanchor_price_refresh("间隔调整")
                 )
-        except Exception:  # noqa: BLE001 —— 重锚触发失败不阻塞保存
+        except Exception:  # noqa: BLE001
             pass
     if payload.catalog_refresh is not None:
-        # 只落偏好：价格轮每轮开工时现读，改动从下一轮生效
         await service.set_value("crawl.catalog_refresh", bool(payload.catalog_refresh))
     for field in ("queue_missing", "queue_pool", "queue_discounts"):
         value = getattr(payload, field)
         if value is not None:
-            # 只落偏好：组队时现读，改动从下一轮生效
             await service.set_value(f"crawl.{field}", bool(value))
-    # 内容源自定义节奏：落 KV + 调度在跑时立即重排（下次启动按 KV 再应用）
     from app.core.scheduler import CONTENT_SCHEDULE_KEYS
 
     for field, job_id in (("hb_schedule", "hb_choice"), ("epic_schedule", "epic_free")):
@@ -478,6 +440,6 @@ async def update_fetch_settings(payload: FetchSettingsUpdate) -> FetchSettingsPa
 
             if core_scheduler.scheduler.running:
                 core_scheduler.apply_content_schedule(job_id, cfg.time, cfg.days)
-        except Exception:  # noqa: BLE001 —— 调度器未起时由启动链按 KV 应用
+        except Exception:  # noqa: BLE001
             pass
     return await _read_fetch_settings()

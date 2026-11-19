@@ -128,7 +128,6 @@ def local_ips() -> list[str]:
     except OSError:
         pass
     try:
-        # 路由表探测：向外连接的本机源地址（多网卡时补齐默认出口地址）
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(0.5)
             sock.connect(("223.5.5.5", 53))
@@ -164,8 +163,6 @@ __all__ = [
 ]
 
 
-# ── 访问密码验证器（P0-1 终态：存储改为不可逆 scrypt PHC 串）────────────
-#
 # PHC 串自包含算法与参数（盐随哈希生成），校验按串内参数重算；KDF 参数
 # 边界校验在重算之前（恶意篡改大 N 曾可致解锁内存耗尽——P0-2 同源）。
 # 格式与 Go 侧 x/crypto/scrypt 跨语言互通（RFC 7914 参数一致即输出一致）。

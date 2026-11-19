@@ -8,59 +8,30 @@ from __future__ import annotations
 import asyncio
 import secrets
 
-import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
-
 from app.core import access, lan_access
-from app.domains.system.router import router as system_router
 from app.domains.system.session_router import (
-    reset_bootstrap,
     resolve_lan_password_verifier,
-    router as session_router,
+)
+from lan_test_support import (
+    LAN_HOST as _LAN_HOST,
+    LAN_IP,
+    LAN_PEER_IP,
+    LOOPBACK_IP,
+    access_app,
+    enable_lan,
+    isolate_lan_state,
+    peer_client,
 )
 
 # 测试夹具密码：运行时生成，与真实凭据无关
 _TEST_PASSWORD = "pw-" + secrets.token_hex(8)
 _WRONG_PASSWORD = "wrong-" + secrets.token_hex(8)
 _ENV_PASSWORD = "env-" + secrets.token_hex(8)
-_LAN_HOST = "192.168.1.5:28765"
-
-
-@pytest.fixture(autouse=True)
-def _fresh_lan_state(monkeypatch):
-    access.reset_token()
-    reset_bootstrap()
-    lan_access.reset_unlock_state()
-    lan_access.set_enabled(False)
-    access.set_extra_hosts(())
-    yield
-    access.reset_token()
-    reset_bootstrap()
-    lan_access.reset_unlock_state()
-    lan_access.set_enabled(False)
-    access.set_extra_hosts(())
-
-
-def _app() -> FastAPI:
-    app = FastAPI()
-    app.add_middleware(access.LocalAccessMiddleware)
-    app.include_router(system_router, prefix="/api/v1")
-    app.include_router(session_router, prefix="/api/v1")
-    return app
-
-
-def _client(app: FastAPI, *, host: str = "127.0.0.1:28765") -> AsyncClient:
-    return AsyncClient(
-        transport=ASGITransport(app=app), base_url=f"http://{host}"
-    )
 
 
 def _enable_lan(monkeypatch, *, password: str | None = _TEST_PASSWORD):
     """开启局域网模式并注入固定验证器（DB 无关路径；解锁走真实 PHC 校验）。"""
-    lan_access.set_enabled(True)
-    # 合成局域网地址与真实本机地址都入白名单，测试与真机两形态都覆盖
-    access.set_extra_hosts([*lan_access.local_ips(), "192.168.1.5"])
+    enable_lan()
     if password is not None:
         phc = lan_access.hash_password(password)
         monkeypatch.setattr(
@@ -76,9 +47,9 @@ async def _async_of(value: str) -> str:
 def test_default_mode_lan_host_still_rejected():
     """默认模式回归：非回环 Host 一律 421（历史行为不变）。"""
     access.session_token()
-    app = _app()
+    app = access_app()
     async def run():
-        async with _client(app, host=_LAN_HOST) as client:
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             return await client.get("/api/v1/health")
     assert asyncio.run(run()).status_code == 421
 
@@ -87,11 +58,8 @@ def test_default_mode_rejects_non_loopback_peer():
     """P0 回归：默认模式（未开局域网）下局域网对端伪造 Host: 127.0.0.1
     也必须被对端判定拦截——Host 是客户端可控字段，不是信任事实源。"""
     access.session_token()
-    app = _app()
-    client = AsyncClient(
-        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
-        base_url="http://127.0.0.1:28765",
-    )
+    app = access_app()
+    client = peer_client(app, peer_ip=LAN_PEER_IP, host="127.0.0.1:28765")
     async def run():
         async with client:
             return await client.get(
@@ -104,47 +72,21 @@ def test_dev_channel_peer_gated(monkeypatch):
     """P0 回归：dev 会话通道按对端地址判定——局域网对端（伪造回环 Host）
     404，回环对端 200（Vite 调试工作流不受影响）。"""
     _enable_lan(monkeypatch)
-    app = _app()
+    app = access_app()
     async def run(client):
         async with client:
             return await client.get("/api/v1/session/dev")
-    lan_client = AsyncClient(
-        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
-        base_url="http://192.168.1.5:28765",
-    )
-    local_client = AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://127.0.0.1:28765"
-    )
+    lan_client = peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST)
+    local_client = peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765")
     assert asyncio.run(run(lan_client)).status_code == 404
     assert asyncio.run(run(local_client)).status_code == 200
-
-
-def test_health_remote_peer_minimal():
-    """P2 回归：health 内部快照（pid/数据目录/解释器路径）仅回环对端可见，
-    局域网对端只获判活最小面。"""
-    lan_access.set_enabled(True)
-    access.set_extra_hosts([*lan_access.local_ips(), "192.168.1.5"])
-    app = _app()
-    async def run(client):
-        async with client:
-            return (await client.get("/api/v1/health")).json()
-    remote = asyncio.run(run(AsyncClient(
-        transport=ASGITransport(app=app, client=("192.168.1.5", 43210)),
-        base_url="http://192.168.1.5:28765",
-    )))
-    local = asyncio.run(run(AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://127.0.0.1:28765",
-    )))
-    assert "dataDir" not in remote and "pid" not in remote
-    assert remote.get("status") == "ok"
-    assert "dataDir" in local
 
 
 def test_default_mode_unlock_disabled():
     """默认模式：解锁入口不存在（发行版无自助通道语义保持）。"""
     async def run():
-        app = _app()
-        async with _client(app) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LOOPBACK_IP, host="127.0.0.1:28765") as client:
             return await client.post(
                 "/api/v1/session/unlock", json={"password": _WRONG_PASSWORD}
             )
@@ -180,8 +122,8 @@ def test_lan_mode_allows_local_ip_host(monkeypatch):
     """局域网模式：本机网卡地址过 Host 闸，落到会话闸（401 而非 421）。"""
     _enable_lan(monkeypatch)
     async def run():
-        app = _app()
-        async with _client(app, host=_LAN_HOST) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             return await client.get("/api/v1/system/security")
     assert asyncio.run(run()).status_code == 401
 
@@ -190,8 +132,8 @@ def test_lan_mode_still_blocks_rebinding_domain(monkeypatch):
     """局域网模式不放宽重绑定防线：攻击者域名 Host 仍 421。"""
     _enable_lan(monkeypatch)
     async def run():
-        app = _app()
-        async with _client(app, host="evil.example:28765") as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host="evil.example:28765") as client:
             return await client.get("/api/v1/health")
     assert asyncio.run(run()).status_code == 421
 
@@ -200,8 +142,8 @@ def test_lan_mode_same_origin_lan_request_passes_gates(monkeypatch):
     """局域网直连形态：Host 与 Origin 同为本机地址 → 只差会话（401）。"""
     _enable_lan(monkeypatch)
     async def run():
-        app = _app()
-        async with _client(app, host=_LAN_HOST) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             return await client.get(
                 "/api/v1/system/security",
                 headers={"Origin": f"http://{_LAN_HOST}"},
@@ -213,8 +155,8 @@ def test_unlock_flow_wrong_password_then_limit(monkeypatch):
     """解锁：错密码 401 计数，连续失败达阈值后 429；正确密码放行并清零。"""
     _enable_lan(monkeypatch)
     async def run():
-        app = _app()
-        async with _client(app) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             codes = []
             for _ in range(5):
                 r = await client.post(
@@ -241,6 +183,35 @@ def test_unlock_flow_wrong_password_then_limit(monkeypatch):
     assert protected == 200
 
 
+def test_unlock_rate_limit_isolated_between_peers(monkeypatch):
+    """错密码锁住攻击端后，另一台局域网设备仍可用正确密码解锁。"""
+    _enable_lan(monkeypatch)
+    app = access_app()
+
+    async def run():
+        attacker = peer_client(app, peer_ip="192.168.1.10", host=_LAN_HOST)
+        victim = peer_client(app, peer_ip="192.168.1.11", host=_LAN_HOST)
+        async with attacker, victim:
+            failed = []
+            for _ in range(5):
+                response = await attacker.post(
+                    "/api/v1/session/unlock", json={"password": _WRONG_PASSWORD}
+                )
+                failed.append(response.status_code)
+            attacker_limited = await attacker.post(
+                "/api/v1/session/unlock", json={"password": _TEST_PASSWORD}
+            )
+            victim_unlocked = await victim.post(
+                "/api/v1/session/unlock", json={"password": _TEST_PASSWORD}
+            )
+            return failed, attacker_limited.status_code, victim_unlocked.status_code
+
+    failed, attacker_limited, victim_unlocked = asyncio.run(run())
+    assert failed == [401, 401, 401, 401, 401]
+    assert attacker_limited == 429
+    assert victim_unlocked == 200
+
+
 def test_unlock_lockout_escalation():
     """P2 回归：锁窗过期后再穷举，锁时按连续轮次加倍（30s→120s，帽 600s）。"""
     for _ in range(5):
@@ -260,8 +231,8 @@ def test_unlock_non_ascii_password_roundtrip(monkeypatch):
     比较统一 bytes 化；错误猜测 401 且计入限速（不再是限速失效双杀）。"""
     _enable_lan(monkeypatch, password="口令测试-八字符")
     async def run():
-        app = _app()
-        async with _client(app) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             wrong = await client.post(
                 "/api/v1/session/unlock", json={"password": "错密码-不是对的"}
             )
@@ -280,11 +251,11 @@ def test_unlock_non_ascii_password_roundtrip(monkeypatch):
 def test_unlock_env_password_channel(monkeypatch):
     """无窗口通道：环境变量指定的密码直接生效。"""
     lan_access.set_enabled(True)
-    access.set_extra_hosts(lan_access.local_ips())
+    enable_lan()
     monkeypatch.setenv(lan_access.ENV_ACCESS_PASSWORD, _ENV_PASSWORD)
     async def run():
-        app = _app()
-        async with _client(app) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             return await client.post(
                 "/api/v1/session/unlock", json={"password": _ENV_PASSWORD}
             )
@@ -456,8 +427,8 @@ def test_unlock_without_password_rejected(monkeypatch):
     )
 
     async def run():
-        app = _app()
-        async with _client(app) as client:
+        app = access_app()
+        async with peer_client(app, peer_ip=LAN_PEER_IP, host=_LAN_HOST) as client:
             r = await client.post(
                 "/api/v1/session/unlock", json={"password": _WRONG_PASSWORD}
             )

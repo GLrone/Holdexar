@@ -161,8 +161,6 @@ async def _application_lifespan(application: FastAPI):
     if not update_token:
         await resume_keys()
 
-    # 数据目录布局入日志：本机支持多布局（系统数据目录 / 便携 / 存量便携），
-    # 「数据跑哪去了」是最高频的排查问题，启动即亮明。
     from app.core.paths import LAYOUT_LABEL, describe_layout
 
     layout = describe_layout(settings.data_dir)
@@ -368,7 +366,6 @@ def create_app() -> FastAPI:
     app.include_router(wishlist_router, prefix="/api/v1")
     app.include_router(crawl_router, prefix="/api/v1")
     app.include_router(proxies_router, prefix="/api/v1")
-    # proxypool 只读面：生产作业台账与出口账本
     app.include_router(proxypool_router, prefix="/api/v1")
     app.include_router(alerts_router, prefix="/api/v1")
     app.include_router(rates_router, prefix="/api/v1")

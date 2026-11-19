@@ -15,6 +15,7 @@ import base64
 import logging
 import struct
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import httpx
@@ -50,16 +51,13 @@ _API_TIMEOUT = 15.0
 # 连接建立失败（代理节点瞬断、TLS 握手被重置）时安全重发：请求未达对端
 _RETRY_ATTEMPTS = 3
 _RETRY_BACKOFF_S = 0.8
-# 等验证码 / 手机确认的总时限：超时判失败，用户重开即可
 _LOGIN_TIMEOUT_S = 300.0
-# 拿到令牌后的收尾重试：网络瞬断不应作废用户已完成的手机确认
 _FINALIZE_ATTEMPTS = 4
 _FINALIZE_RETRY_BACKOFF_S = 2.0
 # EAuthTokenPlatformType：WebBrowser——令牌受众为 web，finalize 后可直接用于站点请求
 _PLATFORM_WEB_BROWSER = 2
 # 令牌持久化：Persistent（勾选「记住我」语义，下发长命续期凭据）
 _PERSISTENCE_PERSISTENT = 1
-# 认证请求的站点标识：商店登录页会话归 Store
 _WEBSITE_ID_STORE = "Store"
 # 提交语言：简体中文
 _LANGUAGE_SCHINESE = 6
@@ -69,10 +67,7 @@ _GUARD_EMAIL_CODE = 2
 _GUARD_DEVICE_CODE = 3
 _GUARD_DEVICE_CONFIRM = 4
 _GUARD_EMAIL_CONFIRM = 5
-# 码形态提交优先级：手机令牌在 App 内随手可查，邮箱码要翻邮件，靠后
 _CODE_GUARD_ORDER = (_GUARD_DEVICE_CODE, _GUARD_EMAIL_CODE)
-# 码形态（可输码）与确认形态（无需输码）的分野：确认形态优先呈现，
-# 输码作为用户主动切换的备选（与商店登录页「改为输入代码」同语义）
 _CODE_GUARDS = frozenset({_GUARD_EMAIL_CODE, _GUARD_DEVICE_CODE})
 _CONFIRM_GUARDS = frozenset({_GUARD_DEVICE_CONFIRM, _GUARD_EMAIL_CONFIRM})
 
@@ -97,7 +92,6 @@ def encrypt_password(password: str, *, mod_hex: str, exp_hex: str) -> str:
     return public_key.encrypt(password.encode("utf-8"), padding.PKCS1v15()).hex()
 
 
-# ── protobuf 编解码（认证接口传输形态） ──────────────────────────────────
 
 def _pb_write_varint(value: int) -> bytes:
     out = bytearray()
@@ -165,7 +159,6 @@ def _pb_pick(fields: list, field: int, wire: int):
     return None
 
 
-# ── 请求体构造（与商店登录页同字段序） ───────────────────────────────────
 
 def _rsakey_request_body(account: str) -> str:
     msg = _pb_bytes_field(1, account.encode("utf-8"))
@@ -204,14 +197,13 @@ def _poll_request_body(client_id: int, request_id: bytes) -> str:
     return base64.b64encode(msg).decode("ascii")
 
 
-# ── Steam 认证调用 ────────────────────────────────────────────────────────
 
 def _api_error_message(code: int, desc: str) -> str:
-    if code == 5:  # 账号或密码不正确
+    if code == 5:
         return "账号或密码不正确"
     if code in (65, 88):  # 邮箱验证码错 / 手机令牌码错
         return "验证码不正确，请重试"
-    if code == 84:  # 尝试过于频繁
+    if code == 84:
         return "尝试次数过多，请稍等几分钟再试"
     return f"Steam 拒绝了登录请求：{desc or f'错误码 {code}'}"
 
@@ -312,7 +304,6 @@ async def _begin_session(account: str, password: str, proxy_url: str | None) -> 
                 ctype = _pb_pick(_pb_fields(v), 1, 0)
                 if ctype is not None:
                     guards.append(int(ctype))
-            # 登录页同序的设备确认：免验证设备在这里被识别，输码步骤跳过
             device_ok = await _check_device(client, str(steam_id), int(client_id))
     except httpx.HTTPError as exc:
         raise LoginError(_NETWORK_MESSAGE) from exc
@@ -378,12 +369,11 @@ async def _poll_once(session: dict, proxy_url: str | None) -> tuple[str, str]:
                 **_pb_form(_poll_request_body(int(session["client_id"]), session["request_id"])),
             )
     except httpx.HTTPError:
-        return "", ""  # 单次网络抖动不判失败，交给超时兜底
+        return "", ""
     if resp.status_code >= 500:
         return "", ""
     eresult = resp.headers.get("x-eresult", "")
     if eresult.isdigit() and int(eresult) != 1:
-        # 等待期出现非 OK 结果码 = 会话终结（拒绝 / 过期），不是可重试错误
         return "rejected", ""
     refresh = _pb_pick(_pb_fields(resp.content), 3, 2)
     if isinstance(refresh, bytes) and refresh:
@@ -391,12 +381,27 @@ async def _poll_once(session: dict, proxy_url: str | None) -> tuple[str, str]:
     return "", ""
 
 
-# ── 登录会话单例 ──────────────────────────────────────────────────────────
 
 _lock = asyncio.Lock()
 _session: dict | None = None
 _task: asyncio.Task | None = None
 _cancelled = asyncio.Event()
+# 找回通道的一次性守卫：登录身份落库前校验其属于绑定账号集合，未绑定
+# 账号不落库不建登录态（防找回流程把任意账号自动绑定进来）。尝试终结
+# （成功/失败/取消）即自动清除，恢复常规绑定语义。
+_recovery_guard: Callable[[str], Awaitable[None]] | None = None
+
+
+def set_recovery_guard(guard: Callable[[str], Awaitable[None]] | None) -> None:
+    global _recovery_guard
+    _recovery_guard = guard
+
+
+def recovery_steam_id() -> tuple[str, bool]:
+    """找回完成态：最近一次登录已成功且未被新尝试覆盖时返回其 SteamID。"""
+    if _session is not None and _session.get("state") == STATE_DONE and _session.get("steam_id"):
+        return str(_session["steam_id"]), True
+    return "", False
 
 
 def _new_session(state: str, message: str = "", *, error: str = "") -> dict:
@@ -432,7 +437,6 @@ def login_status() -> dict:
     }
 
 
-# ── 会话动作 ─────────────────────────────────────────────────────────────
 
 async def start_login(account_name: str, password: str) -> dict:
     """发起账号密码登录。返回 {"ok", "state"|"busy"?, "error"?}。"""
@@ -467,8 +471,6 @@ async def start_login(account_name: str, password: str) -> dict:
         if info["device_ok"]:
             _update_state(STATE_AWAITING_CONFIRM, "本机已获 Steam 信任，正在完成登录…")
         elif _CONFIRM_GUARDS & set(info["guards"]):
-            # 手机验证器账号与登录页同序：默认等用户在手机上确认（轮询全程在跑），
-            # 输码是用户主动切换的备选路径
             _update_state(STATE_AWAITING_CONFIRM, "")
         elif info["code_guard"]:
             _update_state(
@@ -486,7 +488,7 @@ async def start_login(account_name: str, password: str) -> dict:
 
 async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
     """轮询至 Steam 确认；命中续期凭据即换 Cookie 并走完整绑定链。"""
-    global _session
+    global _session, _recovery_guard
     deadline = time.monotonic() + _LOGIN_TIMEOUT_S
     try:
         while time.monotonic() < deadline:
@@ -505,8 +507,6 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
             if not refresh:
                 continue
             _update_state(STATE_FINALIZING, "正在建立登录态…")
-            # 令牌在手，收尾链（换 Cookie + 绑定）不因一次网络瞬断作废——
-            # 作废意味着用户要在手机上重新确认一遍
             cookies = ""
             for attempt in range(_FINALIZE_ATTEMPTS):
                 try:
@@ -517,7 +517,6 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
                 except SessionRefreshError:
                     if attempt + 1 >= _FINALIZE_ATTEMPTS or time.monotonic() > deadline:
                         raise
-                    # 过程反馈：重试期间让用户看见「在自动恢复」而不是「卡住」
                     _update_state(
                         STATE_FINALIZING,
                         f"网络不稳，正在自动恢复登录（第 {attempt + 1}/{_FINALIZE_ATTEMPTS - 1} 次重试）…",
@@ -529,6 +528,14 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
                         detail={"第几次尝试": attempt + 1},
                     )
                     await asyncio.sleep(_FINALIZE_RETRY_BACKOFF_S * (attempt + 1))
+            guard = _recovery_guard
+            _recovery_guard = None
+            if guard is not None:
+                try:
+                    await guard(info["steam_id"])
+                except LoginError as exc:
+                    _update_state(STATE_FAILED, error=str(exc))
+                    return
             await bind_account(cookies)
             log_event(
                 logger,
@@ -545,10 +552,12 @@ async def _poll_until_authed(info: dict, proxy_url: str | None) -> None:
             _update_state(STATE_FAILED, error=str(exc))
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 —— 落库链异常归为登录失败，凭据链路细节留日志
+    except Exception:  # noqa: BLE001
         log_event(logger, "应用内登录收尾失败", level=logging.ERROR, exc_info=True)
         if not _cancelled.is_set():
             _update_state(STATE_FAILED, error="登录收尾失败，请重试")
+    finally:
+        _recovery_guard = None
 
 
 async def submit_guard_code(code: str) -> dict:
@@ -585,7 +594,9 @@ async def submit_guard_code(code: str) -> dict:
 
 def cancel_login() -> dict:
     """取消当前登录会话（等待中的轮询任务随后退出）。"""
+    global _recovery_guard
     _cancelled.set()
+    _recovery_guard = None
     if _session is not None and _session["state"] not in (STATE_DONE, STATE_FAILED):
         _update_state(STATE_IDLE)
     return {"ok": True, "state": login_status()}

@@ -200,6 +200,14 @@ export interface SettingsPayload {
   mcp_error: string
   /** 环境变量强制开启（界面开关不可用） */
   mcp_forced_by_env: boolean
+  /** 局域网访问模式状态；密码原文永不回显，设置走 update 的 lan_access.password */
+  lan_access: {
+    enabled: boolean
+    /** 启动参数强制：界面开关与密码均不可改 */
+    env_forced: boolean
+    has_password: boolean
+    password_source: 'user' | 'env' | 'none'
+  }
 }
 
 // ─── regions（区服元数据单一来源：服务端下发，前端零硬编码）───
@@ -299,6 +307,8 @@ export const settingsApi = {
     direct_notice_seen?: boolean
     /** MCP 服务开关（写入即运行时启停） */
     mcp_enabled?: boolean
+    /** 局域网访问开关与访问密码（≥8 位；改密即吊销旧解锁会话，无需旧密码） */
+    lan_access?: { enabled?: boolean; password?: string }
   }) => request<SettingsPayload>('PUT', '/settings', payload),
   getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
   updateFetch: (payload: Partial<FetchSettingsPayload>) =>
@@ -1059,9 +1069,48 @@ export interface PilotQuoteRef {
   text: string
 }
 
+/** 局域网找回登录状态（Steam 官方登录流程的状态机投影，无凭据字段） */
+export interface RecoveryLoginState {
+  state: 'idle' | 'signing' | 'awaiting_code' | 'awaiting_confirmation' | 'finalizing' | 'done' | 'failed'
+  message: string
+  error: string
+  /** 'email' = 邮箱码；'totp' = 手机令牌码 */
+  code_hint: '' | 'email' | 'totp'
+  code_available: boolean
+  started_at: string
+  updated_at: string
+}
+
 /** 局域网访问解锁：访问密码换会话 Cookie（局域网模式关闭时后端 404） */
 export async function unlockAccess(password: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('POST', '/session/unlock', { password }, { noCache: true })
+}
+
+// ─── 忘记密码找回：Steam 官方登录验证号主身份（锁定态公开通道）──────────
+
+export async function recoveryStart(
+  account: string,
+  password: string,
+): Promise<{ ok: boolean; state?: RecoveryLoginState; error?: string }> {
+  return request('POST', '/session/recovery/login/start', { account, password }, { noCache: true })
+}
+
+export async function recoverySubmitCode(
+  code: string,
+): Promise<{ ok: boolean; no_session?: boolean; state?: RecoveryLoginState; error?: string }> {
+  return request('POST', '/session/recovery/login/code', { code }, { noCache: true })
+}
+
+export async function recoveryStatus(): Promise<RecoveryLoginState> {
+  return request('GET', '/session/recovery/login/status', undefined, { noCache: true })
+}
+
+export async function recoveryCancel(): Promise<{ ok: boolean }> {
+  return request('POST', '/session/recovery/cancel', undefined, { noCache: true })
+}
+
+export async function recoveryComplete(): Promise<{ ok: boolean; error?: string }> {
+  return request('POST', '/session/recovery/complete', undefined, { noCache: true })
 }
 
 export async function askPilotStream(

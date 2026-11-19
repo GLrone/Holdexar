@@ -15,16 +15,20 @@
 from __future__ import annotations
 
 import hmac
+import logging
 import secrets
 import sys
 import time
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from app.core import access, lan_access
 from app.core.logging import log_event
+from app.domains.account.login import LoginError, cancel_login, login_status, recovery_steam_id, set_recovery_guard, start_login, submit_guard_code
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["session"])
 
@@ -158,4 +162,83 @@ async def session_unlock(body: _UnlockBody, request: Request):
     lan_access.unlock_record_success(peer)
     response = JSONResponse({"ok": True})
     access.issue_session(response)
+    return response
+
+
+@router.post("/session/logout", status_code=204)
+async def session_logout(request: Request):
+    access.revoke_session(request.scope)
+    response = Response(status_code=204)
+    response.delete_cookie(access.SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return response
+
+
+# 信任锚 = Steam 官方认证产生的登录身份 ∈ 数据库绑定账号集合（登录流程在
+# 绑定落库前经一次性守卫校验，未绑定账号不落库不建登录态）。通过后签发
+# 本机会话，用户随后在设置页修改局域网访问密码。
+# 攻击面控制：五个端点全部公开可达（找回发生在锁定态、无会话），共用
+# 局域网解锁限速器——同一条口令防线，任一通道穷举都触发全局锁定。
+
+class _RecoveryStartBody(BaseModel):
+    account: str
+    password: str
+
+
+class _RecoveryCodeBody(BaseModel):
+    code: str
+
+
+_recovery_last_cancel = time.monotonic() - 1.0
+
+
+async def _bound_account_check(steam_id: str) -> None:
+    """找回守卫：登录身份必须是已绑定账号，否则拒绝（不落库）。"""
+    from app.domains.account import service as account_service
+
+    bound = {sid for sid, _ in await account_service.list_bound_cookies()}
+    if steam_id not in bound:
+        raise LoginError("该 Steam 账号未绑定到本应用，无法用于找回访问密码")
+
+
+@router.post("/session/recovery/login/start")
+async def recovery_login_start(body: _RecoveryStartBody, request: Request):
+    locked = lan_access.unlock_locked_seconds(lan_access.peer_key(request.scope))
+    if locked > 0:
+        return {"ok": False, "error": f"尝试次数过多，{int(locked) + 1} 秒后可重试"}
+    set_recovery_guard(_bound_account_check)
+    return await start_login(body.account.strip(), body.password)
+
+
+@router.post("/session/recovery/login/code")
+async def recovery_login_code(body: _RecoveryCodeBody):
+    return await submit_guard_code(body.code)
+
+
+@router.get("/session/recovery/login/status")
+async def recovery_login_status():
+    return login_status()
+
+
+@router.post("/session/recovery/cancel")
+async def recovery_cancel():
+    # 冷却 1 秒：免认证端点不可被无成本高频重置（打断进行中的找回）
+    global _recovery_last_cancel
+    if time.monotonic() - _recovery_last_cancel < 1.0:
+        return {"ok": True}
+    _recovery_last_cancel = time.monotonic()
+    return cancel_login()
+
+
+@router.post("/session/recovery/complete")
+async def recovery_complete(request: Request):
+    locked = lan_access.unlock_locked_seconds(lan_access.peer_key(request.scope))
+    if locked > 0:
+        return {"ok": False, "error": f"尝试次数过多，{int(locked) + 1} 秒后可重试"}
+    _steam_id, done = recovery_steam_id()
+    if not done:
+        return {"ok": False, "error": "Steam 登录流程未完成"}
+    response = JSONResponse({"ok": True})
+    access.issue_session(response)
+    lan_access.unlock_record_success(lan_access.peer_key(request.scope))
+    log_event(logger, "找回完成：Steam 登录身份通过绑定核验，已签发会话", tag="成功")
     return response
