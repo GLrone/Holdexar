@@ -67,6 +67,10 @@ var (
 
 func pilotToolBridge(db *sql.DB, gate *store.WriteGate, mux *http.ServeMux, monitor *monitoring.Service) pilot.ToolBridge {
 	runner, runnerErr := agent.NewPilotRunner(mux, db, &agent.Deps{WriteGate: gate})
+	extraSchemas := make(map[string]*agent.CompiledSchema, len(pilotExtraToolDefs))
+	for _, def := range pilotExtraToolDefs {
+		extraSchemas[def.name] = agent.CompileToolSchema(def.name, def.parameters)
+	}
 	return func(ctx *pilot.CallCtx, name string, args map[string]any, guarded bool) map[string]any {
 		if guarded && agent.IsWriteTool(name) {
 			return map[string]any{
@@ -77,6 +81,11 @@ func pilotToolBridge(db *sql.DB, gate *store.WriteGate, mux *http.ServeMux, moni
 		}
 		if args == nil {
 			args = map[string]any{}
+		}
+		if sch := extraSchemas[name]; sch != nil {
+			if err := sch.Validate(args); err != nil {
+				return map[string]any{"kind": "failed", "tool": name, "note": err.Error()}
+			}
 		}
 		switch name {
 		case "list_tools":

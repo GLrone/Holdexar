@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"holdexar/server-go/internal/access"
@@ -238,25 +239,33 @@ func (s *Surface) availabilityGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
-// validateArgs 全量校验工具入参（type/enum/minimum/required 等），未声明额外键不拦截；
-// schema 解析失败时回退必需键检查。
-func validateArgs(reg *ToolRegistry, spec *ToolSpec, args map[string]any) error {
-	if res := reg.resolvedSchema(spec.Name); res != nil {
+// ValidateArgsWithSchema 使用已解析 schema（缺失时回退 required 键检查）校验工具入参，未声明额外键不拦截。
+func ValidateArgsWithSchema(res *jsonschema.Resolved, name, rawSchema string, required []string, args map[string]any) error {
+	if res != nil {
 		if err := res.Validate(schemaView(args)); err != nil {
-			return fmt.Errorf("%s 参数校验失败：%v", spec.Name, err)
+			return fmt.Errorf("%s 参数校验失败：%v", name, err)
 		}
 		return nil
 	}
-	required := spec.required
-	if !spec.requiredParsed {
-		required = parseRequiredParams(spec.Parameters)
+	if len(required) == 0 && rawSchema != "" {
+		required = parseRequiredParams(rawSchema)
 	}
 	for _, k := range required {
 		if _, ok := args[k]; !ok {
-			return fmt.Errorf("%s 缺少必需参数 %q", spec.Name, k)
+			return fmt.Errorf("%s 缺少必需参数 %q", name, k)
 		}
 	}
 	return nil
+}
+
+// validateArgs 全量校验工具入参（type/enum/minimum/required 等），未声明额外键不拦截；
+// schema 解析失败时回退必需键检查。
+func validateArgs(reg *ToolRegistry, spec *ToolSpec, args map[string]any) error {
+	raw := ""
+	if !spec.requiredParsed {
+		raw = spec.Parameters
+	}
+	return ValidateArgsWithSchema(reg.resolvedSchema(spec.Name), spec.Name, raw, spec.required, args)
 }
 
 // schemaView 复制入参并把 json.Number 归一为 float64，使 schema 数值类型可识别。

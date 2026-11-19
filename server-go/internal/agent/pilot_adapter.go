@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 type ExportedSpec struct {
@@ -144,6 +147,23 @@ func NewPilotRunner(mux *http.ServeMux, db *sql.DB, deps *Deps) (*PilotRunner, e
 	}, nil
 }
 
+var pilotCardToolSet = CardTools()
+
+// ValidatePilotArgs 在 JSON Schema 校验之外额外约束卡片工具的可选 emit_card 参数类型。
+func ValidatePilotArgs(res *jsonschema.Resolved, name, rawSchema string, required []string, args map[string]any) error {
+	if err := ValidateArgsWithSchema(res, name, rawSchema, required, args); err != nil {
+		return err
+	}
+	if pilotCardToolSet[name] {
+		if v, exists := args["emit_card"]; exists {
+			if _, ok := v.(bool); !ok {
+				return fmt.Errorf("%s 参数校验失败：/properties/emit_card: type: got %T, want \"boolean\"", name, v)
+			}
+		}
+	}
+	return nil
+}
+
 func (r *PilotRunner) Execute(ctx context.Context, name string, args map[string]any, guarded bool) (map[string]any, bool) {
 	if r == nil || r.registry == nil {
 		return nil, false
@@ -152,11 +172,22 @@ func (r *PilotRunner) Execute(ctx context.Context, name string, args map[string]
 	if spec == nil {
 		return nil, false
 	}
+	if decide(spec, guarded) == "deny" {
+		out, _ := objToAny(denyResult()).(map[string]any)
+		return out, true
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if args == nil {
 		args = map[string]any{}
+	}
+	rawSchema := ""
+	if !spec.requiredParsed {
+		rawSchema = spec.Parameters
+	}
+	if err := ValidatePilotArgs(r.registry.resolvedSchema(spec.Name), spec.Name, rawSchema, spec.required, args); err != nil {
+		return map[string]any{"kind": "failed", "tool": name, "note": err.Error()}, true
 	}
 	res := Execute(&CallContext{
 		Ctx:   ctx,

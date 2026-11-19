@@ -73,3 +73,35 @@ func (r *ToolRegistry) resolvedSchema(name string) *jsonschema.Resolved {
 func (r *ToolRegistry) schemaFailures() map[string]error {
 	return r.schemaErrs
 }
+
+// CompiledSchema 预编译的工具参数校验器，供宿主扩展工具复用与注册表一致的校验链。
+type CompiledSchema struct {
+	name     string
+	raw      string
+	resolved *jsonschema.Resolved
+	required []string
+}
+
+// CompileToolSchema 预编译工具入参 schema；解析失败时保留必需键兜底信息。
+func CompileToolSchema(name, raw string) *CompiledSchema {
+	res, _ := resolveToolSchema(raw)
+	return &CompiledSchema{
+		name:     name,
+		raw:      raw,
+		resolved: res,
+		required: parseRequiredParams(raw),
+	}
+}
+
+// Validate 对 Pilot 直接调用传入的参数执行与注册表一致的 schema 与 emit_card 校验。
+func (c *CompiledSchema) Validate(args map[string]any) error {
+	if c == nil {
+		return nil
+	}
+	return ValidatePilotArgs(c.resolved, c.name, c.raw, c.required, args)
+}
+
+// Resolved reports whether the JSON Schema compiled cleanly.
+func (c *CompiledSchema) Resolved() bool {
+	return c != nil && c.resolved != nil
+}
