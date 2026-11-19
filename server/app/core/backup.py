@@ -46,17 +46,17 @@ from .logging import log_event
 
 logger = logging.getLogger(__name__)
 
-BACKUP_KEEP = 5  # 自动备份最大份数
-BACKUP_MIN_KEEP = 2  # 总量受限时仍强制保留的最少份数
-BACKUP_TOTAL_CAP_RATIO = 2.0  # 自动备份总量上限 = 主库体积 × 该倍数
+BACKUP_KEEP = 5
+BACKUP_MIN_KEEP = 2
+BACKUP_TOTAL_CAP_RATIO = 2.0
 BACKUP_SUFFIX = ".db"
-ARCHIVE_SUFFIX = ".db.gz"  # 压缩归档后缀
-META_SUFFIX = ".gz.json"  # 归档元数据（sha256/游戏数/原始体积）
-COMPRESS_LEVEL = 6  # 每日常规档的压缩档：更高档省得少、慢得多
+ARCHIVE_SUFFIX = ".db.gz"
+META_SUFFIX = ".gz.json"
+COMPRESS_LEVEL = 6
 _BACKUP_DIR_NAME = "backups"
 _LOCK_FILE = ".restore.lock"
-MANUAL_LABEL = "manual"  # 手动备份的文件名标记：独立轮转，仅保留最新一份
-_REPLACE_ATTEMPTS = 6  # 主库替换重试次数（每次重试前重关一次引擎）
+MANUAL_LABEL = "manual"
+_REPLACE_ATTEMPTS = 6
 _REPLACE_RETRY_SECONDS = 0.3
 
 
@@ -112,9 +112,6 @@ def _protect_restore_recovery(lock_path: Path, token: str, src: Path,
             os.fsync(stream.fileno())
     finally:
         _remove_transient(staging)
-
-
-# ─── 创建 / 校验 / 列表 ─────────────────────────────────────
 
 
 def _remove_transient(path: Path) -> bool:
@@ -216,9 +213,6 @@ async def _wait_for_active_crawl(crawl_service, operation: str) -> None:
             level=logging.ERROR,
         )
         raise RuntimeError(f"{operation}未执行：正在运行的价格更新没有及时结束") from exc
-
-
-# ─── 归档压缩与哈希 ─────────────────────────────────────────
 
 
 def _compress_to_archive(snapshot: Path, dest: Path) -> str:
@@ -336,9 +330,6 @@ async def _compact_main_db() -> dict:
             engine_ok = bool(await _rebuild_engine())
         if not engine_ok:
             raise RuntimeError("空间回收后数据库引擎重建失败——请检查数据目录")
-        # 收缩会把整库经 WAL 重写一遍，事后 WAL 可能涨到库体积量级；不截断它，
-        # 「总占用」反而变大，用户看到的释放量就是负数。截断只影响文件长度，
-        # 不影响已提交数据。
         await _truncate_wal()
         after = _footprint(src)
         after_main = src.stat().st_size
@@ -475,7 +466,6 @@ async def verify_backup(name: str, deep: bool = False) -> dict:
         actual = await complete_db_thread(sha256_of, path)
         hash_ok = actual.lower() == expected.lower()
         if not hash_ok:
-            # 归档与随档哈希不符：不再往下解档，结论已确定
             return {
                 "name": name, "integrityOk": False, "games": 0, "sizeBytes": size,
                 "sha256": actual, "rawBytes": int(meta.get("rawBytes") or 0),
@@ -494,7 +484,7 @@ async def verify_backup(name: str, deep: bool = False) -> dict:
             "checks": {"hashOk": hash_ok, "restorableOk": restorable_ok, "deepOk": None},
         }
 
-    probe = path.with_name(path.name + ".verify.tmp")  # 不进备份列表的解档探针
+    probe = path.with_name(path.name + ".verify.tmp")
     try:
         await complete_db_thread(_decompress_archive, path, probe)
         deep_ok, games = await complete_db_thread(_verify_file, probe, deep)
@@ -577,9 +567,6 @@ def _rotate_old_backups() -> None:
         log_event(logger, "手动备份仅保留最新一份，清理旧档", detail={"文件名": old.name})
 
 
-# ─── 恢复（三段式，防误恢复伤生产库）──────────────────────────
-
-
 def safe_backup_path(base: Path, name: str) -> Path:
     """路径穿越防护：备份文件名只允许合法字符且必须落在备份目录内。"""
     if not name or "/" in name or "\\" in name or ".." in name:
@@ -629,13 +616,9 @@ async def _restore_backup(name: str) -> dict:
     src = _db_path()
     rollback = src.with_suffix(".rollback.db")
     staging = src.with_suffix(".restoring.db")
-    probe = backup_dir() / (name + ".verify.tmp")  # 解档待验，不进备份列表
+    probe = backup_dir() / (name + ".verify.tmp")
     compressed = path.suffix == ".gz"
 
-    # ── 段 1：哈希比对 → 解档 → 完整性与表集合比对 ──
-    # 本段自带清理：解档可能抛（截断归档的 EOFError/BadGzipFile），若把清理留给
-    # 段 2 的 finally，异常会直接穿出并把探针留在备份目录里——那个名字既不被
-    # 列表认领也不被删除放行，用户永远看不见也删不掉。
     try:
         if compressed:
             expected = str(_read_archive_meta(path).get("sha256") or "")
@@ -670,8 +653,6 @@ async def _restore_backup(name: str) -> dict:
         _remove_transient(probe)
         raise
 
-    # ── 段 2：回滚档 → 停写入面（调度器 + 爬取 + 引擎连接）──
-    # 原库快照与持久恢复保护就绪后才能替换主库。
     from ..core.scheduler import scheduler, start_scheduler, stop_scheduler
     from app.domains.crawl import service as crawl_service
     from .database import acquire_write_maintenance_barrier
@@ -699,14 +680,12 @@ async def _restore_backup(name: str) -> dict:
         digest = await complete_db_thread(sha256_of, rollback)
         _protect_restore_recovery(lock_path, lock_token, src, rollback, digest)
 
-        # 替换前释放连接池句柄。
         engine_disposed = True
         engine_ok = False
         await _dispose_engine()
 
-        # ── 段 3：文件轮换替换 + 引擎重建 ──
         if compressed:
-            os.replace(probe, staging)       # 已验过的解档直接就位（同卷改名）
+            os.replace(probe, staging)
         else:
             await complete_db_thread(shutil.copy2, path, staging)
         await _replace_main_db(staging, src)

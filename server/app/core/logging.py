@@ -39,13 +39,6 @@ from pathlib import Path
 
 from app.core.app_info import APP_SLUG
 
-# 日志噪声与泄漏源：httpx 逐请求打印完整 URL（含查询串里的密钥）。
-# 降到 WARNING 后请求失败仍可见（httpx 的错误走 WARNING/ERROR），成功不再刷屏。
-#
-# APScheduler 同理且量更大：每跑一个 job 打两行 INFO（Running job "_job_x
-# (trigger: interval[0:05:00], next run at: ...)" / executed successfully），
-# 占全量日志约一半，零业务信息，把真正的日志冲得看不见。它的失败仍走
-# WARNING/ERROR（Job 抛异常、maximum number of running instances reached），不受影响。
 _NOISY_LOGGERS = (
     "httpx",
     "httpcore",
@@ -53,15 +46,11 @@ _NOISY_LOGGERS = (
     "apscheduler.scheduler",
 )
 
-# ── 脱敏规则 ────────────────────────────────────────────────
-# 全部按「保留字段名、抹掉值」替换：日志的可读性与排障价值留在字段名上。
-
 # 代理链接：值本身就是凭据（vless/vmess 的 UUID 嵌在 URL 里，ss 整条是 base64）。
 _PROXY_LINK = re.compile(
     r"(?i)\b(vless|vmess|trojan|ssr?|hysteria2?|tuic|wireguard)://([^\s\"'<>]+)"
 )
 
-# URL 用户信息：scheme://user:pass@host → 抹掉 user:pass，保留 host（host 用于判断打到哪）。
 _URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*)://([^/\s:@]+):([^/\s@]+)@")
 
 # 查询串/表单里的凭据参数。key 一项即 Steam Web API；sessionid/steamLogin* 是 Steam 会话 Cookie。
@@ -81,7 +70,6 @@ _JSON_SECRET = re.compile(
     r'[A-Za-z0-9_.\-]*)"(\s*:\s*)"([^"]*)"'
 )
 
-# Authorization 头。
 _AUTH_HEADER = re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=\-]{8,})")
 
 # 环境变量式赋值：HOLDEXAR_SMTP_PASSWORD=xxx / STEAM_API_KEY=xxx。
@@ -162,8 +150,6 @@ def _mask_token_urls(text: str) -> str:
     return _URL_IN_LINE.sub(_downgrade, text)
 
 
-# ── 人话渲染 ────────────────────────────────────────────────
-# 结果词由级别兜底，事件语义更精确时调用方用 tag= 覆盖。
 _RESULT_BY_LEVEL = {
     logging.DEBUG: "调试",
     logging.INFO: "信息",
@@ -200,7 +186,6 @@ TAG_SEVERITY = {
 # 印「代理池·健康检查」才说明白这条日志属于谁。映射是 1:1 的，故排障时按名反查模块无歧义。
 # 与源码同步的守卫见 tests/test_logging_redact.py（新增日志模块漏登记会测试失败）。
 _MODULE_LABELS = {
-    # 内核
     "app.main": "应用启动",
     "app.core.scheduler": "定时任务",
     "app.core.database": "数据库",
@@ -213,7 +198,6 @@ _MODULE_LABELS = {
     "app.core.mini_seed": "小种子",
     "app.core.logging": "日志",
     "app.domains.system.session_router": "本地会话",
-    # 爬取
     "app.domains.crawl.retention": "价格保留",
     "app.crawler.scheduler": "爬取调度",
     "app.crawler.runner": "爬取执行",
@@ -228,12 +212,10 @@ _MODULE_LABELS = {
     "app.crawler.http_client": "爬取·HTTP 客户端",
     "app.crawler.cdk_fetcher": "爬取·CDK 查价",
     "app.crawler.tag_names": "爬取·标签名",
-    # 价格刷新
     "app.domains.crawl.service": "价格刷新·周期链",
     "app.domains.crawl.cycle_run": "价格刷新·周期执行",
     "app.domains.crawl.cycle": "价格刷新·周期",
     "app.domains.crawl.router": "价格刷新·接口",
-    # 代理池
     "app.domains.proxypool.health": "代理池·健康检查",
     "app.domains.proxypool.runtime": "代理池·运行时",
     "app.domains.proxypool.bootstrap": "代理池·启动装配",
@@ -243,14 +225,12 @@ _MODULE_LABELS = {
     "app.domains.proxypool.exitstats": "代理池·出口统计",
     "app.domains.proxypool.jobruns": "代理池·作业记录",
     "app.domains.proxypool.dead_probe": "代理池·死节点回收",
-    # 代理订阅与内核
     "app.domains.proxies.clash_manager": "代理内核",
     "app.domains.proxies.service": "代理订阅",
     "app.domains.proxies.router": "代理接口",
     "app.domains.proxies.subscription_secret": "代理订阅·密钥",
     "app.domains.proxies.credentials": "代理凭据",
     "app.domains.proxies.node_secret_files": "代理节点·凭据文件",
-    # 账户与资产
     "app.domains.account.service": "Steam 账号",
     "app.domains.account.login": "Steam 登录",
     "app.domains.account.steam_wallet": "Steam 钱包",
@@ -258,7 +238,6 @@ _MODULE_LABELS = {
     "app.domains.wishlist.service": "愿望单同步",
     "app.domains.achievements.service": "成就同步",
     "app.domains.steam_events.service": "Steam 活动",
-    # 价格与账单
     "app.domains.bills.service": "账单同步",
     "app.domains.bills.steam_fetch": "账单抓取",
     "app.domains.games.boards": "榜单同步",
@@ -278,7 +257,6 @@ _MODULE_LABELS = {
     "app.domains.notifications.retention": "通知·保留",
     "app.domains.redeem.service": "兑换",
     "app.domains.regions.service": "区域",
-    # 运行账本与领航员
     "app.domains.agent.service": "运行账本",
     "app.domains.agent.runtime.scheduler_bridge": "运行账本·调度桥",
     "app.domains.agent.runtime.executor": "运行账本·工具执行",
@@ -290,7 +268,6 @@ _MODULE_LABELS = {
     "app.domains.pilot.flywheel": "领航员·反馈闭环",
 }
 
-# 三级域兜底：未登记的中文名按 `app.<层>.<名>` 推 `层·名`，至少不让点分路径漏给用户。
 _LAYER_LABELS = {"core": "内核", "crawler": "爬取", "domains": "业务", "providers": "数据源"}
 _DROPPED_SEGMENTS = {"service", "router", "models", "schemas", "main", "__init__"}
 
@@ -408,7 +385,7 @@ class RingBufferLogHandler(logging.Handler):
         for queue in subscribers:
             try:
                 loop.call_soon_threadsafe(self._offer, queue, line)
-            except RuntimeError:  # 循环已关闭（关闭阶段尾部日志）
+            except RuntimeError:
                 pass
 
     @staticmethod
@@ -447,7 +424,6 @@ def setup_logging(data_dir: Path, level: int = logging.INFO) -> None:
     if root.handlers:
         return
     root.setLevel(level)
-    # 控制台与日志页要「当下读到什么」，只留时分秒；文件是归档与贴 issue 的凭据，留完整日期。
     live_fmt = HumanFormatter(datefmt="%H:%M:%S")
     file_fmt = HumanFormatter()
     scrub = RedactFilter()
@@ -472,6 +448,5 @@ def setup_logging(data_dir: Path, level: int = logging.INFO) -> None:
     ring_log_handler.addFilter(scrub)
     root.addHandler(ring_log_handler)
 
-    # 源头静音放在最后：它只影响此后新取的 logger，与上面的 handler 装配互不依赖。
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)

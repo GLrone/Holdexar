@@ -21,10 +21,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 单文件体积上限：挡住误入库的 SQLite 库 / 构建产物 / 二进制大文件。
 MAX_FILE_BYTES = 5 * 1024 * 1024
 
-# ── 路径层：这些位置的任何文件都不该进版本库 ──
 # 与 .gitignore 互为独立防线（.gitignore 默认不跟踪；这里拦 -f 强加或
 # .gitignore 失效的提交）。第 1 组必须锚定仓库根（`^`）——「logs」「release」
 # 也是业务视图目录名，写成任意深度会误伤 `web/src/views/logs/Index.vue`；
@@ -44,7 +42,6 @@ PATH_DENY: list[tuple[str, str]] = [
     (r"(?:^|/)secrets(?:/|$)", "凭据目录"),
 ]
 
-# ── 内容层：只匹配「真实凭据的形状」，匹配到的值一律掩码输出 ──
 # 每条都必须满足：合法源码里不存在同形状的字面量。加新特征前先跑
 # `python scripts/check_secrets.py --all` 确认全树零命中。
 CONTENT_PATTERNS: list[tuple[str, str]] = [
@@ -120,7 +117,7 @@ def scan_lines(path: str, lines: list[tuple[int, str]]) -> list[Finding]:
             match = pattern.search(text)
             if match:
                 findings.append(Finding(path, label, f"第 {lineno} 行，{_mask(match.group(0))}"))
-                break  # 一行只报第一条，避免同一行刷屏
+                break
     return findings
 
 

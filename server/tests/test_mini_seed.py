@@ -19,8 +19,8 @@ from app.domains.games.models import Bundle, Game, GamePriceHistory, GameCurrent
 from app.domains.monitoring.models import MonitorTarget
 from app.domains.settings import service as settings_service
 
-APPID_NEW = 998_001   # 仅在种子里（空库导入场景）
-APPID_OLD = 998_002   # 本地已有行（union-only 场景）
+APPID_NEW = 998_001
+APPID_OLD = 998_002
 BID_NEW = 998_101
 BID_OLD = 998_102
 STAMP = "2026-10-25T04:51:19.313341+00:00"
@@ -55,18 +55,14 @@ def _make_seed(path: Path) -> None:
     con.executemany(
         "INSERT INTO curated VALUES (?,?,?,?,?,?,?)",
         [
-            # 新行：xgp 权威覆写 + epic 正向并集
             (APPID_NEW, "core", None, 0, 0, None, "seed-series"),
-            # 老行：种子想降级（本地已有更新事实，必须保持本地）
             (APPID_OLD, None, "2020-01-01", 0, 1, None, "seed-tries-downgrade"),
         ],
     )
     con.executemany(
         "INSERT INTO bundle_index VALUES (?,?,?,?,?)",
         [
-            # 新包：item_kind=-1 未知保真；app_ids JSON 文本
             (BID_NEW, -1, "种子新捆绑包", "[10, 80]", 0),
-            # 本地已有 bundle_id：不覆盖
             (BID_OLD, 1, "种子版本名（不得覆盖）", "[1]", 1),
         ],
     )
@@ -124,18 +120,17 @@ async def test_empty_db_import_recovers_catalog_curated_bundles(seed_file):
     """空库导入：目录/人工列/捆绑主档齐备；未抓价真实（现价与历史 0 行、
     updated_at=种子时刻而非当下）；不写任何监控目标（目录不进价格队列）。"""
     stats = await mini_seed.import_mini_seed(seed_file)
-    # 目录段先落两行，人工列段随后两行都可命中；捆绑两包本地皆无 → 全新落
     assert stats == {"games": 2, "curated": 2, "bundles": 2}
 
     games, bundles, prices, history, monitored = await _counts()
     assert games == 2 and bundles == 2
-    assert prices == 0 and history == 0      # 未抓价真实；无任何价格数据
-    assert monitored == 0                    # 目录全集不进爬取队列
+    assert prices == 0 and history == 0
+    assert monitored == 0
 
     async with get_session_factory()() as session:
         row = await session.get(Game, APPID_NEW)
         assert row.name == "种子新游戏" and row.type == "GAME"
-        assert row.xgp_tier == "core"        # xgp 无本地写者：权威覆写
+        assert row.xgp_tier == "core"
         assert row.smart_score is not None
         assert row.series_id == "seed-series"
         assert row.updated_at == datetime.fromisoformat(STAMP.replace("+00:00", ""))
@@ -178,15 +173,13 @@ async def test_catalog_import_groups_new_series_and_rolls_back_derived_failure(s
 async def test_repeat_import_idempotent_and_new_version_merges(seed_file, monkeypatch):
     """同版本幂等空转；换版本重并仍幂等（已有行不重复、不回拨）。"""
     await mini_seed.import_mini_seed(seed_file)
-    assert await mini_seed.import_mini_seed(seed_file) is None  # marker 命中跳过
+    assert await mini_seed.import_mini_seed(seed_file) is None
 
-    # 换版本（模拟种子更新）：重并，目录零新增（已在位）
     con = sqlite3.connect(seed_file)
     con.execute("UPDATE seed_meta SET value=? WHERE key='exported_at_utc'",
                 ("2026-11-01T00:00:00+00:00",))
     con.commit(); con.close()
     stats = await mini_seed.import_mini_seed(seed_file)
-    # 已在位行零新增；人工列重并幂等（union-only 对已饱和事实是恒等操作）
     assert stats == {"games": 0, "curated": 2, "bundles": 0}
     games, _, _, _, _ = await _counts()
     assert games == 2
@@ -198,19 +191,17 @@ async def test_union_only_never_downgrades_local_facts(seed_file):
     降级或覆盖；正向并集（种子有而本地无的仍补齐）。"""
     await _seed_local_facts()
     stats = await mini_seed.import_mini_seed(seed_file)
-    # 本地已有 APPID_OLD/BID_OLD：目录与捆绑只补缺（各 +1）；
-    # 人工列两行都在场（老行本地在场、新行刚被目录段落位）
     assert stats == {"games": 1, "curated": 2, "bundles": 1}
 
     async with get_session_factory()() as session:
         row = await session.get(Game, APPID_OLD)
-        assert row.epic_date == "2026-10-01 ~ 2026-10-08"  # 本地更新日期保住
-        assert row.series_id == "local-series"              # 本地系列保住
-        assert row.is_hb is True                            # 种子正向并集（1 生效）
+        assert row.epic_date == "2026-10-01 ~ 2026-10-08"
+        assert row.series_id == "local-series"
+        assert row.is_hb is True
         bundle = (await session.execute(
             select(Bundle).where(Bundle.bundle_id == BID_OLD)
         )).scalar_one()
-        assert bundle.name == "本地捆绑包"                   # 主档不覆盖
+        assert bundle.name == "本地捆绑包"
         assert bundle.app_ids == [7, 8]
 
 
@@ -225,13 +216,12 @@ async def test_bundle_identity_fidelity(seed_file):
         )).scalar_one()
         assert bundle.item_kind == -1
         assert bundle.must_purchase_as_set == 0
-        assert bundle.app_ids == [10, 80]     # 列表而非 '["10","80"]' 字符串
+        assert bundle.app_ids == [10, 80]
 
 
 @pytest.mark.asyncio
 async def test_bad_seed_rejected(tmp_path):
     """坏档拒绝：结构不符 / 声明含价格 → 按无种子处理，零写入零 marker。"""
-    # 表集多一张价格表（结构不符 + 声明含价双违规）
     path = tmp_path / "holdexar_mini_seed.db"
     con = sqlite3.connect(path)
     con.executescript(

@@ -1,4 +1,5 @@
 import pytest
+from starlette.requests import Request
 
 from app.core.database import get_session_factory, write_session
 from app.domains.games.models import Game, GameCurrentPrice
@@ -19,7 +20,10 @@ async def test_import_commits_currency_conversion_and_derived_snapshot(tmp_path,
     async with write_session() as session:
         session.add(FxRate(currency_code="USD", rate_to_cny=7))
         await session.commit()
-    result = await system.import_legacy(system.LegacyImport(path=str(source)))
+    result = await system.import_legacy(
+        system.LegacyImport(path=str(source)),
+        Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []}),
+    )
     assert result["currentUpserted"] == 2
     async with get_session_factory()() as session:
         game = await session.get(Game, 9900951)

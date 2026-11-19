@@ -7,25 +7,28 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import http.client
 
 
-from app.core import layout
+from app.core import layout, update_signing
 from app.core.app_info import (
     APP_NAME,
     ENV_PREFIX,
     HEALTH_TIMEOUT,
+    MANIFEST_SCHEMA,
     STAGING_MANIFEST_NAME,
     version_from_tag,
     version_gt,
@@ -57,12 +60,6 @@ DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 28765
 UPDATE_DATA_PROTOCOL = 1
 
-# 交接信任锚记录（数据目录落盘，写入侧在 app.core.updater）：下载完成时的
-# 清单验签+sha256 结论持久化于此。暂存目录与自带 manifest 攻击者可写，
-# 执行任何暂存载荷前唯一可对照的锚是这条记录。
-TRUST_RECORD_NAME = "update-trust.json"
-
-# 健康验收失败归因（写入事务与诊断报告的 error 字段前缀）
 HEALTH_BINDING_ERROR = "健康验收未绑定本事务"
 HEALTH_EXIT_ERROR = "新版本进程已退出"
 HEALTH_TIMEOUT_ERROR = "健康验收超时"
@@ -249,10 +246,6 @@ def cleanup_old_executables(directory: Path) -> None:
             pass
 
 
-    # 2. 载荷多版本布局时同步刷新根目录启动器与 updater/UpdateHost.exe。
-    #    利用 _safe_replace_executable 处理 Windows 运行期 EXE 文件锁。
-
-
 def install_version_payload(
     root: Path,
     staging_dir: Path,
@@ -279,19 +272,15 @@ def install_version_payload(
 
     versions_sub = payload / "versions"
 
-    # 1. 载荷自带多版本布局（含 versions/ 子目录）
     if versions_sub.is_dir():
         src_ver = versions_sub / target_version
         if not src_ver.is_dir():
-            # 载荷版本目录名与清单版本不一致即为错包：绝不拿别的目录冒充目标版本
             raise RuntimeError(f"更新载荷的 versions/ 下未找到版本目录：{target_version}")
         shutil.copytree(src_ver, dest, dirs_exist_ok=True)
 
     else:
-        # 传统扁平单版本载荷：直接作为版本目录
         shutil.copytree(payload, dest, dirs_exist_ok=True)
 
-    # 完整性校验：主程序不存在即整次换装失败（不得以残缺版本目录提交）
     if not layout.is_version_valid(root, target_version):
         raise RuntimeError(f"安装到 {dest} 失败：缺少主可执行程序")
 
@@ -555,7 +544,6 @@ def probe_version_health(
                                   dataProbeRegistrationRequired=True, launchPending=True,
                                   launchImage=str(exe.resolve()))
     try:
-        # 带 --server：仅起本地服务做健康检查，不打开 WebView2 窗口
         proc = subprocess.Popen(
             [str(exe), *([] if require_window else ["--server"])],
             cwd=str(exe.parent),
@@ -580,8 +568,6 @@ def probe_version_health(
     last_reason = f"{HEALTH_BINDING_ERROR}：无可用健康响应"
     # 验收进程的映像在拉起后固化：后续只与自身比对，防止中途被替换
     expected_image = process_image_path(proc.pid)
-    # 迁移阶段与健康验收分账（只读信号，不进验收判据）：信号推进=迁移存活，刷新
-    # 空闲窗；空闲窗兜「真卡死」，总上限兜「无限慢」。
     started = time.monotonic()
     migration_cap = started + MIGRATION_MAX_DURATION
     last_schema: int | None = None
@@ -707,44 +693,82 @@ def _verify_staging_payload(staging_dir: Path, manifest: dict[str, Any]) -> str:
     return ""
 
 
-def verify_staged_trust(staging_dir: Path, data_dir: Path, target_version: str | None = None) -> str:
-    """交接信任锚复核：暂存载荷对照数据目录信任记录逐文件复算（fail-closed）。
-
-    下载完成时 updater 已对 zip 过 Ed25519 清单验签与 sha256 校验，并把结论
-    与载荷 files 表写入数据目录记录；暂存目录与自带 manifest 均可被改写，
-    只有这条记录是执行暂存载荷前唯一可对照的锚。返回错误描述，空串=通过。
-    """
+def verify_staged_trust(
+    staging_dir: Path, data_dir: Path | None = None, target_version: str | None = None
+) -> str:
+    """Verify staged files against the publisher-signed manifest before execution."""
+    try:
+        staging_info = staging_dir.lstat()
+    except OSError:
+        return "暂存目录缺失"
+    if (not stat.S_ISDIR(staging_info.st_mode) or stat.S_ISLNK(staging_info.st_mode)
+            or getattr(staging_info, "st_file_attributes", 0) & 0x400):
+        return "暂存目录路径非法"
     manifest = _read_manifest(staging_dir)
     if not manifest:
         return "暂存清单缺失或不可读"
-    try:
-        record = json.loads((data_dir / TRUST_RECORD_NAME).read_text(encoding="utf-8"))
-        if not isinstance(record, dict):
-            raise ValueError
-    except (OSError, ValueError):
-        return "信任记录缺失或损坏，拒绝执行暂存载荷；请重新下载更新"
-    recorded_tag = str(record.get("version") or "")
-    manifest_tag = str(manifest.get("tag") or "")
-    if (version_from_tag(recorded_tag) != version_from_tag(manifest_tag)
-            or (target_version and version_from_tag(recorded_tag) != version_from_tag(target_version))):
-        return f"信任记录版本不符：记录 {recorded_tag or '(空)'} / 暂存 {manifest_tag or '(空)'}"
-    files = record.get("files")
+    release = manifest.get("release_manifest")
+    if not isinstance(release, dict):
+        return "发布清单缺失，拒绝执行暂存载荷；请重新下载更新"
+    trusted, reason = update_signing.verify_manifest(release)
+    if (not trusted or release.get("app") != APP_NAME
+            or release.get("schema") != MANIFEST_SCHEMA):
+        return f"发布清单签名无效或版本不受支持：{reason or '清单内容不匹配'}"
+    tag = str(release.get("tag") or f"v{release.get('version') or ''}")
+    version = version_from_tag(tag)
+    if not version or version != version_from_tag(str(release.get("version") or "")):
+        return "发布清单版本信息不一致"
+    if (version_from_tag(str(manifest.get("tag") or "")) != version
+            or (target_version and version != version_from_tag(target_version))):
+        return f"发布清单版本不符：签名清单 {tag or '(空)'} / 暂存 {target_version or '(空)'}"
+    assets = release.get("assets")
+    asset = next((item for item in assets if isinstance(item, dict)
+                  and item.get("role") == "app"), None) if isinstance(assets, list) else None
+    if not asset:
+        return "发布清单缺少应用安装包"
+    name = str(asset.get("name") or "")
+    if (PurePosixPath(name).name != name or "\\" in name
+            or not name.lower().startswith(f"{APP_NAME}-win64-v".lower())
+            or not name.lower().endswith(".zip")):
+        return "发布清单应用包名称非法"
+    files = asset.get("files")
     if not isinstance(files, dict) or not files:
-        return "信任记录缺少载荷校验表，拒绝执行暂存载荷；请重新下载更新"
-    if manifest.get("files") != files:
-        return "暂存清单校验表与信任记录不一致，拒绝执行暂存载荷；请重新下载更新"
-    digest = str(record.get("zip_sha256") or "").lower()
-    if len(digest) != 64 or set(digest) - set("0123456789abcdef"):
-        return "信任记录缺少下载校验值，拒绝执行暂存载荷；请重新下载更新"
+        return "发布清单缺少已签名的载荷校验表"
+    expected: dict[str, str] = {}
+    for name, digest in files.items():
+        path = PurePosixPath(str(name))
+        value = str(digest).lower()
+        if ("\\" in str(name) or path.is_absolute()
+                or not path.parts or any(part in {"", ".", ".."} for part in path.parts)
+                or not re.fullmatch(r"[0-9a-f]{64}", value)):
+            return "发布清单载荷校验表非法"
+        expected[path.as_posix()] = value
     payload = staging_dir / APP_NAME
-    if not payload.is_dir():
+    try:
+        payload_info = payload.lstat()
+    except OSError:
         return "暂存包载荷缺失"
-    for name in sorted(files):
-        path = payload / name
-        if not path.is_file():
-            return f"暂存包载荷缺失：{name}"
-        if hashlib.sha256(path.read_bytes()).hexdigest() != str(files[name]).lower():
-            return f"暂存包载荷校验不符：{name}"
+    if (not stat.S_ISDIR(payload_info.st_mode) or stat.S_ISLNK(payload_info.st_mode)
+            or getattr(payload_info, "st_file_attributes", 0) & 0x400):
+        return "暂存包载荷缺失"
+    actual: dict[str, str] = {}
+    for path in payload.rglob("*"):
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            return "暂存包载荷包含重解析路径"
+        if path.is_file():
+            actual[path.relative_to(payload).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif not path.is_dir():
+            return "暂存包载荷包含非普通文件"
+    if actual != expected:
+        missing = sorted(expected.keys() - actual.keys())
+        if missing:
+            return f"暂存包载荷缺失：{missing[0]}"
+        changed = sorted(name for name in expected.keys() & actual.keys()
+                         if expected[name] != actual[name])
+        if changed:
+            return f"暂存包载荷校验不符：{changed[0]}"
+        return "暂存包载荷包含发布清单之外的文件"
     return ""
 
 
@@ -965,7 +989,6 @@ def recover_interrupted_update(root: Path) -> bool:
     with update_mutex():
         tx = layout.read_transaction(root) or {}
         if tx.get("dataRollbackReleased"):
-            # 已释放=数据已还原且保护解除，事务完结；指针归启动链相容性校验管
             if tx.get("dataRecoveryPhase") not in (None, "restored"):
                 raise RuntimeError("更新恢复相位无法证明完成，已停止启动并保留数据")
             update_data.finish_rollback(root)
@@ -1007,7 +1030,6 @@ def recover_interrupted_update(root: Path) -> bool:
             layout.clear_transaction(root)
         elif tx.get("dataDir"):
             if update_data._read_marker(Path(tx["dataDir"])) is None:
-                # 无准备标记=数据从未进入保护，事务只是残壳；指针归属由启动链相容校验管
                 layout.clear_transaction(root)
             else:
                 update_data.abort_preparation(root, data_dir=Path(tx["dataDir"]))
@@ -1047,7 +1069,6 @@ def _execute_update_locked(
     previous_tx = layout.read_transaction(root) or {}
     if previous_tx.get("dataDir"):
         recover_interrupted_update(root)
-        # 裁决只认恢复后的最新事务：恢复已收尾（含清场）即放行
         current_tx = layout.read_transaction(root) or {}
         if current_tx.get("dataDir") and (not current_tx.get("dataAccepted")
                 and not current_tx.get("dataRollbackReleased")):
@@ -1107,7 +1128,6 @@ def _execute_update_locked(
 
     layout.update_transaction(root, layout.STAGE_SWITCHING, dataDir=str(expected_data_dir))
     if recovering:
-        # 上次换装装完文件却没来得及提交：指针已在本版本上，回退目标已落盘
         _log_update(root, f"检测到未完成的换装（版本 {t_ver}），直接沿用已落盘文件重新验收")
     else:
         try:
@@ -1205,7 +1225,6 @@ def _commit(
     _log_update(root, f"换装成功！清理历史版本：{pruned}")
 
     _finish_diagnosis(root, target_version, diagnosis)
-    # 提交即终态：指针与相容记录已落 current.json，事务档案使命结束
     layout.clear_transaction(root)
     return True
 

@@ -77,9 +77,6 @@ _WEBVIEW2_REG_KEYS = (
 )
 _WEBVIEW2_DL_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
-# 启动等待页：pywebview 内联 HTML（零网络依赖）。窗口初始化与后端 lifespan
-# 并行重叠，health 就绪后由 _wait_and_navigate 整窗跳转真实应用。
-# uvicorn 在 lifespan 完成前不监听端口，等待期只有内联 html= 可用。
 _SPLASH_HTML = (
     "<!doctype html><html><head><meta charset='utf-8'>"
     f"<title>{APP_NAME}</title>"
@@ -96,14 +93,9 @@ _SPLASH_HTML = (
     f"{APP_NAME} 启动中，请稍候…</div></body></html>"
 )
 
-# 绑定地址可配（NAS/局域网场景）：默认回环，行为与历史版本一致
 SERVER_HOST = os.environ.get(f"{ENV_PREFIX}HOST", "127.0.0.1")
-# 端口协商结果：默认取环境变量（HOLDEXAR_PORT/HOLDEXAR_LOCK_PORT），
-# main() 启动时被占则按 DEV/FROZEN 态分流协商（见 _negotiate_ports）
 SERVER_PORT = int(os.environ.get(f"{ENV_PREFIX}PORT", "28765"))
-# 锁端口可换：被外来程序占坑时，设 HOLDEXAR_LOCK_PORT 换一个即可自救
 LOCK_PORT = int(os.environ.get(f"{ENV_PREFIX}LOCK_PORT", "28965"))
-# frozen 态服务端口被占时的自动扫描窗口（从默认端口起试 N 个）
 _PORT_SCAN_SPAN = 20
 WINDOW_TITLE = APP_NAME
 DEFAULT_SIZE = (1280, 860)
@@ -171,7 +163,7 @@ def _negotiate_ports() -> None:
 
     if not _port_free(SERVER_PORT):
         if _probe_running():
-            return  # 已有实例：原值保留，由 main() 唤醒分支处理
+            return
         if not frozen:
             _alert(
                 f"启动失败：服务端口 {SERVER_PORT} 已被其他程序占用。\n\n"
@@ -197,17 +189,13 @@ def _negotiate_ports() -> None:
                 LOCK_PORT = candidate
                 break
         else:
-            # 全部备选锁位被外来程序占满（极端环境）：让位，
-            # 单实例判定回落到"服务端口健康探活"（_probe_running）
             print(f"[警告] 锁端口 {LOCK_PORT} 与备选全被占用，单实例锁降级为探活判定")
 
 
-# 备选锁位：避开常用本地服务端口段（28765/28965 附近），依次尝试
 _LOCK_FALLBACKS = (28966, 28967, 28968, 29965, 29966)
 
 
 def _start_server(ready: threading.Event, error_box: list[str]) -> None:
-    # sys.path 已在模块头部按开发/打包态配好；此处无需再注入
     try:
         import uvicorn
         from app.main import app
@@ -320,7 +308,7 @@ def _watch_launcher() -> None:
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         handle = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
         if not handle:
-            return  # 包装进程已不在/句柄打不开：无孤儿风险，不设防
+            return
 
         def _await_death() -> None:
             kernel32.WaitForSingleObject(handle, INFINITE)
@@ -338,7 +326,7 @@ def _watch_launcher() -> None:
 
 def _alert(message: str) -> None:
     """windowed 打包态 print 不可见：关键失败路径弹系统对话框兜底。"""
-    print(message)  # 控制台模式（python 直跑 / --server 调试）照常可见
+    print(message)
     try:
         import ctypes
 
@@ -530,11 +518,8 @@ def _data_dir() -> Path:
     return resolve_data_dir(APP_SLUG, ENV_PREFIX)
 
 
-# 暂存目录内的文件名（与后端 app/core/updater.py 同源常量，改名单点生效）
 _MANIFEST_NAME = STAGING_MANIFEST_NAME
-# 不支持安全换装的暂存包落盘标记：避免每次启动重复探测与弹窗
 _UNSUPPORTED_MARK = HANDOFF_UNSUPPORTED_MARK
-# 更新失败标记随数据目录保留。
 _FAILED_MARK = SWAP_FAILED_FLAG
 
 
@@ -584,10 +569,10 @@ def _swap_mutex_held() -> bool:
     kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
     handle = kernel32.OpenMutexW(SYNCHRONIZE, False, _SWAP_MUTEX_NAME)
     if not handle:
-        return False  # 互斥体不存在：没有换装进程
+        return False
     held = kernel32.WaitForSingleObject(handle, 0) == _WAIT_TIMEOUT
     if not held:
-        kernel32.ReleaseMutex(handle)  # 探测把空闲/弃置互斥拿到了手上，必须放回去
+        kernel32.ReleaseMutex(handle)
     kernel32.CloseHandle(handle)
     return held
 
@@ -724,9 +709,7 @@ def _handoff_pending_update() -> bool:
         _clear_handoff_ledger()
         return False
 
-    # 信任锚复核先于一切暂存执行（含协议探测）：下载期的验签+sha256 结论
-    # 持久化在数据目录，暂存目录自带的 manifest 不作数；旧版本留下的无记录
-    # 暂存包同样在此清掉，用户重新下载即可
+    # 发布签名与逐文件校验先于一切暂存执行（含协议探测）。
     from app.core.update_host import verify_staged_trust
 
     trust_error = verify_staged_trust(staging, _data_dir(), staged_version)
@@ -824,7 +807,7 @@ def _cleanup_old_dir_async(old_dir: Path) -> None:
     """后台线程清 __old__：sharing violation 重试（Windows 文件锁语义）。"""
 
     def _retry_delete() -> None:
-        for _ in range(30):  # ~30s 窗口
+        for _ in range(30):
             if shutil.rmtree(old_dir, ignore_errors=True) or not old_dir.exists():
                 return
             time.sleep(1.0)
@@ -853,11 +836,10 @@ def _browser_fallback(url: str, reason: str) -> None:
     print(f"{reason}，改用系统浏览器打开。")
     _alert(f"{reason}，将改用系统浏览器打开本地服务（关闭本进程即退出服务）。")
     webbrowser.open(url)
-    while True:  # 保活进程以维持本地服务
+    while True:
         time.sleep(3600)
 
 
-# 托盘「退出」置位后，关窗守卫放行真关窗（区别于用户点 X 的隐藏）
 _tray_state: dict = {"quit": False, "tray": None}
 
 
@@ -914,7 +896,6 @@ def _create_tray(window) -> object | None:
             window.destroy()
         except Exception:  # noqa: BLE001
             pass
-        # closed 事件兜底之外直接终审：后台线程随进程内核终结
         sys.stdout.flush()
         os._exit(0)
 
@@ -935,20 +916,12 @@ def _create_tray(window) -> object | None:
     return tray
 
 
-# ── 关闭弹窗外观（色值对齐 tokens.css 两档主题）────────────────────────
-# 弹窗是独立 WinForms 窗，主题跟随网页（_app_theme 读 app_settings 镜像）；
-# WinForms 无 CSS 变量体系，模块级只放字体与几何常量，配色全在 _DIALOG_THEMES。
-_DIALOG_FONT_FAMILY = "Microsoft YaHei UI"  # 同网页 --font-sans 的中文回退栈
-# 窗体圆角半径（无边框窗的圆滑轮廓，Region 裁切 + Paint 描边共用）
+_DIALOG_FONT_FAMILY = "Microsoft YaHei UI"
 _DIALOG_CORNER_RADIUS = 12
 
-# ── 弹窗幕布与出入场动效（数值对齐网页弹层档位）──────────────────────
-# 幕布是页面级遮罩（.hl-close-curtain，同 .hl-overlay），由 _toggle_close_curtain
-# 调页面里的 window.__hlxCloseCurtain 拉起。出入场：透明度 + 位移，
-# 时长与缓动对齐 .hl-dialog-pop-* 档位（--ease-inout）。
-_ANIM_MS = 170            # 网页档位 --duration-2/3 之间
-_ANIM_TICK_MS = 15        # 帧间隔：约 60fps
-_ANIM_RISE = 16           # 入场位移（px）：自下方浮到位，出场反向沉出
+_ANIM_MS = 170
+_ANIM_TICK_MS = 15
+_ANIM_RISE = 16
 
 # 页面幕布开关脚本：显式返回布尔（页面没有挂载点 → false）。
 # hook(true) 返回 undefined，不能用 !!(hook && hook(true)) 缩写。
@@ -957,13 +930,11 @@ _CURTAIN_JS = (
     " window.__hlxCloseCurtain({0}); return true; }})()"
 )
 
-# 双主题配色（色值对齐 tokens.css 两档）：深色 = html.dark 档，浅色 = :root 档。
-# 模块级 RGB 元组，绘制处经 _c()（Color.FromArgb(*palette[name])）取用。
 _DIALOG_THEMES: dict[str, dict] = {
     "dark": {
         "bg": (27, 40, 56),              # #1b2838
         "border": (44, 62, 82),          # #2c3e52
-        "head": (255, 255, 255),         # 标题白
+        "head": (255, 255, 255),
         "text": (199, 213, 224),         # #c7d5e0
         "subtle": (143, 152, 160),       # #8f98a0
         "accent_fill": (102, 192, 244),  # #66c0f4
@@ -976,11 +947,11 @@ _DIALOG_THEMES: dict[str, dict] = {
         "close_fg_hover": (255, 255, 255),
         # 关闭键圆形悬停底：半透明白（FromArgb 参数序是 (a, r, g, b)）
         "close_hover_bg": (32, 255, 255, 255),
-        "logo": "logo_dark.ico",         # 深色面 → 浅色（白色线条）logo
+        "logo": "logo_dark.ico",
     },
     "light": {
         "bg": (247, 250, 253),           # #f7fafd（surface-pop-deep）
-        "border": (219, 228, 238),       # 浅色描边档
+        "border": (219, 228, 238),
         "head": (23, 32, 42),            # #17202a text-primary
         "text": (51, 71, 90),            # #33475a text-secondary
         "subtle": (100, 119, 140),       # #64778c text-muted
@@ -993,7 +964,7 @@ _DIALOG_THEMES: dict[str, dict] = {
         "close_fg": (100, 119, 140),     # #64778c（浅色面叉线用深灰蓝）
         "close_fg_hover": (23, 32, 42),  # #17202a
         "close_hover_bg": (26, 23, 32, 42),  # 半透明深（a,r,g,b）
-        "logo": "logo_light.ico",        # 浅色面 → 深色线条 logo
+        "logo": "logo_light.ico",
     },
 }
 
@@ -1016,8 +987,6 @@ def _app_theme() -> str:
         finally:
             con.close()
         if row and row[0] is not None:
-            # app_settings 存的是 JSON 编码值（前端写进去的是带引号的 "light"），
-            # 先按 JSON 解码，解不动再按裸值判。
             value = str(row[0]).strip()
             try:
                 value = str(json.loads(value))
@@ -1100,7 +1069,7 @@ def _attach_close_animation(dialog) -> None:
 
     state: dict = {
         "timer": None, "phase": "in", "step": 0, "base": None, "closed": False,
-        "result": None,  # 用户的选择（DialogResult）：关闭被拦时它会丢，这里存一份
+        "result": None,
     }
 
     def _stop() -> None:
@@ -1159,7 +1128,7 @@ def _attach_close_animation(dialog) -> None:
         try:
             state["step"] += 1
             t = min(1.0, state["step"] / total_steps)
-            k = t * t * (3.0 - 2.0 * t)  # smoothstep ≈ 网页 --ease-inout
+            k = t * t * (3.0 - 2.0 * t)
             _place(k, state["phase"])
             if t < 1.0:
                 return
@@ -1203,14 +1172,12 @@ def _attach_close_animation(dialog) -> None:
             _settle()
 
     def _on_closing(sender, e) -> None:
-        # 动效走完的那次真关（_close_now 已置位）、系统关动画：直接放行
         if state["closed"] or not _animations_enabled():
             return
-        # DialogResult 还是「未选择」= 不是用户按键（程序化/system 路径），交给原流程
         result = dialog.DialogResult
         if result is unset_result or result == unset_result:
             return
-        state["result"] = result  # 接住选择：本次关闭被拦后它会被 WinForms 复位
+        state["result"] = result
         e.Cancel = True
         try:
             _place(0.0, "out")
@@ -1279,7 +1246,6 @@ def _make_close_button(
         if bg is not None:
             g.FillRectangle(SolidBrush(bg), Rectangle(0, 0, button.Width, button.Height))
         if state["hover"]:
-            # 圆形悬停底：hover 高亮是圆的，不是系统那种方块。
             # fg/fg_hover/hover_bg 已是 Color 对象（主题表经 _c() 转换后传入），
             # 直接用——对 Color 做 * 展开会抛「argument after * must be an
             # iterable, not Color」并弹 CLR 异常对话框。
@@ -1377,11 +1343,10 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     font_body = Font(_DIALOG_FONT_FAMILY, 14.0, FontStyle.Regular, GraphicsUnit.Pixel)
     font_button = Font(_DIALOG_FONT_FAMILY, 15.0, FontStyle.Bold, GraphicsUnit.Pixel)
 
-    # 布局（客户区 520×240）：自绘标题栏 52 → 正文 → 按键行 y=170
     WIDTH, HEIGHT = 520, 240
     BTN_W, BTN_H, BTN_GAP = 200, 44, 16
     BTN_Y = 170
-    BTN_X0 = (WIDTH - (BTN_W * 2 + BTN_GAP)) // 2  # 组居中：起点 52
+    BTN_X0 = (WIDTH - (BTN_W * 2 + BTN_GAP)) // 2
 
     def _round_button(
         text: str, dialog_result, x: int, y: int, font, fill, hover, text_color
@@ -1397,7 +1362,7 @@ def _build_close_dialog(owner=None, theme: str | None = None):
         """
         btn = WinButton()
         btn.Text = text
-        btn.AccessibleName = text  # 自绘按键给语义名（读屏/测试都按它找控件）
+        btn.AccessibleName = text
         btn.DialogResult = dialog_result
         btn.Size = Size(BTN_W, BTN_H)
         btn.Location = Point(x, y)
@@ -1449,16 +1414,11 @@ def _build_close_dialog(owner=None, theme: str | None = None):
 
     dialog = WinForm()
     dialog.Text = f"关闭 {APP_NAME}"
-    # 无边框自绘：标题栏（logo/标题/圆滑关闭键）全部自绘，拖动转交系统
-    # （WM_NCLBUTTONDOWN）。AutoScaleMode.None + 全程像素坐标（含字号），
-    # 不做 DPI 换算。
     dialog.AutoScaleMode = getattr(AutoScaleMode, "None")
     dialog.FormBorderStyle = getattr(FormBorderStyle, "None")
     dialog.BackColor = _c("bg")
     dialog.ForeColor = _c("text")
     dialog.ShowInTaskbar = False
-    # 锚点失效（owner 缺席/隐形/最小化）时 CenterParent 不生效，弹窗会落回
-    # 默认 (0,0)——必须退到屏幕居中，绝不让确认框孤零零出现在桌面左上角。
     dialog.StartPosition = (
         FormStartPosition.CenterParent
         if _owner_anchorable(owner)
@@ -1466,7 +1426,6 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     )
     dialog.ClientSize = Size(WIDTH, HEIGHT)
 
-    # 窗口图标 = 品牌 logo（任务栏/Alt-Tab；按主题取线条版）
     logo_bitmap = None
     icon_path = _brand_logo_path(theme)
     if icon_path:
@@ -1516,7 +1475,6 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     dialog.SizeChanged += _apply_round_region
     dialog.MouseDown += _start_drag
 
-    # ── 标题栏：品牌 logo（按主题取线条版）+ 标题 + 圆滑关闭键 ──
     if logo_bitmap is not None:
         logo = PictureBox()
         logo.Image = logo_bitmap
@@ -1550,7 +1508,6 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     )
     dialog.Controls.Add(btn_close)
 
-    # ── 正文 ──
     head = WinLabel()
     head.Text = f"要如何关闭 {APP_NAME}？"
     head.AutoSize = False
@@ -1571,7 +1528,6 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     detail.BackColor = _c("bg")
     dialog.Controls.Add(detail)
 
-    # ── 按键：圆角纯色双色（两色分工动作性质）──
     btn_min = _round_button(
         "最小化",
         DialogResult.Yes,
@@ -1595,7 +1551,7 @@ def _build_close_dialog(owner=None, theme: str | None = None):
     dialog.Controls.Add(btn_min)
     dialog.Controls.Add(btn_quit)
 
-    dialog.AcceptButton = btn_min  # 回车 = 最小化（安全侧）
+    dialog.AcceptButton = btn_min
     # Esc = 留在窗口（回车交给 AcceptButton）：圆滑关闭键是 Label 载体，
     # 接不了 CancelButton，键盘语义由 KeyPreview + KeyDown 兜住。
     dialog.KeyPreview = True
@@ -1679,11 +1635,11 @@ def _ask_close_intent(owner=None, window=None) -> str:
     try:
         theme = _app_theme()
         dialog, mapping = _build_close_dialog(owner, theme)
-        _toggle_close_curtain(window, True)  # 幕布先亮（页面侧渲染，与弹窗同拍）
+        _toggle_close_curtain(window, True)
         try:
             _attach_close_animation(dialog)
         except Exception:  # noqa: BLE001
-            dialog.Opacity = 1.0  # 动效装配失败：弹窗必须看得见
+            dialog.Opacity = 1.0
         result = dialog.ShowDialog(owner) if owner is not None else dialog.ShowDialog()
         return mapping.get(result, "minimize")
     except Exception:  # noqa: BLE001 —— 问不出就按旧语义隐藏，不误杀进程
@@ -1707,28 +1663,22 @@ def _make_closing_guard(window):
     （托盘菜单是明确意图，免询问）。"""
     def _guard() -> bool:
         if _tray_state["quit"]:
-            return True  # 托盘「退出」：放行真关闭
+            return True
         owner = getattr(window, "native", None)
         if not _background_mode and owner is not None and _owner_hidden(owner):
-            # closing 落在不可见窗口上（托盘态的杂散关闭）：意图无从判断，
-            # 先亮出主窗口再问——绝不给隐形窗口弹孤儿确认框，也不能无声放行
-            # 或无声取消（前者误杀常驻，后者托盘退出会变成关不掉）。
             try:
                 window.show()
             except Exception:  # noqa: BLE001 —— 亮不了窗就照常走询问降级链
                 pass
         intent = "minimize" if _background_mode else _ask_close_intent(owner, window)
         if intent == "quit":
-            # 先撤窗再放行：点「退出程序」窗口必须当场消失，进程收尾期间窗口
-            # 不滞留屏幕。撤窗只收走可见面；真关闭照常走（closed 事件里
-            # os._exit(0) 终结进程）。
             try:
                 window.hide()
             except Exception:  # noqa: BLE001
                 pass
-            return True  # 放行真关闭：closed 事件里 os._exit(0) 终结进程
+            return True
         if intent == "stay":
-            return False  # 弹窗右上角 X：取消关闭，窗口原地不动
+            return False
         # 托盘没建起来时**不能 hide()**：窗口从屏幕与任务栏一起消失且无入口
         # 可召回。退化成最小化，任务栏仍可点回来。
         if _tray_state.get("tray") is None:
@@ -1741,7 +1691,7 @@ def _make_closing_guard(window):
             window.hide()
         except Exception:  # noqa: BLE001
             pass
-        return False  # 最小化：取消关闭，窗口隐藏、进程常驻
+        return False
 
     return _guard
 
@@ -1827,7 +1777,6 @@ def _open_window(app_url: str) -> None:
 
         window.events.loaded += _on_loaded
 
-        # 隐藏时保留窗口与托盘的共同生命周期，明确退出再销毁。
         window.events.closing += _make_closing_guard(window)
         def closed():
             if _background_mode and not _tray_state["quit"]:
@@ -1847,7 +1796,6 @@ def _open_window(app_url: str) -> None:
             threading.Thread(target=_wait_and_navigate, args=(win, url), daemon=True).start()
             _run_tray(win)
 
-        # 托盘与 health 跳转都在窗口建好后由 start(func) 拉起（时序见 _run_tray）
         webview.start(_on_ready, (window, app_url), **start_kwargs)
     except Exception as e:  # noqa: BLE001 —— 窗口创建/渲染层初始化失败一并降级浏览器
         _browser_fallback(app_url, f"窗口初始化失败：{e}")
@@ -1949,12 +1897,10 @@ def main() -> None:
         if raw.isdigit():
             _wait_pid_exit(int(raw), timeout=15.0)
 
-    # 启动期端口协商（已运行实例检测在前）：被占自动避让/唤醒分流
     _negotiate_ports()
 
     lock = _acquire_lock()
     if lock is None:
-        # 锁没拿到：真实例（探活命中→置前唤醒）或外来占坑（降级告警）
         if _probe_running():
             print(f"{APP_NAME} 已在运行。")
             if args.server:
@@ -1965,10 +1911,8 @@ def main() -> None:
             if not _focus_running_window():
                 if _activate_running():
                     return
-                # 无窗口实例（--server 模式）：才退到浏览器唤醒
                 webbrowser.open(f"http://{SERVER_HOST}:{SERVER_PORT}")
             return
-        # 锁位被外来程序占坑且无真实例：协商已选好服务端口，降级运行
         print(f"[警告] 锁端口 {LOCK_PORT} 被其他程序占用，单实例保护降级为探活判定。")
 
     # 交接放在单实例锁之后：只有拿到锁（= 此刻唯一的正式实例）才有资格交接。
@@ -1980,13 +1924,10 @@ def main() -> None:
         sys.stdout.flush()
         os._exit(75 if _background_mode else 0)
 
-    # 换装：暂存就绪则把换装交给暂存包的新 exe（本进程立即退出，不再起服务）；
-    # 交接失败（旧版暂存包/拉不起来）就照常启动现装，下次启动再试
     if not update_token and _handoff_pending_update():
         sys.stdout.flush()
         os._exit(75 if _background_mode else 0)
 
-    # 换装残留清理：已消费的暂存目录（无 manifest）+ 上一版程序备份 __old__
     if not update_token:
         _cleanup_staging_leftover()
     _stale_old_dir = _app_root() / "__old__"
@@ -2030,9 +1971,6 @@ def main() -> None:
             return
         sys.exit(1)
 
-    # 窗口模式：窗口初始化（CLR/WebView2）与后端 lifespan 并行——窗口先载
-    # 内联等待页（不经网络，后端未监听也不受影响），health 就绪后整窗跳转
-    # 真实应用（_wait_and_navigate）
     def _watchdog() -> None:
         """后台看门狗：HEALTH_TIMEOUT 内后端仍不可用则弹窗报错（窗口模式下
         等待页会一直转圈，用户需要明确的失败反馈）。"""

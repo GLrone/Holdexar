@@ -1,7 +1,3 @@
-// Holdexar 全原生启动器（Go 完整实现）。
-// 根目录原生入口；版本、迁移与更新事实沿用现有 state/ 与 data/ 账本。
-// 版本定位与自愈回退、数据相容校验（穿 WAL 读 user_version）、AppData 迁移
-// （VACUUM INTO 在线快照 + 密钥/辅助目录保留 + 冲突拒启）、参数与环境逐字传递。
 package main
 
 import (
@@ -50,8 +46,6 @@ var reservedVersionNames = map[string]bool{
 	"state": true, "versions": true, "update-staging": true, "_internal": true,
 	"__old__": true, "__legacy__": true, "cache": true, "temp": true, "tmp": true,
 }
-
-// ───────────────────────── 基础工具 ─────────────────────────
 
 func showFatalDialog(args []string) bool {
 	for _, arg := range args {
@@ -137,7 +131,6 @@ func finalPath(path string) (string, error) {
 	return resolved, nil
 }
 
-// resolvePath 对齐 Path.resolve()：返回绝对真实路径；不存在时退回绝对化。
 func resolvePath(path string) string {
 	if resolved, err := finalPath(path); err == nil {
 		return resolved
@@ -153,8 +146,6 @@ func resolvePath(path string) string {
 	}
 	return filepath.Join(resolvePath(parent), name)
 }
-
-// ───────────────────────── 状态指针 ─────────────────────────
 
 type currentState struct {
 	Version           string         `json:"version"`
@@ -399,8 +390,6 @@ func writeCurrentState(root, version string, lastKnownGood *string) (*currentSta
 	return state, nil
 }
 
-// ───────────────────────── 数据相容与 schema ─────────────────────────
-
 func validateDataCompat(compat *dataCompat) (*dataCompat, error) {
 	if compat == nil {
 		return nil, errors.New("数据与程序的相容记录无效")
@@ -463,8 +452,6 @@ func readSchemaVersion(dataDir string) (int, error) {
 	}
 	return version, nil
 }
-
-// ───────────────────────── 历史数据迁移 ─────────────────────────
 
 func machineCandidates() []string {
 	var out []string
@@ -919,8 +906,6 @@ func resolveDataDirConflict(targetDataDir, srcDir string) (bool, error) {
 	return true, nil
 }
 
-// ───────────────────────── 启动器主流程 ─────────────────────────
-
 func activeDataDir(root string, compat *dataCompat) string {
 	if compat != nil {
 		return compat.DataDir
@@ -1252,7 +1237,6 @@ func runLauncher(argv []string, root string) (int, error) {
 	if err := recoverInterruptedUpdate(root); err != nil {
 		return 1, err
 	}
-	// 2. 基础目录结构与遗留清理。
 	for _, dir := range []string{"state", "data", "logs", "versions", "updater", "update-staging"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
 			return 1, err
@@ -1261,7 +1245,6 @@ func runLauncher(argv []string, root string) (int, error) {
 	cleanupOldExecutables(filepath.Join(root, "updater"))
 	cleanupOldExecutables(root)
 
-	// 3. 历史数据迁移：冲突即拒启；迁移未完成不启动。
 	compat, err := readDataCompatibility(root)
 	if err != nil {
 		return 1, err
@@ -1294,7 +1277,6 @@ func runLauncher(argv []string, root string) (int, error) {
 		}
 	}
 
-	// 4. 定位有效版本（含相容校验与自愈回退）。
 	targetVersion, err := findTargetVersion(root, compat)
 	if err != nil {
 		return 1, err
@@ -1304,7 +1286,6 @@ func runLauncher(argv []string, root string) (int, error) {
 			filepath.Join(root, "versions"))
 	}
 
-	// 5. 拉起目标版本。
 	return launchVersion(root, targetVersion, argv)
 }
 

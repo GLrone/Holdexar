@@ -126,7 +126,7 @@ async def switch_mode(
     - mode=dpapi：新随机主密钥用 DPAPI 封装（仅 Windows）；
     - mode=passphrase：新随机主密钥用口令封装；返回后进程处于已解锁态。
 
-    当前为口令模式且锁定时，须提供 current_passphrase 解锁后才能换钥。
+    当前为口令模式时，须验证 current_passphrase 后才能换钥。
     失败（口令错 / DPAPI 不可用 / 换钥异常）时不改变库与密钥文件。
 
     **崩溃恢复协议**（顺序不可调换）：
@@ -144,7 +144,7 @@ async def switch_mode(
 
     data_dir = secretbox._data_dir()
     old_mode = keyring.mode_of(data_dir)
-    if old_mode == keyring.MODE_PASSPHRASE and keyring.is_locked(data_dir):
+    if old_mode == keyring.MODE_PASSPHRASE:
         if not current_passphrase or not keyring.unlock(data_dir, current_passphrase):
             raise keyring.KeyringError("当前口令不正确或未提供，无法切换保护方式")
 
@@ -172,7 +172,7 @@ async def switch_mode(
     )
 
     if mode == keyring.MODE_PASSPHRASE:
-        keyring.load_unlocked_key(new_master)  # 刚设的口令即当前会话口令
+        keyring.load_unlocked_key(new_master)
     secretbox.clear_key_cache()
     log_event(
         logger,
@@ -269,7 +269,6 @@ async def resume_pending_migration(data_dir, passphrase: str | None = None) -> d
         return {"resumed": False, "reason": "当前密钥不可用"}
 
     if old_master == new_master:
-        # 密钥文件根本没被替换（崩溃在写文件之前）——直接清记录即可
         keyring.remove_staging(data_dir)
         log_event(logger, "上次密钥换装未生效，已清理过渡记录")
         return {"resumed": True, "counts": {}}
@@ -316,7 +315,7 @@ async def _resume_reencrypt(data_dir, old_master: bytes, new_master: bytes) -> d
         try:
             plain = secretbox.decrypt_with(token, purpose, old_master)
         except secretbox.SecretBoxError:
-            return None  # 已迁移过：旧密钥解不开属预期
+            return None
         return secretbox.encrypt_with(plain, purpose, new_master)
 
     async with write_session(WritePriority.INTERACTIVE, label="rekey-resume") as session:

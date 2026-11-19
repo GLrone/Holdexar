@@ -68,30 +68,22 @@ def _register_sqlite_name_bigram(dbapi_conn, _record) -> None:
     create_function("name_bigram", 2, _name_bigram_udf, deterministic=True)
 
 
-# ── 轻量 schema 迁移（统一标准）─────────────────────────────
-# create_all 不会给已有表加列/索引；这里按表声明增量 DDL，启动幂等执行。
-# 新列/新索引一律在此登记，保持单一来源。
 _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "xgp_tier": "VARCHAR(50)",
         "is_epic": "BOOLEAN DEFAULT 0",
         "epic_date": "VARCHAR(100)",
         "is_hb": "BOOLEAN DEFAULT 0",
         "hb_data": "VARCHAR(100)",
-        # 第三方渠道 bundle 计数（NULL=未拉取）
         "bundle_count": "INTEGER",
         "series_id": "VARCHAR(100)",
         "hl_flag": "INTEGER DEFAULT 0",
         "pp_flag": "INTEGER DEFAULT 0",
-        # 最近一次原价跳变时刻（永降/永涨徽章 14 天时效判据）
         "pp_changed_at": "DATETIME",
         "is_adult": "BOOLEAN DEFAULT 0",
         "is_visual_novel": "BOOLEAN DEFAULT 0",
-        # 排序缓存预计算列（对齐 mv_game_sort_cache）
         "min_cny_fen": "BIGINT",
         "diff_fen": "INTEGER DEFAULT 0",
-        # smart 排序评分（update_price_derived 维护；NULL=未计算）
         "smart_score": "REAL",
-        # 商店移除监控：下架判定时间戳 + 连续全 404 轮数
         "removed_at": "DATETIME",
         "removed_strikes": "INTEGER DEFAULT 0",
         # 免费态：NULL=付费 / f2p=永久免费 / promo=限时赠送中；promo_end_at=结束 Unix 秒
@@ -100,29 +92,17 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
     },
     "wishlist_items": {
         "owned": "BOOLEAN DEFAULT 0",
-        # 星标关注标记：同步停用核对免疫；与愿望单同属爬取第一优先级
         "manual": "BOOLEAN DEFAULT 0",
-        # 愿望单成员标记：爬取第一优先级；反向核对时随成员资格清零
         "wishlisted": "BOOLEAN DEFAULT 0",
-        # 手动加入监控池（池页添加 / 导入）：同步反向核对免疫
         "manual_pool": "BOOLEAN DEFAULT 0",
-        # 手动移出监控池：同步复活挡标（重加时清标）
         "excluded": "BOOLEAN DEFAULT 0",
-        # 榜单发现源入池标记（topsellers/popularnew/comingsoon 轮询落池；
-        # 同步反向核对免疫——榜单游戏不在 Steam 名单里）
         "board_pool": "BOOLEAN DEFAULT 0",
     },
-    # 告警触发后行为（once=触发即收敛 / cooldown=冷却 / always=持续提醒）
     "price_alerts": {
         "config_json": "JSON",
         "repeat_mode": "VARCHAR(10) NOT NULL DEFAULT 'once'",
         "repeat_hours": "INTEGER NOT NULL DEFAULT 24",
     },
-    # 补抓账本：missing 状态的补抓尝试计数
-    # + 促销截止（browse active_discounts 下发，Unix 秒；每轮 UPSERT 跟随最新抓取）
-    # + 尝试观察三元组：每次抓取尝试都留下结果（成功观察 = 拿到 Steam 的明确
-    #   答复，含 locked / 无购买选项；传输类失败 = failed）；last_success_at
-    #   只在成功观察时推进，失败保留旧价与上次成功时刻
     "game_current_prices": {
         "fail_count": "INTEGER DEFAULT 0",
         "discount_end_ts": "INTEGER",
@@ -130,58 +110,42 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "steam_answer": "VARCHAR(12)",
         "last_success_at": "DATETIME",
     },
-    # bundle-as-sub 识别标记（版本显示修复）
-    # 促销元数据随价格历史同事务写入。
     "game_price_history": {
         "is_bundle": "BOOLEAN DEFAULT 0",
         "discount_end_ts": "INTEGER",
         "discount_desc": "VARCHAR(60)",
         "bundle_id": "INTEGER",
         "bundle_discount_pct": "INTEGER",
-        # 所属 Steam 活动周期标签（steam_events.event_key；观测写入时打标 +
-        # 同步后按窗口回贴，NULL = 不属于任何已知活动窗口）
         "steam_event_key": "VARCHAR(60)",
-        # 观测来源：steam=官方渠道爬取观测，community=社区历史源回填
         "source": "VARCHAR(20) NOT NULL DEFAULT 'steam'",
-        # 商品身份未知（社区历史源 appid 级序列）：不并入标准版，未知保持未知
         "product_unknown": "BOOLEAN NOT NULL DEFAULT 0",
     },
-    # 捆绑包形态列：链接/CDN 用（与购买语义 mps 解耦）
-    # + 排序快照预计算列（对齐 games：min_cny_fen/diff_fen/is_lowest；
-    # is_lowest 是旧库可能缺列的存量列，一并登记保证补齐）
     "bundles": {
         "item_kind": "INTEGER DEFAULT -1",
         "min_cny_fen": "BIGINT",
         "diff_fen": "INTEGER DEFAULT 0",
         "is_lowest": "BOOLEAN DEFAULT 0",
-        # smart 排序评分（refresh_bundle_sort_cache 维护；NULL=未计算）
         "smart_score": "REAL",
     },
-    # 捆绑包区域价促销截止（browse active_discounts 下发的 Unix 秒；NULL=无促销）
     "bundle_region_prices": {
         "discount_end_ts": "INTEGER",
     },
-    # bills 域新导出字段（Steam 消费历史分类器对齐）
     "bill_game_txs": {
         "wallet_balance": "VARCHAR(60) DEFAULT ''",
         "base_price": "VARCHAR(60) DEFAULT ''",
         "payment_parts_json": "TEXT",
         "gift_to_json": "TEXT",
     },
-    # 许可证 appid（名称列商店链接提取；家庭库存精确关联用）
     "bill_cdk_games": {
         "appid": "BIGINT",
     },
-    # 标签英文名（英文界面展示；存量库启动 ALTER 补列，seed_names 回填）
     "tags": {
         "name_en": "VARCHAR(100)",
     },
-    # 节点行上挂最近成功 L0 延迟（出口槽排序键的持久化形态；成功不落观测行）
     "proxy_nodes": {
         "cooldown_until": "DATETIME",
         "l0_delay_ms": "INTEGER",
     },
-    # 订阅废弃终态（节点状态存储：>95% 不可用 → deprecated）
     "proxy_subscriptions": {
         "deprecated": "BOOLEAN DEFAULT 0",
         "deprecated_at": "DATETIME",
@@ -196,13 +160,10 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         # 生产准入（订阅级）：库层默认 ACTIVE —— **只为把已存在的历史行兼容成
         # ACTIVE**；新行由模型默认 CANDIDATE（见 proxies/models.py 常量说明）。
         "admission_status": "VARCHAR(16) DEFAULT 'ACTIVE'",
-        # 自动更新订阅：0 = 只手动重拉。限时订阅（只能在其窗口内下载、下载后
-        # 可长期使用）关掉它，就不会每轮定时刷新都去撞一次注定失败的抓取。
         "auto_refresh": "BOOLEAN DEFAULT 1",
     },
     "subscription_snapshots": {
         "url": "VARCHAR(500)",
-        # 模型里有、但更早建成的库里缺这些列：登记后启动幂等补齐。
         "http_status": "INTEGER",
         "content_type": "VARCHAR(100)",
         "source_channel": "VARCHAR(32)",
@@ -214,43 +175,31 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "attempts_json": "TEXT",
         "provider_nodes_json": "TEXT",
     },
-    # account 域多账号在线状态（GetPlayerSummaries/miniprofile 双通道）
     "steam_accounts": {
         "is_online": "BOOLEAN DEFAULT 0",
         "in_game": "VARCHAR(200) DEFAULT ''",
-        # 钱包轮转递增退避级别（0=正常；每次失败 +1，成功清零；
-        # 映射 _WALLET_BACKOFF_MINUTES：2→5→15→30 封顶）
         "wallet_backoff_level": "INTEGER DEFAULT 0",
-        # 钱包熔断：连续失败计数（成功清零）与冻结终态（手动刷新/换绑解锁）
         "wallet_fail_streak": "INTEGER DEFAULT 0",
         "wallet_frozen": "BOOLEAN DEFAULT 0",
-        # 官方在线状态批量通道最近一次成功采集时刻（NULL=从未查过）
         "online_checked_at": "DATETIME",
     },
-    # 愿望单账户行展示：Steam 昵称/头像（miniprofile 免 Key 通道）
     "tracked_accounts": {
         "persona_name": "VARCHAR(100)",
         "avatar_url": "VARCHAR(500)",
     },
-    # family_groups 游玩明细快照列（游玩动态的快照兜底数据源）
     "family_groups": {
         "play_json": "JSON",
     },
-    # 成就域游戏行来源（owned=本号已购 / shared=家庭共享等库外来源 / manual=手动补录）
     "achievement_games": {
         "source": "VARCHAR(12) NOT NULL DEFAULT 'owned'",
     },
-    # 成就定义的游戏内 API 名（Web API 明细通道按它直连解锁态；爬虫通道为空）
     "achievement_defs": {
         "apiname": "VARCHAR(160)",
     },
-    # 触发事件的人民币分快照（触发时刻 cny_fen 同源落库，历史行回看免再折算）
     "alert_events": {
         "price_cny": "BIGINT",
         "details_json": "JSON",
     },
-    # 投递账本：已尝试次数（首次投递记 1）与最近一次失败原因原文
-    # （retryable 判定的输入）；已有行从 0 起算、无失败记录
     "notification_candidates": {
         "source_kind": "VARCHAR(16) NOT NULL DEFAULT 'price_event'",
         "payload_json": "JSON",
@@ -259,30 +208,22 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "last_error": "TEXT",
         "delivery_history_json": "JSON",
     },
-    # 汇率历史 canonical 语义列（数据回填与唯一索引在 v8 迁移链，见
-    # _migrate_fx_history_canonical；此处只保证老库列存在，迁移链信任本层先跑）
     "fx_rate_history": {
         "rate_date": "DATE",
         "source_kind": "VARCHAR(12)",
         "observed_at": "DATETIME",
     },
-    # 健康观测的归属列：run_id 挂体检运行台账（health_runs），channel 区分
-    # scheduled / manual 写入通道，target 记录本次探测的实际目标 URL
     "health_observations": {
         "run_id": "INTEGER",
         "channel": "VARCHAR(16)",
         "target": "VARCHAR(500)",
     },
-    # 所属价格刷新周期（NULL = 不挂周期：手动任务 / 暂不归属的修复轮 / 历史任务）
     "crawl_jobs": {
         "cycle_id": "INTEGER",
     },
-    # 作业台账显式关联爬取任务行（NULL = bundles/CLI 直调，或本列上线前的历史行）
     "proxy_job_runs": {
         "crawl_job_id": "INTEGER",
     },
-    # 价格周期的阶段时刻与生产统计（统计口径见 crawl/stats.py）：
-    # 统计列全为 NULL = 本轮没留下统计（未收敛 / 进程中断）
     "price_cycles": {
         "running_at": "DATETIME",
         "finalizing_at": "DATETIME",
@@ -297,23 +238,18 @@ _TABLE_EXTRA_COLUMNS: dict[str, dict[str, str]] = {    "games": {
         "notification_scan_json": "JSON",
         "batches_expected": "INTEGER",
         "batches_done": "INTEGER",
-        # missing/blocked 拆分（units_failed 的拆分来源，覆盖读路径由统计列重建）
         "units_missing": "INTEGER",
         "units_blocked": "INTEGER",
     },
-    # 体检运行台账收尾原因（值域见 proxypool/models.py HealthRun.end_reason 注释）
     "health_runs": {
         "end_reason": "VARCHAR(30)",
     },
 }
 
-# 增量索引（CREATE INDEX IF NOT EXISTS 幂等）
 _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     "notification_candidates": [
         "CREATE INDEX IF NOT EXISTS ix_notification_cycle ON notification_candidates(cycle_id)",
     ],
-    # 活动窗口标签回贴的增量扫描（snapshot_at 范围谓词）；唯一索引
-    # ux_gph_snapshot 首列 appid 服务不了该谓词
     "game_price_history": [
         "CREATE INDEX IF NOT EXISTS ix_gph_snapshot_at ON game_price_history(snapshot_at)",
     ],
@@ -324,16 +260,12 @@ _TABLE_EXTRA_INDEXES: dict[str, list[str]] = {
     "games": [
         "CREATE INDEX IF NOT EXISTS ix_games_diff_fen ON games(diff_fen DESC)",
     ],
-    # 捆绑包列表查询：WHERE 有区域价 + ORDER BY 差价降序（排序快照列）
     "bundles": [
         "CREATE INDEX IF NOT EXISTS ix_bundles_diff_fen ON bundles(diff_fen DESC)",
     ],
-    # 汇率历史按币种取尾段（rate_history WHERE currency ORDER BY id DESC），
-    # 汇率档案批量导入后走此复合索引
     "fx_rate_history": [
         "CREATE INDEX IF NOT EXISTS ix_frh_currency_id ON fx_rate_history(currency_code, id)",
     ],
-    # 周期归属回查：本轮挂了哪些 job
     "crawl_jobs": [
         "CREATE INDEX IF NOT EXISTS ix_crawl_jobs_cycle ON crawl_jobs(cycle_id)",
     ],
@@ -392,17 +324,9 @@ def _ensure_schema(sync_conn) -> None:
         log_event(logger, "存量库补索引", detail={"索引": added_indexes})
 
 
-# ── 迁移链（后门）：结构性 schema 变更登记处 ──────────────────────────
-# 使用法（唯一通道，见模块 docstring 的双层机制说明）：
-#   1. SCHEMA_VERSION += 1
-#   2. _MIGRATIONS 追加 (版本号, 描述, SQL 列表)；SQL 须幂等（中断续跑 +
-#      用户库版本乱序防御），复杂逻辑可登记 async fn(engine) 同位元素
-
 SCHEMA_VERSION = 34
 
 
-# 零小数货币（Steam 以整数计价）：旧捆绑包链路的除数表按 1 处理，与「统一存分」
-# 的新约定差 100 倍——v2 归一的目标集合
 _BUNDLE_DECIMAL_FREE = ("IDR", "JPY", "KRW", "VND", "CLP", "COP", "PYG", "HUF")
 
 
@@ -438,7 +362,6 @@ async def _migrate_bundle_price_units(conn) -> None:
         if rate
     }
     marks = ", ".join(f"'{c}'" for c in _BUNDLE_DECIMAL_FREE)
-    # 每包参考价：小数货币区行（约定无歧义）的 cny_fen 中位数
     ref_rows = (
         await conn.execute(
             text(
@@ -477,25 +400,23 @@ async def _migrate_bundle_price_units(conn) -> None:
         if not rate:
             skipped += 1
             continue
-        fen_cents = round(price * rate)  # price 当「分」时的正确 CNY 分
-        fen_units = round(price * rate * 100)  # price 当「元」时的正确 CNY 分
+        fen_cents = round(price * rate)
+        fen_units = round(price * rate * 100)
         ref = ref_median.get(int(bundle_id))
         if ref and fen_cents > 0:
-            # 先与参考行比量级（两套解读差 100 倍，区域定价差异远小于此）
             is_units = abs(math.log(fen_units / ref)) < abs(math.log(fen_cents / ref))
         elif abs(fen - fen_cents) <= abs(fen - fen_units):
-            is_units = False  # fen 已与「分」口径自洽
+            is_units = False
         elif mps == 1:
-            is_units = False  # 歧义区退回轨道：Sub 轨落分
+            is_units = False
         elif mps == 0:
-            is_units = True  # Bundle 轨落元
+            is_units = True
         else:
             undecided += 1
             continue
         if is_units:
             new_price = price * 100
             new_original = original * 100 if original else original
-            # fen 在「元价」解读下本就正确；若它其实按分口径写的（第三种写法），一并归位
             new_fen = fen if abs(fen - fen_units) <= abs(fen - fen_cents) else fen_units
         else:
             new_price, new_original = price, original
@@ -568,7 +489,7 @@ async def _migrate_alert_targets_to_cny(conn) -> None:
         if rate is None and currency:
             rate = DEFAULT_EXCHANGE_RATES.get(currency)
         if rate is None:
-            skipped += 1  # 区码/币种认不出：留原值留痕，不猜
+            skipped += 1
             continue
         await conn.execute(
             text("UPDATE price_alerts SET target_value = :v WHERE id = :id"),
@@ -729,8 +650,6 @@ async def _migrate_monitoring_bootstrap(conn) -> None:
 
     now = get_beijing_time_obj().replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
-    # 同一 appid 多账户取最高档：与 crawl 层既有排序档位一致（关注 > 愿望单
-    # > 手动入池 > 已购 > 榜单）
     prio = (
         "MAX(CASE WHEN COALESCE(manual, 0) = 1 THEN 100"
         " WHEN COALESCE(wishlisted, 0) = 1 THEN 95"
@@ -775,7 +694,6 @@ async def _migrate_monitoring_bootstrap(conn) -> None:
             {"source": source, "priority": priority, "now": now},
         )
 
-    # 手动移出 = 用户排除（排除 free_kind='f2p'：那是业务状态脱池）
     _removed_where = (
         "active = 0 AND COALESCE(excluded, 0) = 1"
         " AND appid NOT IN (SELECT appid FROM wishlist_items WHERE active = 1)"
@@ -832,7 +750,6 @@ async def _migrate_pool_flags_retire(conn) -> None:
     )
     _project_flag = "(COALESCE(board_pool, 0) = 1 OR COALESCE(manual_pool, 0) = 1)"
 
-    # 1) 活跃项目行 → 监控层真身补齐
     await conn.execute(
         text(
             "INSERT OR IGNORE INTO monitor_targets"
@@ -865,8 +782,6 @@ async def _migrate_pool_flags_retire(conn) -> None:
             {"source": source, "priority": priority, "now": now},
         )
 
-    # 2) 非活跃项目行（用户手动移出）→ 排除真身补齐（排除 free_kind='f2p'：
-    #    那是业务状态脱池，不是用户意图）
     _removed_where = (
         "active = 0 AND COALESCE(excluded, 0) = 1"
         f" AND {_project_flag}"
@@ -892,7 +807,6 @@ async def _migrate_pool_flags_retire(conn) -> None:
         {"now": now},
     )
 
-    # 3) 混合行清项目旗标（Steam 侧事实行保留），纯项目行删除
     _has_account_fact = (
         "(COALESCE(wishlisted, 0) = 1 OR COALESCE(owned, 0) = 1 OR COALESCE(manual, 0) = 1)"
     )
@@ -917,7 +831,6 @@ async def _migrate_pool_flags_retire(conn) -> None:
         )
     )
 
-    # 4) 受影响账户条目数重算（全量重算，追踪账户个位数，成本可忽略）
     await conn.execute(
         text(
             "UPDATE tracked_accounts SET item_count = ("
@@ -1116,7 +1029,7 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
         text("SELECT name FROM sqlite_master WHERE type='table'")
     )).all()}
     if "proxy_nodes" not in tables:
-        return  # 新库由 create_all 建表，无需迁移
+        return
 
     cols = {row[1] for row in (await conn.execute(text("PRAGMA table_info(proxy_nodes)")))}
     if "subscription_id" not in cols:
@@ -1133,7 +1046,6 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
         except Exception:  # noqa: BLE001 —— 解不开的链接用订户号兜底
             tags[int(sid)] = f"sub{int(sid)}"
 
-    # 回填归属与原名（来源表可能已不存在——重跑时跳过）
     if "proxy_node_sources" in tables:
         rows = (await conn.execute(text(
             "SELECT node_id, subscription_id, original_name FROM proxy_node_sources"
@@ -1147,8 +1059,6 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
                 {"sid": int(sid), "nm": name, "nid": node_id},
             )
 
-    # 来源表没覆盖到的部分用 `runtime_name` 前缀兜底：名字形如 `<订阅id>|<原名>`，
-    # 是登记时铸下的归属证据（早期版本未落 source 行，只靠它才追得回来）。
     for rid, runtime_name, sid in (await conn.execute(text(
         "SELECT id, runtime_name, subscription_id FROM proxy_nodes"
     ))).all():
@@ -1165,7 +1075,6 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
             {"sid": int(prefix), "nm": rest, "rid": rid},
         )
 
-    # 重算身份并合并同组重复行
     rows = (await conn.execute(text(
         "SELECT id, node_id, subscription_id, normalized_config, state FROM proxy_nodes"
     ))).all()
@@ -1188,7 +1097,6 @@ async def _migrate_proxynode_subscription_identity(conn) -> None:
             {"fp": fp, "rid": keep[0]},
         )
         for rid, node_id, _ in members[1:]:
-            # 健康观测随化身一起走：这些行不属于任何真实存在的节点
             await conn.execute(
                 text("DELETE FROM health_observations WHERE node_id = :nid"),
                 {"nid": node_id},
@@ -1328,7 +1236,6 @@ async def _migrate_notification_identity(conn) -> None:
     await _migrate_gph_snapshot_unique(conn)
 
 
-# (目标版本, 说明, 迁移体)：迁移体 = SQL 语句列表，或 async callable(engine)
 async def _migrate_price_snapshot(conn) -> None:
     from app.domains.games.derived import install_functions, input_version, save_input_version, update_price_derived
     from app.domains.games.series import refresh_series
@@ -1717,10 +1624,6 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
     (5, "wishlist_items 愿望单成员标记回填（监控池三模块语义："
         "愿望单与星标关注识别为爬取队列第一优先级）",
      [
-         # 活跃条目中 owned=0 且非星标关注的行均为愿望单同步来源；回填后
-         # 未覆盖的行（manual=1）已属第一优先级，其愿望单成员资格由下一次
-         # 账户同步按真实愿望单覆写补正（15min 一轮，自愈）。脱池行
-         # （active=0）不回填：成员资格随下一次同步恢复入池时写入。
          "UPDATE wishlist_items SET wishlisted = 1"
          " WHERE owned = 0 AND active = 1 AND manual = 0",
      ]),
@@ -1812,8 +1715,6 @@ _MIGRATIONS: list[tuple[int, str, object]] = [    (2, "bundle_region_prices 零�
 
 # 迁移前快照后缀：与生产库同在数据目录，**不进 backups/**
 _PRE_MIGRATION_SUFFIX = ".pre-migration.bak"
-# 快照保留窗：回滚点只为「刚迁移完就出问题」的窗口服务；结构已达最新且
-# 超窗后，快照只剩与生产库同量级的磁盘占用，到点由启动链回收
 _PRE_MIGRATION_RETENTION = timedelta(days=1)
 
 
@@ -1950,7 +1851,6 @@ async def _run_schema_migrations(*, snapshot_ready: bool = False) -> None:
         await _snapshot_before_migration(current, pending[-1][0])
 
     if current == 0:
-        # 首登版本账本：v1 = 账本启用（无数据变更）
         async with engine.connect() as conn:
             await conn.exec_driver_sql("BEGIN IMMEDIATE")
             try:
@@ -1995,7 +1895,6 @@ async def _run_schema_migrations(*, snapshot_ready: bool = False) -> None:
                 await conn.rollback()
                 raise
 
-    # 迁移链收尾（含无差额的稳态启动）：结构已确认不超过 latest，到期快照在此回收
     _reclaim_stale_pre_migration_snapshots()
 
 
@@ -2021,7 +1920,6 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
                 await init_db(maintenance_token=maintenance_token)
             return
 
-    # 导入各域模型模块，确保表注册到 Base.metadata
     from app.domains.agent import models as _agent_models  # noqa: F401
     from app.domains.achievements import models as _achievements_models  # noqa: F401
     # 成就域有两处表注册：models 三张表 + level 的经验流水表（后者只在本模块
@@ -2066,7 +1964,6 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
                 await _prepare_legacy_v10_columns(conn)
             await conn.run_sync(_ensure_schema)
 
-        # 结构性迁移链（user_version 账本；v1 起步）
         await _run_schema_migrations(snapshot_ready=bool(pending))
 
     if maintenance_token is None:
@@ -2077,12 +1974,10 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
             raise RuntimeError("数据库恢复初始化必须持有维护屏障")
         await _prepare_schema()
 
-    # 区服配置种子：CC_LIST → crawl_regions（含旧 crawl.enabled_regions 键迁移）
     from app.domains.regions import service as regions_service
 
     await regions_service.ensure_seeded()
 
-    # 汇率种子：CNY 恒为 1.0（其余币种 M5 由汇率域回填）
     from sqlalchemy import select
 
     from app.domains.rates.models import FxRate
@@ -2094,7 +1989,6 @@ async def init_db(*, maintenance_token: str | None = None) -> None:
             await session.commit()
             log_event(logger, "汇率基准行已落库", detail={"币种": "CNY", "对人民币汇率": 1.0})
 
-    # 标签中文名底座：内置热门标签表落库（零请求；冷门 tagid 由爬取侧懒请求兜底）
     from app.domains.games import tags as tags_service
 
     written = await tags_service.seed_names()
@@ -2137,7 +2031,6 @@ def get_engine():
         # 让每个连接做完 checkpoint 都把 WAL 收回本限内。
         cursor.execute("PRAGMA journal_size_limit=67108864")
         cursor.execute("PRAGMA foreign_keys=ON")
-        # 256MB 页缓存（默认 2MB）
         cursor.execute("PRAGMA cache_size=-262144")
         # mmap 按连接各映射一份、不跨连接共享，连接一多内存成倍叠加，故不启用
         cursor.execute("PRAGMA mmap_size=0")
@@ -2156,14 +2049,11 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(get_engine(), expire_on_commit=False)
 
 
-# SQLite 单写者：交互写优先，后台分块提交；进程间锁按数据库路径共享。
-
-
 class WritePriority(IntEnum):
     """写事务调度优先级：值小者先获得写者。"""
 
-    INTERACTIVE = 0   # 用户操作：设置/账号/钱包/关注/提醒/账单手动同步
-    BACKGROUND = 10   # 后台批量：价格落库/体检台账/元数据/定时维护
+    INTERACTIVE = 0
+    BACKGROUND = 10
 
 
 class _SchedulerMetrics:
@@ -2239,8 +2129,6 @@ class WriteScheduler:
             WritePriority.INTERACTIVE: _SchedulerMetrics(),
             WritePriority.BACKGROUND: _SchedulerMetrics(),
         }
-        # 超阈值持闸/排队事件环（巨无霸收网用）：auto: 归属 + 等待者快照，
-        # 诊断端点直接出列表——不用再翻日志文本归因「是谁在堵」
         self._events: deque[dict] = deque(maxlen=100)
 
     def snapshot(self) -> dict:
@@ -2556,9 +2444,6 @@ class _WriteGate:
         self._scheduler = _scheduler_for_loop()
         label = self._label
         if label is None:
-            # 归属兜底：未显式标注时从调用栈取「谁在过闸」（auto:文件:行号）。
-            # owner_label=None 的观测盲区会让超长持闸无法点名——
-            # 任何巨型持闸都必须能回答「是谁」。
             frame = sys._getframe(1)
             label = f"auto:{frame.f_code.co_filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{frame.f_lineno}"
         reentrant = self._scheduler.owned_by_current_task()

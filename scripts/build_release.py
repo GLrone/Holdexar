@@ -39,11 +39,10 @@ SERVER = ROOT / "server"
 WEB = ROOT / "web"
 DESKTOP = ROOT / "desktop"
 CLASH_DIR = ROOT / "assets" / "clash"
-# 小种子（目录/人工列/捆绑主档，不含价格）：随包携带的离线豁免资产
 MINI_SEED_SRC = ROOT / "assets" / "seed" / "holdexar_mini_seed.db"
 MINI_SEED_BASENAME = "holdexar_mini_seed.db"
 RELEASE = ROOT / "release"
-DIST_DIR = RELEASE / "build"  # PyInstaller distpath（COLLECT 输出 DIST_DIR/<APP_NAME>/）
+DIST_DIR = RELEASE / "build"
 WORK_DIR = RELEASE / "work"
 VENV_PY = SERVER / ".venv" / "Scripts" / "python.exe"
 
@@ -86,7 +85,6 @@ def ensure_clash_assets() -> None:
     """随包许可原文与来源说明就位（内核二进制按需独立维护，不随应用包分发）。"""
     CLASH_DIR.mkdir(parents=True, exist_ok=True)
     (CLASH_DIR / "README.txt").write_text(bundled_source_note(), encoding="utf-8")
-    # 优先从仓库受版本控制的 packaging/licenses/ 复制许可原文
     local_lic = ROOT / "packaging" / "licenses" / "LICENSE-mihomo.txt"
     dest_lic = CLASH_DIR / "LICENSE-mihomo.txt"
     if local_lic.is_file() and not dest_lic.is_file():
@@ -95,7 +93,6 @@ def ensure_clash_assets() -> None:
     expected = release_asset_names()
     missing = [name for name in expected if not (CLASH_DIR / name).is_file()]
     if missing:
-        # 尝试调用 fetch_kernel 仅下载随包许可文本
         try:
             import scripts.fetch_kernel as fk
             fk.fetch(license_only=True)
@@ -173,7 +170,6 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
     launcher_exe = build_go_launcher(version, python)
     aux_exclude_flags = [arg for exc in AUX_EXCLUDES for arg in ("--exclude-module", exc)]
 
-    # 编译独立更新宿主 UpdateHost.exe
     print("[更新宿主] 编译 UpdateHost.exe...")
     updater_dist = DIST_DIR / "_updater_build"
     updater_ver_file = WORK_DIR / "updater_version_info.txt"
@@ -191,23 +187,18 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         str(DESKTOP / "update_host_main.py"),
     ])
 
-    # 重建 APP_DIR 并组装布局
     APP_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. 移动完整应用运行文件至 versions/<version>/
     v_dir = APP_DIR / "versions" / version
     v_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(temp_app), str(v_dir))
 
-    # 2. 根目录放置轻量启动器 Holdexar.exe
     shutil.copy2(launcher_exe, APP_DIR / f"{APP_NAME}.exe")
 
-    # 3. updater 目录放置独立 UpdateHost.exe
     updater_dir = APP_DIR / "updater"
     updater_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(updater_dist / "UpdateHost.exe", updater_dir / "UpdateHost.exe")
 
-    # 4. 版本目录携带小种子（目录/人工列/捆绑主档离线资产；消毒按严格名放行）
     if MINI_SEED_SRC.is_file():
         seed_dir = v_dir / "seed"
         seed_dir.mkdir(parents=True, exist_ok=True)
@@ -218,7 +209,6 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         print("[提示] 未找到小种子（assets/seed/holdexar_mini_seed.db），"
               "本轮包不含离线目录资产")
 
-    # 5. state/current.json 版本指针
     state_dir = APP_DIR / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     current_state = {
@@ -230,13 +220,11 @@ def assemble_versioned_layout(version: str, python: Path) -> None:
         json.dumps(current_state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    # 5. 校验最终发行包内三个 EXE 的 Windows 版本属性
     print("[校验] 检查发行包内三个 EXE 的 Windows 版本属性...")
     pe_info = verify_exe_version_resources(APP_DIR, version)
     for role, props in pe_info.items():
         print(f"  ✓ [{role}] {props.get('FileDescription')} | FileVersion={props.get('FileVersion')} | ProductVersion={props.get('ProductVersion')}")
 
-    # 清理构建临时产物
     shutil.rmtree(launcher_exe.parent, ignore_errors=True)
     shutil.rmtree(updater_dist, ignore_errors=True)
     print(f"[布局] 多版本结构组装完成：{APP_DIR}")
@@ -250,7 +238,6 @@ def sanitize() -> None:
     内核二进制独立维护（按需下载），产物里出现任何 mihomo 可执行文件均清理。
     """
     assert APP_DIR.is_dir(), f"打包产物缺失：{APP_DIR}"
-    # 清理所有 __pycache__ 与 .pyc 残留
     for p in list(APP_DIR.rglob("__pycache__")):
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)

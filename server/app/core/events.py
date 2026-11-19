@@ -11,7 +11,6 @@ import json
 import time
 from dataclasses import dataclass, field
 
-# 走 progress 通道（可丢）的事件类型；其余全部走 critical
 PROGRESS_EVENT_TYPES = {"crawl.progress"}
 
 _CRITICAL_MAX = 256
@@ -52,7 +51,6 @@ class Subscriber:
                 {cgetter, pgetter}, return_when=asyncio.FIRST_COMPLETED
             )
             if cgetter in done:
-                # progress getter 可能已取走一条进度：进度可丢，直接取消
                 pgetter.cancel()
                 return cgetter.result()
             # progress 先到；critical getter 可能也已取走关键事件（不丢，缓存补投）
@@ -100,7 +98,6 @@ class EventBus:
             return
         except asyncio.QueueFull:
             pass
-        # 满：挤掉最旧（job.status 类是状态语义，消费端只认最新），保新事件
         try:
             queue.get_nowait()
         except asyncio.QueueEmpty:

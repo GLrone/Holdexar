@@ -34,9 +34,7 @@ if str(SERVER_ROOT) not in sys.path:
 from app.core.app_info import APP_NAME, ENV_PREFIX  # noqa: E402
 
 DEFAULT_PORT = "28765"
-# 覆盖运行链关键面：Web 框架 / 数据层 / 调度 / 桌面壳
 REQUIRED_MODULES = ("fastapi", "uvicorn", "sqlalchemy", "aiohttp", "apscheduler", "webview")
-# 随包内核资产就位的判据（assets/clash/ 内的可执行文件，见 scripts/fetch_kernel.py）
 KERNEL_EXE = ROOT / "assets" / "clash" / ("mihomo.exe" if os.name == "nt" else "mihomo")
 
 
@@ -55,7 +53,6 @@ def ensure_venv() -> Path:
     if rc == 0 and VENV_PY.is_file():
         print("[环境] 虚拟环境已就绪")
         return VENV_PY
-    # venv 建失败（如精简发行版缺 ensurepip）：退回当前解释器，依赖照装
     print("[环境] venv 创建失败，回退当前解释器（依赖将装入该环境）")
     return Path(sys.executable)
 
@@ -168,7 +165,6 @@ def main() -> None:
     except KeyboardInterrupt:
         print(f"\n[停止] {APP_NAME} 已退出")
     except subprocess.CalledProcessError as e:
-        # 桌面壳异常退出（窗口层初始化失败等）：给可行动的指引而非裸 traceback
         print(f"\n[错误] 启动器异常退出（exit {e.returncode}）。")
         print("       可改用 python run.py --server 以无窗口模式启动本地服务排查。")
         sys.exit(e.returncode or 1)

@@ -45,7 +45,6 @@ def data_env(tmp_path, monkeypatch):
     conn.execute("CREATE TABLE games (appid INTEGER PRIMARY KEY, name TEXT)")
     conn.execute("INSERT INTO games VALUES (620, 'Portal 2')")
     conn.commit()
-    # 模拟持续占用：连接保持打开，写入留在 WAL
     holder = {"conn": conn}
 
     class _FakeSettings:
@@ -71,7 +70,6 @@ async def test_snapshot_includes_wal_committed_data(data_env):
     """担忧①最新性：WAL 未 checkpoint 的写入必须进快照（copy 主文件会丢）。"""
     tmp, holder = data_env
     db = tmp / "holdexar.db"
-    # 占用连接再写入（数据只落 -wal，主文件没有）
     holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
     holder["conn"].execute("INSERT INTO games VALUES (400, 'Portal')")
     holder["conn"].commit()
@@ -79,7 +77,7 @@ async def test_snapshot_includes_wal_committed_data(data_env):
 
     result = await core_backup.create_backup()
     assert result["integrityOk"] is True
-    assert result["games"] == 3  # 620 + 440 + 400（WAL 里的 2 条必须在）
+    assert result["games"] == 3
 
 
 @pytest.mark.asyncio
@@ -93,13 +91,11 @@ async def test_snapshot_is_compressed_and_consistent(data_env):
     archive = Path(result["path"])
     assert archive.name.endswith(".db.gz")
     assert archive.is_file()
-    # 未压缩中间档不留（否则备份目录里同时躺着两份同内容库）
     assert not archive.with_name(archive.name[: -len(".gz")]).exists()
-    # 哈希随档走
     meta = core_backup._read_archive_meta(archive)
     assert meta["sha256"] == result["sha256"]
     assert meta["games"] == 2
-    assert meta["rawBytes"] > archive.stat().st_size  # 压缩确实省了体积
+    assert meta["rawBytes"] > archive.stat().st_size
 
     probe = tmp / "opened.db"
     core_backup._decompress_archive(archive, probe)
@@ -109,7 +105,6 @@ async def test_snapshot_is_compressed_and_consistent(data_env):
         assert conn.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 2
     finally:
         conn.close()
-    # 归档自洽：单文件即可解，无 -wal 伴随
     assert not archive.with_name(archive.name + "-wal").exists()
 
 
@@ -122,8 +117,8 @@ async def test_rotation_keeps_recent(data_env):
         await core_backup.create_backup(label=f"t{i}")
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 3
-    assert any("t4" in n for n in names)  # 最新的保留
-    assert not any("t0" in n for n in names)  # 最老的清掉
+    assert any("t4" in n for n in names)
+    assert not any("t0" in n for n in names)
 
 
 @pytest.mark.asyncio
@@ -137,7 +132,7 @@ async def test_manual_backup_keeps_only_latest(data_env, monkeypatch):
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 1
     assert names[0].endswith("-manual.db.gz")
-    assert "-00002-manual.db" in names[0]  # 留的是最新那份
+    assert "-00002-manual.db" in names[0]
 
 
 @pytest.mark.asyncio
@@ -146,14 +141,13 @@ async def test_manual_backup_independent_of_auto_rotation(data_env, monkeypatch)
     tmp, _ = data_env
     seq = iter(range(10))
     monkeypatch.setattr(core_backup, "_ts", lambda: f"20260101-0000{next(seq)}")
-    for i in range(4):  # BACKUP_KEEP=3：第 4 份自动备份轮掉 a0
+    for i in range(4):
         await core_backup.create_backup(label=f"a{i}")
     await core_backup.create_backup(manual=True)
     names = [b["name"] for b in core_backup.list_backups()]
-    assert len(names) == 4  # 3 自动 + 1 手动
+    assert len(names) == 4
     assert not any("a0" in n for n in names)
     assert sum(1 for n in names if n.endswith("-manual.db.gz")) == 1
-    # 再手动一次：旧手动被顶替，自动 3 份原样
     await core_backup.create_backup(manual=True)
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 4
@@ -175,8 +169,8 @@ async def test_rotation_caps_total_size(data_env, monkeypatch):
         await core_backup.create_backup(label=f"c{i}")
     names = [b["name"] for b in core_backup.list_backups()]
     assert len(names) == 2
-    assert any("c3" in n for n in names)  # 最新一份必在
-    assert not any("c0" in n for n in names)  # 最老的被清
+    assert any("c3" in n for n in names)
+    assert not any("c0" in n for n in names)
 
 
 @pytest.mark.asyncio
@@ -192,7 +186,6 @@ async def test_path_traversal_rejected(data_env):
         safe_backup_path(core_backup.backup_dir(), "sub/holdexar.db")
     with pytest.raises(ValueError):
         safe_backup_path(core_backup.backup_dir(), "evil.exe")
-    # 归档后缀合法（.db.gz），元数据后缀不放开给恢复入口
     assert safe_backup_path(core_backup.backup_dir(), "a.db.gz").name == "a.db.gz"
     with pytest.raises(ValueError):
         safe_backup_path(core_backup.backup_dir(), "a.db.gz.json")
@@ -202,7 +195,6 @@ async def test_path_traversal_rejected(data_env):
 async def test_corrupt_backup_rejected_for_restore(data_env):
     """担忧③误恢复：integrity 不过的备份文件拒绝恢复。"""
     tmp, _ = data_env
-    # 造一个损坏的「备份」文件
     bad = core_backup.backup_dir() / "bad.db"
     bad.write_bytes(b"this is not a sqlite file" * 100)
     with pytest.raises(RuntimeError, match="校验失败"):
@@ -283,20 +275,16 @@ async def test_restore_replaces_production_db(data_env, maintenance_mock):
     tmp, holder = data_env
     db = tmp / "holdexar.db"
 
-    # 1) 先备份（此刻只有 620）
     result = await core_backup.create_backup(label="base")
 
-    # 2) 生产库继续演进（新增 440——备份里没有）
     holder["conn"].execute("INSERT INTO games VALUES (440, 'TF2')")
     holder["conn"].commit()
 
-    # 占用连接必须先关——恢复前模拟「停服」释放句柄
     holder["conn"].close()
 
     res = await core_backup.restore_backup(result["name"])
     assert res["restored"] is True
 
-    # 3) 生产库内容回到备份时刻：只有 620，没有 440
     conn = sqlite3.connect(db.as_posix())
     try:
         rows = conn.execute("SELECT appid FROM games ORDER BY appid").fetchall()
@@ -410,7 +398,7 @@ async def test_replace_main_db_retries_after_file_is_held(data_env, monkeypatch)
     src = tmp / "holdexar.db"
     staging = tmp / "holdexar.restoring.db"
     staging.write_bytes(b"staged")
-    holder["conn"].close()  # 占用连接先释放，替换才有成功的可能
+    holder["conn"].close()
     disposes: list[int] = []
     attempts = {"n": 0}
     real_replace = os.replace
@@ -577,7 +565,6 @@ async def test_verify_uses_hash_and_rejects_tampered_archive(data_env):
     assert ok["integrityOk"] is True
     assert ok["games"] == 1
     assert ok["sha256"] == result["sha256"]
-    # 默认档只做「哈希 + 流式解压」两件事，不开 SQLite
     assert ok["checks"] == {"hashOk": True, "restorableOk": True, "deepOk": None}
 
     archive = core_backup.backup_dir() / name
@@ -607,7 +594,7 @@ async def test_verify_without_meta_still_proves_restorable(data_env):
 
     ok = await core_backup.verify_backup(result["name"])
     assert ok["integrityOk"] is True
-    assert ok["checks"]["hashOk"] is None      # 没有随档哈希可比
+    assert ok["checks"]["hashOk"] is None
     assert ok["checks"]["restorableOk"] is True
 
 
@@ -631,7 +618,7 @@ async def test_restore_rejects_tampered_archive(data_env, maintenance_mock):
     tmp, holder = data_env
     result = await core_backup.create_backup(label="t")
     archive = core_backup.backup_dir() / result["name"]
-    archive.write_bytes(archive.read_bytes()[:-8])  # 截断即哈希不符
+    archive.write_bytes(archive.read_bytes()[:-8])
     with pytest.raises(RuntimeError, match="哈希不符"):
         await core_backup.restore_backup(result["name"])
     assert (tmp / "holdexar.db").is_file()
@@ -675,7 +662,7 @@ async def test_create_backup_refuses_while_maintenance_lock_held(data_env):
 @pytest.mark.asyncio
 async def test_rotation_removes_meta_with_archive(data_env):
     """轮转删档连带删元数据档：不留无人认领的哈希。"""
-    for i in range(5):  # BACKUP_KEEP=3 → 最老两份被清
+    for i in range(5):
         await core_backup.create_backup(label=f"r{i}")
     base = core_backup.backup_dir()
     archives = {p.name for p in base.glob(f"*{core_backup.ARCHIVE_SUFFIX}")}
@@ -706,12 +693,11 @@ def test_vacuum_reclaims_free_pages_and_absorbs_wal(data_env) -> None:
     before_total = core_backup._footprint(db)
     assert before_total > before_main, "前置失败：写入未滞留 WAL（测试环境不成立）"
 
-    holder["conn"].close()  # 真实回收会先停写入面并断开所有连接
+    holder["conn"].close()
     core_backup._vacuum_file(db)
 
     after_main = db.stat().st_size
     after_total = core_backup._footprint(db)
-    # 主文件可能因页分配而不变小；真正的回收口径是「总占用下降」（WAL 收进主库）
     assert after_main <= before_main, f"主文件反而变大：{before_main} → {after_main}"
     assert after_total < before_total, f"磁盘总占用未下降：{before_total} → {after_total}"
     check = sqlite3.connect(db.as_posix())

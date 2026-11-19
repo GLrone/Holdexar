@@ -46,13 +46,11 @@ FULL_BLAST = {
     "pyproject.toml",
 }
 
-# 无导入关系的工具脚本 → 手工映射到其行为测试
 SCRIPT_TESTS = {
     "scripts/check_secrets.py": ["server/tests/test_check_secrets.py"],
     "scripts/check_dev_traces.py": ["server/tests/test_dev_traces.py"],
 }
 
-# 核心生命线精选集：建库 → 启动 → 出口 → 任务 → 落价 → 展示
 SMOKE = [
     ("server/tests/test_schema_migrations.py", "建库与迁移链（库能建、老库能升级）"),
     ("server/tests/test_data_dir.py", "数据目录判定（升级不丢数据）"),

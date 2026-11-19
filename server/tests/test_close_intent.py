@@ -147,8 +147,8 @@ class _Controls:
         self.items.append(item)
 
 
-_SHOW_OUTCOME: dict = {}   # ShowDialog 的返回值（或 Exception）
-_SHOW_ARGS: list = []      # ShowDialog 的实参（owner 传递断言）
+_SHOW_OUTCOME: dict = {}
+_SHOW_ARGS: list = []
 
 
 class _FakeForm(_Widget):
@@ -284,7 +284,6 @@ def _by_name(controls):
     return out
 
 
-# ── 意图映射与降级 ──────────────────────────────────────────────────────────
 
 
 def test_yes_maps_to_minimize(monkeypatch):
@@ -322,7 +321,6 @@ def test_dialog_failure_falls_back_to_minimize(monkeypatch):
     assert desktop._ask_close_intent(None) == "minimize"
 
 
-# ── 对话框结构 ──────────────────────────────────────────────────────────────
 
 
 def test_dialog_structure(monkeypatch):
@@ -352,7 +350,6 @@ def test_dialog_texts_not_autosize(monkeypatch):
     """文本 Label 必须 AutoSize=False：AutoSize 的 Label 不折行，超宽即截断。"""
     _patch_winforms(monkeypatch)
     dialog, _ = desktop._build_close_dialog(None)
-    # 文本 Label = Label 载体且无语义名（标题/正文；关闭键有语义名"关闭"）
     labels = [
         c
         for c in dialog.Controls.items
@@ -368,15 +365,13 @@ def test_dialog_texts_not_autosize(monkeypatch):
 def test_dialog_gets_owner_in_showdialog(monkeypatch):
     """弹窗必须以主窗口为 owner（居中其上、模态随主窗）。"""
     _patch_winforms(monkeypatch)
-    _SHOW_OUTCOME["value"] = None  # 返回值无关紧要，只断言实参
+    _SHOW_OUTCOME["value"] = None
     _SHOW_ARGS.clear()
     owner = object()
     desktop._ask_close_intent(owner)
     assert _SHOW_ARGS and _SHOW_ARGS[-1] == (owner,)
 
 
-# ── 隐形窗口锚点不变量（孤儿确认框防线） ────────────────────────────────────
-#
 # closing 落在不可见（托盘态）主窗上时，CenterParent 对隐形 parent 不生效，
 # 弹窗落回默认 (0,0)——「托盘退出后确认框孤零零出现在桌面左上角」。不变量：
 # ① 隐形窗口绝不弹询问；② 锚点失效时落点退到屏幕居中；③ 守卫先亮窗再问。
@@ -453,12 +448,11 @@ def test_guard_restores_hidden_window_before_asking(monkeypatch):
         native=SimpleNamespace(Visible=False),
     )
     guard = desktop._make_closing_guard(window)
-    assert guard() is False  # 最小化语义：取消关闭，进程常驻
+    assert guard() is False
     assert shown == [1], "询问前必须先亮出主窗口"
     assert asked, "亮窗后必须走询问链拿用户意图"
 
 
-# ── 关窗守卫（closing 契约） ────────────────────────────────────────────────
 
 
 def test_guard_quit_intent_releases_close(monkeypatch):
@@ -477,7 +471,7 @@ def test_guard_minimize_intent_hides_and_cancels(monkeypatch):
     hidden = []
     window = SimpleNamespace(hide=lambda: hidden.append(1), minimize=lambda: None, native=None)
     guard = desktop._make_closing_guard(window)
-    desktop._tray_state["tray"] = object()  # 托盘在位：隐藏后还有图标可召回
+    desktop._tray_state["tray"] = object()
     try:
         assert guard() is False
     finally:
@@ -526,16 +520,9 @@ def test_guard_tray_quit_bypasses_dialog(monkeypatch):
         assert guard() is True
     finally:
         desktop._tray_state["quit"] = False  # 模块级状态，测完必须复位
-    assert not asked  # 托盘退出不该触发询问
+    assert not asked
 
 
-# ── 关窗幕布与出入场动效 ────────────────────────────────────────────────────
-#
-# 关窗幕布与出入场动效由两件组成：① 页面级关窗幕布（.hl-close-curtain，
-# 网页 backdrop-filter 模糊，桌面壳经后台线程调 __hlxCloseCurtain 拉起）；
-# ② 原生弹窗自身的出入场（透明度 + 位移）。用例钉死四件事：幕布**必须后台
-# 线程派发**（evaluate_js 同步阻塞，UI 线程直调会自锁）、关窗流程**无论走哪条
-# 路都撤幕布**、动效炸穿不得把弹窗留在「不可见」或「关不掉」、**用户的选择必须
 # 原样带回 ShowDialog**（关闭被拦下后 WinForms 会把 DialogResult 复位，延后真关
 # 时不放回去就只剩 Cancel——症状是两个按键点完弹窗关了、程序什么都不做）。
 
@@ -561,7 +548,7 @@ def test_toggle_curtain_dispatches_from_background_thread(monkeypatch):
             spawns.append((target, daemon))
 
         def start(self):
-            pass  # 不起真线程：测试里手动执行目标
+            pass
 
     monkeypatch.setattr(desktop.threading, "Thread", _FakeThread)
     window = SimpleNamespace(evaluate_js=lambda script: calls.append(script))
@@ -593,7 +580,7 @@ def test_toggle_curtain_survives_missing_page_hook(monkeypatch):
             self._target = None
 
     monkeypatch.setattr(desktop.threading, "Thread", _InlineThread)
-    desktop._toggle_close_curtain(SimpleNamespace(evaluate_js=_boom), True)  # 不该抛
+    desktop._toggle_close_curtain(SimpleNamespace(evaluate_js=_boom), True)
 
 
 def test_enter_animation_fades_in_and_rises(monkeypatch):
@@ -661,7 +648,7 @@ def test_programmatic_close_is_not_intercepted(monkeypatch):
     _FakeTimer.instances.clear()
     desktop._attach_close_animation(dialog)
     dialog.Shown.fire(dialog)
-    _FakeTimer.instances.clear()  # 入场动效的定时器不算，只看这次关闭有没有起出场
+    _FakeTimer.instances.clear()
 
     event = SimpleNamespace(Cancel=False)
     dialog.FormClosing.fire(dialog, event)
@@ -725,7 +712,6 @@ def test_ask_close_intent_raises_and_lowers_curtain(monkeypatch):
     assert desktop._ask_close_intent(None, window) == "minimize"
     assert len(calls) == 2 and "true" in calls[0] and "false" in calls[1], calls
 
-    # 弹窗炸穿也要撤幕布
     calls.clear()
     _SHOW_OUTCOME["value"] = RuntimeError("弹窗链路炸穿")
     assert desktop._ask_close_intent(None, window) == "minimize"
@@ -740,7 +726,6 @@ def test_ask_close_intent_works_without_window(monkeypatch):
     assert desktop._ask_close_intent(object()) == "quit"
 
 
-# ─ 主题镜像读取（弹窗配色跟随主界面） ──────────────────────────────────────
 
 
 def _theme_db(tmp_path, raw):

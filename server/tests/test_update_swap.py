@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests.update_security_fixtures import seal_staging
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,33 +56,8 @@ def _make_payload(staging: Path, *, exe: str = "new-exe", files: dict | None = N
 
 
 def _stage_manifest(staging: Path, tag: str = "v9.9.9", ready: bool = True) -> None:
-    """默认 tag 必须比现装（app_info.APP_VERSION，0.3.1-beta）新：版本门只放行更新。
-
-    同时落数据目录信任记录（staging.parent 即各用例的 data_dir），与真实下载
-    产物同构——桌面信任闸先于协议探测对照它复核暂存载荷。
-    """
-    import hashlib
-    import json
-
-    from app.core import update_host
-
-    staging.mkdir(parents=True, exist_ok=True)
-    payload = staging / APP_NAME
-    files = {
-        p.relative_to(payload).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in sorted(payload.rglob("*")) if p.is_file()
-    }
-    (staging / "manifest.json").write_text(
-        json.dumps({"tag": tag, "sha256": "x" * 64, "ready": ready, "files": files}),
-        encoding="utf-8",
-    )
-    (staging.parent / update_host.TRUST_RECORD_NAME).write_text(
-        json.dumps({
-            "version": tag, "zip_sha256": "0" * 64,
-            "files": files, "protocol": 0, "staging_dir": str(staging),
-        }),
-        encoding="utf-8",
-    )
+    """默认较新 tag 只放行签名有效、可交接的更新。"""
+    seal_staging(staging, tag, ready=ready)
 
 
 # ── 换装主体（_swap_payload）───────────────────────────────────────────

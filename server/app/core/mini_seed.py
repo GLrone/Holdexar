@@ -43,10 +43,8 @@ logger = logging.getLogger(__name__)
 
 MINI_SEED_FILENAME = "holdexar_mini_seed.db"
 MINI_SEED_SCHEMA = 1
-# 幂等 marker：值 = 种子 exported_at_utc（版本变化才重并）
 MARKER_KEY = "miniseed.imported_version"
 
-# 允许出现在小种子里的表集（缺一或多一都按坏档拒绝）
 _EXPECTED_TABLES = {"seed_meta", "catalog", "curated", "bundle_index"}
 
 # 分块行数（SQLite 变量上限约束，与既有种子期通道同型）
@@ -146,9 +144,6 @@ def _parse_stamp(meta: dict) -> datetime:
         return datetime.now()
 
 
-# ── 三个合并段（每段独立小事务分块，段间交还写者位）──────────────────
-
-
 async def _merge_catalog(path: Path, stamp: datetime) -> int:
     from app.domains.games.derived import update_price_derived
 
@@ -162,8 +157,6 @@ async def _merge_catalog(path: Path, stamp: datetime) -> int:
                 "name": r["name"] or str(r["appid"]),
                 "name_en": r["name_en"],
                 "type": r["type"],
-                # 种子数据时刻而非当下：目录行「尚未抓价」由现价表缺席表达，
-                # 非空 updated_at 保证孤儿补抓不把目录全集捡进爬取队列
                 "updated_at": stamp,
             }
             for r in rows
@@ -178,8 +171,6 @@ async def _merge_catalog(path: Path, stamp: datetime) -> int:
         return len(missing)
 
 
-# 人工列合并口径：种子是冷启动引导而非权威——本地有在役编辑器/在线更新
-# 链的列只补空/正向并集、不降级；xgp_tier 无本地写者，种子保持权威覆写
 _CURATED_SETS = {
     "xgp_tier": ":xgp_tier",
     "is_epic": "CASE WHEN :is_epic = 1 THEN 1 ELSE games.is_epic END",

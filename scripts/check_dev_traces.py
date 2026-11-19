@@ -65,7 +65,6 @@ ALLOW: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-# ── 文件分类：注释形态决定提取器 ──
 PY_LIKE = {".py", ".spec"}
 C_LIKE = {".js", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".css", ".scss", ".html", ".htm"}
 HASH_LIKE = {".sh", ".ps1"}
@@ -79,8 +78,6 @@ _COMPILED_ALLOW = {
 }
 
 
-# ── 注释提取：返回 [(行号, 注释文本)]；字符串字面量一律不收 ──
-
 def _py_comments(text: str) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     try:
@@ -88,7 +85,6 @@ def _py_comments(text: str) -> list[tuple[int, str]]:
             if tok.type == tokenize.COMMENT:
                 out.append((tok.start[0], tok.string))
     except tokenize.TokenError:
-        # 语法不完整时退化为逐行前缀判定， # 注释仍可收
         out.extend(
             (i, line) for i, line in enumerate(text.splitlines(), 1)
             if line.lstrip().startswith("#")
@@ -191,7 +187,6 @@ def _c_like_comments(text: str) -> list[tuple[int, str]]:
             i += 1
             continue
 
-        # 字符串态：跳过内容（含模板串），不把其中的 // 或 /* 当注释
         if ch == "\n":
             line += 1
             prev = ""
@@ -207,7 +202,7 @@ def _c_like_comments(text: str) -> list[tuple[int, str]]:
             prev = ch
         i += 1
 
-    flush()  # EOF：未闭合注释（截断文件）也收
+    flush()
     return out
 
 
@@ -241,7 +236,6 @@ def extract_comments(path: str, text: str) -> list[tuple[int, str]]:
     return []
 
 
-# ── 扫描 ──
 
 class Finding:
     __slots__ = ("path", "label", "detail")
@@ -267,11 +261,10 @@ def scan_comments(path: str, comments: list[tuple[int, str]]) -> list[Finding]:
             findings.append(
                 Finding(path, label, f"第 {lineno} 行「{match.group(0)}」：{snippet}")
             )
-            break  # 一行只报第一条
+            break
     return findings
 
 
-# ── 范围解析 ──
 
 def _run_git(*args: str) -> str:
     proc = subprocess.run(

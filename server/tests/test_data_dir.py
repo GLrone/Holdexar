@@ -54,7 +54,6 @@ def _seed_repo_db(app_dir: Path) -> Path:
     return legacy
 
 
-# ── 判定链：前三条 ──────────────────────────────────────────
 
 
 def test_env_override_wins(fake_env, monkeypatch, tmp_path):
@@ -74,7 +73,7 @@ def test_portable_flag_keeps_data_next_to_app(fake_env, monkeypatch):
 def test_legacy_layout_kept_in_place(fake_env, monkeypatch):
     """存量布局（程序目录已有 data/<slug>.db）：原地继续用，绝不擅迁。"""
     _freeze(monkeypatch)
-    legacy = _seed_repo_db(fake_env["app_dir"])  # 先造库，再解析
+    legacy = _seed_repo_db(fake_env["app_dir"])
     assert paths.resolve_data_dir() == legacy
 
 
@@ -89,7 +88,6 @@ def test_dev_legacy_repo_db_kept_in_place(fake_env, monkeypatch):
     assert paths.resolve_data_dir() == legacy
 
 
-# ── 判定链：第 4 条（开发态）────────────────────────────────
 
 
 def test_dev_mode_uses_dev_machine_dir(fake_env, monkeypatch):
@@ -98,7 +96,6 @@ def test_dev_mode_uses_dev_machine_dir(fake_env, monkeypatch):
     resolved = paths.resolve_data_dir()
     assert resolved == fake_env["local"] / f"{paths.APP_SLUG}-dev"
     assert (resolved / "logs").is_dir()
-    # 硬约束：开发态数据目录绝不位于仓库工作树内
     assert not paths.is_inside(resolved, paths.PROJECT_ROOT)
 
 
@@ -137,7 +134,6 @@ def _only_appdir_writable(app_dir: Path):
     return fake
 
 
-# ── 判定链：第 5 条（打包态）────────────────────────────────
 
 
 def test_dev_pointer_honored(fake_env, monkeypatch):
@@ -186,7 +182,7 @@ def test_dev_pointer_unwritable_falls_back_to_machine_dir(fake_env, monkeypatch)
     _unfreeze(monkeypatch)
     blocked = fake_env["tmp"] / "blocked"
     blocked.mkdir()
-    (blocked / "logs").write_text("", encoding="utf-8")  # logs 被文件占住，目录建不出
+    (blocked / "logs").write_text("", encoding="utf-8")
     (fake_env["app_dir"] / paths.DEV_POINTER).write_text(str(blocked), encoding="utf-8")
     assert paths.resolve_data_dir() == fake_env["local"] / f"{paths.APP_SLUG}-dev"
 
@@ -242,22 +238,17 @@ def _only_machine_writable(local: Path):
     return fake
 
 
-# ── 布局标签 ────────────────────────────────────────────────
 
 
 def test_layout_labels(fake_env, monkeypatch):
     _freeze(monkeypatch)
-    # 新装：与程序同盘
     assert paths.describe_layout(paths.resolve_data_dir()) == "appdir"
     assert paths.describe_layout(fake_env["tmp"] / "elsewhere") == "custom"
-    # 机器级已有库：标 machine
     machine = fake_env["local"] / paths.APP_SLUG
     machine.mkdir(parents=True, exist_ok=True)
     (machine / paths.data_dir_filename()).write_bytes(b"")
     assert paths.describe_layout(machine) == "machine"
-    # 程序目录 data/ 但无库：仍是 appdir
     assert paths.describe_layout(fake_env["app_dir"] / "data") == "appdir"
-    # 造出程序目录存量库后，同一个位置改判 legacy
     assert paths.describe_layout(_seed_repo_db(fake_env["app_dir"])) == "legacy"
 
 
@@ -269,11 +260,9 @@ def test_layout_labels_unfrozen(fake_env, monkeypatch):
     """
     _unfreeze(monkeypatch)
     assert paths.describe_layout(paths.resolve_data_dir()) == "dev-machine"
-    # 便携标记优先于「无库」
     (fake_env["app_dir"] / paths.PORTABLE_FLAG).write_text("", encoding="utf-8")
     assert paths.describe_layout(fake_env["app_dir"] / "data") == "portable"
     (fake_env["app_dir"] / paths.PORTABLE_FLAG).unlink()
-    # 存量库（未打包）→ legacy，不是 dev
     assert paths.describe_layout(_seed_repo_db(fake_env["app_dir"])) == "legacy"
 
 
@@ -294,13 +283,12 @@ def test_every_layout_has_a_label(fake_env, monkeypatch):
     assert produced <= set(paths.LAYOUT_LABEL)
 
 
-# ── is_inside / layout_warning ──────────────────────────────
 
 
 def test_is_inside(tmp_path):
     assert paths.is_inside(tmp_path / "a" / "b", tmp_path)
     assert paths.is_inside(tmp_path / "data.old", tmp_path)
-    assert not paths.is_inside(tmp_path, tmp_path)  # 相等不算「之内」
+    assert not paths.is_inside(tmp_path, tmp_path)
     assert not paths.is_inside(tmp_path.parent, tmp_path)
 
 
@@ -309,14 +297,14 @@ def test_layout_warning_fires_for_repo_internal_data(fake_env, monkeypatch):
     _unfreeze(monkeypatch)
     msg = paths.layout_warning(fake_env["app_dir"] / "data")
     assert "仓库工作树内" in msg
-    assert "dev.bat" in msg  # 必须给出可执行的正解，而不只是报错
-    assert paths.ENV_PREFIX in msg  # 以及另一条出路：显式指定目录
+    assert "dev.bat" in msg
+    assert paths.ENV_PREFIX in msg
 
 
 def test_layout_warning_silent_outside_repo(fake_env, monkeypatch):
     _unfreeze(monkeypatch)
     assert paths.layout_warning(fake_env["local"] / paths.APP_SLUG) == ""
-    assert paths.layout_warning(paths.resolve_data_dir()) == ""  # 正常开发态不告警
+    assert paths.layout_warning(paths.resolve_data_dir()) == ""
 
 
 def test_layout_warning_silent_when_explicitly_configured(fake_env, monkeypatch):

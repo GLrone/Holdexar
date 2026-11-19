@@ -2,9 +2,8 @@
 
 四条不变量：
 ① 显式 HOLDEXAR_UPDATE_URL 只认回环主机（免验签通道不出本机）；
-② 下载完成即把信任锚原子写入数据目录 update-trust.json（Ed25519 验签结论
-   不随 zip 删除而丢失，新下载覆盖旧记录）；
-③ 交接/换装执行任何暂存载荷前必须对照信任记录逐文件复算（fail-closed，
+② 下载完成将经过 Ed25519 验签的发布清单嵌入暂存记录；
+③ 交接/换装执行任何暂存载荷前必须复验签名并逐文件核对（fail-closed，
    无记录/篡改/版本不符/清单不一致一律拒绝）；
 ④ 换装方向硬闸：目标不新于来源即拒绝（降级/平级不得过装）。
 """
@@ -17,18 +16,27 @@ import shutil
 import sys
 import threading
 import zipfile
+import base64
 from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core import layout, update_host, updater  # noqa: E402
-from app.core.app_info import APP_NAME, GITHUB_REPO  # noqa: E402
+from app.core import layout, update_host, update_signing, updater  # noqa: E402
+from app.core.app_info import APP_NAME, GITHUB_REPO, MANIFEST_SCHEMA  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 EXE_NAME = f"{APP_NAME}.exe"
+_TEST_SIGNING_KEY = Ed25519PrivateKey.from_private_bytes(bytes(32))
+_TEST_KEY_ID = "pentest-fixture"
+_TEST_PUBLIC_KEY = _TEST_SIGNING_KEY.public_key().public_bytes(
+    serialization.Encoding.Raw, serialization.PublicFormat.Raw
+).hex()
+update_signing.TRUSTED_PUBKEYS[_TEST_KEY_ID] = _TEST_PUBLIC_KEY
 
 
 def _mock_client(handler):
@@ -44,6 +52,53 @@ def _sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _sign_manifest(manifest: dict) -> dict:
+    signature = _TEST_SIGNING_KEY.sign(update_signing.canonical_manifest_bytes(manifest))
+    return {
+        **manifest,
+        update_signing.SIGNATURE_FIELD: {
+            "alg": update_signing.SIGNATURE_ALG,
+            "keyId": _TEST_KEY_ID,
+            "sig": base64.b64encode(signature).decode("ascii"),
+        },
+    }
+
+
+def _payload_files(payload: Path) -> dict[str, str]:
+    return {
+        path.relative_to(payload).as_posix(): _sha256_of(path)
+        for path in sorted(payload.rglob("*")) if path.is_file()
+    }
+
+
+def _signed_archive_manifest(archive: Path, tag: str) -> dict:
+    files = {}
+    with zipfile.ZipFile(archive) as zf:
+        for item in zf.infolist():
+            if item.is_dir():
+                continue
+            name = item.filename.removeprefix(f"{APP_NAME}/")
+            files[name] = hashlib.sha256(zf.read(item)).hexdigest()
+    return _sign_manifest({
+        "schema": MANIFEST_SCHEMA,
+        "app": APP_NAME,
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "notes": "test release",
+        "assets": [{
+            "role": "app",
+            "name": f"{APP_NAME}-win64-{tag}.zip",
+            "size": archive.stat().st_size,
+            "sha256": _sha256_of(archive),
+            "files": files,
+        }],
+    })
+
+
+async def _return_value(value):
+    return value
+
+
 def _make_staged_payload(staging: Path, *, body: bytes = b"new-payload") -> Path:
     """合成暂存载荷：staging/<APP_NAME>/（主程序 + _internal + 更新宿主）。"""
     payload = staging / APP_NAME
@@ -57,26 +112,34 @@ def _make_staged_payload(staging: Path, *, body: bytes = b"new-payload") -> Path
 
 
 def _seal_staging(staging: Path, data_dir: Path | None, tag: str = "v0.3.7", with_record: bool = True) -> None:
-    """写暂存 manifest（含 files 表）+ 数据目录信任记录（与真实下载产物同构）。"""
+    """Build a staging tree whose payload hashes are covered by a test signature."""
     payload = staging / APP_NAME
-    files = {
-        p.relative_to(payload).as_posix(): _sha256_of(p)
-        for p in sorted(payload.rglob("*")) if p.is_file()
-    }
     staging.mkdir(parents=True, exist_ok=True)
-    (staging / "manifest.json").write_text(
-        json.dumps({"tag": tag, "ready": True, "attempt_id": "att-sec", "files": files}),
-        encoding="utf-8",
-    )
-    if with_record and data_dir is not None:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        (data_dir / update_host.TRUST_RECORD_NAME).write_text(
-            json.dumps({
-                "version": tag, "zip_sha256": "a" * 64,
-                "files": files, "protocol": 0, "staging_dir": str(staging),
-            }),
-            encoding="utf-8",
-        )
+    archive = staging / "update.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for path in sorted(payload.rglob("*")):
+            if path.is_file():
+                zf.write(path, f"{APP_NAME}/{path.relative_to(payload).as_posix()}")
+    release = _sign_manifest({
+        "schema": MANIFEST_SCHEMA,
+        "app": APP_NAME,
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "assets": [{
+            "role": "app",
+            "name": f"{APP_NAME}-win64-{tag}.zip",
+            "size": archive.stat().st_size,
+            "sha256": _sha256_of(archive),
+            "files": _payload_files(payload),
+        }],
+    })
+    (staging / "manifest.json").write_text(json.dumps({
+        "tag": tag,
+        "ready": True,
+        "attempt_id": "att-sec",
+        "files": _payload_files(payload),
+        "release_manifest": release if with_record else {},
+    }), encoding="utf-8")
 
 
 def _seed_installation(root: Path, version: str = "0.3.6") -> None:
@@ -128,11 +191,40 @@ async def test_fetch_manifest_ignores_remote_env_override(monkeypatch) -> None:
     assert all("evil.example.com" not in u for u in seen)
 
 
+@pytest.mark.asyncio
+async def test_loopback_update_manifest_must_also_be_signed(monkeypatch) -> None:
+    """回环调试源仍是运输通道，不能绕过版本清单签名。"""
+    monkeypatch.setenv("HOLDEXAR_UPDATE_URL", "http://127.0.0.1:8888")
+    payload = {"version": "0.3.7", "tag": "v0.3.7", "assets": []}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    assert await updater._fetch_manifest() is None
+
+
+def test_staged_trust_rejects_attacker_forged_json_record(tmp_path) -> None:
+    """匹配的普通 JSON 记录不能替代发布者签名。"""
+    staging = tmp_path / "staging"
+    data_dir = tmp_path / "data"
+    _make_staged_payload(staging)
+    _seal_staging(staging, data_dir, with_record=False)
+    files = _payload_files(staging / APP_NAME)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / "update-trust.json").write_text(json.dumps({
+        "version": "v0.3.7", "zip_sha256": "a" * 64, "files": files,
+    }), encoding="utf-8")
+    error = update_host.verify_staged_trust(staging, data_dir, "0.3.7")
+    assert error
+    assert "签名" in error or "发布清单" in error
+
+
 # ── ② 下载完成写信任锚（PKG-1 前半：Ed25519 结论持久化）──────────────────
 
 
 @pytest.mark.asyncio
-async def test_download_writes_trust_record(tmp_path, monkeypatch) -> None:
+async def test_download_persists_signed_manifest_for_handoff(tmp_path, monkeypatch) -> None:
     payload = tmp_path / "release.zip"
     with zipfile.ZipFile(payload, "w") as zf:
         zf.writestr(f"{APP_NAME}/{EXE_NAME}", "MZ-fake")
@@ -144,7 +236,9 @@ async def test_download_writes_trust_record(tmp_path, monkeypatch) -> None:
 
     staging = tmp_path / "staging"
     data_dir = tmp_path / "data"
+    release = _signed_archive_manifest(payload, "v0.3.7")
     monkeypatch.setattr(updater.httpx, "AsyncClient", _mock_client(handler))
+    monkeypatch.setattr(updater, "_fetch_manifest", lambda: _return_value(release))
     monkeypatch.setattr(updater, "staging_dir", lambda: staging)
     monkeypatch.setattr("app.core.paths.resolve_data_dir", lambda: data_dir)
     monkeypatch.setattr(updater, "_MIN_PACKAGE_BYTES", 0)
@@ -153,23 +247,20 @@ async def test_download_writes_trust_record(tmp_path, monkeypatch) -> None:
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    result = await updater.download_update("v0.3.7", expected_sha256=sha, asset_name="x.zip")
+    asset = release["assets"][0]
+    result = await updater.download_update(
+        "v0.3.7", expected_sha256=sha, asset_name=asset["name"], expected_size=asset["size"]
+    )
     assert result["ok"] is True
 
-    record = json.loads((data_dir / update_host.TRUST_RECORD_NAME).read_text(encoding="utf-8"))
     manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
-    assert record["version"] == "v0.3.7"
-    assert record["zip_sha256"] == sha
-    assert record["files"] == manifest["files"]
-    assert record["files"][EXE_NAME] == hashlib.sha256(b"MZ-fake").hexdigest()
-    assert record["staging_dir"] == str(staging)
-    # 原子落盘：不留临时文件
-    assert not list(data_dir.glob("*.tmp"))
+    assert manifest["release_manifest"] == release
+    assert manifest["release_manifest"]["assets"][0]["files"][EXE_NAME] == hashlib.sha256(b"MZ-fake").hexdigest()
+    assert update_host.verify_staged_trust(staging, data_dir, "0.3.7") == ""
+    assert not (data_dir / "update-trust.json").exists()
 
-    # 新下载覆盖旧记录
-    await updater.download_update("v0.3.8", expected_sha256=sha, asset_name="x.zip")
-    record = json.loads((data_dir / update_host.TRUST_RECORD_NAME).read_text(encoding="utf-8"))
-    assert record["version"] == "v0.3.8"
+    with pytest.raises(RuntimeError, match="签名清单"):
+        await updater.download_update("v0.3.8", expected_sha256=sha, asset_name=asset["name"])
 
 
 # ── ③ 交接/换装信任复核（PKG-1 后半：执行前唯一锚）───────────────────────
@@ -189,7 +280,7 @@ def test_verify_staged_trust_missing_record_fails_closed(tmp_path) -> None:
     _make_staged_payload(staging)
     _seal_staging(staging, data_dir, with_record=False)
     error = update_host.verify_staged_trust(staging, data_dir, "0.3.7")
-    assert "信任记录" in error and "重新下载" in error
+    assert error
 
 
 def test_verify_staged_trust_rejects_tampered_payload(tmp_path) -> None:
@@ -199,6 +290,15 @@ def test_verify_staged_trust_rejects_tampered_payload(tmp_path) -> None:
     _seal_staging(staging, data_dir)
     (staging / APP_NAME / "_internal" / "a.txt").write_text("evil", encoding="utf-8")
     assert "校验不符" in update_host.verify_staged_trust(staging, data_dir, "0.3.7")
+
+
+def test_verify_staged_trust_rejects_unlisted_payload_file(tmp_path) -> None:
+    staging = tmp_path / "staging"
+    data_dir = tmp_path / "data"
+    _make_staged_payload(staging)
+    _seal_staging(staging, data_dir)
+    (staging / APP_NAME / "unexpected.dll").write_bytes(b"untrusted")
+    assert "发布清单之外" in update_host.verify_staged_trust(staging, data_dir, "0.3.7")
 
 
 def test_verify_staged_trust_rejects_version_mismatch(tmp_path) -> None:
@@ -218,9 +318,9 @@ def test_verify_staged_trust_rejects_manifest_files_mismatch(tmp_path) -> None:
     _make_staged_payload(staging)
     _seal_staging(staging, data_dir)
     manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
-    manifest["files"] = {k: v for k, v in manifest["files"].items() if "internal" not in k}
+    manifest["release_manifest"]["assets"][0]["files"]["different.exe"] = "0" * 64
     (staging / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    assert "不一致" in update_host.verify_staged_trust(staging, data_dir, "0.3.7")
+    assert "签名" in update_host.verify_staged_trust(staging, data_dir, "0.3.7")
 
 
 def test_verify_staged_trust_rejects_missing_payload(tmp_path) -> None:

@@ -33,7 +33,6 @@ PROXY_SCHEME = "vless" + "://"
 # 32 位十六进制，形状与真实 Steam Web API Key 相同（门禁只在它紧跟在
 # `steam_api_key` 字样之后时才判定为凭据，故这里用查询串形式是安全的）。
 FAKE_STEAM_KEY = "0123456789ABCDEF0123456789ABCDEF"
-# 伪装成真实会话：<steamid64>%7C%7C<40位十六进制>
 FAKE_STEAM_ID = "76561190000000000"
 FAKE_SESSION = "A1B2C3D4E5F60718293A4B5C6D7E8F9012345678"
 FAKE_COOKIE = f"steamLoginSecure={FAKE_STEAM_ID}%7C%7C{FAKE_SESSION}"
@@ -41,7 +40,6 @@ FAKE_COOKIE = f"steamLoginSecure={FAKE_STEAM_ID}%7C%7C{FAKE_SESSION}"
 FAKE_SMTP_CODE = "fake-smtp-app-code"
 
 
-# ── redact()：值抹除 ────────────────────────────────────────
 
 
 def test_redact_steam_api_key_in_httpx_style_line():
@@ -54,8 +52,8 @@ def test_redact_steam_api_key_in_httpx_style_line():
     out = app_logging.redact(line)
     assert FAKE_STEAM_KEY not in out
     assert FAKE_STEAM_ID in out          # 非凭据参数保留：排障需要知道查了谁
-    assert "key=***" in out              # 字段名保留
-    assert "api.steampowered.com" in out  # 目标主机保留
+    assert "key=***" in out
+    assert "api.steampowered.com" in out
 
 
 def test_redact_proxy_url_credentials():
@@ -64,7 +62,7 @@ def test_redact_proxy_url_credentials():
     out = app_logging.redact(line)
     assert "nodeuser" not in out
     assert "nodepass123" not in out
-    assert "127.0.0.1:7890" in out  # host 保留
+    assert "127.0.0.1:7890" in out
 
 
 def test_redact_proxy_node_link():
@@ -110,7 +108,6 @@ def test_redact_is_idempotent():
     assert app_logging.redact(once) == once
 
 
-# ── redact()：不误伤 ────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -120,9 +117,7 @@ def test_redact_is_idempotent():
         "2026-09-12 00:01:42,655 [INFO] app.main: 历史表初始化完成：2373 行",
         "[链式] 跳过 repair：没有待补抓的欠账（missing）数据",
         "2026-09-12 00:01:43,194 [INFO] app.main: 愿望单初始化完成：2570 款",
-        # 无凭据的普通 URL 不应被改动
         "汇率源请求失败（3 次）: https://api.exchangerate.host/latest?base=CNY",
-        # 短参数名但非凭据词根
         "分页参数 page=3&size=50 已应用",
     ],
 )
@@ -131,7 +126,6 @@ def test_redact_leaves_ordinary_lines_alone(line):
     assert app_logging.redact(line) == line
 
 
-# ── 过滤器：生效位置 ────────────────────────────────────────
 
 
 class _Sink(logging.Handler):
@@ -202,7 +196,7 @@ def installed_logging(tmp_path):
     finally:
         for handler in list(root.handlers):
             if isinstance(handler, logging.FileHandler):
-                handler.close()  # 关掉临时日志文件句柄
+                handler.close()
         root.handlers = saved_handlers
         root.setLevel(saved_level)
         for name, level in saved_noisy.items():
@@ -252,7 +246,6 @@ def test_filter_survives_broken_format_args():
     assert app_logging.RedactFilter().filter(record) is True
 
 
-# ── setup_logging：源头静音 ─────────────────────────────────
 
 
 def test_setup_logging_silences_httpx(tmp_path):
@@ -260,7 +253,7 @@ def test_setup_logging_silences_httpx(tmp_path):
     with installed_logging(tmp_path) as root:
         assert logging.getLogger("httpx").level >= logging.WARNING
         assert logging.getLogger("httpcore").level >= logging.WARNING
-        assert root.level == logging.INFO  # 应用自身仍是 INFO
+        assert root.level == logging.INFO
 
 
 def test_setup_logging_silences_apscheduler(tmp_path):
@@ -293,9 +286,6 @@ def test_ring_buffer_holds_scrubbed_lines(tmp_path):
         assert all(FAKE_SESSION not in line for line in tail), tail
 
 
-# ── HumanFormatter：人话渲染 ────────────────────────────────
-# 验收线：日志页每一行都要能回答「谁在做什么、结果如何」。判据是行里不许留下
-# 点分模块路径与裸状态枚举，主句在前、细节在 `│` 之后。
 
 
 def _record(level: int, message: str, name: str = "app.core.scheduler", **extra):
@@ -416,7 +406,6 @@ def test_every_used_tag_is_in_the_vocabulary():
     assert not unknown, f"以下结果词未登记（前端分色会漏）：{unknown}"
 
 
-# ── redact_url：订阅类 URL 的主机形态降级 ────────────────────
 # 订阅地址的凭据在路径段 token 里，逐行 redact 正则对路径型 token 失明；
 # 落日志前必须先过 redact_url。URL 用拼接构造（原因同上：字面订阅形状
 # 会被提交门禁拦住本文件）。
@@ -442,7 +431,6 @@ def test_redact_url_survives_malformed_url():
     assert app_logging.redact_url("http://[::1") == "***"
 
 
-# ── 路径型 token：日志层的第二道网 ──────────────────────────
 # 订阅凭据常嵌在 URL 路径段里（`/api/v1/pq/<32 位随机串>`），调用点必须先过
 # redact_url；但调用点是纪律不是机制，漏写即泄漏。redact() 对「路径含整段
 # 长随机串」的 URL 整体降级为主机形态，堵住调用点漏网。误伤面同样钉死：
@@ -465,8 +453,8 @@ def test_redact_masks_path_token_url(path_prefix):
     line = f"订阅抓取失败：{_subscribe_url(path_prefix)}"
     out = app_logging.redact(line)
     assert SUB_TOKEN not in out
-    assert SUB_HOST in out           # 主机保留：排障仍知道是哪家
-    assert path_prefix.strip("/") not in out  # 路径整段降级
+    assert SUB_HOST in out
+    assert path_prefix.strip("/") not in out
     assert "/***" in out
 
 
@@ -484,15 +472,15 @@ def test_redact_keeps_ordinary_path_segments():
         f"?key={FAKE_STEAM_KEY}"
     )
     out = app_logging.redact(steam_api)
-    assert "GetPlayerSummaries" in out      # 纯字母词段保留
+    assert "GetPlayerSummaries" in out
     assert "api.steampowered.com" in out
-    assert "key=***" in out                  # 查询串凭据仍由既有规则抹除
+    assert "key=***" in out
 
     profile = "档案: https://steamcommunity.com/profiles/76561190000000000/inventoryhistory/"
-    assert app_logging.redact(profile) == profile  # 纯数字 SteamID64 段保留
+    assert app_logging.redact(profile) == profile
 
     asset = "下载: https://github.com/owner/repo/releases/download/v1.2.3/Holdexar-1.2.3-win64.zip"
-    assert app_logging.redact(asset) == asset      # 带点文件名段保留
+    assert app_logging.redact(asset) == asset
 
 
 def test_real_log_line_masks_path_token_in_detail(root_logging):

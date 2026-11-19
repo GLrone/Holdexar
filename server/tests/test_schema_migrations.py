@@ -68,11 +68,9 @@ def _user_version(db: Path) -> int:
 @pytest.mark.asyncio
 async def test_ledger_bootstrap_and_idempotent(isolated_db: Path) -> None:
     """存量库（0）首启登 v1；空链二跑零迁移零前进。"""
-    # 建最小 games 表（init_db 域模型导入链需要可建表库；此处直接全量 init）
     await database_module.init_db()
     assert _user_version(isolated_db) == 1
 
-    # 二跑：版本未动（空链无增量）
     await database_module.init_db()
     assert _user_version(isolated_db) == 1
 
@@ -80,7 +78,7 @@ async def test_ledger_bootstrap_and_idempotent(isolated_db: Path) -> None:
 @pytest.mark.asyncio
 async def test_migration_chain_applies_and_resumes(isolated_db: Path) -> None:
     """登记 v2/v3 步骤后：v1 库补跑全部差额；v3 半途失败 v2 已落账。"""
-    await database_module.init_db()  # → v1
+    await database_module.init_db()
 
     database_module._MIGRATIONS.extend([
         (2, "v2 测试：建回填表", [
@@ -99,8 +97,6 @@ async def test_migration_chain_applies_and_resumes(isolated_db: Path) -> None:
     finally:
         con.close()
 
-    # 断点续跑语义：v4 抛错 → user_version 停在 3，v4 变更未落；
-    # 修好后重放只执行 v4（v2/v3 幂等吸收不重复执行）
     async def _boom(_conn):
         raise RuntimeError("v4 炸了")
 
@@ -356,7 +352,6 @@ async def test_player_tags_v12_drops_genres(isolated_db: Path) -> None:
     finally:
         con.close()
 
-    # 全新库形态（模型已无该列）：重放不报错
     async with database_module.get_engine().begin() as conn:
         await database_module._migrate_player_tags(conn)
 
@@ -368,7 +363,7 @@ async def test_snapshot_taken_only_when_migration_pending(isolated_db: Path) -> 
     「快照里的 user_version 小于迁移后」是这条用例的关键断言——只断言
     「文件存在」会漏掉「快照落在迁移之后」这种等于没备份的实现。
     """
-    await database_module.init_db()  # 空链：无差额
+    await database_module.init_db()
     snap = isolated_db.with_name(isolated_db.name + ".pre-migration.bak")
     assert not snap.exists(), "无差额迁移不该落快照（每次启动都会覆盖一份）"
 
@@ -379,7 +374,6 @@ async def test_snapshot_taken_only_when_migration_pending(isolated_db: Path) -> 
     assert _user_version(isolated_db) == 2
     assert snap.is_file(), "有差额迁移却没落迁移前快照"
 
-    # 快照必须自洽可独立打开，且停在迁移前的版本
     con = sqlite3.connect(str(snap))
     try:
         assert con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -388,9 +382,6 @@ async def test_snapshot_taken_only_when_migration_pending(isolated_db: Path) -> 
         con.close()
 
 
-# ── v4：game_price_history 幂等唯一索引 ──────────────────────────────
-# 写入侧用 INSERT OR REPLACE 去重，靠的就是这个索引；此前它只手工建在开发库上，
-# 代码里没有定义 → 新装的库没有约束，同日同 sub 反复堆积。
 
 _GPH_DDL = (
     "CREATE TABLE game_price_history ("
@@ -465,7 +456,6 @@ async def test_v4_index_is_actually_enforcing(isolated_db: Path) -> None:
 async def test_v4_refuses_index_when_duplicates_exist(isolated_db: Path, monkeypatch) -> None:
     """库内已有重复行时保留原数据并阻止迁移版本前进。"""
     monkeypatch.setattr(database_module, "_snapshot_before_migration", _noop_snapshot)
-    # 先造一张无索引的表并塞入重复行——模拟「此前无约束写入」的存量库
     con = sqlite3.connect(str(isolated_db))
     try:
         con.execute(_GPH_DDL)
@@ -504,12 +494,6 @@ async def test_gph_migration_replaces_wrong_index_with_same_name(isolated_db: Pa
     finally:
         con.close()
 
-# ── v5：wishlist_items 愿望单成员标记回填 ──────────────────────────
-#
-# 监控池三模块语义下，愿望单（wishlisted）与星标关注（manual）是爬取队列
-# 第一优先级。存量库的新列由 _ensure_schema 加，但「哪些行是愿望单来源」
-# 只有迁移链知道：活跃且非已购、非关注的行全部来自愿望单同步（手动入池
-# 功能此前不存在），必须回填——否则升级后老愿望单条目掉出第一优先级。
 
 
 @pytest.mark.asyncio
@@ -528,7 +512,6 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：旧列结构 + 存量行
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -537,10 +520,10 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
             " active BOOLEAN, owned BOOLEAN, manual BOOLEAN,"
             " PRIMARY KEY (steamid, appid))"
         )
-        con.execute("INSERT INTO wishlist_items VALUES ('1', 100, NULL, 1, 0, 0)")  # 愿望单
-        con.execute("INSERT INTO wishlist_items VALUES ('1', 200, NULL, 1, 0, 1)")  # 关注
-        con.execute("INSERT INTO wishlist_items VALUES ('1', 300, NULL, 1, 1, 0)")  # 已购
-        con.execute("INSERT INTO wishlist_items VALUES ('1', 400, NULL, 0, 0, 0)")  # 已脱池
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 100, NULL, 1, 0, 0)")
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 200, NULL, 1, 0, 1)")
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 300, NULL, 1, 1, 0)")
+        con.execute("INSERT INTO wishlist_items VALUES ('1', 400, NULL, 0, 0, 0)")
         con.commit()
     finally:
         con.close()
@@ -565,9 +548,6 @@ async def test_v5_backfills_wishlist_member_flag(tmp_path: Path, monkeypatch) ->
         await engine.dispose()
 
 
-# v7：price_alerts 的 price 类阈值口径归一（该区货币最小单位 → 人民币分）。
-# 旧行为下阈值与该区货币分直比（US 规则填 1000 = $10），前端与邮件却一律
-# 按 ¥ 展示——外区规则语义三方分裂；归一后与 crawl 落库的 cny_fen 同口径。
 
 
 @pytest.mark.asyncio
@@ -586,7 +566,6 @@ async def test_v7_converts_price_targets_to_cny(tmp_path: Path, monkeypatch) -> 
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：旧口径阈值行 + 汇率表（只放 USD，JPY 刻意缺档走兜底）
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -604,12 +583,12 @@ async def test_v7_converts_price_targets_to_cny(tmp_path: Path, monkeypatch) -> 
             "INSERT INTO price_alerts (appid, region, target_type, target_value, active)"
             " VALUES (?, ?, ?, ?, 1)",
             [
-                (100, "US", "price", 1000.0),       # $10 → 7250 人民币分
-                (100, "CN", "price", 5000.0),       # ¥50 → 不变
-                (100, "JP", "price", 29900.0),      # 兜底 0.048 → 1435 分
-                (100, "US", "pct", 30.0),           # 折扣率，不动
-                (100, "US", "historic_low", None),  # 创新低，不动
-                (100, "ZZ", "price", 1000.0),       # 区码认不出，跳过留原值
+                (100, "US", "price", 1000.0),
+                (100, "CN", "price", 5000.0),
+                (100, "JP", "price", 29900.0),
+                (100, "US", "pct", 30.0),
+                (100, "US", "historic_low", None),
+                (100, "ZZ", "price", 1000.0),
             ],
         )
         con.commit()
@@ -639,8 +618,6 @@ async def test_v7_converts_price_targets_to_cny(tmp_path: Path, monkeypatch) -> 
         await engine.dispose()
 
 
-# v8：fx_rate_history canonical 化（rate_date/source_kind 回填 + 旧 backfill 行
-# 改标 carried + 同日按日收语义合并 + (currency_code, rate_date) 唯一索引）。
 
 
 @pytest.mark.asyncio
@@ -657,7 +634,6 @@ async def test_v8_fx_history_canonical(tmp_path: Path, monkeypatch) -> None:
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：旧列结构（无 rate_date/source_kind）+ 同日多行 + backfill 行
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -695,18 +671,14 @@ async def test_v8_fx_history_canonical(tmp_path: Path, monkeypatch) -> None:
         finally:
             con.close()
         assert rows == [
-            ("2026-01-05", 0.015, "carried"),   # backfill 行 → carried（保留不删）
-            ("2026-01-06", 0.017, "observed"),  # 同日最后一行胜出（日收语义）
+            ("2026-01-05", 0.015, "carried"),
+            ("2026-01-06", 0.017, "observed"),
         ], f"迁移结果不符：{rows}"
         assert idx is not None, "唯一日索引 ux_frh_currency_date 未落位"
     finally:
         await engine.dispose()
 
 
-# v10：wishlist_items 项目旗标行退役（榜单落池 / 手动入池真身归监控层）。
-# 监控真身在 monitor_targets / monitor_sources / monitor_exclusions，账户侧
-# 统计（愿望单数 / 条目数）只认 Steam 账户事实行——项目旗标行清洗后，
-# 账户卡不再被榜单批次虚增。
 
 
 @pytest.mark.asyncio
@@ -724,7 +696,6 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：v9 时代库——项目旗标行挂在账户名下，版本账本停在 9
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -742,12 +713,12 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
         con.executemany(
             "INSERT INTO wishlist_items VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
             [
-                ("1", 100, 1, 0, 0, 1, 0, 0, 0),  # 纯愿望单：保留
-                ("1", 200, 1, 0, 0, 0, 0, 0, 1),  # 纯榜单：删行 + board 来源补齐
-                ("1", 300, 1, 1, 0, 0, 0, 0, 1),  # 已购 + 榜单混合：留行清旗标
-                ("1", 400, 0, 0, 0, 0, 0, 1, 1),  # 用户移出的榜单行：删行 + 排除
-                ("1", 500, 1, 0, 0, 0, 1, 0, 0),  # 纯手动入池：删行 + manual 来源
-                ("1", 600, 1, 0, 1, 0, 0, 0, 1),  # 星标 + 榜单混合：留行清旗标
+                ("1", 100, 1, 0, 0, 1, 0, 0, 0),
+                ("1", 200, 1, 0, 0, 0, 0, 0, 1),
+                ("1", 300, 1, 1, 0, 0, 0, 0, 1),
+                ("1", 400, 0, 0, 0, 0, 0, 1, 1),
+                ("1", 500, 1, 0, 0, 0, 1, 0, 0),
+                ("1", 600, 1, 0, 1, 0, 0, 0, 1),
             ],
         )
         con.execute("PRAGMA user_version = 9")
@@ -804,12 +775,10 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
 
         async with database_module.get_session_factory()() as session:
             states = dict((await session.execute(select(MonitorTarget.target_id, MonitorTarget.state))).all())
-        # 混合行保留且旗标清零；纯项目行删除
         assert set(rows) == {100, 300, 600}
         assert rows[300][4] == 0 and rows[300][1] == 1, "已购行只清榜单旗标"
         assert rows[600][4] == 0 and rows[600][2] == 1, "星标行只清榜单旗标"
         assert rows[100][3] == 1, "愿望单事实行不动"
-        # 监控真身：项目条目全部补齐（来源激活），移除行落排除
         assert states == {
             100: "active", 200: "active", 300: "active",
             500: "active", 600: "active", 400: "excluded",
@@ -817,7 +786,6 @@ async def test_v10_retires_pool_flags(tmp_path: Path, monkeypatch) -> None:
         assert board_sources == {200: 1, 300: 1, 600: 1}
         assert 500 in manual_sources
         assert exclusions == {400}
-        # 条目数回归账户事实口径：活跃账户行 100/300/600
         assert item_count == 3
     finally:
         await engine.dispose()
@@ -849,7 +817,6 @@ async def test_v11_snapshot_step_remains_compatible_with_current_upgrade(tmp_pat
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：v10 时代库——price_cycles 无 coverage_json，版本账本停在 10
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -872,7 +839,6 @@ async def test_v11_snapshot_step_remains_compatible_with_current_upgrade(tmp_pat
             cols = {r[1] for r in con.execute("PRAGMA table_info(price_cycles)")}
             assert "coverage_json" not in cols
             assert reached == [11]
-            # 幂等重放：第二次 init_db 不得因列已存在而抛错
         finally:
             con.close()
         await database_module.init_db()
@@ -894,7 +860,6 @@ async def test_extra_columns_add_price_cycle_split_stats(tmp_path: Path, monkeyp
         "get_session_factory",
         lambda: async_sessionmaker(engine, expire_on_commit=False),
     )
-    # 迁移前形态：v15 时代库——price_cycles 无拆分列，版本账本停在 15
     con = sqlite3.connect(str(db))
     try:
         con.execute(
@@ -918,7 +883,6 @@ async def test_extra_columns_add_price_cycle_split_stats(tmp_path: Path, monkeyp
             assert {"units_missing", "units_blocked"} <= cols
         finally:
             con.close()
-        # 幂等重放：第二次 init_db 不得因列已存在而抛错
         await database_module.init_db()
     finally:
         await engine.dispose()
@@ -951,9 +915,6 @@ async def test_extra_columns_fresh_library_carries_split_stats(tmp_path: Path, m
         await engine.dispose()
 
 
-# ── v14：game_price_history 冗余索引退役 ─────────────────────────────
-# 删的是两条重复检索路径；去重唯一索引必须留在场——它是写入侧
-# INSERT OR REPLACE 的去重依据，删了会让同刻同价反复堆积。
 
 _V14_REDUNDANT = (
     "CREATE INDEX ix_gph_sub_id ON game_price_history (sub_id)",

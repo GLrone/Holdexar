@@ -52,7 +52,6 @@ BLOCKED_IO_MODULES = {
 }
 NETWORK_METHODS = {"request", "get", "post", "put", "patch", "delete", "send", "fetch"}
 
-# (文件, 函数) → (语句种类及调用点上限, 理由)。
 ALLOW: dict[tuple[str, str], tuple[dict[str, int], str]] = {
     ("scripts/check_launcher_contract.py", "make_database"): (
         {"execute": 3, "commit": 1},

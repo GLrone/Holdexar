@@ -26,7 +26,6 @@ from app.domains.settings.models import AppSetting
 A = "76561198000000001"
 
 
-# ── 夹具 ────────────────────────────────────────────────
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +81,6 @@ async def _read_cookie() -> str:
         return row.cookies if row else ""
 
 
-# ── 模式与锁定 ──────────────────────────────────────────
 
 
 def test_default_mode_is_legacy(tmp_path):
@@ -108,8 +106,8 @@ def test_write_record_preserves_old_on_tmp_failure(tmp_path, monkeypatch):
     with pytest.raises(keyring.KeyringError):
         keyring.write_record(tmp_path, {"mode": "passphrase", "v": 2})
     monkeypatch.undo()
-    assert master.read_bytes() == original  # 旧主密钥完好
-    assert list(tmp_path.glob("*.tmp")) == []  # 失败路径不留半截临时件
+    assert master.read_bytes() == original
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_restore_record_replaces_atomically(tmp_path):
@@ -118,7 +116,7 @@ def test_restore_record_replaces_atomically(tmp_path):
     assert master.read_bytes() == b"old-master-bytes"
     keyring.restore_record(tmp_path, b"new-master-bytes")
     assert master.read_bytes() == b"new-master-bytes"
-    assert list(tmp_path.glob("*.tmp")) == []  # 成功路径不留临时残件
+    assert list(tmp_path.glob("*.tmp")) == []
     keyring.restore_record(tmp_path, None)
     assert master.exists() is False
 
@@ -130,9 +128,8 @@ async def test_passphrase_enable_locks_then_unlocks(db, tmp_path):
 
     await rekey.switch_mode("passphrase", passphrase="pw-123456")
     assert keyring.mode_of(tmp_path) == keyring.MODE_PASSPHRASE
-    assert keyring.is_locked(tmp_path) is False  # 刚设置即当前会话口令
+    assert keyring.is_locked(tmp_path) is False
 
-    # 模拟重启：清进程态 → 锁定
     keyring.reset_state()
     secretbox.clear_key_cache()
     assert keyring.is_locked(tmp_path) is True
@@ -140,9 +137,7 @@ async def test_passphrase_enable_locks_then_unlocks(db, tmp_path):
     with pytest.raises(SecretBoxError):
         secretbox.decrypt_secret(ct, "steam-cookies")
 
-    # 错误口令不解锁
     assert keyring.unlock(tmp_path, "wrong") is False
-    # 正确口令解锁 → 换钥后的密文可解
     assert keyring.unlock(tmp_path, "pw-123456") is True
     secretbox.clear_key_cache()
     assert await settings_service.get_secret_value("account.steam_api_key") == "APIKEY-123"
@@ -170,9 +165,22 @@ async def test_switch_requires_current_passphrase_when_locked(db, tmp_path):
     keyring.reset_state()
     secretbox.clear_key_cache()
     with pytest.raises(keyring.KeyringError):
-        await rekey.switch_mode("legacy")  # 未提供当前口令
+        await rekey.switch_mode("legacy")
     with pytest.raises(keyring.KeyringError):
         await rekey.switch_mode("legacy", current_passphrase="nope")
+
+
+@pytest.mark.asyncio
+async def test_switch_requires_current_passphrase_even_when_unlocked(db, tmp_path):
+    """持有 API 会话不应足以把已解锁密钥库换成攻击者口令。"""
+    await _seed_user_rows()
+    await rekey.switch_mode("passphrase", passphrase="pw-123456")
+
+    with pytest.raises(keyring.KeyringError):
+        await rekey.switch_mode("legacy", current_passphrase="wrong-passphrase")
+
+    assert keyring.mode_of(tmp_path) == keyring.MODE_PASSPHRASE
+    assert await settings_service.get_secret_value("account.steam_api_key") == "APIKEY-123"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI 仅 Windows 可用")
@@ -185,12 +193,11 @@ async def test_dpapi_mode_roundtrip(db, tmp_path):
     keyring.reset_state()
     secretbox.clear_key_cache()
     assert keyring.mode_of(tmp_path) == keyring.MODE_DPAPI
-    assert keyring.is_locked(tmp_path) is False  # 系统凭据，无需口令
+    assert keyring.is_locked(tmp_path) is False
     assert secretbox.decrypt_secret(ct, "steam-cookies") == "COOKIE-DATA"
     assert await settings_service.get_secret_value("account.steam_api_key") == "APIKEY-123"
 
 
-# ── 导出 ────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -201,20 +208,16 @@ async def test_export_excludes_seed_and_decrypts_secrets(db, tmp_path):
 
     payload = await data_export.build_payload()
 
-    # 种子 / 公共目录表不进导出
     for table in ("games", "game_current_prices", "game_price_history", "fx_rates",
                   "crawl_regions", "bundles", "clash_nodes", "proxy_nodes"):
         assert table not in payload["tables"]
-    # 种子 marker 键被剔除
     keys = {row["key"]: row["value"] for row in payload["tables"]["app_settings"]}
     assert "seed.imported_version" not in keys
     assert keys["ui.theme"] == "light"
-    # 凭据解密后随正文导出
     assert keys["account.steam_api_key"] == "APIKEY-123"
     assert payload["tables"]["steam_accounts"][0]["cookies"] == "COOKIE-DATA"
     assert payload["tables"]["proxy_subscriptions"][0]["url"] == "https://sub.example/url"
 
-    # 口令加密 → 回读
     envelope = data_export.encrypt_payload(payload, "exportpw")
     assert envelope["cipher"] == "AES-256-GCM"
     back = data_export.decrypt_payload(envelope, "exportpw")
@@ -247,7 +250,6 @@ async def test_export_blocked_when_locked(db, tmp_path):
         await data_export.build_payload()
 
 
-# ── P0-2 回归：口令封装记录校验（恶意文件在昂贵派生前拒绝）──────────────
 
 
 def _valid_passphrase_record():
@@ -256,7 +258,7 @@ def _valid_passphrase_record():
 
 def test_validate_passphrase_record_accepts_current_format():
     record = _valid_passphrase_record()
-    keyring._validate_passphrase_record(record)  # 不抛即通过
+    keyring._validate_passphrase_record(record)
     master = keyring._unwrap_passphrase(record, "atk-test-passphrase")
     assert master == bytes(range(32))
 

@@ -50,11 +50,9 @@ MAIN_BRANCH = "main"
 
 # build_release.py 生成的说明模板占位文案——带着它发版 = 客户端更新提示里
 NOTES_PLACEHOLDER = "在此写本次更新内容"
-# 发布正文固定四段式（新增/更新/优化/修复，一条一行）
 NOTES_SECTIONS = ("新增：", "更新：", "优化：", "修复：")
 NOTES_BRACKET_PLACEHOLDER = "写完删掉本括号"
 
-# 0.3.1 标准版式分级标题匹配模式
 STANDARD_SECTION_PATTERNS = [
     re.compile(r"^#{2,4}\s*(?:新增功能|新增特性|新增|New Features?)", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^#{2,4}\s*(?:问题修复|缺陷修复|修复|Bug Fixes?)", re.IGNORECASE | re.MULTILINE),
@@ -76,11 +74,9 @@ from app.core.app_info import (  # noqa: E402
 )
 
 VERSION_RE = re.compile(r'^APP_VERSION\s*=\s*"([^"]+)"', re.MULTILINE)
-# 支持标准三段式正式版（x.y.z）及预发布版本（如 0.3.1-beta、0.3.1-beta.2、0.1.0-rc.1）
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 
 
-# ── 基础设施 ────────────────────────────────────────────────
 
 
 def pick_python() -> Path:
@@ -112,7 +108,6 @@ def die(message: str) -> None:
     sys.exit(f"\n[中止] {message}")
 
 
-# ── 步骤 1：预检 ────────────────────────────────────────────
 
 
 def git_dirty() -> list[str]:
@@ -152,7 +147,6 @@ def validate_release_notes(body: str, filename: str = "RELEASE_NOTES.md") -> str
     if NOTES_PLACEHOLDER in text or NOTES_BRACKET_PLACEHOLDER in text:
         return f"{filename} 还是模板占位文案，请先写本次更新内容并删除说明括号"
 
-    # 1. 0.3.1 标准分级 Markdown 结构识别
     is_standard = "## 本次更新" in text or any(p.search(text) for p in STANDARD_SECTION_PATTERNS)
     if is_standard:
         lines = text.splitlines()
@@ -181,7 +175,6 @@ def validate_release_notes(body: str, filename: str = "RELEASE_NOTES.md") -> str
             return f"{filename} 各段均无有效更新条目，正文至少需有一条有效更新内容"
         return None
 
-    # 2. 传统四段式校验
     missing = [s for s in NOTES_SECTIONS if s not in text]
     if missing:
         return f"{filename} 缺少四段式标题（{'、'.join(missing)}）"
@@ -259,7 +252,6 @@ def preflight(version: str, allow_dirty: bool, allow_republish: bool) -> None:
             "        （没有 gh 也可用 scripts/publish_release.py 打印手工发布清单）"
         )
 
-    # 文档与构建一致性快速检查（版本/资产/调度/安全建议/许可证）
     consistency_script = SCRIPTS / "check_docs_consistency.py"
     if consistency_script.is_file():
         c_code, c_out = capture([str(pick_python()), str(consistency_script)])
@@ -288,7 +280,6 @@ def preflight(version: str, allow_dirty: bool, allow_republish: bool) -> None:
     print("[预检] 通过")
 
 
-# ── 步骤 2：敏感面门禁 ──────────────────────────────────────
 
 
 def secret_gate(dry: bool) -> None:
@@ -307,7 +298,6 @@ def secret_gate(dry: bool) -> None:
         )
 
 
-# ── 步骤 3：版本号 ──────────────────────────────────────────
 
 
 def bump(kind: str) -> str:
@@ -389,7 +379,6 @@ def commit_and_push(version: str, dry: bool, yes: bool) -> None:
     run(["git", "push", "origin", MAIN_BRANCH], dry, label="推送")
 
 
-# ── 步骤 5/6：构建与发布 ────────────────────────────────────
 
 
 def build(dry: bool) -> None:
@@ -405,7 +394,6 @@ def publish(dry: bool) -> None:
     run(cmd, dry=False)
 
 
-# ── 步骤 7：复验 ────────────────────────────────────────────
 
 
 def fetch_json(url: str) -> dict:
@@ -476,7 +464,6 @@ def summarize(version: str) -> None:
     print(f"  Scoop 清单   : release/scoop/{APP_SLUG}.json（提交进 bucket 仓库后生效）")
 
 
-# ── 主流程 ──────────────────────────────────────────────────
 
 
 def main() -> None:

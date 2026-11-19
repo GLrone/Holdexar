@@ -30,7 +30,6 @@ _BOARD_LABELS = {
     "comingsoon": "即将推出",
     "specials": "特惠榜",
 }
-# job_id → 中文任务名（日志主句用；漏登记的新 job 原样露出 id）
 _JOB_LABELS = {
     "wishlist_sync": "心愿单同步",
     "price_refresh": "价格刷新",
@@ -168,7 +167,6 @@ async def _job_wishlist_sync() -> None:
                         "数据通道": result.get("ownedSource") or "未知",
                     },
                 )
-            # 占用漏爬的新增（sync_account crawlTriggered=False 且有 newAppids）
             if auto_crawl and result.get("crawlTriggered") is False and result.get("newAppids"):
                 pending_new.extend(result["newAppids"])
         except Exception:  # noqa: BLE001
@@ -180,8 +178,6 @@ async def _job_wishlist_sync() -> None:
                 exc_info=True,
             )
 
-    # 收尾补爬：本轮同步中因任务占用未首爬的新增条目，定向小批补一次
-    # （同批去重；仍在占用则 run_sequential 内部跳过，下轮 15min 同步兜底）
     if pending_new:
         from app.domains.crawl import service as crawl_service
 
@@ -204,11 +200,6 @@ async def _job_wishlist_sync() -> None:
                 exc_info=True,
             )
 
-    # 未爬新增回补：同步入库了但从未获得过价格数据（绑定后进程重启中断、
-    # 任务占用漏爬后 15min 内被再次跳过等），会留下
-    # 「active=1 且 games 无行」的条目——这些是监控池第一优先级，用户绑定
-    # 后看不到价格即体验为「首爬没跑」。每次同步收尾做一次存量对账（配额
-    # 帽 _WISH_UNCRAWLED_BATCH 限批），漏多少补多少，直到清零。
     if auto_crawl:
         try:
             appids = await _uncrawled_active_appids()
@@ -231,9 +222,6 @@ async def _job_wishlist_sync() -> None:
                             "单轮上限": _WISH_UNCRAWLED_BATCH,
                         },
                     )
-                    # 爬完仍无 games 行的条目（全球不可见/预取全空）写一笔
-                    # missing 尝试痕迹，防止下轮回补对同一批无限重扫——
-                    # 之后由 missing 账本通道按自己的节奏重试。
                     await _stamp_uncrawled_missing(appids)
         except Exception:  # noqa: BLE001
             log_event(
@@ -244,8 +232,6 @@ async def _job_wishlist_sync() -> None:
             )
 
 
-# 未爬新增回补单轮配额帽：首绑大愿望单（几百款）一次全爬会长时间占住
-# 单任务模型；分轮消化、可预期。
 _WISH_UNCRAWLED_BATCH = 400
 
 
@@ -266,8 +252,6 @@ async def _uncrawled_active_appids() -> list[int]:
     from app.domains.wishlist.models import WishlistItem
 
     async with get_session_factory()() as session:
-        # NOT EXISTS 反连接：短路价格表逐行扇出，
-        # DISTINCT 保留（多账号对同一 appid 复写行）
         not_in_games = (
             _select(Game.appid).where(Game.appid == WishlistItem.appid).exists()
         )
@@ -309,7 +293,6 @@ async def _stamp_uncrawled_missing(appids: list[int]) -> int:
     now = get_beijing_time_obj().replace(tzinfo=None)
     wrote = 0
     async with write_session(WritePriority.BACKGROUND) as session:
-        # 只挑仍然整行缺失的（回补成功建行的跳过）
         still_missing = (
             await session.execute(
                 _select(Game.appid).where(Game.appid.in_([int(a) for a in appids]))
@@ -406,7 +389,6 @@ async def _reanchor_price_refresh(reason: str, *, external: bool = True) -> None
         )
 
 
-# 主轮执行期间，普通补抓拍让路。
 _price_cycle_busy = False
 
 
@@ -461,10 +443,6 @@ async def kick_source_jobs(job_ids: list[str]) -> None:
             )
 
 
-# ─── 内容源自定义刷新节奏（自动抓取页：HB 月包 / Epic 喜加一）─────────────
-# KV `fetch.<source>_schedule` = {"time": "HH:MM", "days": N}（1=每天，上限 30）。
-# 注册用默认；启动链（apply_content_schedules_from_settings）与设置保存
-# （settings 路由直调 apply_content_schedule）双生效点共用同一重排入口。
 CONTENT_SCHEDULE_KEYS = {
     "hb_choice": "fetch.hb_choice_schedule",
     "epic_free": "fetch.epic_free_schedule",
@@ -584,9 +562,6 @@ async def _job_price_refresh() -> None:
 
         await cycle_run.run_price_cycle(await crawl_service.default_queue_specs(), kind="scheduled")
 
-        # 链尾段：捆绑包刷新（游戏侧跑完才轮到它，busy 窗口内修复轮
-        # 继续让路；发现桩首抓并入同一次全量刷新，成败细节由
-        # refresh_bundles 内部日志记录）
         try:
             from app.domains.bundles import refresh as bundles_refresh
 
@@ -693,7 +668,7 @@ async def _job_fx_history_repair() -> None:
 
     if not await content_fetch_enabled("fetch.fx_history"):
         await scheduler_bridge_note("fx_history_repair", {"skipped": "汇率历史补全已关闭"})
-        return  # 「汇率历史补全」开关关闭
+        return
     if not _crawler_idle():
         log_event(
             logger,
@@ -726,8 +701,6 @@ async def _job_fx_history_repair() -> None:
         log_event(logger, "汇率历史修复异常", level=logging.ERROR, exc_info=True)
 
 
-# 历史修复单轮窗口上限：8 窗口/轮 ≈ 单日最多 8 次 Provider 请求
-# （跨月重置自然续跑；缺口极大时多日消化，不挤占当月全部额度）
 _FX_REPAIR_MAX_WINDOWS = 8
 
 
@@ -735,7 +708,6 @@ _FX_REPAIR_MAX_WINDOWS = 8
 # 它同秒起跑会一起抢 SQLite 写锁（真实生产已出现 `database is locked`）。
 _BILLS_STAGGER = timedelta(minutes=2)
 
-# 启动期错峰排程：首屏 0~5s 关键窗口期让路给前台会话与聚合读，后台定时重活在 5s~30s 错峰分批执行。
 _STARTUP_STAGGER_PROXYPOOL_CYCLE = timedelta(seconds=5)
 _STARTUP_STAGGER_PRICE_REPAIR = timedelta(seconds=10)
 _STARTUP_STAGGER_SUBSCRIPTION_REFRESH = timedelta(seconds=15)
@@ -968,7 +940,7 @@ async def _job_proxy_health() -> None:
     """
     if not await content_fetch_enabled("proxy.health_auto"):
         await scheduler_bridge_note("proxy_health", {"skipped": "自动节点体检已关闭"})
-        return  # 「自动节点体检」开关关闭：定时全测与 Clash 节点检测一并停转
+        return
     from app.domains.proxies import service as proxies_service
 
     proxies = await proxies_service.list_proxies(enabled_only=True)
@@ -978,8 +950,6 @@ async def _job_proxy_health() -> None:
         except Exception:  # noqa: BLE001
             log_event(logger, "代理节点体检失败", level=logging.ERROR, exc_info=True)
 
-    # 体检后判定通道健康度：全灭 / 可用占比过低才发告警（12h 冷却，
-    # 未配置任何通道视为用户选择，不告警）
     try:
         from app.domains.alerts import service as alerts_service
 
@@ -993,7 +963,6 @@ async def _job_proxy_health() -> None:
         )
 
 
-# 钱包全员失败日志按「账号总数+冻结数」签名收敛：形态不变只报一次，之后每小时注意级提醒
 _WALLET_FAIL_LOG_DIGEST_SECONDS = 3600.0
 _wallet_fail_log_state: dict = {}
 
@@ -1084,7 +1053,6 @@ async def _job_bills_sync() -> None:
         accounts = await account_service.list_accounts()
         if not accounts:
             await scheduler_bridge_note("bills_sync", {"skipped": "未绑定 Steam Cookie"})
-        # 逐账号并发：同步锁按账号分键，同账号互斥、不同账号并行
         await asyncio.gather(*(_sync_account_bills(a["steam_id"]) for a in accounts))
     except Exception:  # noqa: BLE001
         log_event(logger, "Steam 账单同步异常", level=logging.ERROR, exc_info=True)
@@ -1153,7 +1121,7 @@ def _make_board_job(
             await scheduler_bridge_note(
                 f"board_{board_key}", {"skipped": "Steam 排行榜自动更新已关闭"}
             )
-            return  # 「Steam 榜单」开关关闭：发现源停转，落池与反哺一并跳过
+            return
         try:
             appids = await boards_mod.refresh_board(board_key)
             if appids:
@@ -1178,8 +1146,6 @@ def _make_board_job(
             )
             return
 
-        # 落持久监控池：board.pool=True 的板本轮整批并入监控池（反复上榜
-        # 只补缺；已手动移除的条目不复活）。落池失败不阻断反哺。
         if boards_mod.BOARDS[board_key].pool:
             from app.domains.wishlist import service as wishlist_service
 
@@ -1295,7 +1261,7 @@ async def _job_backup() -> None:
     """自动备份只在最近快照超过保留间隔时创建。"""
     if not await content_fetch_enabled("backup.auto"):
         await scheduler_bridge_note("auto_backup", {"skipped": "自动备份已关闭"})
-        return  # 「每日自动备份」开关关闭：定时与启动补备一并停转，手动备份不受影响
+        return
     from app.core import backup as core_backup
 
     try:
@@ -1319,7 +1285,6 @@ async def _job_backup() -> None:
         )
     except Exception as e:  # noqa: BLE001
         log_event(logger, "自动备份失败", level=logging.ERROR, exc_info=True)
-        # 系统告警：备份失败是「数据没有第二份」的信号，24h 冷却内只提醒一次
         try:
             from app.domains.alerts import service as alerts_service
 
@@ -1349,7 +1314,7 @@ async def _job_hb_choice() -> None:
     当月即漏，因此按日检查而非按月）+ 已标记未取价补首爬。"""
     if not await content_fetch_enabled("fetch.hb_choice"):
         await scheduler_bridge_note("hb_choice", {"skipped": "Humble Choice 每月合集自动更新已关闭"})
-        return  # 「Humble Choice」开关关闭：当月包核对停转，已有标记保留
+        return
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1375,8 +1340,6 @@ async def _job_hb_choice() -> None:
                 "Humble Choice 当月包已标记",
                 detail={"月包标识": result.get("machineName")},
             )
-        # 新月包结案即发一封当月包清单（标签游标保证同月只发一封；
-        # 失败/未结案/跳过都不发，次日重试）
         try:
             from app.domains.alerts import service as alerts_service
 
@@ -1395,9 +1358,6 @@ async def _job_hb_choice() -> None:
             level=logging.ERROR,
             exc_info=True,
         )
-    # 已标记未取价的 HB 游戏补首爬（标记 ≠ 取价；打标失败不挡补价）。
-    # 撞锁/池未就绪由链式层跳过留日志，次日重试；走爬取通道，auto_price
-    # 关闭时与 comingsoon/free_promo 重试层一并停转。
     try:
         if await price_auto_enabled():
             backfill = await metadata_service.backfill_hb_prices()
@@ -1426,7 +1386,7 @@ async def _job_epic_free() -> None:
     后续轮次自然补齐）。"""
     if not await content_fetch_enabled("fetch.epic_free"):
         await scheduler_bridge_note("epic_free", {"skipped": "Epic 免费游戏自动更新已关闭"})
-        return  # 「Epic 免费游戏」开关关闭：喜加一标记停转，已有标记保留
+        return
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1455,8 +1415,6 @@ async def _job_epic_free() -> None:
                     "新标款数": len(result.get("marked") or []),
                 },
             )
-        # 标记完成后发喜加一邮件（当期新条目才发；预告段只作展示，
-        # 转正后才自己发一封）
         try:
             from app.domains.alerts import service as alerts_service
 
@@ -1482,7 +1440,7 @@ async def _job_steam_events_sync() -> None:
     活动窗口是价格观测行周期标签的来源，回贴随同步幂等执行。"""
     if not await content_fetch_enabled("fetch.steam_events"):
         await scheduler_bridge_note("steam_events_sync", {"skipped": "Steam 活动日历自动更新已关闭"})
-        return  # 「Steam 活动日历」开关关闭：同步停转，已有数据保留展示
+        return
     from app.domains.steam_events import service as steam_events_service
 
     try:
@@ -1509,7 +1467,7 @@ async def _job_bartervg_bundles() -> None:
     差量写入幂等，档案拉取失败保留库内旧值）。"""
     if not await content_fetch_enabled("fetch.bundle_counts"):
         await scheduler_bridge_note("bartervg_bundles", {"skipped": "捆绑包记录自动更新已关闭"})
-        return  # 「捆绑包资料」开关关闭：进包计数刷新停转（启动补跑同闸）
+        return
     from app.domains.metadata import service as metadata_service
 
     try:
@@ -1559,7 +1517,7 @@ async def _job_coming_soon_retry() -> None:
 
     if not await price_auto_enabled():
         await scheduler_bridge_note("comingsoon_retry", {"skipped": "自动价格更新已关闭"})
-        return  # 自动价格更新关闭：重探也走爬取通道，一并停转
+        return
     try:
         pairs = await DbWriter().coming_soon_retry_pairs(
             cooldown_days=14, limit=20
@@ -1576,7 +1534,6 @@ async def _job_coming_soon_retry() -> None:
         await scheduler_bridge_note("comingsoon_retry", {"skipped": "暂无需要重新检查的游戏"})
         return
     try:
-        # 走 kind=scheduled 正常 worker 通道（重探目标量小、多为元数据短路）
         results = await crawl_service.run_sequential(
             [{"scope": "appids", "appids": [a for a, _ in pairs],
               "kind": "comingsoon_retry"}], trigger="scheduled",
@@ -1613,7 +1570,7 @@ async def _job_free_promo_retry() -> None:
 
     if not await price_auto_enabled():
         await scheduler_bridge_note("free_promo_retry", {"skipped": "自动价格更新已关闭"})
-        return  # 自动价格更新关闭：复查也走爬取通道，一并停转
+        return
     try:
         now_ts = int(get_beijing_time_obj().timestamp())
         async with get_session_factory()() as session:
@@ -1659,8 +1616,6 @@ async def _job_free_promo_retry() -> None:
         )
 
 
-# ── 启动新鲜度补偿 ──
-# 启动只补一轮，后续恢复原网格；所有启用地区都近期成功才算对象新鲜。
 _STARTUP_STALE_HOURS = 24
 _STARTUP_STALE_SHARE = 0.5
 _STARTUP_KICK_DELAY_SECONDS = 120
@@ -1795,7 +1750,6 @@ async def _note_max_instances(event) -> None:
         logger.debug("让路流水投递失败", exc_info=True)
         return
     if not delivered:
-        # 在飞 run 恰好刚收口（投递竞态）：降级出同词形日志，痕不丢
         log_event(
             logger,
             f"定时任务「{_job_label(event.job_id)}」上一轮还在进行，本拍让路",
@@ -1842,7 +1796,6 @@ def start_scheduler() -> None:
         id="wishlist_sync",
         next_run_time=now + _STARTUP_STAGGER_WISHLIST_SYNC,
     )
-    # 失败记录修复：5min 一轮，job 内部自判空闲（busy/任务表），占线即静默让路
     scheduler.add_job(
         _job_price_repair,
         "interval",
@@ -1862,7 +1815,6 @@ def start_scheduler() -> None:
         coalesce=True, misfire_grace_time=None,
     )
     scheduler.add_job(_acct("fx_refresh", _job_fx_refresh), "cron", hour=3, minute=0, id="fx_refresh", next_run_time=now + _STARTUP_STAGGER_FX_REFRESH)
-    # 汇率历史修复：与实时刷新分离的独立任务（配额账本 + 缺口 + 爬虫空闲门禁）
     scheduler.add_job(
         _acct("fx_history_repair", _job_fx_history_repair), "cron", hour=4, minute=0, id="fx_history_repair"
     )
@@ -1879,31 +1831,23 @@ def start_scheduler() -> None:
         next_run_time=datetime.now() + _BILLS_STAGGER,
     )
     scheduler.add_job(_acct("achievements_sync", _job_achievements_sync), "cron", hour=5, minute=20, id="achievements_sync")
-    # 热销榜：发现面 5 页（500 条，其中前 100 条仍作 TOP100 展示序）；
-    # 首轮反哺放宽到 500 一次补满初始游戏库，并登记预设池清单（随种子分发）
     scheduler.add_job(
         _acct("board_topsellers", _make_board_job("topsellers", backfill_limit=500, record_preset=True)),
         "interval", hours=1, id="board_topsellers",
     )
     scheduler.add_job(_acct("board_popularnew", _make_board_job("popularnew")), "interval", hours=24, id="board_popularnew")
-    # specials 不设独立 job：特惠+热门榜的去重爬取随价格轮尾段进行
-    # （`default_queue_specs`），与内部队列重合的对象不重复爬
     scheduler.add_job(_acct("board_comingsoon", _make_board_job("comingsoon")), "interval", hours=24, id="board_comingsoon")
     scheduler.add_job(_acct("comingsoon_retry", _job_coming_soon_retry), "cron", hour=10, minute=0, id="comingsoon_retry")
-    # 限时赠送复查：到期（或 1h 内到期）的 promo 重爬翻转状态；通常 0 候选
     scheduler.add_job(_acct("free_promo_retry", _job_free_promo_retry), "interval", hours=6, id="free_promo_retry")
     _hb_hour, _hb_minute = parse_schedule_time(CONTENT_SCHEDULE_DEFAULTS["hb_choice"]["time"])
     scheduler.add_job(_acct("hb_choice", _job_hb_choice), "cron", hour=_hb_hour, minute=_hb_minute, id="hb_choice")
     _ep_hour, _ep_minute = parse_schedule_time(CONTENT_SCHEDULE_DEFAULTS["epic_free"]["time"])
     scheduler.add_job(_acct("epic_free", _job_epic_free), "cron", hour=_ep_hour, minute=_ep_minute, id="epic_free")
-    # Steam 活动日历：官方文档页低频变更，每日一拍足够；05:00 避开已占分钟
     scheduler.add_job(
         _acct("steam_events_sync", _job_steam_events_sync), "cron", hour=5, minute=0, id="steam_events_sync"
     )
     scheduler.add_job(_acct("bartervg_bundles", _job_bartervg_bundles), "cron", hour=5, minute=40, id="bartervg_bundles", next_run_time=now + timedelta(seconds=90))
     scheduler.add_job(_acct("wal_truncate", _job_wal_truncate), "cron", hour=4, minute=30, id="wal_truncate")
-    # proxypool 遥测保留：每日 04:35（紧随 WAL 收缩，不与 04:30 的重活撞同一分钟）。
-    # 分块删除 + 单轮块上限在函数内部；max_instances=1 防叠轮。
     scheduler.add_job(
         _acct("proxypool_retention", _job_proxypool_retention), "cron", hour=4, minute=35, id="proxypool_retention",
         max_instances=1, coalesce=True,
@@ -1920,12 +1864,10 @@ def start_scheduler() -> None:
         _acct("proxypool_cycle", _job_proxypool_cycle), "interval", minutes=5, id="proxypool_cycle",
         next_run_time=now + _STARTUP_STAGGER_PROXYPOOL_CYCLE, max_instances=1, coalesce=True,
     )
-    # 运行账本保留：job 型 run 过窗清理（级联事件），每日 04:36
     scheduler.add_job(
         _acct("agent_ledger_prune", _job_agent_ledger_prune), "cron", hour=4, minute=36, id="agent_ledger_prune",
         max_instances=1, coalesce=True,
     )
-    # 价格周期台账保留：每日 04:37（错峰序列 04:30 WAL→04:35 遥测→04:36 运行账→04:37 周期）
     scheduler.add_job(
         _acct("price_cycle_retention", _job_price_cycle_retention), "cron", hour=4, minute=37, id="price_cycle_retention",
         max_instances=1, coalesce=True,

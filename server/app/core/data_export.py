@@ -69,7 +69,6 @@ _USER_TABLES = (
     "bill_cdk_games",
 )
 
-# app_settings 里属于「种子状态」的键（种子版本 marker），不进导出
 _SEED_KEY_PREFIX = "seed."
 
 _CONTAINS_LABELS = (
@@ -152,7 +151,6 @@ async def build_payload() -> dict:
 
     tables: dict[str, list[dict]] = {}
     async with get_session_factory()() as session:
-        # app_settings：剔除种子 marker，凭据键解密
         settings_rows = await _dump_table(session, "app_settings")
         kept: list[dict] = []
         for row in settings_rows:

@@ -33,7 +33,7 @@ import shutil
 import time
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 
@@ -46,6 +46,7 @@ from app.core.app_info import (
     HANDOFF_LEDGER_NAME,
     HANDOFF_UNSUPPORTED_MARK,
     MANIFEST_ASSET,
+    MANIFEST_SCHEMA,
     MANIFEST_TAG,
     STAGING_DIR_NAME,
     STAGING_MANIFEST_NAME,
@@ -58,30 +59,8 @@ from app.core import update_signing
 
 logger = logging.getLogger(__name__)
 
-# 仓库标识统一在 app.core.app_info.GITHUB_REPO（更新检查与种子获取共用）
-
-# release 资产命名（build_release.py make_zip 产物）
 _ASSET_PATTERN = re.compile(rf"^{re.escape(APP_NAME)}-win64-v[\w.-]+\.zip$", re.IGNORECASE)
 
-# 更新清单的落点常量（MANIFEST_TAG / MANIFEST_ASSET）在 app.core.app_info，
-# 与 scripts/build_manifest.py、scripts/publish_release.py 共用一份。
-# 固定 tag 下挂 latest.json：地址与版本号解耦，检查更新只读这一个文件。
-
-# 镜像前缀（单一来源 app.core.app_info.GITHUB_MIRRORS，空串 = 直连 GitHub）。
-_MIRRORS = GITHUB_MIRRORS
-
-# 探测：候选通道各发一笔 `Range: bytes=0-0`（只读响应头，几十字节代价），一次并发
-# 同时判出「资产在不在」与「这条通道快不快」。
-_PROBE_TIMEOUT = 8.0
-# 传输停滞判定：连续这么久一个字节都没到即换道（不让进度条在半死连接上干等）。
-_STALL_TIMEOUT = 15.0
-# 速率考核：下载跑满 _TRIAL_SECONDS 后平均速率仍低于下限即换道；最后一个可用通道
-# 不考核（全网都慢也得让它下完，不能把所有通道都试死）。
-_MIN_CHANNEL_RATE = 64 * 1024  # B/s
-_TRIAL_SECONDS = 15.0
-# 续传落盘的临时名（.part：没校验通过前不得被当成完整包）
-_PART_NAME = "update.zip.part"
-DOWNLOAD_META_NAME = "download_meta.json"
 # 安装包体积下限：小于它必然不是应用包（镜像对不存在的资产常回几百字节的
 # 200 错误页——把它当下载成功，用户会看到「校验失败」而不是「没这个包」）。
 _MIN_PACKAGE_BYTES = 1 * 1024 * 1024
@@ -96,7 +75,7 @@ def staging_dir() -> Path:
 
 
 def _env_update_base() -> str:
-    """显式更新源覆盖仅认回环主机：该分支豁免清单验签，绝不许指向远端。"""
+    """显式更新源覆盖仅认回环主机；它只选择运输通道，不改变签名要求。"""
     from urllib.parse import urlparse
 
     base = os.environ.get(f"{ENV_PREFIX}UPDATE_URL", "").rstrip("/")
@@ -137,13 +116,32 @@ def _pick_asset(assets: list[dict], name: str | None = None) -> dict | None:
     return next((a for a in assets if _ASSET_PATTERN.match(str(a.get("name", "")))), None)
 
 
+def _trusted_update_manifest(data: dict) -> bool:
+    ok, _reason = update_signing.verify_manifest(data)
+    return ok and data.get("app") == APP_NAME and data.get("schema") == MANIFEST_SCHEMA
+
+
+def _valid_payload_files(files: object) -> bool:
+    if not isinstance(files, dict) or not files:
+        return False
+    return all(
+        isinstance(name, str)
+        and "\\" not in name
+        and not PurePosixPath(name).is_absolute()
+        and all(part not in {"", ".", ".."} for part in PurePosixPath(name).parts)
+        and isinstance(digest, str)
+        and re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+        for name, digest in files.items()
+    )
+
+
 
 async def _fetch_manifest() -> dict | None:
     """按镜像链取 latest.json。全通道并发取回，按镜像优先级取**第一个验签通过**者；全失败返回 None。
 
     信任模型：镜像只是运输——清单必须经内嵌公钥验签（update_signing），
     伪造/篡改/无签名清单按通道失败处理。显式 HOLDEXAR_UPDATE_URL 仅当指向
-    回环主机时豁免验签（本机自控调试面），其余覆盖一律忽略。
+    回环主机时作为运输通道使用，但仍须验签；其余覆盖一律忽略。
     """
     base = _env_update_base()
     if base:
@@ -152,15 +150,11 @@ async def _fetch_manifest() -> dict | None:
                 resp = await client.get(f"{base}/{MANIFEST_ASSET}")
                 if resp.status_code == 200:
                     data = resp.json()
-                    if isinstance(data, dict) and data.get("version"):
+                    if isinstance(data, dict) and _trusted_update_manifest(data):
                         return data
         except Exception:  # noqa: BLE001
             return None
         return None
-
-    def _trusted(data: dict) -> bool:
-        ok, _reason = update_signing.verify_manifest(data)
-        return ok
 
     async def _try_one(mirror: str) -> dict | None:
         try:
@@ -169,7 +163,7 @@ async def _fetch_manifest() -> dict | None:
                 if resp.status_code != 200:
                     return None
                 data = resp.json()
-                if isinstance(data, dict) and data.get("version") and _trusted(data):
+                if isinstance(data, dict) and _trusted_update_manifest(data):
                     return data
         except Exception:  # noqa: BLE001 —— 单通道失败不影响其余
             return None
@@ -186,9 +180,6 @@ async def _fetch_manifest() -> dict | None:
         detail={"原因": "全部镜像均未返回有效签名清单"},
     )
     return None
-
-
-# ── 更新检查（清单优先，GitHub API 兜底）─────────────────────────────
 
 
 async def check_update() -> dict:
@@ -219,6 +210,8 @@ def _payload_from_manifest(data: dict) -> dict:
     # 资产缺 sha256 = 发布侧残缺：有更新也不能进「无校验下载」的口子
     if not str(asset.get("sha256") or "").strip():
         return {"available": False, "reason": "bad_manifest"}
+    if not _valid_payload_files(asset.get("files")):
+        return {"available": False, "reason": "bad_manifest"}
 
     return {
         "available": version_gt(latest, current),
@@ -227,7 +220,6 @@ def _payload_from_manifest(data: dict) -> dict:
         "tag": str(data.get("tag") or f"v{latest}"),
         "notes": _plain_notes(str(data.get("notes") or "")),
         "sizeBytes": asset.get("size"),
-        # 清单自带校验值 → 下载端不必再解 release body；资产名同理由此确定
         "sha256": asset.get("sha256"),
         "asset": asset.get("name"),
         "publishedAt": data.get("publishedAt"),
@@ -297,12 +289,7 @@ def _plain_notes(body: str, limit: int = 8000) -> str:
     return text[:limit]
 
 
-# ── 下载暂存（staging）──────────────────────────────────────────────
-
-# 下载进度（模块级单例，对齐 clash_manager._KERNEL_PROGRESS 模式：
-# 下载协程写，轮询端点读，dict 原子替换免锁）
 _PROGRESS: dict = {}
-# 取消旗标（用户点「取消」置位；下载循环在分片边界自查退出）
 _CANCEL: dict = {"flag": False}
 
 
@@ -311,7 +298,6 @@ def _progress_reset() -> None:
     _PROGRESS.update({
         "running": False, "phase": None, "percent": None,
         "received": 0, "total": None, "error": None, "ok": False,
-        # code：机器可读的失败归因（前端按它给不同文案，不靠解析错误字符串）
         "code": None, "speed": 0, "channel": None,
     })
 
@@ -375,8 +361,30 @@ async def download_update(
     """
     from app.domains.proxies import clash_manager
 
-    if not expected_sha256 or not str(expected_sha256).strip():
-        raise RuntimeError("更新源未提供完整性校验值，已拒绝下载（更新源不可信或残缺）")
+    release = await _fetch_manifest()
+    if release is None:
+        raise RuntimeError("签名更新清单不可用，已拒绝下载")
+    release_tag = str(release.get("tag") or f"v{release.get('version') or ''}")
+    if tag != release_tag:
+        raise RuntimeError("请求的更新版本与签名清单不一致")
+    asset = _pick_asset(release.get("assets") or [])
+    if asset is None:
+        raise RuntimeError("签名清单缺少应用安装包")
+    if not _ASSET_PATTERN.fullmatch(str(asset.get("name") or "")):
+        raise RuntimeError("签名清单应用安装包名称非法")
+    if not _valid_payload_files(asset.get("files")):
+        raise RuntimeError("签名清单缺少有效的载荷校验表")
+    signed_sha256 = str(asset["sha256"]).lower()
+    signed_asset = str(asset["name"])
+    signed_size = int(asset["size"])
+    if ((expected_sha256 and expected_sha256.strip().lower() != signed_sha256)
+            or (asset_name and asset_name != signed_asset)
+            or (expected_size is not None and expected_size != signed_size)):
+        raise RuntimeError("下载参数与签名清单不一致")
+    expected_sha256 = signed_sha256
+    asset_name = signed_asset
+    expected_size = signed_size
+    notes = str(release.get("notes") or "")
 
     if not _PROGRESS.get("running"):
         _progress_reset()
@@ -393,10 +401,6 @@ async def download_update(
     part = staging / _PART_NAME
     meta_path = staging / DOWNLOAD_META_NAME
 
-    # 续传基线与资产绑定：
-    # 仅当历史元数据与当前下载的目标资产（tag / asset / size / sha256）完全一致时，
-    # 并且已下载字节数不超过目标大小时，才保留 .part 接着下；
-    # 任何一项不符均视为其他版本或损坏残留，丢弃从头开始。
     meta_valid = False
     if part.is_file() and meta_path.is_file():
         try:
@@ -433,16 +437,10 @@ async def download_update(
     try:
         asset_url = await _resolve_asset_url(tag, asset_name)
 
-        # 通道链：复用应用运行中的内核代理（runtime_port）+ 本地混合端口 + 镜像，
-        # 直连 GitHub 国内基本不可用——更新下载必须用应用自身可用的出口，否则全应用
-        # 只有这一处网络操作不走代理，表现为「检查更新能拿到清单、下载却卡死/失败」
         attempts = clash_manager.runtime._download_attempts()
         channels = _channel_plan(asset_url, attempts)
         probes = await _probe_channels(channels, expected_size)
 
-        # 「资产不存在」的两种成因一起判：**明确 404**（直连 GitHub 的判定）与
-        # **回了别的体积**（镜像对不存在的资产常回 200 + 几百字节的错误页，
-        # 体积远小于真实资产，可据体积差提前判缺）。
         def _unusable(p: dict) -> bool:
             return bool(p["missing"] or p["bogus"])
 
@@ -469,9 +467,6 @@ async def download_update(
                     min_rate_bps=0 if idx == len(usable) - 1 else _MIN_CHANNEL_RATE,
                     label=probe["label"],
                 )
-                # 落盘后必过的完整性闸：拿到的字节数对不上（少了 / 明显不像
-                # 一个安装包）就当这条通道没干成活——**不进校验阶段**，否则
-                # 用户看到的是「校验失败」，真因（通道返回了垃圾）被盖住。
                 got = part.stat().st_size if part.is_file() else 0
                 if got < _MIN_PACKAGE_BYTES or (expected_size and got != expected_size):
                     _truncate_to(part, baseline)
@@ -514,7 +509,6 @@ async def download_update(
         zip_path = staging / "update.zip"
         part.replace(zip_path)
 
-        # sha256 校验（安全兜底防线）
         if expected_sha256:
             _PROGRESS.update({"phase": "verify"})
             actual = await asyncio.to_thread(_sha256_of, zip_path)
@@ -524,13 +518,10 @@ async def download_update(
                     f"SHA256 校验失败：期望 {expected_sha256[:16]}… 实得 {actual[:16]}…"
                 )
 
-        # 解包到 staging/holdexar/（zip 内根目录即 Holdexar/）
         _PROGRESS.update({"phase": "extract"})
         await asyncio.to_thread(_extract, zip_path, staging)
         meta_path.unlink(missing_ok=True)
 
-        # 逐文件校验值入清单：换装宿主据此核验暂存载荷——解包后到换装前
-        # 的窗口期内文件缺失/被改（含杀软隔离）都能在换装前被拒
         payload_root = staging / APP_NAME
         files = await asyncio.to_thread(_payload_hashes, payload_root)
         manifest = {
@@ -540,7 +531,8 @@ async def download_update(
             "attempt_id": str(uuid.uuid4()),
             "source_version": APP_VERSION,
             "files": files,
-            "notes": notes or "",
+            "notes": notes,
+            "release_manifest": release,
         }
         (staging / STAGING_MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -553,21 +545,9 @@ async def download_update(
         # 换装失败标记与交接账本落在数据目录（与桌面壳写入侧同一路径判定，
         # 不是安装根——staging 在安装根下，staging.parent 对错文件）
         from app.core.paths import resolve_data_dir
-        from app.core.update_host import TRUST_RECORD_NAME
 
         (resolve_data_dir() / SWAP_FAILED_FLAG).unlink(missing_ok=True)
         (resolve_data_dir() / HANDOFF_LEDGER_NAME).unlink(missing_ok=True)
-        # 信任锚持久化：Ed25519 验签只活到下载完成，交接期执行暂存载荷前唯一
-        # 可对照的锚是数据目录这条记录（暂存目录可被改写，自证不作数）；
-        # 写失败即抛——宁可下载报错，不留无锚暂存包
-        _write_trust_record(resolve_data_dir() / TRUST_RECORD_NAME, {
-            "version": tag,
-            "zip_sha256": expected_sha256.strip().lower(),
-            "files": files,
-            # 下载期不执行载荷做协议探测，交接期在记录复核通过后再探
-            "protocol": 0,
-            "staging_dir": str(staging),
-        })
         _PROGRESS.update({"ok": True, "running": False, "phase": "done", "percent": 100})
         log_event(
             logger,
@@ -577,7 +557,6 @@ async def download_update(
         )
         return {"ok": True, "staging": str(staging), "tag": tag}
     except _Cancelled:
-        # 用户主动取消：保留已下载的 .part（受 download_meta.json 保护），下次可接着下
         _PROGRESS.update({"running": False, "phase": None, "code": "cancelled",
                           "error": "已取消下载"})
         return {"ok": False, "cancelled": True}
@@ -852,17 +831,6 @@ def _payload_hashes(payload_root: Path) -> dict[str, str]:
         path.relative_to(payload_root).as_posix(): _sha256_of(path)
         for path in sorted(payload_root.rglob("*")) if path.is_file()
     }
-
-
-def _write_trust_record(path: Path, record: dict) -> None:
-    """信任记录原子落盘（临时文件 + os.replace），交接/换装复核以此为准。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
-
-
-# ── 换装状态查询 ─────────────────────────────────────────────────────
 
 
 def _completed_update_transaction(transaction: dict | None) -> bool:

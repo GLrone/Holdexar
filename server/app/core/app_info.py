@@ -24,9 +24,6 @@ GITHUB_REPO = "GLrone/Holdexar"
 # 供 updater 与 desktop 壳共用，唯一事实源。
 GITHUB_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://gh-proxy.net/", "")
 
-# 更新清单落在一个**固定 tag** 的 Release 资产下，与版本号解耦：
-# 客户端检查更新永远只读这一个地址，不打 api.github.com（免限速、国内可达）。
-# 发布端的对应动作在 scripts/publish_release.py（刷该 tag 的资产）。
 MANIFEST_TAG = "updater"
 MANIFEST_ASSET = "latest.json"
 # schema 2 起：清单附 Ed25519 签名（signature 字段），客户端只认内嵌公钥
@@ -45,7 +42,6 @@ STAGING_MANIFEST_NAME = "manifest.json"
 HANDOFF_UNSUPPORTED_MARK = ".handoff-unsupported"
 SWAP_FAILED_FLAG = ".swap-failed"
 
-# 环境变量前缀（pydantic-settings 用；改品牌时如需改前缀在此同步）
 ENV_PREFIX = "HOLDEXAR_"
 
 # 交接账本：现装进程每次把换装交给暂存包前登记（tag + 次数），同一暂存包第二次
@@ -98,9 +94,9 @@ def version_gt(a: str, b: str) -> bool:
     if not pre_a and not pre_b:
         return False
     if not pre_a:
-        return True  # a 是正式版、b 是预发布 → a 更新
+        return True
     if not pre_b:
-        return False  # a 是预发布、b 是正式版 → a 更旧
+        return False
 
     for got, want in zip(pre_a, pre_b):
         if got != want:

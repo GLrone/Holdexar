@@ -14,7 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.core.app_info import APP_NAME, APP_SLUG, APP_VERSION, ENV_PREFIX
 from app.core.paths import resolve_data_dir
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]  # server/app/core/config.py -> Holdexar/
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SERVER_ROOT = PROJECT_ROOT / "server"
 
 
@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     @property
     def clash_dir(self) -> Path:
         """随包内核、许可与来源说明目录；按可执行文件就位情况选择路径。"""
-        # 与 proxies/kernel_release.kernel_filename() 同源（core 不反向依赖 domains，两处对齐）
         kernel_name = "holdexar-mihomo.exe" if sys.platform == "win32" else "holdexar-mihomo"
         if getattr(sys, "frozen", False):
             meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))

@@ -25,7 +25,6 @@ A = "76561198000000001"
 _DAY = 86400.0
 
 
-# ── Cookie / JWT 构造（同 test_account_session 口径）──────
 
 def _jwt(claims: dict) -> str:
     def seg(obj: dict) -> str:
@@ -46,7 +45,6 @@ def cookie_str(*, access_exp: float) -> str:
     )
 
 
-# ── 夹具 ────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def _key_material(tmp_path, monkeypatch):
@@ -73,12 +71,11 @@ async def _row(steam_id: str) -> SteamAccount:
         return await session.get(SteamAccount, steam_id)
 
 
-# ── secretbox 原语 ──────────────────────────────────────
 
 def test_encrypt_decrypt_roundtrip_and_random_nonce():
     ct1 = secretbox.encrypt_secret("hello-credential", "p1")
     ct2 = secretbox.encrypt_secret("hello-credential", "p1")
-    assert ct1.startswith("enc1:") and ct1 != ct2  # 每次随机 nonce
+    assert ct1.startswith("enc1:") and ct1 != ct2
     assert secretbox.is_encrypted(ct1) and not secretbox.is_encrypted("raw-plain")
     assert secretbox.decrypt_secret(ct1, "p1") == "hello-credential"
     assert secretbox.encrypt_secret("", "p1") == ""
@@ -108,7 +105,7 @@ def test_tampered_ciphertext_rejected():
 
 def test_key_stable_across_cache_clear():
     ct = secretbox.encrypt_secret("secret", "p1")
-    secretbox.clear_key_cache()  # 等价进程重启：同一数据目录重新派生
+    secretbox.clear_key_cache()
     assert secretbox.decrypt_secret(ct, "p1") == "secret"
 
 
@@ -120,7 +117,6 @@ def test_machine_fingerprint_change_invalidates(monkeypatch):
         secretbox.decrypt_secret(ct, "p1")
 
 
-# ── 账号 Cookie 密文落库 ────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_save_cookies_stores_ciphertext(db):
@@ -129,8 +125,8 @@ async def test_save_cookies_stores_ciphertext(db):
 
     row = await _row(A)
     assert secretbox.is_encrypted(row.cookies)
-    assert "steamLoginSecure" not in row.cookies  # 明文不上库
-    assert await account_service.get_cookies() == raw  # 消费侧解密还原
+    assert "steamLoginSecure" not in row.cookies
+    assert await account_service.get_cookies() == raw
 
     status = await account_service.get_status()
     assert status["has_cookie"] is True
@@ -206,7 +202,7 @@ async def test_plaintext_row_sealed_at_startup(db):
     row = await _row(A)
     assert secretbox.is_encrypted(row.cookies)
     assert await account_service.get_cookies() == raw
-    assert await account_service.seal_credentials_at_rest() == 0  # 幂等
+    assert await account_service.seal_credentials_at_rest() == 0
 
 
 @pytest.mark.asyncio
@@ -227,7 +223,7 @@ async def test_unreadable_ciphertext_degrades_to_expired(db, monkeypatch):
     await _seed(A, sealed)
 
     status = await account_service.get_status()
-    assert status["has_cookie"] is True  # 绑过仍为真
+    assert status["has_cookie"] is True
     assert status["session_expired"] is True
     assert status["session_has_refresh"] is False
     assert await account_service.get_cookies() == ""
@@ -236,14 +232,13 @@ async def test_unreadable_ciphertext_degrades_to_expired(db, monkeypatch):
     assert result["status"] == "no_cookie"
 
 
-# ── 凭据类设置键（API Key）───────────────────────────────
 
 @pytest.mark.asyncio
 async def test_api_key_secret_roundtrip(db):
     await settings_service.set_secret_value("account.steam_api_key", "fake-key-abcdef")
 
     stored = await settings_service.get_value("account.steam_api_key", "")
-    assert secretbox.is_encrypted(str(stored))  # 落库即密文
+    assert secretbox.is_encrypted(str(stored))
     assert await settings_service.get_secret_value("account.steam_api_key") == "fake-key-abcdef"
 
     await settings_service.set_secret_value("account.steam_api_key", "")

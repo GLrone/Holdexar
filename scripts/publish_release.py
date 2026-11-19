@@ -213,7 +213,6 @@ def publish_manifest_release(dry: bool) -> None:
             str(MANIFEST),
             "--repo", GITHUB_REPO,
             "--title", f"{APP_NAME} 更新清单",
-            # 面向用户：讲清「这是什么、删了会怎样」，不写实现细节
             "--notes",
             "本页是 Holdexar 应用内「检查更新」读取的数据：最新版本号、安装包\n"
             "下载地址与文件校验值。\n"
@@ -223,7 +222,6 @@ def publish_manifest_release(dry: bool) -> None:
             # 只加 --latest=false 挡不住它 —— 清单页会把 releases/latest
             # 抢过去（那是机器页，客户端降级路径拿它当版本页会扑空）
             "--prerelease",
-            # 双保险：预发布本就不会被标 Latest
             "--latest=false",
         ],
         dry,
@@ -288,13 +286,11 @@ def main() -> None:
             + "\n先跑 scripts/build_release.py（含清单生成）"
         )
 
-    # 正文就绪检查（直接调用 publish_release.py 时不能绕过）
     from release import notes_ready
     notes_err = notes_ready(notes_file)
     if notes_err:
         sys.exit(f"[错误] 发布说明未就绪：{notes_err}")
 
-    # 清单版本、notes 及应用包一致性检查
     try:
         manifest_data = json.loads(MANIFEST.read_text(encoding="utf-8"))
         signed_ok, sign_reason = update_signing.verify_manifest(manifest_data)

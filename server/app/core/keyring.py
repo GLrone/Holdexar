@@ -34,7 +34,6 @@ MODE_DPAPI = "dpapi"
 MODE_PASSPHRASE = "passphrase"
 MODES = (MODE_LEGACY, MODE_DPAPI, MODE_PASSPHRASE)
 
-# 密钥文件（数据目录内）：封装后的主密钥 + 模式元数据
 MASTER_FILE = "secret.master"
 _FILE_VERSION = 1
 
@@ -99,9 +98,6 @@ def load_unlocked_key(key: bytes) -> None:
     _unlocked_key = key
 
 
-# ── 模式读写 ──────────────────────────────────────────────
-
-
 def _master_path(data_dir: Path) -> Path:
     return Path(data_dir) / MASTER_FILE
 
@@ -161,9 +157,6 @@ def status(data_dir: Path) -> dict:
     }
 
 
-# ── 主密钥解析 ────────────────────────────────────────────
-
-
 def _legacy_master(data_dir: Path) -> bytes:
     """legacy 主密钥：委托 secretbox 用本机材料派生（延迟导入避免循环）。"""
     from app.core import secretbox
@@ -205,9 +198,6 @@ def lock() -> None:
     """清空进程内主密钥（口令模式回到锁定态）。"""
     global _unlocked_key
     _unlocked_key = None
-
-
-# ── 封装 / 解封 ───────────────────────────────────────────
 
 
 def wrap_dpapi(master: bytes, data_dir: Path) -> dict:
@@ -330,7 +320,7 @@ def _unwrap_passphrase(record: dict, passphrase: str) -> bytes | None:
     try:
         return AESGCM(kek).decrypt(nonce, sealed, None)
     except InvalidTag:
-        return None  # 口令错误
+        return None
 
 
 def _scrypt(passphrase: str, salt: bytes) -> bytes:
@@ -343,9 +333,6 @@ def _scrypt(passphrase: str, salt: bytes) -> bytes:
         dklen=_SCRYPT_DKLEN,
         maxmem=_SCRYPT_MAXMEM,
     )
-
-
-# ── 密钥文件落盘 ──────────────────────────────────────────
 
 
 def write_record(data_dir: Path, record: dict) -> None:
@@ -395,13 +382,10 @@ def restore_record(data_dir: Path, raw: bytes | None) -> None:
         raise KeyringError(f"密钥文件恢复失败（数据目录不可写？）：{exc}") from exc
 
 
-# ── 换钥过渡记录（崩溃恢复的唯一依据）────────────────────────
-#
 # 换钥要同时改两处：密钥文件与库内密文。两者不是同一个原子事务，中途被
 # 强杀必然出现「密钥文件已是新的、库内密文还是旧的」。旧实现只对 legacy
 # 有兜底（legacy 主密钥可由本机材料重算），dpapi / passphrase 之间的任意
 # 方向都会永久解不开。
-#
 # 过渡记录把**旧主密钥**用与当前模式同等的强度封装后落盘，换钥期间与
 # 密钥文件并存。崩溃后无论库内密文归哪一边，都能解开；迁移完成后删除。
 # 记录本身不含明文密钥：dpapi 模式走系统凭据，passphrase 模式走口令派生
@@ -509,7 +493,6 @@ def staging_master(data_dir: Path, passphrase: str | None = None) -> bytes | Non
         except (KeyringError, KeyLockedError):
             return None
         return unwrap_staging(record, current)
-    # 兼容旧格式：按记录自带的 mode 解
     mode = str(record.get("mode") or "")
     try:
         if mode == MODE_LEGACY:
@@ -526,9 +509,6 @@ def staging_master(data_dir: Path, passphrase: str | None = None) -> bytes | Non
     except (KeyringError, KeyLockedError):
         return None
     return None
-
-
-# ── DPAPI（ctypes 直调，避免引入 pywin32 增大打包体积）──────
 
 
 def _dpapi_protect(data: bytes) -> bytes:

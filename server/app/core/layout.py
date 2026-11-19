@@ -237,7 +237,6 @@ def is_managed_version_name(name: str) -> bool:
         return False
     if any(sep in text for sep in ("/", "\\", ":")):
         return False
-    # 明确排除保留字和目录名，防止 data 或 holdexar 被当作版本目录
     if text.lower() in {
         "data", "holdexar", "app", "logs", "updater",
         "state", "versions", "update-staging", "_internal",
@@ -316,7 +315,6 @@ def prune_versions(
     if last_good:
         protected.add(last_good)
 
-    # 若保护清单不足 min_keep，按目录修改时间保留最新的几个
     if len(protected) < min_keep and all_vers:
         sorted_by_mtime = sorted(
             all_vers,
@@ -419,7 +417,6 @@ def find_target_version(root: Path) -> str | None:
         if usable(active):
             return active
 
-        # 目标版本损坏或丢失，尝试上一有效版本
         last_good = curr.get("lastKnownGood")
         if usable(last_good):
             logger.warning(
@@ -434,12 +431,10 @@ def find_target_version(root: Path) -> str | None:
             write_current_state(root, previous, last_known_good=None)
             return previous
 
-    # 状态丢失或指定版本均不可用：扫描 versions/ 中最新有效版本
     installed = [version for version in list_installed_versions(root) if usable(version)]
     if not installed:
         return None
 
-    # 按目录修改时间选取最新安装的有效版本
     best = max(
         installed,
         key=lambda v: (root / "versions" / v).stat().st_mtime,

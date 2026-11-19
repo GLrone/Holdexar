@@ -51,7 +51,6 @@ CLASH_DIR = ROOT / "assets" / "clash"
 KERNEL_FILE = CLASH_DIR / kernel_filename()
 LOCAL_LICENSE_SRC = ROOT / "packaging" / "licenses" / "LICENSE-mihomo.txt"
 
-# 有效性下限：拒绝半截下载与占位文件。
 _MIN_KERNEL_BYTES = 5 * 1024 * 1024
 _MIN_LICENSE_BYTES = 8 * 1024
 _TIMEOUT_S = 300

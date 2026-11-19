@@ -172,7 +172,7 @@ def read_pe_properties(exe_path: Path) -> dict[str, str]:
         val_ptr = ctypes.c_void_p()
         val_len = wintypes.UINT()
 
-        # 尝试常用代码页前缀
+
         code_pages = ["040904b0", "080404b0", "000004b0", "040904e4", "080404e4"]
         keys = [
             "CompanyName",

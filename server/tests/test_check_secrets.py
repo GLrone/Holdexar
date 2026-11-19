@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "server"))  # 与 conftest 一致，供 app.* 导入
+sys.path.insert(0, str(ROOT / "server"))
 
 _spec = importlib.util.spec_from_file_location(
     "check_secrets", ROOT / "scripts" / "check_secrets.py"
@@ -33,11 +33,9 @@ def scan_one(line: str):
     return check_secrets.scan_lines("probe.py", [(1, line)])
 
 
-# ── 内容层：必须命中 ──
 
 
 def test_detects_steam_session_cookie():
-    # 真实形状：<steamid64>%7C%7C<40 位十六进制>
     line = f"cookies = \"{76561198000000000}{'%7C'}{'%7C'}{'a' * 40}\""
     assert labels(scan_one(line)) == ["Steam 登录会话 cookie"]
 
@@ -72,7 +70,6 @@ def test_detects_github_token():
     assert labels(scan_one(line)) == ["GitHub 令牌"]
 
 
-# ── 内容层：必须放过（每条都对应一个真实文件形态）──
 
 
 @pytest.mark.parametrize(
@@ -107,7 +104,6 @@ def test_allows_bare_identifier_and_placeholder_mentions(line):
     assert scan_one(line) == []
 
 
-# ── 路径层 ──
 
 
 @pytest.mark.parametrize(
@@ -123,7 +119,7 @@ def test_allows_bare_identifier_and_placeholder_mentions(line):
         "assets/clash/geoip.dat",
         ".tmp-pytest/x/test.db",
         "gui-test-screenshots/a.png",
-        "server/data/holdexar.db-wal",  # 嵌套位置：由扩展名规则兜住
+        "server/data/holdexar.db-wal",
         "backup/creds.pem",
         ".env.local",
         "mail.ini",
@@ -136,11 +132,9 @@ def test_path_deny_matches(path):
 @pytest.mark.parametrize(
     "path",
     [
-        # 回归：曾把「任意深度的 logs/release 目录名」写成规则，误伤了这三类
         "web/src/views/logs/Index.vue",
         "server/app/domains/release/router.py",
         "web/src/views/data/Index.vue",
-        # 其余正常源码
         "scripts/check_secrets.py",
         "server/app/core/paths.py",
         "web/scripts/check-routes.mjs",
@@ -161,18 +155,16 @@ def test_allows_normal_file_size():
     assert not check_secrets.check_size("small.py", 4096)
 
 
-# ── 掩码：门禁自身不得成为泄漏路径 ──
 
 
 def test_mask_never_reveals_the_value():
     secret = "76561198000000000" + "%7C" + "%7C" + "b" * 40
     masked = check_secrets._mask(secret)
     assert secret not in masked
-    assert secret[4:] not in masked  # 除首 4 字符外一律不出现
-    assert str(len(secret)) in masked  # 长度信息保留，便于判断是否完整凭据
+    assert secret[4:] not in masked
+    assert str(len(secret)) in masked
 
 
-# ── 全树自检：任何新增特征若误伤既有代码，在这里立刻暴露 ──
 
 
 def test_cli_scope_parsing_is_python_version_independent():

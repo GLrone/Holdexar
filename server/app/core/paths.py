@@ -16,12 +16,10 @@ from pathlib import Path
 
 from app.core.app_info import APP_SLUG, ENV_PREFIX
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]  # server/app/core/paths.py -> Holdexar/
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-# 便携模式显式标记（程序目录内放一个同名空文件即启用）
 PORTABLE_FLAG = "portable.flag"
 
-# 开发态数据目录指针（工作树内的文本文件，内容一行绝对路径即生效）
 DEV_POINTER = f"{APP_SLUG}-dev-home.txt"
 
 
@@ -53,13 +51,10 @@ def install_root() -> Path:
         return Path(override).expanduser().resolve()
     if is_frozen():
         exe = Path(sys.executable).resolve()
-        # 1. 运行在 versions/<version>/Holdexar.exe
         if exe.parent.parent.name == "versions":
             return exe.parent.parent.parent
-        # 2. 运行在 updater/UpdateHost.exe
         if exe.parent.name == "updater":
             return exe.parent.parent
-        # 3. 运行在根目录 Holdexar.exe (Launcher 或旧式扁平)
         return exe.parent
     return PROJECT_ROOT
 
@@ -152,7 +147,6 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
 
     root = install_root()
 
-    # 开发态：指针文件或机器级 dev 目录，避免运行时写污染工作树
     if not is_frozen():
         if (root / PORTABLE_FLAG).is_file():
             return _ensure(root / "data")
@@ -166,15 +160,12 @@ def resolve_data_dir(slug: str = APP_SLUG, env_prefix: str = ENV_PREFIX) -> Path
                 pass
         return _first_writable(dev_machine_candidates(slug), root / "data")
 
-    # 打包态（正式运行）：永远落安装根目录 data/
     target = root / "data"
     try:
         _ensure(target)
     except OSError as e:
         raise PermissionError(f"安装目录数据文件夹不可写，请更换安装位置或检查权限：{target}") from e
 
-    # 存量/新装判定与平滑迁移：
-    # 检查是否有旧版本 AppData 数据与冲突，自动完成仲裁、备份与收拢
     db_file = target / data_dir_filename(slug)
     from app.core.migration import (
         detect_legacy_data_locations,

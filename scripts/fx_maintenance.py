@@ -71,13 +71,11 @@ IMPORT_SOURCE = "archive_pg"
 FXDB_SOURCE = "fx_archive"
 FXJSON_SOURCE = "archive_json"
 
-# 外部档案路径（由环境变量提供：本机 secrets/fx_maintenance.env 自动加载）
 DEFAULT_FXJSON = os.environ.get("FX_ARCHIVE_FXJSON", "")
 
 DEFAULT_FXDB = os.environ.get("FX_ARCHIVE_DB", "")
 
 
-# ── 公共小件 ──────────────────────────────────────────────
 
 
 def _sqlite_path() -> Path:
@@ -107,7 +105,6 @@ def _existing_days(con) -> dict[str, set[date]]:
     return existing
 
 
-# 档案行统一写法：source_kind=observed（档案是真实来源）；唯一索引冲突即忽略
 _ARCHIVE_INSERT_SQL = (
     "INSERT OR IGNORE INTO fx_rate_history"
     " (currency_code, rate_to_cny, source, source_kind, rate_date, fetched_at)"
@@ -115,7 +112,6 @@ _ARCHIVE_INSERT_SQL = (
 )
 
 
-# ── import-pg：PG 汇率档案 → 本地 ─────────────────────
 # 纯 sqlite3 写入（不经 SQLAlchemy）：psycopg2 装在系统 Python 而 venv 没有，
 # 本段保持双解释器可跑。
 
@@ -143,7 +139,6 @@ def _write_archive_batch(con, batch) -> None:
 def import_pg(dsn: str) -> None:
     import psycopg2
 
-    # 白名单直接由 CC_LIST 派生（与 rates 域同口径），避免拖入 SQLAlchemy 依赖链
     from app.crawler.config import CC_LIST
 
     allowed = {cur for _, _, cur in CC_LIST} | {"TRY", "ARS"}
@@ -188,12 +183,6 @@ def import_pg(dsn: str) -> None:
     print(f"[import-pg] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
 
 
-# ── import-fxdb：外部汇率 sqlite 档案 → 本地 ─────
-# 账单折算（bills 域）依赖逐日汇率档案；本库恰好补齐 import-pg 未覆盖的
-# 币种-年份（AUD/GBP/MYR/THB 等 2015 前后日线）。幂等：只补缺失的
-# （币种, 日），已有数据一律不动。纯 sqlite3 双库直读，venv/系统 Python 均可跑。
-
-
 def import_fxdb(src: str = DEFAULT_FXDB) -> None:
     import sqlite3
 
@@ -231,12 +220,6 @@ def import_fxdb(src: str = DEFAULT_FXDB) -> None:
     src_con.close()
     con.close()
     print(f"[import-fxdb] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
-
-
-# ── import-fxjson：fx_rates.json 导出档案 → 本地 ─────
-# pg 档案的定期导出覆盖：币种比 PG 通道全、不依赖 PG 存活。
-# 幂等：只补缺失的（币种, 日），已有数据一律不动。
-# 纯标准库（json + sqlite3），系统 Python / venv 均可跑。
 
 
 def import_fxjson(src: str = DEFAULT_FXJSON) -> None:
@@ -282,7 +265,6 @@ def import_fxjson(src: str = DEFAULT_FXJSON) -> None:
     print(f"[import-fxjson] 完成：插入 {inserted} 行，跳过（白名单外/已有）{skipped} 行")
 
 
-# ── update：实时刷新（复用服务层多源容灾） ─────────────────
 
 
 async def update() -> None:
@@ -291,7 +273,6 @@ async def update() -> None:
     print(f"[update] source={result['source']} 币种={result['count']} 时间={result['fetchedAt']}")
 
 
-# ── gaps / repair / quota：缺口扫描与真实修复（语义单一实现在 rates/history.py）──
 
 
 async def gaps() -> None:
@@ -340,7 +321,6 @@ async def repair(
         print(f"[repair] 账单重估：{rv.get('bills', 0)} 个账单 / {rv.get('transactions', 0)} 笔交易")
 
 
-# ── 附带：白名单清洗（与服务层 cleanup_disallowed 同语义） ──
 
 
 async def cleanup() -> None:

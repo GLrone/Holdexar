@@ -57,7 +57,6 @@ def _decrypt(token: str, purpose: str = "steam-cookies") -> str:
     return secretbox.decrypt_secret(token, purpose)
 
 
-# ── 阶段 1：过渡记录已落、新密钥文件未落 ──────────────────
 
 
 def test_crash_after_staging_before_record(data_dir):
@@ -70,7 +69,6 @@ def test_crash_after_staging_before_record(data_dir):
     assert keyring.read_staging(data_dir) is not None
 
 
-# ── 阶段 2：新密钥已落、库内密文未迁 ────────────────────
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI 仅 Windows")
@@ -107,7 +105,6 @@ def test_crash_after_record_before_reencrypt_passphrase_to_dpapi(data_dir):
     keyring.reset_state()
     secretbox.clear_key_cache()
 
-    # 当前是 dpapi 模式，新密钥解不开旧密文；过渡记录用旧口令解
     staged = keyring.staging_master(data_dir, "old-pw")
     assert staged is not None
     assert secretbox.decrypt_with(
@@ -124,7 +121,7 @@ def test_crash_dpapi_to_legacy(data_dir):
     token = _encrypt("DPAPI-LEGACY-VALUE")
 
     keyring.write_staging(data_dir, keyring.wrap_dpapi(dpapi_master, data_dir))
-    keyring.remove_record(data_dir)  # 模拟 legacy 方向删记录后崩溃
+    keyring.remove_record(data_dir)
     keyring.reset_state()
     secretbox.clear_key_cache()
 
@@ -144,7 +141,6 @@ def test_crash_legacy_to_passphrase(data_dir):
     assert _decrypt(token) == "LEGACY-VALUE"
 
 
-# ── 磁盘写入失败 ────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -191,7 +187,6 @@ async def test_record_write_failure_leaves_staging_for_resume(data_dir, monkeypa
     assert _decrypt(token) == "STILL-OK"
 
 
-# ── 迁移回滚 ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -217,7 +212,6 @@ async def test_reencrypt_failure_rolls_back_record(data_dir, monkeypatch):
     assert _decrypt(token) == "ROLLBACK"
 
 
-# ── 跨版本升级：旧版本写入的密文被新版本读到 ──────────────
 
 
 def test_cross_version_ciphertext_survives_upgrade(data_dir):
@@ -241,7 +235,6 @@ def test_legacy_fallback_still_works_without_staging(data_dir):
     assert _decrypt(token) == "LEGACY-ONLY"
 
 
-# ── 断电模拟：文件替换中断 ──────────────────────────────
 
 
 def test_torn_staging_write_is_atomic(data_dir, monkeypatch):
@@ -259,7 +252,6 @@ def test_torn_staging_write_is_atomic(data_dir, monkeypatch):
         keyring.write_staging(data_dir, {"v": 1, "mode": keyring.MODE_DPAPI})
     monkeypatch.setattr(Path, "replace", real_replace)
 
-    # 旧记录完好，不出现半截文件
     assert (data_dir / keyring.STAGING_FILE).read_bytes() == original
     assert keyring.read_staging(data_dir) == {"v": 1, "mode": keyring.MODE_LEGACY}
 
@@ -273,7 +265,6 @@ def test_corrupt_staging_does_not_break_decryption(data_dir, monkeypatch):
     assert _decrypt(token) == "NORMAL"
 
 
-# ── 全方向崩溃矩阵：任意两模式之间的中途崩溃都必须可恢复 ──────────
 
 
 @pytest.mark.parametrize("old_mode", ["legacy", "dpapi", "passphrase"])
@@ -288,7 +279,6 @@ def test_all_direction_crash_matrix(data_dir, old_mode, new_mode):
         pytest.skip("DPAPI 仅 Windows 可用")
 
     old_pw = "old-pw-888888"
-    # 1) 建立 old_mode 下的密文
     if old_mode == "legacy":
         old_master = secretbox.legacy_master(data_dir)
     else:
@@ -305,7 +295,6 @@ def test_all_direction_crash_matrix(data_dir, old_mode, new_mode):
         keyring.load_unlocked_key(old_master)
     token = _encrypt("MATRIX-VALUE")
 
-    # 2) 建立 new_mode 的主密钥，并按新协议落「密钥文件 + 过渡记录」后崩溃
     new_master = (
         secretbox.legacy_master(data_dir)
         if new_mode == "legacy"
@@ -322,7 +311,6 @@ def test_all_direction_crash_matrix(data_dir, old_mode, new_mode):
         keyring.write_record(data_dir, new_record)
     keyring.write_staging(data_dir, keyring.wrap_staging(old_master, new_master))
 
-    # 3) 重启（进程态清空）——旧密文必须仍可解
     keyring.reset_state()
     secretbox.clear_key_cache()
     if new_mode == "passphrase":
@@ -382,11 +370,9 @@ def test_resume_completes_after_crash(data_dir, old_mode, new_mode):
         result = loop.run_until_complete(rekey.resume_pending_migration(data_dir))
     finally:
         loop.close()
-    # 没有待迁密文时仍然清掉记录（续跑是幂等的空操作）
     assert rekey.migration_pending(data_dir) is False, result
 
 
-# ── 断电模拟：部分写入 / 元数据未落盘 / 目录项撕裂 ──────────────
 
 
 def test_partial_write_then_crash_leaves_old_record_readable(data_dir, monkeypatch):
@@ -401,7 +387,6 @@ def test_partial_write_then_crash_leaves_old_record_readable(data_dir, monkeypat
     real_write = Path.write_text
 
     def _half_write(self, data, **kw):
-        # 只落一半字节就"断电"：真实是页缓存只刷了一部分
         real_write(self, str(data)[: len(str(data)) // 2], **kw)
         raise OSError("断电（写入中途）")
 
@@ -410,7 +395,6 @@ def test_partial_write_then_crash_leaves_old_record_readable(data_dir, monkeypat
         keyring.write_staging(data_dir, {"v": 1, "kind": "rekey-staging", "nonce": "c", "ct": "d"})
     monkeypatch.setattr(Path, "write_text", real_write)
 
-    # 目标文件仍是完整的旧记录（临时文件损坏不影响它）
     assert (data_dir / keyring.STAGING_FILE).read_bytes() == good
     assert keyring.read_staging(data_dir)["nonce"] == "a"
 
@@ -420,7 +404,6 @@ def test_truncated_staging_file_is_detected_not_silently_trusted(data_dir):
     (data_dir / keyring.STAGING_FILE).write_text('{"v":1,"kind":"rekey-stag', encoding="utf-8")
     with pytest.raises(keyring.KeyringError):
         keyring.read_staging(data_dir)
-    # 解密路径不因此瘫痪（把损坏记录当作缺席）
     token = _encrypt("STILL-FINE")
     secretbox.clear_key_cache()
     assert _decrypt(token) == "STILL-FINE"

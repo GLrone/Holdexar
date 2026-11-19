@@ -66,6 +66,38 @@ def sign_manifest(monkeypatch):
     return _sign
 
 
+def _signed_archive_manifest(archive: Path, tag: str, sign_manifest) -> dict:
+    files = {}
+    with zipfile.ZipFile(archive) as zf:
+        for item in zf.infolist():
+            if not item.is_dir():
+                name = item.filename.removeprefix(f"{app_info.APP_NAME}/")
+                files[name] = hashlib.sha256(zf.read(item)).hexdigest()
+    return sign_manifest({
+        "schema": app_info.MANIFEST_SCHEMA,
+        "app": app_info.APP_NAME,
+        "version": tag.lstrip("vV"),
+        "tag": tag,
+        "assets": [{
+            "role": "app",
+            "name": f"{app_info.APP_NAME}-win64-{tag}.zip",
+            "size": archive.stat().st_size,
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "files": files,
+        }],
+    })
+
+
+async def _resolved(value):
+    return value
+
+
+def _use_signed_archive(monkeypatch, archive: Path, tag: str, sign_manifest) -> dict:
+    manifest = _signed_archive_manifest(archive, tag, sign_manifest)
+    monkeypatch.setattr(updater, "_fetch_manifest", lambda: _resolved(manifest))
+    return manifest
+
+
 @pytest.mark.parametrize(
     ("latest", "current", "expect"),
     [
@@ -116,11 +148,14 @@ async def test_new_staging_clears_handoff_marks(tmp_path: Path, monkeypatch, sig
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
     await updater.download_update(
         "v0.2.0",
-        expected_sha256=hashlib.sha256(payload.read_bytes()).hexdigest(),
-        asset_name="fake-release.zip",
+        expected_sha256=asset["sha256"],
+        asset_name=asset["name"],
+        expected_size=asset["size"],
     )
 
     assert not (staging / updater.HANDOFF_UNSUPPORTED_MARK).exists()
@@ -140,7 +175,7 @@ async def test_check_update_prefers_manifest(tmp_path: Path, monkeypatch, sign_m
         "notes": "- **新增** 更新清单",
         "assets": [
             {"role": "app", "name": "Holdexar-win64-v9.9.9.zip", "size": 4242,
-             "sha256": "a" * 64},
+                 "sha256": "a" * 64, "files": {"Holdexar.exe": "b" * 64}},
         ],
     })
     seen: list[str] = []
@@ -220,8 +255,10 @@ async def test_check_update_rejects_tampered_manifest(monkeypatch, sign_manifest
 async def test_check_update_picks_verified_among_racing_mirors(monkeypatch, sign_manifest) -> None:
     """镜像竞速只在验签通过者中取：先到的未签名清单不挡后面的可信清单。"""
     signed = sign_manifest({
-        "schema": 2, "version": "9.9.9", "tag": "v9.9.9", "notes": "signed",
-        "assets": [{"role": "app", "name": "good.zip", "size": 1, "sha256": "a" * 64}],
+        "schema": 2, "app": app_info.APP_NAME, "version": "9.9.9",
+        "tag": "v9.9.9", "notes": "signed",
+        "assets": [{"role": "app", "name": "good.zip", "size": 1,
+                    "sha256": "a" * 64, "files": {"Holdexar.exe": "b" * 64}}],
     })
     unsigned = {
         "schema": 2, "version": "8.8.8", "tag": "v8.8.8",
@@ -281,7 +318,9 @@ async def test_check_update_manifest_falls_back_to_api(tmp_path: Path, monkeypat
 @pytest.mark.asyncio
 async def test_check_update_bad_manifest_is_not_available(monkeypatch, sign_manifest) -> None:
     """验签清单有版本但无可用资产：available=False + reason=no_asset，不误报有更新。"""
-    manifest = sign_manifest({"schema": 2, "version": "0.9.0", "assets": []})
+    manifest = sign_manifest({
+        "schema": 2, "app": app_info.APP_NAME, "version": "0.9.0", "assets": []
+    })
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=manifest)
@@ -295,7 +334,7 @@ async def test_check_update_bad_manifest_is_not_available(monkeypatch, sign_mani
 async def test_check_update_signed_manifest_without_sha256_refused(monkeypatch, sign_manifest) -> None:
     """验签清单的资产缺 sha256：按残缺清单拒绝（available=False），不给无校验下载留口。"""
     manifest = sign_manifest({
-        "schema": 2, "version": "9.9.9", "tag": "v9.9.9",
+        "schema": 2, "app": app_info.APP_NAME, "version": "9.9.9", "tag": "v9.9.9",
         "assets": [{"role": "app", "name": "x.zip", "size": 10}],
     })
 
@@ -322,17 +361,18 @@ async def test_check_update_network_fail_soft(tmp_path: Path, monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_download_rejects_missing_sha256(tmp_path: Path, monkeypatch) -> None:
-    """校验值缺失即拒绝下载：不存在「无校验放行」的口子（护栏先于一切暂存动作）。"""
+async def test_download_rejects_unavailable_signed_manifest(tmp_path: Path, monkeypatch) -> None:
+    """Without the publisher manifest the download path refuses to stage a package."""
     monkeypatch.setattr(updater, "staging_dir", lambda: tmp_path / "staging")
-    with pytest.raises(RuntimeError, match="校验值"):
+    with pytest.raises(RuntimeError):
         await updater.download_update("v0.2.0", expected_sha256=None)
-    with pytest.raises(RuntimeError, match="校验值"):
+    with pytest.raises(RuntimeError):
         await updater.download_update("v0.2.0", expected_sha256="   ")
+    assert not (tmp_path / "staging").exists()
 
 
 @pytest.mark.asyncio
-async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
+async def test_download_and_pending_flow(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """下载 → 解包 → manifest：pending 状态翻转 + sha256 校验拒绝坏档。
 
     下载通道链 mock 成直连单通道（不依赖 clash_manager 网络发现）。
@@ -364,8 +404,13 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
-    result = await updater.download_update("v0.2.0", expected_sha256=real_sha)
+    result = await updater.download_update(
+        "v0.2.0", expected_sha256=asset["sha256"], asset_name=asset["name"],
+        expected_size=asset["size"],
+    )
     assert result["ok"] is True
     status = updater.pending_status()
     assert status["pending"] is True and status["tag"] == "v0.2.0"
@@ -378,8 +423,8 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
     cleared = updater.pending_status()
     assert cleared["pending"] is False and cleared["swapFailed"] is False
 
-    # 期望值不匹配：staging 清空 + 抛错
-    with pytest.raises(RuntimeError, match="SHA256"):
+    # Caller metadata cannot substitute for the publisher's signed values.
+    with pytest.raises(RuntimeError, match="签名清单"):
         await updater.download_update("v0.2.0", expected_sha256="dead" * 16)
     assert updater.pending_status()["pending"] is False
     # 期望值正确：通过
@@ -389,7 +434,7 @@ async def test_download_and_pending_flow(tmp_path: Path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) -> None:
+async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """清单给了确切资产名：按名直下，不做 release 资产列表反查（省一次 API 调用）。"""
     payload = tmp_path / "asset.zip"
     with zipfile.ZipFile(payload, "w") as zf:
@@ -413,19 +458,20 @@ async def test_download_uses_manifest_asset_name(tmp_path: Path, monkeypatch) ->
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
     await updater.download_update(
-        "v0.2.0", hashlib.sha256(payload.read_bytes()).hexdigest(),
-        "Holdexar-win64-v9.9.9.zip",
+        "v0.2.0", asset["sha256"], asset["name"], expected_size=asset["size"],
     )
     assert updater.pending_status()["pending"] is True
-    assert any("Holdexar-win64-v9.9.9.zip" in u for u in seen)
+    assert any(asset["name"] in u for u in seen)
     updater.clear_staging()
 
 
 @pytest.mark.asyncio
 async def test_download_skips_missing_channel_before_downloading(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, sign_manifest
 ) -> None:
     """探测阶段就排除「资产不存在」的通道（镜像 404），不浪费一次真实下载。
 
@@ -456,9 +502,11 @@ async def test_download_skips_missing_channel_before_downloading(
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
     result = await updater.download_update(
-        "v0.2.0", hashlib.sha256(data).hexdigest(), "x.zip", expected_size=len(data)
+        "v0.2.0", asset["sha256"], asset["name"], expected_size=asset["size"]
     )
     assert result["ok"] is True
     # 404 通道只出现在探测请求里（带 Range），不出现在正式下载里
@@ -468,7 +516,7 @@ async def test_download_skips_missing_channel_before_downloading(
 
 
 @pytest.mark.asyncio
-async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) -> None:
+async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """全通道 404（release 还是草稿 / 资产被撤）→ AssetMissing + code=asset_missing。
 
     探测一轮（各通道并发、8s 上限）即定性；串行试跑整条通道链（每通道最长 20s）
@@ -486,9 +534,22 @@ async def test_download_asset_missing_fails_fast(tmp_path: Path, monkeypatch) ->
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = sign_manifest({
+        "schema": app_info.MANIFEST_SCHEMA,
+        "app": app_info.APP_NAME,
+        "version": "0.2.0",
+        "tag": "v0.2.0",
+        "assets": [{
+            "role": "app", "name": "Holdexar-win64-v0.2.0.zip", "size": 1234,
+            "sha256": "a" * 64, "files": {"Holdexar.exe": "b" * 64},
+        }],
+    })
+    monkeypatch.setattr(updater, "_fetch_manifest", lambda: _resolved(release))
 
     with pytest.raises(updater.AssetMissing):
-        await updater.download_update("v0.2.0", "a" * 64, "x.zip", expected_size=1234)
+        await updater.download_update(
+            "v0.2.0", "a" * 64, "Holdexar-win64-v0.2.0.zip", expected_size=1234
+        )
     progress = updater.download_progress()
     assert progress["code"] == "asset_missing"
     assert progress["running"] is False
@@ -535,7 +596,7 @@ async def test_stream_to_file_restarts_when_range_ignored(
 
 
 @pytest.mark.asyncio
-async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
+async def test_download_respects_cancel(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """用户取消：下载循环在分片边界退出，返回 cancelled 而不是抛故障。"""
     payload = tmp_path / "fake.zip"
     with zipfile.ZipFile(payload, "w") as zf:
@@ -553,6 +614,8 @@ async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
     # 探测刚落定即取消（download_update 开头会清旗标，必须在这之后置位）
     real_probe = updater._probe_channels
@@ -564,7 +627,7 @@ async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr(updater, "_probe_channels", probe_then_cancel)
     result = await updater.download_update(
-        "v0.2.0", hashlib.sha256(data).hexdigest(), "x.zip", expected_size=len(data)
+        "v0.2.0", asset["sha256"], asset["name"], expected_size=asset["size"]
     )
     assert result["ok"] is False and result["cancelled"] is True
     assert updater.download_progress()["code"] == "cancelled"
@@ -575,7 +638,7 @@ async def test_download_respects_cancel(tmp_path: Path, monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_download_sha256_mismatch_falls_back_to_next_channel(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, sign_manifest
 ) -> None:
     """镜像返回错误内容（SHA256 不符）时，通道循环内即刻换道下一镜像，最终下载成功。"""
     payload = tmp_path / "real.zip"
@@ -609,8 +672,13 @@ async def test_download_sha256_mismatch_falls_back_to_next_channel(
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = _use_signed_archive(monkeypatch, payload, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
 
-    result = await updater.download_update("v0.2.0", expected_sha256=good_sha, asset_name="x.zip")
+    result = await updater.download_update(
+        "v0.2.0", expected_sha256=asset["sha256"], asset_name=asset["name"],
+        expected_size=asset["size"],
+    )
     assert result["ok"] is True
     assert called_urls == ["https://bad_mirror/x.zip", "https://good_mirror/x.zip"]
     assert updater.pending_status()["pending"] is True
@@ -618,7 +686,7 @@ async def test_download_sha256_mismatch_falls_back_to_next_channel(
     updater.clear_staging()
 
 
-def test_download_meta_binding_discards_different_version(tmp_path: Path, monkeypatch) -> None:
+def test_download_meta_binding_discards_different_version(tmp_path: Path, monkeypatch, sign_manifest) -> None:
     """旧 .part 文件若属于不同版本或资产，启动下载时必须清除重来，防止损坏拼接。"""
     staging = tmp_path / "staging"
     staging.mkdir(parents=True)
@@ -644,7 +712,16 @@ def test_download_meta_binding_discards_different_version(tmp_path: Path, monkey
         lambda *_a, **_k: [(None, "直连")],
     )
 
-    asyncio.run(updater.download_update("v0.2.0", expected_sha256="newsha", asset_name="x.zip", expected_size=100))
+    archive = tmp_path / "target.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("Holdexar/Holdexar.exe", "target")
+    release = _use_signed_archive(monkeypatch, archive, "v0.2.0", sign_manifest)
+    asset = release["assets"][0]
+
+    asyncio.run(updater.download_update(
+        "v0.2.0", expected_sha256=asset["sha256"],
+        asset_name=asset["name"], expected_size=asset["size"],
+    ))
     # 因为 tag 不同，旧的 .part 必须已被清空
     assert not part.exists()
 
@@ -725,7 +802,9 @@ async def test_stream_to_file_preserves_partial_on_200_failure(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
-async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, monkeypatch) -> None:
+async def test_download_all_channels_fail_preserves_part_file(
+    tmp_path: Path, monkeypatch, sign_manifest
+) -> None:
     """所有通道失败时不应清空暂存区，需保留 .part 文件以便下次续传。"""
     staging = tmp_path / "update-staging"
     staging.mkdir()
@@ -733,7 +812,10 @@ async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, mo
     part.write_bytes(b"downloaded-50MB-chunk")
     expected_sha = "f" * 64
     meta = staging / "download_meta.json"
-    meta.write_text(json.dumps({"tag": "v0.3.6", "asset": "", "size": 0, "sha256": expected_sha}), encoding="utf-8")
+    asset_name = "Holdexar-win64-v0.3.6.zip"
+    meta.write_text(json.dumps({
+        "tag": "v0.3.6", "asset": asset_name, "size": 100, "sha256": expected_sha,
+    }), encoding="utf-8")
 
     def handler(_request: httpx.Request):
         raise httpx.ConnectError("network down")
@@ -744,9 +826,23 @@ async def test_download_all_channels_fail_preserves_part_file(tmp_path: Path, mo
         "app.domains.proxies.clash_manager._download_attempts",
         lambda *_a, **_k: [(None, "直连")],
     )
+    release = sign_manifest({
+        "schema": app_info.MANIFEST_SCHEMA,
+        "app": app_info.APP_NAME,
+        "version": "0.3.6",
+        "tag": "v0.3.6",
+        "assets": [{
+            "role": "app", "name": asset_name, "size": 100, "sha256": expected_sha,
+            "files": {"Holdexar.exe": "a" * 64},
+        }],
+    })
+    monkeypatch.setattr(updater, "_fetch_manifest", lambda: _resolved(release))
 
     with pytest.raises(RuntimeError, match="所有下载通道均失败"):
-        await updater.download_update("v0.3.6", expected_sha256=expected_sha)
+        await updater.download_update(
+            "v0.3.6", expected_sha256=expected_sha, asset_name=asset_name,
+            expected_size=100,
+        )
 
     # .part 文件依然存在，未被清空
     assert part.is_file()
@@ -881,7 +977,8 @@ def test_payload_from_manifest_has_no_patch_fields(monkeypatch) -> None:
         "tag": "v0.3.6",
         "notes": "Feature notes",
         "assets": [
-            {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000, "sha256": "app-sha"},
+            {"role": "app", "name": "Holdexar-win64-v0.3.6.zip", "size": 50000000,
+             "sha256": "a" * 64, "files": {"Holdexar.exe": "b" * 64}},
         ],
     }
 
@@ -892,7 +989,7 @@ def test_payload_from_manifest_has_no_patch_fields(monkeypatch) -> None:
 
     payload = updater._payload_from_manifest(manifest_data)
     assert payload["available"] is True
-    assert payload["sha256"] == "app-sha"
+    assert payload["sha256"] == "a" * 64
     assert "isPatch" not in payload
     assert "patchFromVersion" not in payload
     assert "fullSizeBytes" not in payload

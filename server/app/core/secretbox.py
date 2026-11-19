@@ -141,9 +141,6 @@ def _fallback_fingerprint(data_dir: Path) -> bytes:
     return data
 
 
-# ── 主密钥与用途密钥 ──────────────────────────────────────
-
-
 def legacy_master(data_dir: Path | str) -> bytes:
     """legacy 数据主密钥：机器指纹 + 安装盐 → HKDF-SHA256。"""
     root = Path(data_dir)
@@ -211,9 +208,6 @@ def _candidate_keys(purpose: str, data_dir: str) -> list[bytes]:
 def clear_key_cache() -> None:
     """清空用途密钥缓存（换钥 / 换数据目录 / 测试隔离后调用）。"""
     _purpose_key.cache_clear()
-
-
-# ── 封装 / 解封 ───────────────────────────────────────────
 
 
 def encrypt_with(plaintext: str, purpose: str, master: bytes) -> str:
