@@ -1,9 +1,5 @@
 package bundles
 
-// HTTP 契约测试（对照 Python test_bundles_api.py 的 HTTP 断言 + 生命周期
-// test_bundle_follow_remove.py）：9 条端点形状、FastAPI 422 复刻、生命周期
-// 状态机、空关注集刷新零键形状。
-
 import (
 	"context"
 	"database/sql"
@@ -131,7 +127,6 @@ func TestBundlesLifecycleFlow(t *testing.T) {
 	if ids := decodeBody(t, rec)["bundleIds"].([]any); len(ids) != 1 || ids[0].(float64) != 10 {
 		t.Fatalf("follows=%s", rec.Body.String())
 	}
-	// 关注再导入（来源共存）：import 来源在场时取关只摘星不遗忘
 	if _, err := svc.Mon.Apply(context.Background(), "bundle", []int64{10},
 		lifecycleTestChange()); err != nil {
 		t.Fatal(err)
@@ -151,7 +146,6 @@ func TestBundlesLifecycleFlow(t *testing.T) {
 	if sources != 1 {
 		t.Fatalf("导入来源应保留，active sources=%d", sources)
 	}
-	// 星标是唯一来源时取关 → forget 基线
 	if _, err := svc.Mon.Apply(context.Background(), "bundle", []int64{10}, lifecycleTestChange()); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +165,6 @@ func TestBundlesLifecycleFlow(t *testing.T) {
 	if targets != 0 {
 		t.Fatalf("唯一来源取关后应遗忘目标，targets=%d", targets)
 	}
-	// remove → 404 语义 / restore 状态机
 	callJSON(t, handler, "PUT", "/api/v1/bundles/10/follow", "")
 	rec = callJSON(t, handler, "POST", "/api/v1/bundles/10/remove", "")
 	if got := decodeBody(t, rec); got["removed"] != true {
@@ -242,7 +235,6 @@ func TestBundlesImportValidation(t *testing.T) {
 	if rec.Code != 400 {
 		t.Fatalf("非 dict 载荷按空文本 → 识别失败 400，得 %d │ %s", rec.Code, rec.Body.String())
 	}
-	// 裸数字识别成功但抓取全空 → 400 抓取失败（browse 打桩返回空响应）
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"response":{}}`))
@@ -314,7 +306,6 @@ func TestBundlesHookUsesTrackedRegions(t *testing.T) {
 	}
 }
 
-// 生命周期测试辅助：直接构造 monitoring.Change 的两态。
 func lifecycleTestChange() monitoring.Change {
 	on := true
 	return monitoring.Change{Sources: map[int64][]string{10: {"import"}}, Excluded: &on}

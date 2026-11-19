@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +19,7 @@ import (
 	"holdexar/server-go/internal/jobrun"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 const AugmentedURL = "https://api.augmentedsteam.com/rates/v1?to=CNY"
@@ -69,7 +70,9 @@ func fetchJSON(ctx context.Context, address string, timeout time.Duration) ([]by
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	if proxy != "" {
+	target, _ := url.Parse(address)
+	isLoopback := target != nil && (target.Hostname() == "127.0.0.1" || target.Hostname() == "localhost" || target.Hostname() == "::1")
+	if proxy != "" && !isLoopback {
 		parsed, e := url.Parse(proxy)
 		if e != nil {
 			return nil, e
@@ -99,7 +102,7 @@ func fetchJSON(ctx context.Context, address string, timeout time.Duration) ([]by
 	}
 	return data, nil
 }
-func (s *Service) now() time.Time { return s.opts.Now().In(time.FixedZone("Beijing", 8*3600)) }
+func (s *Service) now() time.Time { return s.opts.Now().In(timeutil.ZoneBeijing) }
 func fxJSON(v any) string         { b, _ := json.Marshal(v); return string(b) }
 
 func (s *Service) fetchCurrent(ctx context.Context, address string, reciprocal bool) (map[string]float64, error) {
@@ -208,7 +211,7 @@ func (s *Service) refresh(ctx context.Context) (map[string]any, error) {
 	for code := range values {
 		codes = append(codes, code)
 	}
-	sort.Strings(codes)
+	slices.Sort(codes)
 	for _, code := range codes {
 		rows = append(rows, map[string]any{"code": code, "rate": values[code]})
 	}

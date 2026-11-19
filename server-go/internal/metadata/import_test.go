@@ -1,5 +1,3 @@
-// import_test.go 三源导入测试：夹具文件 → 打标仅库内已有行、错误形状、
-// all 聚合与未知来源（Python service.py:182-288 形状锚点）。
 package metadata
 
 import (
@@ -43,10 +41,10 @@ func metaFixture(t *testing.T) (*sql.DB, *store.WriteGate, string) {
 	return db, store.NewWriteGate(db, filepath.Join(dir, "gate.lock")), dir
 }
 
-func routeFixture(t *testing.T, db *sql.DB, gate *store.WriteGate) func(string, string) *httptest.ResponseRecorder {
+func routeFixture(t *testing.T, db *sql.DB, gate *store.WriteGate, dataDir string) func(string, string) *httptest.ResponseRecorder {
 	t.Helper()
 	mux := http.NewServeMux()
-	Register(mux, db, gate)
+	Register(mux, db, gate, WithDataDir(dataDir))
 	return func(method, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, "/api/v1/metadata/import", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -95,8 +93,6 @@ func seedHBFile(t *testing.T, dir string) {
 	}
 }
 
-// TestImportEpic applist → 库内已有行打标：is_epic + epic_date；库外 appid
-// 不入库（updated 只数命中行）。
 func TestImportEpic(t *testing.T) {
 	db, gate, dir := metaFixture(t)
 	seedEpicFile(t, dir)
@@ -121,7 +117,6 @@ func TestImportEpic(t *testing.T) {
 	}
 }
 
-// TestImportXGP tiered 打标 + links 名称匹配计数 + PC Collection 优先。
 func TestImportXGP(t *testing.T) {
 	db, gate, dir := metaFixture(t)
 	seedXGPFiles(t, dir)
@@ -144,7 +139,6 @@ func TestImportXGP(t *testing.T) {
 	}
 }
 
-// TestImportHB game_lows.humble_choice → is_hb + hb_data 月份标注。
 func TestImportHB(t *testing.T) {
 	db, gate, dir := metaFixture(t)
 	seedHBFile(t, dir)
@@ -167,7 +161,6 @@ func TestImportHB(t *testing.T) {
 	}
 }
 
-// TestImportHBNoColumn 外部库缺 humble_choice 列 → 逐字错误。
 func TestImportHBNoColumn(t *testing.T) {
 	db, gate, dir := metaFixture(t)
 	path := filepath.Join(dir, historicalDB)
@@ -185,11 +178,9 @@ func TestImportHBNoColumn(t *testing.T) {
 	}
 }
 
-// TestImportRouteSemantics 路由层：422 形状、未知来源 200 error、缺文件
-// error 形状、all 聚合（epic→xgp→hb 顺序）。
 func TestImportRouteSemantics(t *testing.T) {
 	db, gate, dir := metaFixture(t)
-	do := routeFixture(t, db, gate)
+	do := routeFixture(t, db, gate, dir)
 	rec := do("POST", "")
 	if rec.Code != 422 {
 		t.Fatalf("缺 source 应 422：%d %s", rec.Code, rec.Body.String())
@@ -206,20 +197,27 @@ func TestImportRouteSemantics(t *testing.T) {
 	if body["error"] != "未知来源: wat（可选 epic/xgp/hb/all）" {
 		t.Fatal(body)
 	}
-	rec = do("POST", `{"source": "epic", "source_dir": "Z:\nope"}`)
+	for _, rejected := range []string{`Z:\nope`, filepath.Join(dir, "..", "escape")} {
+		rec = do("POST", `{"source": "epic", "source_dir": `+jsonString(rejected)+`}`)
+		body = decodeMeta(t, rec)
+		if rec.Code != 422 || body["detail"] != ErrSourceDirRejected.Error() {
+			t.Fatalf("越界 source_dir %q 应 422：%d %s", rejected, rec.Code, rec.Body.String())
+		}
+	}
+	rec = do("POST", `{"source": "epic", "source_dir": `+jsonString(filepath.Join(dir, "missing_sub"))+`}`)
 	body = decodeMeta(t, rec)
-	if body["ok"] != false || !hasPrefix(body["error"], "找不到数据文件: ") {
-		t.Fatalf("缺文件形状不符：%s", rec.Body.String())
+	if rec.Code != 200 || body["ok"] != false || !hasPrefix(body["error"], "找不到数据文件: ") {
+		t.Fatalf("目录内缺文件形状不符：%d %s", rec.Code, rec.Body.String())
 	}
 	seedEpicFile(t, dir)
-	rec = do("POST", `{"source": "epic", "source_dir": `+ jsonString(dir) + `}`)
+	rec = do("POST", `{"source": "epic", "source_dir": `+jsonString(dir)+`}`)
 	body = decodeMeta(t, rec)
 	if body["ok"] != true || body["updated"] != 1.0 {
 		t.Fatal(body)
 	}
 	seedXGPFiles(t, dir)
 	seedHBFile(t, dir)
-	rec = do("POST", `{"source": "all", "source_dir": `+ jsonString(dir) + `}`)
+	rec = do("POST", `{"source": "all", "source_dir": `+jsonString(dir)+`}`)
 	body = decodeMeta(t, rec)
 	results, _ := body["results"].([]any)
 	if len(results) != 3 {

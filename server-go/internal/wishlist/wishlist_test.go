@@ -9,8 +9,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// 表结构照抄真实库 sqlite_master（Python create_all 产物），字段语义见
-// monitoring/wishlist 模型；games 仅保留排序断言所需的最小列。
 const schema = `
 CREATE TABLE wishlist_items (
 	steamid VARCHAR(20) NOT NULL,
@@ -56,8 +54,6 @@ func newTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// 种子：关注 3 款（100/200/300）、愿望单 2 款（100/400，100 与关注重叠）、
-// 其余 500/600；干扰行 = 非激活关注、非愿望单来源、停用愿望单行。
 func seed(t *testing.T, db *sql.DB) {
 	t.Helper()
 	for _, c := range []struct {
@@ -136,7 +132,6 @@ func TestWishlistAppIDs(t *testing.T) {
 	}
 }
 
-// 位次序：关注段 > 愿望单段 > 原价格排序；wishlistPriority=false 只剩关注段。
 func TestOrderPrefix(t *testing.T) {
 	db := newTestDB(t)
 	seed(t, db)
@@ -180,11 +175,9 @@ func TestOrderPrefixNoWishlist(t *testing.T) {
 	}
 }
 
-// 空集行为：无有效关注与愿望单行时前缀为空串、参数为空，SQL 保持原样。
 func TestOrderPrefixEmpty(t *testing.T) {
 	db := newTestDB(t)
 	seed(t, db)
-	// 清空有效来源：关注与愿望单只剩非激活/停用行
 	for _, stmt := range []string{
 		"UPDATE monitor_sources SET active = 0",
 		"UPDATE wishlist_items SET active = 0",

@@ -15,10 +15,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/wishlist"
 )
 
-const toleranceFenDefault = 500 // 近似全区最低容差（分）
+const toleranceFenDefault = 500
 const dlcExemptAppids = 2778580
 
 const (
@@ -30,8 +31,7 @@ const (
 		" g.diff_fen / 1000.0 DESC, g.review_count / 1000.0 DESC, g.positive_rate DESC"
 )
 
-// 列表查询参数正则约束；*Src 常量同时是 422 ctx 里的 pattern 原文（照抄
-// Python Query(pattern=...)）。
+// *Src 常量同时用作 422 ctx.pattern 原文。
 var (
 	flagPatternSrc       = `^(|hl|pp|any|(new|flat|nonhl)(,(new|flat|nonhl))*)$`
 	giftModePatternSrc   = `^(|out|in)$`
@@ -78,31 +78,18 @@ type listParams struct {
 	wishlistPriority bool
 }
 
-// ---- 列表查询参数校验（422 形状对齐 FastAPI/Pydantic 实测锚点） ----
-
-// valErr 校验错误项：type/loc/msg/input/ctx 与 Pydantic 查询参数 422 输出
-// 逐字段一致（ctx 仅约束类错误携带）。
-type valErr struct {
-	Type  string         `json:"type"`
-	Loc   []any          `json:"loc"`
-	Msg   string         `json:"msg"`
-	Input any            `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type valErr = httpx.ValErr
 
 const (
 	errIntParsing     = "int_parsing"
-	errIntParsingMsg  = "Input should be a valid integer, unable to parse string as an integer"
+	errIntParsingMsg  = httpx.IntParseMsg
 	errBoolParsing    = "bool_parsing"
 	errBoolParsingMsg = "Input should be a valid boolean, unable to interpret input"
 )
 
-// pyIntRe 宽松整数形状：可选符号、数字间单下划线、整值小数（"5.0"）。
 var pyIntRe = regexp.MustCompile(`^[+-]?[0-9](_?[0-9])*(\.0(_?0+)*)?$`)
 
-// pyInt 宽松整数解析（Pydantic lax 同径，实测锚点：首尾空白忽略、下划线为
-// 数字分隔、"5.0" 收整；"1e2"/"5.5"/"0x10"/"5."/空串拒绝）。越界大数钳到
-// int64 极值交约束检查（Python 任意精度同效：出约束错误而非解析错误）。
+// pyInt 宽松整数解析（支持空白/下划线/"5.0" 收整），越界大数钳到 int64 极值交约束校验。
 func pyInt(s string) (int, bool) {
 	t := strings.TrimSpace(s)
 	if !pyIntRe.MatchString(t) {
@@ -114,7 +101,6 @@ func pyInt(s string) (int, bool) {
 	}
 	v, err := strconv.Atoi(t)
 	if err != nil {
-		// 形状已过正则，仅可能越界
 		if strings.HasPrefix(t, "-") {
 			return math.MinInt64, true
 		}
@@ -129,8 +115,6 @@ func queryErr(errType, name, msg string, input any, ctx map[string]any) valErr {
 	return valErr{Type: errType, Loc: []any{"query", name}, Msg: msg, Input: input, Ctx: ctx}
 }
 
-// checkInt 整数参数：q 中存在时宽松解析并查 ge/le；错误追加 errs。
-// 返回（值, 在场, 合法）；缺席时值无意义。
 func checkInt(errs *[]valErr, q url.Values, name string, ge, le *int) (int, bool, bool) {
 	vals, ok := q[name]
 	if !ok {
@@ -157,8 +141,6 @@ func checkInt(errs *[]valErr, q url.Values, name string, ge, le *int) (int, bool
 	return v, true, true
 }
 
-// checkBool 布尔参数（Pydantic lax 集合：true/false/t/f/y/n/yes/no/on/off/
-// 0/1，大小写不敏感）；非法追加 bool_parsing。返回（值, 在场且合法）。
 func checkBool(errs *[]valErr, q url.Values, name string) (bool, bool) {
 	vals, ok := q[name]
 	if !ok {
@@ -175,8 +157,6 @@ func checkBool(errs *[]valErr, q url.Values, name string) (bool, bool) {
 	return false, false
 }
 
-// checkStrMax 字符串参数最长 maxLen（按字符计数非字节，Pydantic max_length
-// 同径）。值恒返回（供后续默认填充），超长追加 string_too_long。
 func checkStrMax(errs *[]valErr, q url.Values, name string, maxLen int) string {
 	vals, ok := q[name]
 	if !ok {
@@ -191,7 +171,6 @@ func checkStrMax(errs *[]valErr, q url.Values, name string, maxLen int) string {
 	return s
 }
 
-// checkStrPattern 正则约束（pattern 原文进 msg 与 ctx，照抄 Python）。
 func checkStrPattern(errs *[]valErr, q url.Values, name, pattern string, re *regexp.Regexp) string {
 	vals, ok := q[name]
 	if !ok {
@@ -206,10 +185,6 @@ func checkStrPattern(errs *[]valErr, q url.Values, name, pattern string, re *reg
 	return s
 }
 
-// parseListParams 查询参数解析：约束全集与 422 形状对齐 FastAPI/Pydantic
-// 实测锚点，错误按字段声明序合并（Pydantic 非短路同径）。
-// hideOwned / hideFamilySharing / wishlistPriority 依赖其他域（wishlist / account），
-// 本包不实现：仅校验布尔形状，行为以无关注集 / 无愿望单集的降级路径呈现。
 func parseListParams(r *http.Request) (listParams, []valErr) {
 	q := r.URL.Query()
 	p := listParams{
@@ -307,7 +282,6 @@ func parseAppID(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// decodeCursor after = base64({"offset": N})；解析失败从 0 开始。
 func decodeCursor(after string) int {
 	if after == "" {
 		return 0
@@ -331,7 +305,7 @@ func decodeCursor(after string) int {
 	return data.Offset
 }
 
-// encodeCursor 与 Python 侧游标字节兼容：{"offset": N}（冒号后带空格）。
+// encodeCursor 保持 {"offset": N} 游标格式（冒号后带空格）。
 func encodeCursor(offset int) string {
 	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"offset": %d}`, offset)))
 }
@@ -342,8 +316,6 @@ func beijingCutoff() string {
 	return t.Format("2006-01-02 15:04:05.000000")
 }
 
-// listGames 游戏列表：全部筛选 / 排序 / 分页在 SQL 完成，价格明细按页取。
-// sort=top100 依赖外部榜单抓取，本包按「榜不可用回空集」的降级路径返回。
 func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, error) {
 	if p.sort == "top100" {
 		return map[string]any{"items": []listItem{}, "total": 0, "hasMore": false, "nextCursor": nil}, nil
@@ -507,8 +479,6 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 	if isLocked {
 		order = "COALESCE(g.min_cny_fen, 999999) ASC, g.appid DESC"
 	}
-	// 置顶前缀：关注位次 → 愿望单位次 → 原排序（对齐 list_games 的
-	// fav_order + wish_order 前置；空集不注入）。
 	prefixSQL, prefixArgs, err := wishlist.OrderPrefixFor(ctx, h.db, p.wishlistPriority)
 	if err != nil {
 		return nil, err
@@ -611,7 +581,6 @@ func (h *handler) listGames(ctx context.Context, p listParams) (map[string]any, 
 	}, nil
 }
 
-// appendFlagCondition 史低 / 永降标记过滤（三值 + 可组合三态）。
 func appendFlagCondition(flag string, conds *[]string, args *[]any) error {
 	switch flag {
 	case "":
@@ -643,7 +612,6 @@ func appendFlagCondition(flag string, conds *[]string, args *[]any) error {
 	return nil
 }
 
-// appendGiftCondition 送礼价轨 EXISTS（收礼侧 ≤ 送礼侧 × 1.15）。
 func appendGiftCondition(p listParams, conds *[]string, args *[]any) {
 	var targets []string
 	for _, part := range strings.Split(p.giftReceivers, ",") {
@@ -676,7 +644,6 @@ func appendGiftCondition(p listParams, conds *[]string, args *[]any) {
 	}
 }
 
-// buildOrderBy 排序规则：地区模式带 3-group 前缀，其余按 sort 分支。
 func buildOrderBy(sort string, regionMode bool) string {
 	if sort == "smart" {
 		return "(cp1.price IS NOT NULL AND cp1.price > 0) DESC, g.smart_score DESC, g.appid DESC"
@@ -708,7 +675,6 @@ func buildOrderBy(sort string, regionMode bool) string {
 	}
 }
 
-// jobTargetUnitsSQL 失败作业的目标单位 CTE（对齐 crawl service 同名常量）。
 const jobTargetUnitsSQL = `
 WITH target_jobs AS MATERIALIZED (
     SELECT id, json_extract(stats_json, '$.targets.appids') AS appids,
@@ -749,8 +715,6 @@ WITH target_jobs AS MATERIALIZED (
     SELECT DISTINCT appid, region, threshold FROM unit_results WHERE settled = 0
 )`
 
-// pendingUnits 未观察欠账集（对齐 _unobserved_job_targets 的 cooldown=0 /
-// 页内 appid / 不限行形态）：失败作业目标单位减去已观察单位。
 func (h *handler) pendingUnits(ctx context.Context, appids []int64) (map[string]bool, error) {
 	pending := map[string]bool{}
 	if len(appids) == 0 {
@@ -781,7 +745,6 @@ func (h *handler) pendingUnits(ctx context.Context, appids []int64) (map[string]
 	return pending, rows.Err()
 }
 
-// loadPagePrices 页级取价：只拉给定 appid 的全区价格行（含非 ok 状态行）。
 func (h *handler) loadPagePrices(ctx context.Context, appids []int64) (map[int64][]priceRow, error) {
 	out := make(map[int64][]priceRow)
 	if len(appids) == 0 {
@@ -811,7 +774,6 @@ func (h *handler) loadPagePrices(ctx context.Context, appids []int64) (map[int64
 	return out, rows.Err()
 }
 
-// enabledRegions 启用区服（覆盖分母）；读取失败按空集降级，列表照常服务。
 func (h *handler) enabledRegions(ctx context.Context) []string {
 	rows, err := h.db.QueryContext(ctx,
 		"SELECT code FROM crawl_regions WHERE enabled = 1 ORDER BY sort, code")

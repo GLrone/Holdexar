@@ -18,9 +18,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// games 域移植端点契约测试（对齐 GAMES_PORT_SPEC §3 断言面）：
-// 榜单读面、价格上下文、版本聚合、系列成员、CDK 查价缓存、目录写三件。
-
 const portSchema = `
 CREATE TABLE games (
   appid INTEGER PRIMARY KEY,
@@ -179,7 +176,7 @@ CREATE TABLE bundle_region_prices (
 
 type jobStub struct {
 	mu    sync.Mutex
-	calls []string // "kind|scope|ids"
+	calls []string
 	next  int64
 	err   error
 }
@@ -234,7 +231,6 @@ func (b *boardStub) get(_ context.Context, key string) ([]int64, error) {
 	return ids, nil
 }
 
-// newPortHandler 建独立临时库 + 完整装配（榜单桩 / 写链桩 / StartJob 桩）。
 func newPortHandler(t *testing.T) (*httptest.Server, *sql.DB, *jobStub, *boardStub) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.db")
@@ -326,8 +322,6 @@ func postJSON(t *testing.T, srv *httptest.Server, path, body string) (int, map[s
 	return resp.StatusCode, m
 }
 
-// ── 榜单读面 ─────────────────────────────────────────────────────────────
-
 func TestTop100Shape(t *testing.T) {
 	srv, _, _, _ := newPortHandler(t)
 	status, body := getJSON(t, srv, "/api/v1/games/top100")
@@ -375,19 +369,15 @@ func TestGamesRoutesMethodAndShadowing(t *testing.T) {
 		t.Fatalf("错误方法应 405: %d", resp.StatusCode)
 	}
 
-	// 字面路由优先于 {appid}；其余段仍走详情 404。
 	status, body := getJSON(t, srv, "/api/v1/games/top100")
 	if status != 200 {
 		t.Fatalf("top100 被详情路由遮蔽: %d %v", status, body)
 	}
-	// GET /games/remove 落回 GET /{appid} → appid 非整数 422。
 	status, body = getJSON(t, srv, "/api/v1/games/remove")
 	if status != 422 {
 		t.Fatalf("GET remove 应 422 int_parsing: %d %v", status, body)
 	}
 }
-
-// ── 价格上下文 ───────────────────────────────────────────────────────────
 
 func TestPriceContextWindow(t *testing.T) {
 	srv, _, _, _ := newPortHandler(t)
@@ -409,27 +399,23 @@ func TestPriceContextWindow(t *testing.T) {
 		t.Fatalf("史低应为窗口最小 3600: %v", lowest)
 	}
 
-	//日后切片不漏入
 	_, body = getJSON(t, srv, "/api/v1/games/900003/price-context?date=2024-01-10")
 	if body["at"].(map[string]any)["cnyFen"].(float64) != 3600 {
 		t.Fatalf("窗口末点应为 3600: %v", body["at"])
 	}
 
-	// 窗口早期：只有首点
 	_, body = getJSON(t, srv, "/api/v1/games/900003/price-context?date=2024-01-04")
 	at = body["at"].(map[string]any)
 	if at["cnyFen"].(float64) != 4800 || at["snapshotAt"] != "2024-01-01T10:00:00" {
 		t.Fatalf("早期窗口应为 2024-01-01 4800: %v", at)
 	}
 
-	// 非标准版不混入（gold 行 01-08 不进窗口）；在售 sub 联合（01-09 3900 进窗口）
 	_, body = getJSON(t, srv, "/api/v1/games/900003/price-context?date=2024-01-09")
 	at = body["at"].(map[string]any)
 	if at["cnyFen"].(float64) != 3900 {
 		t.Fatalf("在售 sub 应经并集进入窗口: %v", at)
 	}
 
-	// 空窗与非法日期均回 null 对（不报错）
 	for _, date := range []string{"2023-06-01", "2035-13-45"} {
 		_, body = getJSON(t, srv, "/api/v1/games/900003/price-context?date="+date)
 		if body["at"] != nil || body["lowest"] != nil {
@@ -497,13 +483,11 @@ func TestPriceContextBatch(t *testing.T) {
 		t.Fatalf("末项应为 2024-01-04 窗口: %v", results[3])
 	}
 
-	// 缺 items → 422 loc ["body","items"]
 	status, body = postJSON(t, srv, "/api/v1/games/price-context-batch", `{}`)
 	detail := body["detail"].([]any)
 	if status != 422 || detail[0].(map[string]any)["type"] != "missing" {
 		t.Fatalf("缺 items 形状异常: %d %v", status, detail)
 	}
-	// 元素类型错累积
 	status, body = postJSON(t, srv, "/api/v1/games/price-context-batch", `{"items":[1,{"appid":"x","date":5}]}`)
 	detail = body["detail"].([]any)
 	if status != 422 || len(detail) != 3 {
@@ -514,7 +498,6 @@ func TestPriceContextBatch(t *testing.T) {
 		detail[2].(map[string]any)["type"] != "string_type" {
 		t.Fatalf("元素错误形状异常: %v", detail)
 	}
-	// ≤200 对截断
 	items := make([]string, 201)
 	for i := range items {
 		items[i] = fmt.Sprintf(`{"appid":900003,"date":"2024-01-15"}`)
@@ -525,8 +508,6 @@ func TestPriceContextBatch(t *testing.T) {
 		t.Fatalf("应截断到 200 对: %d", len(body["results"].([]any)))
 	}
 }
-
-// ── 版本聚合 ─────────────────────────────────────────────────────────────
 
 func TestVersionsAggregation(t *testing.T) {
 	srv, _, _, _ := newPortHandler(t)
@@ -555,7 +536,6 @@ func TestVersionsAggregation(t *testing.T) {
 		t.Fatalf("US cnyFen 应按汇率折算 round(1499*7.25)=10868: %v", us["cnyFen"])
 	}
 
-	// 排序：标准版 → 无后缀在售 sub → 有后缀 gold
 	sub5 := versions[1].(map[string]any)
 	gold := versions[2].(map[string]any)
 	if sub5["subId"].(float64) != 5 || gold["subId"].(float64) != 2 {
@@ -576,8 +556,6 @@ func TestVersionsEmpty(t *testing.T) {
 		t.Fatalf("空数据应回空列表: %v", body["versions"])
 	}
 }
-
-// ── 系列成员 ─────────────────────────────────────────────────────────────
 
 func TestSeriesMembers(t *testing.T) {
 	srv, _, _, _ := newPortHandler(t)
@@ -610,7 +588,6 @@ func TestSeriesMembers(t *testing.T) {
 		t.Fatalf("无国区行成员应为 null 对: %v", other)
 	}
 
-	// 落单与不存在 → 404
 	for _, path := range []string{"/api/v1/games/900002/series", "/api/v1/games/424242/series"} {
 		status, body = getJSON(t, srv, path)
 		if status != 404 || body["detail"] != "未识别到同系列游戏" {
@@ -618,8 +595,6 @@ func TestSeriesMembers(t *testing.T) {
 		}
 	}
 }
-
-// ── 目录写三件 ───────────────────────────────────────────────────────────
 
 func exclusionReason(t *testing.T, db *sql.DB, appid int64) (string, bool) {
 	t.Helper()
@@ -663,7 +638,6 @@ func TestRemoveWritesLedgerAndExclusion(t *testing.T) {
 		t.Fatal("目录外 appid 不应落行")
 	}
 
-	// 幂等：重复移除保留首次时刻，removed 按目录内计
 	if _, e := db.Exec(`UPDATE catalog_removals SET removed_at='2026-01-01 08:00:00' WHERE appid=900001`); e != nil {
 		t.Fatal(e)
 	}
@@ -679,7 +653,6 @@ func TestRemoveWritesLedgerAndExclusion(t *testing.T) {
 		t.Fatalf("账本应恰 2 行: %d %v", count, e)
 	}
 
-	// 默认视图隐藏、removed 视图独占
 	_, list := getJSON(t, srv, "/api/v1/games?limit=100")
 	for _, it := range list["items"].([]any) {
 		if it.(map[string]any)["appid"].(float64) == 900001 {
@@ -703,7 +676,6 @@ func TestRemoveWritesLedgerAndExclusion(t *testing.T) {
 
 func TestRestorePreservesUserExclusionAndClearsOwnReason(t *testing.T) {
 	srv, db, jobs, _ := newPortHandler(t)
-	// 预置：900001/900002 均已移除
 	for _, appid := range []int64{900001, 900002} {
 		if _, e := db.Exec(`INSERT INTO catalog_removals (appid, reason, removed_at) VALUES (?, 'user_removed', '2026-01-01 08:00:00')`, appid); e != nil {
 			t.Fatal(e)
@@ -717,7 +689,6 @@ func TestRestorePreservesUserExclusionAndClearsOwnReason(t *testing.T) {
 		t.Fatal(e)
 	}
 
-	// 恢复款含用户显式排除（900002）：只回商店，不洗掉排除，不进重爬
 	status, body := postJSON(t, srv, "/api/v1/games/restore", `{"appids":[900001, 900002]}`)
 	if status != 200 || body["restored"].(float64) != 2 || body["missing"].(float64) != 0 {
 		t.Fatalf("恢复计数异常: %d %v", status, body)
@@ -784,7 +755,6 @@ func TestRetryRemovedContract(t *testing.T) {
 		t.Fatalf("清标未生效: %v %d %v", removedAt, strikes, e)
 	}
 
-	// 忙 / 空任务 → note 语义不视为失败
 	jobs.err = errors.New("价格更新正在进行")
 	status, body = postJSON(t, srv, "/api/v1/games/900001/retry-removed", "")
 	if status != 200 || body["ok"] != true || body["jobId"] != nil || body["requeued"] != false || body["note"] == "" {
@@ -816,8 +786,6 @@ func TestGameIdsBodyValidation(t *testing.T) {
 		t.Fatalf("额外键应忽略: %d %v", status, body)
 	}
 }
-
-// ── CDK 查价 ─────────────────────────────────────────────────────────────
 
 func TestCDKFetcher(t *testing.T) {
 	srv, _, _, _ := newPortHandler(t)
@@ -851,7 +819,6 @@ func TestCDKFetcher(t *testing.T) {
 	cdkCiciURL = upstream.URL + "/cici"
 	t.Cleanup(func() { cdkSteampyURL, cdkCiciURL = oldSteampy, oldCici })
 
-	// 缺省 sub：从库内解析（CN 行 sub 9 在 900001；900003 CN sub 5）
 	status, body := getJSON(t, srv, "/api/v1/games/900003/cdk")
 	if status != 200 {
 		t.Fatalf("状态码 %d: %v", status, body)
@@ -871,7 +838,6 @@ func TestCDKFetcher(t *testing.T) {
 		t.Fatal("成功载荷不应带 error 键")
 	}
 
-	// 同键复用缓存：外部调用恰好一次
 	status, body = getJSON(t, srv, "/api/v1/games/900003/cdk")
 	if status != 200 || body["steampy"].(map[string]any)["price"] != "¥12.5" {
 		t.Fatalf("缓存回执异常: %v", body)
@@ -883,7 +849,6 @@ func TestCDKFetcher(t *testing.T) {
 		t.Fatalf("缓存未生效: steampy=%d cici=%d", steampyHits, ciciHits)
 	}
 
-	// 显式 sub 独立键：新查询、缺省键与显式键互不串
 	status, body = getJSON(t, srv, "/api/v1/games/900003/cdk?sub_id=9")
 	if status != 200 || body["subId"].(float64) != 9 {
 		t.Fatalf("显式 sub 回执异常: %v", body)
@@ -899,7 +864,6 @@ func TestCDKFetcher(t *testing.T) {
 		t.Fatalf("显式键应触发新查询: steampy=%d cici=%d", totalSteampy, totalCici)
 	}
 
-	// 坏 sub_id → 422
 	status, body = getJSON(t, srv, "/api/v1/games/900003/cdk?sub_id=abc")
 	if status != 422 {
 		t.Fatalf("坏 sub_id 应 422: %d %v", status, body)
@@ -913,7 +877,6 @@ func TestCDKErrorFieldAndResolveOrder(t *testing.T) {
 		case "/steampy":
 			w.Write([]byte(`{"success":true,"result":{"keyPrice":30,"id":"id9"}}`))
 		case "/cici":
-			// 非 JSON 响应 → error 字段，不抛错
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte("oops"))
 		}
@@ -925,7 +888,6 @@ func TestCDKErrorFieldAndResolveOrder(t *testing.T) {
 	cdkCiciURL = upstream.URL + "/cici"
 	t.Cleanup(func() { cdkSteampyURL, cdkCiciURL = oldSteampy, oldCici })
 
-	// resolve 顺序：CN 优先（900001 CN sub 9 > JP sub 3）
 	status, body := getJSON(t, srv, "/api/v1/games/900001/cdk")
 	if status != 200 || body["subId"].(float64) != 9 {
 		t.Fatalf("sub 解析应 CN 优先: %d %v", status, body)
@@ -938,7 +900,6 @@ func TestCDKErrorFieldAndResolveOrder(t *testing.T) {
 		t.Fatalf("上游故障应落 error 字段不抛错: %v", cici)
 	}
 
-	// 无任何价格行的游戏：sub 解析 null，双平台不发起 HTTP
 	status, body = getJSON(t, srv, "/api/v1/games/900004/cdk")
 	if status != 200 || body["subId"] != nil {
 		t.Fatalf("无价格行应 subId null: %d %v", status, body)
@@ -947,8 +908,6 @@ func TestCDKErrorFieldAndResolveOrder(t *testing.T) {
 		t.Fatalf("无 sub 应双平台 listed false: %v", body)
 	}
 }
-
-// ── 关联捆绑包包壳 ───────────────────────────────────────────────────────
 
 func TestBundlesShell(t *testing.T) {
 	srv, db, _, _ := newPortHandler(t)

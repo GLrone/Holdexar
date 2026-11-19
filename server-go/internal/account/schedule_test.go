@@ -1,5 +1,3 @@
-// schedule_test.go 自动轮换跳过语义：冻结只在会话已死时停摆，会话有效必须
-// 放行按退避重试（否则续期成功的账号被永久冻结死锁）。
 package account
 
 import (
@@ -29,7 +27,6 @@ func TestRotationSkipFrozenOnlyWhileSessionDead(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	// 会话已死 + 冻结 → 维持冻结跳过（死会话不值得发请求）
 	dead := "sessionid=x; steamLoginSecure=" + deadSid + "||" + accessJWT(deadSid, time.Now().Add(-time.Hour).Unix()) + "; steamRefresh_steam=" + deadSid + "||refresh"
 	insert(t, deadSid, dead)
 	row, ok, e := s.row(context.Background(), deadSid)
@@ -39,7 +36,6 @@ func TestRotationSkipFrozenOnlyWhileSessionDead(t *testing.T) {
 	if skip := s.rotationSkip(row, 30); skip == nil || skip["status"] != "frozen" {
 		t.Fatalf("死会话冻结应跳过：%v", skip)
 	}
-	// 会话有效 + 冻结（续期已成功的历史冻结）→ 必须放行按退避重试
 	live := "sessionid=x; steamLoginSecure=" + liveSid + "||" + accessJWT(liveSid, time.Now().Add(24*time.Hour).Unix()) + "; steamRefresh_steam=" + liveSid + "||refresh"
 	insert(t, liveSid, live)
 	row, ok, e = s.row(context.Background(), liveSid)

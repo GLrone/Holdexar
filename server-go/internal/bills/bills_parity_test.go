@@ -1,5 +1,3 @@
-// bills 只读域对拍：Python 侧 bills_summary 输出与 Go ListImports 逐字段
-// 哈希等价（真实账单为用户数据——只比哈希与计数，内容不落日志）。
 package bills
 
 import (
@@ -16,7 +14,6 @@ import (
 	"testing"
 )
 
-// TestListImportsShape 库态自检：金额口径（净额=支出-退款）、笔数口径、isoformat。
 func TestListImportsShape(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", filepath.Join(dir, "t.db"))
@@ -47,9 +44,6 @@ func TestListImportsShape(t *testing.T) {
 		t.Fatalf("行数 %d", len(recs))
 	}
 	r := recs[0]
-	// spend=12500（两条非退款有价），refund=3000，net=9500，orders=3
-	//（CASE..THEN id 对 NULL 行不计数？cny_fen IS NULL 的行 is_refund=0 → orders 含它），
-	// fxMissing=1
 	if r.GameSpendFen != 12500 || r.GameRefundFen != 3000 || r.GameNetFen != 9500 {
 		t.Fatalf("金额口径: %+v", r)
 	}
@@ -61,12 +55,10 @@ func TestListImportsShape(t *testing.T) {
 	}
 }
 
-// g6Data 隔离副本数据文件（G6 副本目录，绝对路径不受测试工作目录影响）。
 func g6Data(name string) string {
 	return filepath.Join("E:/Holdexar-g6/python-test-data", name)
 }
 
-// TestPyParityHash 与 Python harness 输出哈希对拍（副本缺席自动跳过）。
 func TestPyParityHash(t *testing.T) {
 	db, err := sql.Open("sqlite", g6Data("holdexar.db"))
 	if err != nil {

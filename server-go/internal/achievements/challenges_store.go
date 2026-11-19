@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -18,7 +17,7 @@ type savedChallenge struct {
 }
 
 func (s ChallengeService) recompute(ctx context.Context, sid string) (challengeOverview, error) {
-	roster, err := (Reader{DB: s.DB}).accounts(ctx)
+	roster, err := (Reader{DB: s.DB, Log: s.Log}).accounts(ctx)
 	if err != nil {
 		return challengeOverview{}, err
 	}
@@ -282,6 +281,6 @@ func (s ChallengeService) publishChallengeFacts(ctx context.Context, notices []l
 	if err := s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		return recordLevelFacts(ctx, conn, notices, now)
 	}); err != nil {
-		slog.Warn("挑战变化未能保存到通知", "error", err)
+		warnLog(s.Log, "挑战变化未能保存到通知", err)
 	}
 }

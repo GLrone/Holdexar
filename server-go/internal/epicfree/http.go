@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/sched"
 )
 
@@ -133,9 +134,5 @@ func (s *Service) respond(w http.ResponseWriter, result any, err error) {
 }
 
 func (s *Service) reply(w http.ResponseWriter, code int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		s.opts.Log("免费促销响应未发送 │ 原因=%v", err)
-	}
+	httpx.WriteJSON(w, code, payload)
 }

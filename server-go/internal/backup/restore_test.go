@@ -24,7 +24,6 @@ func restoreFixture(t *testing.T) (*Service, *sql.DB, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 真实 v34 全量结构+种子：恢复后的库要经得起启动校验
 	if err := store.InitializeFreshDatabase(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +32,6 @@ func restoreFixture(t *testing.T) (*Service, *sql.DB, string) {
 		VALUES(620, 'Portal 2', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`); err != nil {
 		t.Fatal(err)
 	}
-	// 主文件落全已提交内容：后续按字节复制的夹具才与真实库一致
 	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +47,6 @@ func TestRestoreRestoresCommittedStateAndRequestsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 备份后再写一笔：恢复应回到备份时点，这一行必须消失
 	if _, err := db.Exec(`INSERT INTO games(appid, name, family_sharing, trading_cards, is_epic, is_hb, hl_flag, pp_flag,
 			diff_fen, is_adult, is_visual_novel, removed_strikes, positive_reviews, review_count, view_count)
 		VALUES(440, 'HL2', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)`); err != nil {
@@ -76,7 +73,6 @@ func TestRestoreRestoresCommittedStateAndRequestsRestart(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("恢复后应只有备份时点的 1 行，实得 %d", count)
 	}
-	// 恢复保护标记待下次启动校验后清除
 	marker, err := os.ReadFile(filepath.Join(filepath.Dir(path), "backups", ".restore.lock"))
 	if err != nil {
 		t.Fatal("恢复后保护标记应保留到下次启动:", err)
@@ -116,7 +112,6 @@ func TestRestoreRejectsCorruptArchive(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "哈希不符") && !strings.Contains(err.Error(), "校验失败") && !strings.Contains(err.Error(), "解压") {
 		t.Fatalf("拒绝原因不合预期：%v", err)
 	}
-	// 段 1 失败不触碰原库：探针不残留，原库连接仍然可用
 	if _, err := db.Exec("SELECT COUNT(*) FROM games"); err != nil {
 		t.Fatalf("原库应保持可用：%v", err)
 	}
@@ -181,7 +176,6 @@ func TestRestoreRejectsNewerSchemaVersion(t *testing.T) {
 	}
 }
 
-// copyDatabase 复制库文件并改写 user_version（构造「未来版本」夹具）。
 func copyDatabase(src, dest string, version int) error {
 	raw, err := os.ReadFile(src)
 	if err != nil {
@@ -214,7 +208,6 @@ func dbClosed(db *sql.DB) bool {
 
 func TestRestoreFailureBeforeReplaceKeepsOriginalReadable(t *testing.T) {
 	s, db, path := restoreFixture(t)
-	// 保护标记被占：恢复在取保护前即失败，原库不受影响
 	blocker, err := store.BeginBackupMaintenance(path)
 	if err != nil {
 		t.Fatal(err)

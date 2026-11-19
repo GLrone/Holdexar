@@ -6,7 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -72,7 +72,7 @@ func LoadSeriesOverrides(dataDir string) (map[string][]int64, []string) {
 		for id := range set {
 			ids = append(ids, id)
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		slices.Sort(ids)
 		if _, exists := out[name]; !exists {
 			order = append(order, name)
 		}

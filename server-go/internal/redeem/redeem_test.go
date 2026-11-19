@@ -1,6 +1,3 @@
-// redeem_test.go 契约测试：复刻 Python tests/test_redeem.py 基线 13 案 +
-// 分桶计数与 account 注入回归 2 案，另加 HTTP 层 422/400 形状守护。
-// 网络全隔离：Steam 端点经包级 registerKeyURL 打桩到 httptest。
 package redeem
 
 import (
@@ -24,8 +21,6 @@ import (
 const primarySteamID = "76561198000000001"
 const otherSteamID = "76561198000000002"
 
-// newFixture 临时库 + 账号服务（钱包/资料请求全部 429 快速失败，不影响绑定）
-// + redeem 服务（RedeemUsed 注入接线，与生产装配同构）。
 func newFixture(t *testing.T) (*Service, *account.Service, *sql.DB) {
 	t.Helper()
 	data := t.TempDir()
@@ -60,7 +55,6 @@ func newFixture(t *testing.T) (*Service, *account.Service, *sql.DB) {
 	return svc, accounts, db
 }
 
-// stubSteam 伪 Steam 激活端点（覆盖包级出网 URL）。
 func stubSteam(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
 	srv := httptest.NewServer(handler)
@@ -69,7 +63,6 @@ func stubSteam(t *testing.T, handler http.HandlerFunc) {
 	t.Cleanup(func() { registerKeyURL = old; srv.Close() })
 }
 
-// bindCookie 绑定账号（sessionid 可为空串模拟缺失）。
 func bindCookie(t *testing.T, accounts *account.Service, steamID, sessionID string) {
 	t.Helper()
 	cookie := "steamLoginSecure=" + steamID + "||jwt-token"
@@ -120,7 +113,6 @@ func ledgerRows(t *testing.T, db *sql.DB) []map[string]any {
 	return out
 }
 
-// 1. test_activate_key_success_receipt：success=1 → ok，回执提取 subId/subName。
 func TestActivateKeySuccessReceipt(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -153,14 +145,13 @@ func TestActivateKeySuccessReceipt(t *testing.T) {
 	}
 }
 
-// 2. test_activate_key_own_receipt_keeps_sub：已拥有回执带 line_items 同样提取。
 func TestActivateKeyOwnReceiptKeepsSub(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
 	captureCall(t, &steamCall{}, map[string]any{
-		"success":                2,
+		"success":                 2,
 		"purchase_result_details": 9,
-		"purchase_receipt_info":  map[string]any{"line_items": []any{map[string]any{"packageid": 52524, "line_item_description": "Counter-Strike 2"}}},
+		"purchase_receipt_info":   map[string]any{"line_items": []any{map[string]any{"packageid": 52524, "line_item_description": "Counter-Strike 2"}}},
 	})
 	res, err := svc.ActivateKey(context.Background(), "AAAAA-BBBBB-CCCCC")
 	if err != nil {
@@ -174,7 +165,6 @@ func TestActivateKeyOwnReceiptKeepsSub(t *testing.T) {
 	}
 }
 
-// 3. test_activate_key_already_owned：错误码 9 → own。
 func TestActivateKeyAlreadyOwned(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -188,7 +178,6 @@ func TestActivateKeyAlreadyOwned(t *testing.T) {
 	}
 }
 
-// 4. test_activate_key_rate_limited：错误码 53 → fail 次数上限语义。
 func TestActivateKeyRateLimited(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -202,7 +191,6 @@ func TestActivateKeyRateLimited(t *testing.T) {
 	}
 }
 
-// 5. test_activate_key_invalid_code_passthrough：未知错误码 → 原码回传。
 func TestActivateKeyInvalidCodePassthrough(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -216,7 +204,6 @@ func TestActivateKeyInvalidCodePassthrough(t *testing.T) {
 	}
 }
 
-// 6. test_activate_batch_aggregation：批量汇总计数与逐码结果顺序保持。
 func TestActivateBatchAggregation(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -249,7 +236,6 @@ func TestActivateBatchAggregation(t *testing.T) {
 	}
 }
 
-// 7/8. test_activate_key_no_cookie / no_sessionid：登录态缺失 → InputError（路由 400）。
 func TestActivateKeyNoCookie(t *testing.T) {
 	svc, _, _ := newFixture(t)
 	_, err := svc.ActivateKey(context.Background(), "AAAAA-BBBBB-CCCCC")
@@ -269,7 +255,6 @@ func TestActivateKeyNoSessionid(t *testing.T) {
 	}
 }
 
-// 9. test_quota_status：无 Cookie 五字段精确等值；绑定后前提齐备。
 func TestQuotaStatus(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	quota, err := svc.QuotaStatus(context.Background())
@@ -289,7 +274,6 @@ func TestQuotaStatus(t *testing.T) {
 	}
 }
 
-// 10. test_activation_count_per_account：按账号计数，换绑清零。
 func TestActivationCountPerAccount(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -316,7 +300,6 @@ func TestActivationCountPerAccount(t *testing.T) {
 	}
 }
 
-// 11. test_activation_ledger_rows_for_each_status：ok/own/fail 各落一行 + 掩码。
 func TestActivationLedgerRowsForEachStatus(t *testing.T) {
 	svc, accounts, db := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -364,7 +347,6 @@ func TestActivationLedgerRowsForEachStatus(t *testing.T) {
 	}
 }
 
-// 12. test_list_activations_order_and_paging：倒序 + 分页 + 夹取。
 func TestListActivationsOrderAndPaging(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -408,11 +390,9 @@ func TestListActivationsOrderAndPaging(t *testing.T) {
 	}
 }
 
-// TestSearchActivationsFilterAndPaging 检索函数：status/key 精确过滤 + q 子串搜索 + 分页。
 func TestSearchActivationsFilterAndPaging(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
-	// ok 回执带版本名，两条失败行无版本名
 	captureCall(t, &steamCall{}, map[string]any{"success": 1, "purchase_receipt_info": map[string]any{
 		"line_items": []any{map[string]any{"packageid": 307574, "line_item_description": "Dark Envoy"}}}})
 	if _, err := svc.ActivateKey(context.Background(), "AAAAA-BBBBB-CCCC1"); err != nil {
@@ -462,7 +442,6 @@ func TestSearchActivationsFilterAndPaging(t *testing.T) {
 	if hit.Total != 1 || hit.Rows[0].Key != "AAAAA-BBBBB-CCCC1" {
 		t.Fatalf("q 搜索不符: %+v", hit)
 	}
-	// 时间倒序：后激活的在前；分页切片一致
 	page0, err := svc.SearchActivations(context.Background(), "", "aaaa", "", 1, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -479,7 +458,6 @@ func TestSearchActivationsFilterAndPaging(t *testing.T) {
 	}
 }
 
-// 13. test_ledger_raw_truncated：落账 raw 截到 8000；展示口径先截 2000。
 func TestLedgerRawTruncated(t *testing.T) {
 	svc, accounts, db := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -500,7 +478,6 @@ func TestLedgerRawTruncated(t *testing.T) {
 	if len(rows[1]["raw"].(string)) != 5000 {
 		t.Fatalf("5000 以内不应截断: %d", len(rows[1]["raw"].(string)))
 	}
-	// 正常链路：结果 raw 按展示口径先截 2000
 	stubSteam(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("z", 5000)))
 	})
@@ -517,7 +494,6 @@ func TestLedgerRawTruncated(t *testing.T) {
 	}
 }
 
-// 14. test_transport_failure_ledger_row：传输失败落 fail 行且不计次数。
 func TestTransportFailureLedgerRow(t *testing.T) {
 	svc, accounts, db := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -551,7 +527,6 @@ func TestTransportFailureLedgerRow(t *testing.T) {
 	}
 }
 
-// +1（test_account_multi 分桶 3/1）：计数按账号独立分桶 + 过期戳清出窗口。
 func TestActivationUsageIsolatedPerAccount(t *testing.T) {
 	now := time.Now()
 	c := newCounter(ACTWindowSeconds*time.Second, func() time.Time { return now })
@@ -571,7 +546,6 @@ func TestActivationUsageIsolatedPerAccount(t *testing.T) {
 	}
 }
 
-// +2（account 注入回归）：写死 0 → 注入后账号 views 反映计数。
 func TestAccountViewsReflectRedeemCounter(t *testing.T) {
 	svc, accounts, _ := newFixture(t)
 	bindCookie(t, accounts, primarySteamID, "abc123")
@@ -597,8 +571,6 @@ func TestAccountViewsReflectRedeemCounter(t *testing.T) {
 		t.Fatalf("注入后 views 应反映计数 2: %v", views[0]["redeem_used"])
 	}
 }
-
-// ── HTTP 层形状守护（FastAPI 复刻） ─────────────────────────────────
 
 func httpFixture(t *testing.T) (*Service, *account.Service, *http.ServeMux) {
 	t.Helper()
@@ -637,7 +609,7 @@ func TestHTTPActivateKeysValidation(t *testing.T) {
 		name   string
 		body   string
 		status int
-		issue  int // 期望 detail 数组长度（0 = 非数组信封）
+		issue  int
 		check  func(t *testing.T, out map[string]any)
 	}{
 		{"empty list too_short", `{"keys": []}`, 422, 1, func(t *testing.T, out map[string]any) {
@@ -689,7 +661,6 @@ func TestHTTPActivateKeysValidation(t *testing.T) {
 			tc.check(t, out)
 		})
 	}
-	// max100：101 个元素 → too_long
 	items := make([]string, 101)
 	for i := range items {
 		items[i] = `"K"`
@@ -706,7 +677,6 @@ func TestHTTPActivateKeysValidation(t *testing.T) {
 
 func TestHTTPActivateKeysEnvelopes(t *testing.T) {
 	_, _, mux := httpFixture(t)
-	// 全空白码过滤后为空 → 400 激活码列表为空
 	rec := doJSON(t, mux, "POST", "/api/v1/redeem/keys", `{"keys": ["   ", "  "]}`)
 	if rec.Code != 400 {
 		t.Fatalf("空白码应 400: %d %s", rec.Code, rec.Body.String())
@@ -714,7 +684,6 @@ func TestHTTPActivateKeysEnvelopes(t *testing.T) {
 	if got := decode(t, rec)["detail"]; got != "激活码列表为空" {
 		t.Fatalf("detail 不符: %v", got)
 	}
-	// 未绑定 Cookie → 400 尚未绑定
 	rec = doJSON(t, mux, "POST", "/api/v1/redeem/keys", `{"keys": ["AAAAA-BBBBB-CCCCC"]}`)
 	if rec.Code != 400 {
 		t.Fatalf("无 Cookie 应 400: %d %s", rec.Code, rec.Body.String())
@@ -737,7 +706,6 @@ func TestHTTPQuotaAndActivations(t *testing.T) {
 			t.Fatalf("quota 字段 %s 不符: %v", key, out[key])
 		}
 	}
-	// 非法 limit → 422 int_parsing
 	rec = doJSON(t, mux, "GET", "/api/v1/redeem/activations?limit=abc", "")
 	if rec.Code != 422 {
 		t.Fatalf("limit=abc 应 422: %d", rec.Code)
@@ -746,7 +714,6 @@ func TestHTTPQuotaAndActivations(t *testing.T) {
 	if issue["type"] != "int_parsing" || issue["loc"].([]any)[1] != "limit" {
 		t.Fatalf("int_parsing 形状不符: %v", issue)
 	}
-	// 落两行后分页读口
 	bindCookie(t, accounts, primarySteamID, "abc123")
 	ctx := context.Background()
 	for _, key := range []string{"K1", "K2"} {

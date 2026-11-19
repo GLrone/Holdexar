@@ -6,12 +6,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func accountResponse(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 func accountHTTPError(w http.ResponseWriter, e error) {
 	status := 500

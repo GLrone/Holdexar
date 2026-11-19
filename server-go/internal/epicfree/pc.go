@@ -62,7 +62,6 @@ type pcPromotionGroup struct {
 	}
 }
 
-// FetchPC reads the authoritative PC window and optionally enriches it with the Chinese catalog.
 func FetchPC(ctx context.Context, client *http.Client) ([]Offer, error) {
 	if client == nil {
 		client = newPublicClient()

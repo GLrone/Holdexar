@@ -19,36 +19,31 @@ type LoginState struct {
 }
 
 type loginAttempt struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	finish    func()
-	infoMu    sync.Mutex
-	auth      *loginAuth
-	state     LoginState
-	running   bool
-	steamID   string
-	codeGuard int
-	interval  time.Duration
+	ctx              context.Context
+	cancel           context.CancelFunc
+	finish           func()
+	infoMu           sync.Mutex
+	auth             *loginAuth
+	state            LoginState
+	running          bool
+	steamID          string
+	codeGuard        int
+	interval         time.Duration
+	isRecovery       bool
+	recoveryConsumed bool
+	guard            func(string) error
+	onFail           func()
 }
 
-// SetRecoveryGuard 挂一次性登录守卫：找回流程在 BindCookies 之前校验
-// 「登录成功的 Steam 账号是否在绑定集合」，未绑定账号不落库不建立登录态。
-// 守卫在一次尝试终结（成功校验/失败/取消）后自动清除。
-func (s *Service) SetRecoveryGuard(guard func(steamID string) error) {
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
-	s.recoveryGuard = guard
-}
-
-// RecoverySteamID 找回流程完成态：最近一次登录已成功且尚未被新尝试覆盖时
-// 返回其 SteamID。
-func (s *Service) RecoverySteamID() (string, bool) {
+// ConsumeRecoverySteamID 消费找回登录完成态，每次找回登录至多兑现一次。
+func (s *Service) ConsumeRecoverySteamID() (string, bool) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
 	a := s.login
-	if a == nil || a.running || a.state.State != "done" || a.steamID == "" {
+	if a == nil || !a.isRecovery || a.recoveryConsumed || a.running || a.state.State != "done" || a.steamID == "" {
 		return "", false
 	}
+	a.recoveryConsumed = true
 	return a.steamID, true
 }
 
@@ -88,9 +83,6 @@ func loginErrorText(err error) string {
 	return "登录收尾失败，请重试"
 }
 func (s *Service) failLogin(a *loginAttempt, err error) {
-	s.loginMu.Lock()
-	s.recoveryGuard = nil // 一次性守卫：尝试终止即恢复常规绑定语义
-	s.loginMu.Unlock()
 	if errors.Is(a.ctx.Err(), context.Canceled) {
 		s.updateLogin(a, "idle", "", "")
 		return
@@ -100,10 +92,19 @@ func (s *Service) failLogin(a *loginAttempt, err error) {
 		message = "登录等待超时，请重试"
 	}
 	if s.updateLogin(a, "failed", "", message) {
+		if a.onFail != nil {
+			a.onFail()
+		}
 		s.opts.Log("应用内账号密码登录未完成 │ 原因=%s", message)
 	}
 }
 func (s *Service) StartLogin(parent context.Context, account, password string) (map[string]any, error) {
+	return s.startLogin(parent, account, password, false, nil, nil)
+}
+func (s *Service) StartRecoveryLogin(parent context.Context, account, password string, guard func(string) error, onFail func()) (map[string]any, error) {
+	return s.startLogin(parent, account, password, true, guard, onFail)
+}
+func (s *Service) startLogin(parent context.Context, account, password string, isRecovery bool, guard func(string) error, onFail func()) (map[string]any, error) {
 	s.loginMu.Lock()
 	if s.login != nil && s.login.running {
 		state := s.loginStatusLocked()
@@ -126,7 +127,13 @@ func (s *Service) StartLogin(parent context.Context, account, password string) (
 		timeout = 5 * time.Minute
 	}
 	ctx, cancel := context.WithTimeout(life, timeout)
-	a := &loginAttempt{ctx: ctx, cancel: cancel, state: s.newLoginState("signing", "正在登录…"), running: true}
+	a := &loginAttempt{
+		ctx: ctx, cancel: cancel,
+		state:      s.newLoginState("signing", "正在登录…"),
+		running:    true,
+		isRecovery: isRecovery,
+		guard:      guard,
+	}
 	var finished sync.Once
 	a.finish = func() {
 		finished.Do(func() {
@@ -156,8 +163,8 @@ func (s *Service) StartLogin(parent context.Context, account, password string) (
 	a.infoMu.Unlock()
 	state, message := "awaiting_confirmation", ""
 	confirmed := false
-	for _, guard := range auth.guards {
-		confirmed = confirmed || guard == 4 || guard == 5
+	for _, g := range auth.guards {
+		confirmed = confirmed || g == 4 || g == 5
 	}
 	if auth.deviceOK {
 		message = "本机已获 Steam 信任，正在完成登录…"
@@ -178,6 +185,7 @@ func (s *Service) StartLogin(parent context.Context, account, password string) (
 		a.finish()
 		return map[string]any{"ok": false, "state": s.LoginStatus()}, nil
 	}
+	a.onFail = onFail
 	go s.pollLoginAttempt(a)
 	return map[string]any{"ok": true, "state": s.LoginStatus()}, nil
 }
@@ -205,15 +213,9 @@ func (s *Service) pollLoginAttempt(a *loginAttempt) {
 		if !s.updateLogin(a, "finalizing", "正在建立登录态…", "") {
 			return
 		}
-		// 找回守卫（一次性）：绑定落库前先校验登录身份是否属于绑定集合，
-		// 未绑定账号不落库（防止找回流程把任意 Steam 账号自动绑定进来）。
-		s.loginMu.Lock()
-		guard := s.recoveryGuard
-		s.recoveryGuard = nil
-		s.loginMu.Unlock()
-		if guard != nil {
-			if err := guard(a.steamID); err != nil {
-				s.failLogin(a, err)
+		if a.guard != nil {
+			if err := a.guard(a.steamID); err != nil {
+				s.failLogin(a, &loginFailure{message: err.Error()})
 				return
 			}
 		}
@@ -245,9 +247,15 @@ func (s *Service) pollLoginAttempt(a *loginAttempt) {
 	}
 }
 func (s *Service) SubmitLoginCode(parent context.Context, code string) (map[string]any, error) {
+	return s.submitLoginCode(parent, code, false)
+}
+func (s *Service) SubmitRecoveryLoginCode(parent context.Context, code string) (map[string]any, error) {
+	return s.submitLoginCode(parent, code, true)
+}
+func (s *Service) submitLoginCode(parent context.Context, code string, requireRecovery bool) (map[string]any, error) {
 	s.loginMu.Lock()
 	a := s.login
-	waiting := a != nil && a.running && (a.state.State == "awaiting_code" || a.state.State == "awaiting_confirmation") && a.codeGuard != 0
+	waiting := a != nil && a.running && (!requireRecovery || a.isRecovery) && (a.state.State == "awaiting_code" || a.state.State == "awaiting_confirmation") && a.codeGuard != 0
 	s.loginMu.Unlock()
 	if !waiting {
 		return map[string]any{"ok": false, "no_session": true, "state": s.LoginStatus(), "error": "当前没有等待验证码的登录"}, nil
@@ -265,7 +273,7 @@ func (s *Service) SubmitLoginCode(parent context.Context, code string) (map[stri
 	defer func() { stop(); cancel() }()
 	a.infoMu.Lock()
 	s.loginMu.Lock()
-	waiting = s.login == a && a.running && (a.state.State == "awaiting_code" || a.state.State == "awaiting_confirmation")
+	waiting = s.login == a && a.running && (!requireRecovery || a.isRecovery) && (a.state.State == "awaiting_code" || a.state.State == "awaiting_confirmation")
 	s.loginMu.Unlock()
 	if waiting {
 		err = s.opts.Steam.submitLoginGuard(ctx, a.auth, code)
@@ -286,10 +294,15 @@ func (s *Service) SubmitLoginCode(parent context.Context, code string) (map[stri
 	return map[string]any{"ok": true, "state": s.LoginStatus()}, nil
 }
 func (s *Service) CancelLogin() map[string]any {
+	return s.cancelLogin(false)
+}
+func (s *Service) CancelRecoveryLogin() map[string]any {
+	return s.cancelLogin(true)
+}
+func (s *Service) cancelLogin(requireRecovery bool) map[string]any {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	s.recoveryGuard = nil
-	if a := s.login; a != nil && a.running {
+	if a := s.login; a != nil && a.running && (!requireRecovery || a.isRecovery) {
 		a.cancel()
 		a.running = false
 		a.state.State, a.state.Message, a.state.Error = "idle", "", ""

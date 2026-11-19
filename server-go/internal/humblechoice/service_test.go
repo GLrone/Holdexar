@@ -47,9 +47,6 @@ func TestMonthlyRetryPreservesTagsThenBackfillsAndNotifiesOnce(t *testing.T) {
 	}
 	var complete atomic.Bool
 	var searches atomic.Int32
-	// 2026-11 改版形态：RSC flight 流内嵌（页面按区块重复同一份清单，解析需去重）。
-	// 覆盖三态：Steam 交付（appid 匹配）/ 非 Steam 平台（blizzard，带标识保留）/
-	// 仅 external_key（订阅权益类，排除）。
 	products := []map[string]any{
 		{"id": "firstgame_choice", "title": "First Game", "deliveryMethods": []string{"steam"},
 			"endDate": "2027-06-01T00:00:00+00:00", "displayPrice": map[string]any{"currentPrice": map[string]any{"centAmount": 1999}}},
@@ -145,7 +142,6 @@ func TestMonthlyRetryPreservesTagsThenBackfillsAndNotifiesOnce(t *testing.T) {
 		offers["games"].([]any)[0].(map[string]any)["priceFen"] != float64(999) {
 		t.Fatalf("price read: %+v", offers)
 	}
-	// 非 Steam 平台游戏：appid=0 + 平台标识 + 官方缩略图/零售价
 	platformGame := offers["games"].([]any)[2].(map[string]any)
 	if platformGame["appid"] != float64(0) || platformGame["name"] != "Third Game" ||
 		platformGame["platform"] != "blizzard" || platformGame["originalPriceFen"] != float64(5999) ||

@@ -13,7 +13,6 @@ import (
 	"io"
 	"net/http"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 
@@ -232,7 +231,7 @@ func safeEntry(entry Installed) Installed {
 		}
 		c[name] = value
 	}
-	sort.Strings(entry.ConfiguredSecrets)
+	slices.Sort(entry.ConfiguredSecrets)
 	entry.Config = c
 	return entry
 }
@@ -447,7 +446,6 @@ func (m *Manager) install(ctx context.Context, raw []byte, source string, unsign
 	return safeEntry(entry), nil
 }
 
-// ActiveDataSource 启用中的数据源插件与其观测集（无启用项回 nil）。
 func (m *Manager) ActiveDataSource(ctx context.Context) (*Installed, *DataSourceData, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -578,6 +576,33 @@ func (m *Manager) readCatalog(ctx context.Context) (CatalogResult, error) {
 	return result, nil
 }
 
+func filterListings(items []Listing, query string) []Listing {
+	if items == nil {
+		return []Listing{}
+	}
+	needle := strings.ToLower(strings.TrimSpace(query))
+	if needle == "" {
+		return items
+	}
+	matches := []Listing{}
+	for _, entry := range items {
+		if strings.Contains(strings.ToLower(fmt.Sprint(entry.Manifest.ID, " ", entry.Manifest.Name, " ", entry.Manifest.Description, " ", entry.Manifest.Author)), needle) {
+			matches = append(matches, entry)
+		}
+	}
+	return matches
+}
+
+func (m *Manager) QueryCatalog(ctx context.Context, query string) (CatalogResult, error) {
+	result, e := m.readCatalog(ctx)
+	if e != nil {
+		return CatalogResult{}, e
+	}
+	result.Cached = true
+	result.Plugins = filterListings(result.Plugins, query)
+	return result, nil
+}
+
 func (m *Manager) Discover(ctx context.Context, source, query string) (CatalogResult, error) {
 	old, e := m.readCatalog(ctx)
 	if e != nil {
@@ -648,18 +673,6 @@ func (m *Manager) Discover(ctx context.Context, source, query string) (CatalogRe
 			}
 		}
 	}
-	if result.Plugins == nil {
-		result.Plugins = []Listing{}
-	}
-	needle := strings.ToLower(strings.TrimSpace(query))
-	if needle != "" {
-		matches := []Listing{}
-		for _, entry := range result.Plugins {
-			if strings.Contains(strings.ToLower(fmt.Sprint(entry.Manifest.ID, " ", entry.Manifest.Name, " ", entry.Manifest.Description, " ", entry.Manifest.Author)), needle) {
-				matches = append(matches, entry)
-			}
-		}
-		result.Plugins = matches
-	}
+	result.Plugins = filterListings(result.Plugins, query)
 	return result, nil
 }

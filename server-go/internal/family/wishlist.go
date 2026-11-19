@@ -1,9 +1,10 @@
 package family
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -84,7 +85,7 @@ WHERE active=1 AND owned=0 AND (? OR steamid IN(SELECT value FROM json_each(?)))
 		}
 		items[i].gameInfo = gameWithInfo(id, info, "")
 	}
-	sort.SliceStable(items, func(i, j int) bool { return items[i].WantCount > items[j].WantCount })
+	slices.SortStableFunc(items, func(a, b familyWish) int { return cmp.Compare(b.WantCount, a.WantCount) })
 	s.kickWishlist(missing)
 	return map[string]any{"fallback": fallback, "familyName": name, "memberIds": ids, "items": items}, nil
 }

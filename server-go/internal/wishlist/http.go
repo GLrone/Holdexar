@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func poolReply(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 func (p *Pool) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/follows", func(w http.ResponseWriter, r *http.Request) {

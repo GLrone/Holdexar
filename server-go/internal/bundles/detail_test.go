@@ -22,18 +22,15 @@ func TestBundleDetailShapeAndGames(t *testing.T) {
 	if detail.URL != "https://store.steampowered.com/bundle/990101/" {
 		t.Fatalf("url=%s", detail.URL)
 	}
-	// 无封面 → bundles 兜底路径
 	if detail.HeaderImage != "https://shared.akamai.steamstatic.com/store_item_assets/steam/bundles/990101/header.jpg" {
 		t.Fatalf("header=%s", detail.HeaderImage)
 	}
-	// 锁区数：US 行缺 APPID_3 → 锁 1 款；CN 齐装 → 0
 	if got := detail.RegionPrices["US"].LockedCount; got != 1 {
 		t.Fatalf("US lockedCount=%d", got)
 	}
 	if got := detail.RegionPrices["CN"].LockedCount; got != 0 {
 		t.Fatalf("CN lockedCount=%d", got)
 	}
-	// 详情区价保留 appIds
 	if got := detail.RegionPrices["US"].AppIDs; !reflect.DeepEqual(got, []int64{app1, app2}) {
 		t.Fatalf("US appIds=%v", got)
 	}
@@ -41,7 +38,6 @@ func TestBundleDetailShapeAndGames(t *testing.T) {
 		t.Fatalf("CN formatted=%s", detail.RegionPrices["CN"].Formatted)
 	}
 
-	// 包内游戏：入库带名称与各区现价，未入库 name=null
 	if len(detail.Games) != 3 {
 		t.Fatalf("games=%d", len(detail.Games))
 	}
@@ -84,14 +80,12 @@ func TestBundleDetailDualProductIsolationAndImageNormalize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// RU 污染行剔除；最低 = CN（唯一同族行）
 	if _, ok := detail.RegionPrices["RU"]; ok {
 		t.Fatalf("C keeps pollution row: %v", detail.RegionPrices)
 	}
 	if detail.LowestRegion != "cn" || detail.LowestCnyFen == nil || *detail.LowestCnyFen != 20000 {
 		t.Fatalf("C lowest=%s/%v", detail.LowestRegion, detail.LowestCnyFen)
 	}
-	// fastly 封面域归一到 akamai
 	if !strings.HasPrefix(detail.HeaderImage, "https://shared.akamai.steamstatic.com/store_item_assets/steam/bundles/") {
 		t.Fatalf("C header=%s", detail.HeaderImage)
 	}
@@ -121,7 +115,6 @@ func TestBundleDetailSubKindFallback(t *testing.T) {
 	if detail.ItemKind != 1 || detail.MustPurchaseAsSet != 1 {
 		t.Fatalf("kind=%d mps=%d", detail.ItemKind, detail.MustPurchaseAsSet)
 	}
-	// sub 形态：URL 用 /sub/，封面兜底走 subs 路径
 	if detail.URL != "https://store.steampowered.com/sub/990105/" {
 		t.Fatalf("url=%s", detail.URL)
 	}

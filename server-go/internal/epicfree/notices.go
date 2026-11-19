@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -12,6 +13,9 @@ import (
 )
 
 func titleIdentity(o Offer) string {
+	if o.AppID != nil && *o.AppID > 0 {
+		return fmt.Sprintf("appid:%d", *o.AppID)
+	}
 	if title := strings.ToLower(strings.TrimSpace(o.Title)); title != "" {
 		return "title:" + title
 	}

@@ -74,7 +74,6 @@ func (w *Windows) KeyAt(ts time.Time) *string {
 	return nil
 }
 
-// Backfill tags missing observations from the calendar loaded by Reload.
 func (w *Windows) Backfill(ctx context.Context, keys []string) (int, error) {
 	if len(keys) == 0 {
 		return 0, nil
@@ -137,7 +136,6 @@ func (w *Windows) Backfill(ctx context.Context, keys []string) (int, error) {
 	return total, nil
 }
 
-// InvalidateBackfill clears revised windows' marks in the calendar write transaction.
 func InvalidateBackfill(ctx context.Context, conn *sql.Conn, keys []string) error {
 	if len(keys) == 0 {
 		return nil

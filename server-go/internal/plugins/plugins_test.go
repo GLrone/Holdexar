@@ -3,17 +3,17 @@ package plugins
 import (
 	"archive/zip"
 	"bytes"
-	"errors"
-	"strconv"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -359,6 +359,89 @@ func TestHTTPPluginMetadataAndDiscoverContract(t *testing.T) {
 	json.Unmarshal(r.Body.Bytes(), &discovered)
 	if _, ok := discovered["items"]; !ok {
 		t.Fatal("discovery does not expose items")
+	}
+}
+
+func TestGETDiscoverIsSideEffectFreeWhilePOSTRefreshesCatalog(t *testing.T) {
+	m, db := testManager(t)
+	manifest := fixture("example.webhook")
+	raw := pack(t, manifest)
+	sum := sha256.Sum256(raw)
+	listing := Listing{Manifest: manifest, SHA256: hex.EncodeToString(sum[:]), URL: "https://example.com/plugin.hlx"}
+	catalogRaw, _ := json.Marshal(map[string]any{"apiVersion": 1, "plugins": []Listing{listing}})
+
+	var netCalls int
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		netCalls++
+		_, _ = w.Write(catalogRaw)
+	}))
+	defer server.Close()
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		netCalls++
+		cloned := r.Clone(r.Context())
+		target, _ := http.NewRequest("GET", server.URL+r.URL.Path, nil)
+		cloned.URL = target.URL
+		return server.Client().Transport.RoundTrip(cloned)
+	})}
+
+	mux := http.NewServeMux()
+	m.Register(mux)
+
+	// GET with ?source=... must make ZERO network calls and ZERO DB writes.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/plugins/discover?source=https://evil.example/index.json&q=Webhook", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET discover status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if netCalls != 0 {
+		t.Fatalf("GET discover made %d outbound calls, want 0", netCalls)
+	}
+	var rowCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_settings WHERE key=?`, catalogKey).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("GET discover wrote %d catalog rows, want 0", rowCount)
+	}
+	var getOut map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &getOut); err != nil {
+		t.Fatal(err)
+	}
+	if getOut["cached"] != true || len(getOut["items"].([]any)) != 0 {
+		t.Fatalf("unexpected GET discover payload: %v", getOut)
+	}
+
+	// POST /api/v1/plugins/discover refreshes and persists the catalog.
+	postRec := httptest.NewRecorder()
+	mux.ServeHTTP(postRec, httptest.NewRequest("POST", "/api/v1/plugins/discover", strings.NewReader(`{"source":"https://example.com/index.json","q":"Webhook"}`)))
+	if postRec.Code != 200 {
+		t.Fatalf("POST discover status=%d body=%s", postRec.Code, postRec.Body.String())
+	}
+	if netCalls == 0 {
+		t.Fatal("POST discover did not fetch remote catalog")
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_settings WHERE key=?`, catalogKey).Scan(&rowCount); err != nil || rowCount != 1 {
+		t.Fatalf("POST discover did not persist catalog: rowCount=%d err=%v", rowCount, err)
+	}
+	var postOut map[string]any
+	if err := json.Unmarshal(postRec.Body.Bytes(), &postOut); err != nil {
+		t.Fatal(err)
+	}
+	if postOut["cached"] != false || len(postOut["items"].([]any)) != 1 {
+		t.Fatalf("unexpected POST discover payload: %v", postOut)
+	}
+
+	// Subsequent GET reads saved catalog with query filter and zero additional network calls.
+	beforeCalls := netCalls
+	rec2 := httptest.NewRecorder()
+	mux.ServeHTTP(rec2, httptest.NewRequest("GET", "/api/v1/plugins/discover?source=https://evil.example/index.json&q=Webhook", nil))
+	if rec2.Code != 200 || netCalls != beforeCalls {
+		t.Fatalf("subsequent GET discover status=%d netCalls=%d (was %d)", rec2.Code, netCalls, beforeCalls)
+	}
+	var getOut2 map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &getOut2)
+	if getOut2["cached"] != true || getOut2["source"] != "https://example.com/index.json" || len(getOut2["items"].([]any)) != 1 {
+		t.Fatalf("subsequent GET discover payload mismatch: %v", getOut2)
 	}
 }
 

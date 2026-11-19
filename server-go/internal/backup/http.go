@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
@@ -83,7 +84,5 @@ func respond(w http.ResponseWriter, value any, err error) {
 		}
 		value = map[string]string{"detail": detail}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }

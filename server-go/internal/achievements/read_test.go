@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,5 +252,15 @@ func TestReaderWarmScopeHTTP(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestWarnLogRoutesAndRedacts(t *testing.T) {
+	var captured string
+	warnLog(func(format string, args ...any) {
+		captured = fmt.Sprintf(format, args...)
+	}, "读取成就家庭账号失败", errors.New("api_key=abcdef123456"))
+	if strings.Contains(captured, "abcdef123456") || !strings.Contains(captured, "api_key=***") {
+		t.Fatalf("captured = %q", captured)
 	}
 }

@@ -20,8 +20,7 @@ import (
 const membershipURL = "https://www.humblebundle.com/membership"
 const steamSearchURL = "https://store.steampowered.com/api/storesearch"
 
-// 2026-11 页面改版：membership 换 Next.js RSC（旧内嵌 JSON 的锚点全部消失），
-// 内容以 flight 流内嵌在首屏；服务器按请求指纹分流，头不全时返回无数据的壳页。
+// flightPush 提取页面内嵌的 RSC flight 文本流。
 var flightPush = regexp.MustCompile(`self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)`)
 var monthDesc = regexp.MustCompile(`Get ([A-Za-z]+) (\d{4}) Humble Choice`)
 var monthKey = regexp.MustCompile(`^([a-z]+)_(\d{4})_choice$`)
@@ -34,12 +33,10 @@ type month struct {
 	Machine string
 	Product string
 	End     string
-	Titles  []string       // Steam 交付：走 appid 匹配入 games 账本
-	Others  []platformGame // 非 Steam 平台游戏：带平台标识，不进 games（无 appid）
+	Titles  []string
+	Others  []platformGame
 }
 
-// platformGame 非 Steam 平台的当月包游戏：平台取 Humble 交付方式原值
-// （blizzard/epic/ubisoft/gog/origin/ea/itch/drm-free…，展示层本地化）。
 type platformGame struct {
 	Title     string `json:"title"`
 	Platform  string `json:"platform"`
@@ -49,20 +46,19 @@ type platformGame struct {
 }
 
 type choiceProduct struct {
-	ID             string   `json:"id"`
-	Title          string   `json:"title"`
-	Delivery       []string `json:"deliveryMethods"`
-	EndDate        string   `json:"endDate"`
-	Thumbnail      string   `json:"thumbnail"`
-	DisplayPrice   struct {
+	ID           string   `json:"id"`
+	Title        string   `json:"title"`
+	Delivery     []string `json:"deliveryMethods"`
+	EndDate      string   `json:"endDate"`
+	Thumbnail    string   `json:"thumbnail"`
+	DisplayPrice struct {
 		CurrentPrice struct {
 			CentAmount float64 `json:"centAmount"`
 		} `json:"currentPrice"`
 	} `json:"displayPrice"`
 }
 
-// flightPayload 抽取并解码页面内嵌的 RSC flight 流（每段 push 是一个 JS 字符串
-// 字面量，按 JSON 转义解码；个别段解码失败跳过，数据在其余段仍可拼齐）。
+// flightPayload 解码各段 RSC push 字符串并拼接，单段解码失败跳过。
 func flightPayload(page string) string {
 	var full strings.Builder
 	for _, match := range flightPush.FindAllStringSubmatch(page, -1) {
@@ -75,7 +71,7 @@ func flightPayload(page string) string {
 	return full.String()
 }
 
-// extractJSONValue 取 key 后第一个完整的 JSON 值（配平引号/转义/括号）。
+// extractJSONValue 提取 key 后第一个完整 JSON 数组（配平引号、转义与方括号）。
 func extractJSONValue(payload, key string) (string, bool) {
 	i := strings.Index(payload, key)
 	if i < 0 {
@@ -117,11 +113,7 @@ func extractJSONValue(payload, key string) (string, bool) {
 	return "", false
 }
 
-// parseMembership 解析当月包：subscriptionProducts 全量游戏 + 页面元描述里的
-// 期号（"Get November 2026 Humble Choice"）。Steam 交付走 appid 匹配；其余
-// 平台交付（blizzard/epic/ubisoft/…，平台名取交付方式原值）按平台游戏保留；
-// 仅 external_key 的条目是订阅/权益类（如 IGN Plus），不是游戏，排除。机器名
-// 归一成旧格式（november_2026_choice），与既有落库状态/月标签派生同构兼容。
+// parseMembership 解析 subscriptionProducts 与期号：Steam 进 Titles、其余平台进 Others、仅 external_key 排除。
 func parseMembership(raw []byte) (month, error) {
 	payload := flightPayload(string(raw))
 	if payload == "" {
@@ -165,7 +157,7 @@ func parseMembership(raw []byte) (month, error) {
 			continue
 		}
 		if platform == "" {
-			continue // 仅 external_key：订阅/权益类，非游戏
+			continue
 		}
 		var retail *int64
 		if cents := int64(p.DisplayPrice.CurrentPrice.CentAmount + 0.5); cents > 0 {
@@ -203,7 +195,6 @@ func parseMonth(raw string) time.Month {
 }
 
 func monthLabel(m month) string {
-	// Machine/Product 两个来源都吃（productHumanName 旧形态与 meta 派生新形态）。
 	for _, candidate := range []string{m.Product, m.Machine} {
 		match := monthKey.FindStringSubmatch(strings.ToLower(candidate))
 		if len(match) > 0 {
@@ -212,7 +203,6 @@ func monthLabel(m month) string {
 			}
 		}
 	}
-	// Product 形如 "November 2026 Humble Choice"（旧）或 "November 2026"（新）
 	if match := productMonth.FindStringSubmatch(m.Product); len(match) > 0 {
 		if mon := parseMonth(match[1]); mon != 0 {
 			return fmt.Sprintf("HB慈善包%s年%d月包", match[2][2:], mon)
@@ -221,7 +211,6 @@ func monthLabel(m month) string {
 	return "HB慈善包"
 }
 
-// monthURL 月档案页已对未登录整体 404（2026-11 改版），唯一入口是 membership 主页。
 func monthURL(machine string) string {
 	return membershipURL
 }
@@ -229,8 +218,7 @@ func monthURL(machine string) string {
 func publicClient(proxy func(context.Context) (string, bool)) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = func(r *http.Request) (*url.URL, error) {
-		// 出网通道：优先应用代理解析（代理池语义，池不可用自动回落直连），
-		// 未装配时退回系统代理（与 Python 池通道语义对齐）
+		// 优先使用注入 proxy，不可用回落直连；proxy 为 nil 时读系统代理。
 		if proxy != nil {
 			if raw, ok := proxy(r.Context()); ok && raw != "" {
 				return url.Parse(raw)
@@ -261,8 +249,7 @@ func (s *Service) request(ctx context.Context, address string, limit int64) ([]b
 		host = parsed.Hostname()
 	}
 	if host == "www.humblebundle.com" {
-		// Humble 会员页：头指纹是数据有无的开关，缺 Sec-Fetch/sec-ch-ua 系列
-		// 时服务端返回不含内嵌数据的降级壳页（2026-11 改版实测）。
+		// 会员页须携带 Sec-Fetch 与 sec-ch-ua 指纹头，否则服务端返回空壳页。
 		r.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 		r.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 		r.Header.Set("Upgrade-Insecure-Requests", "1")
@@ -274,8 +261,7 @@ func (s *Service) request(ctx context.Context, address string, limit int64) ([]b
 		r.Header.Set("sec-ch-ua-mobile", "?0")
 		r.Header.Set("sec-ch-ua-platform", `"Windows"`)
 	} else {
-		// Steam JSON API：文档导航形态的头会被对端直接断连（实测 http=000），
-		// 必须保持 JSON 客户端形态。
+		// Steam JSON API 须使用 JSON Accept 头，携带导航头会被对端断连。
 		r.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
 	}
 	r.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
@@ -365,13 +351,11 @@ func (s *Service) resolve(ctx context.Context, title string) int64 {
 	if len(words) > 1 {
 		terms = append(terms, words[0])
 	}
-	// Steam 直连在大陆环境时通时断：每个词两次尝试（短退避），失败继续
-	// 下一个词而不是整题放弃——单次刷新的解析成功率是月包完整性的一半。
 	for _, term := range terms {
 		address := s.opts.SearchURL + "?" + (url.Values{"term": {term}, "cc": {"us"}, "l": {"en"}}).Encode()
 		var raw []byte
 		var err error
-		for attempt := 0; attempt < 2 && err == nil; attempt++ {
+		for attempt := 0; attempt < 2; attempt++ {
 			if attempt > 0 {
 				select {
 				case <-time.After(1500 * time.Millisecond):
@@ -382,7 +366,10 @@ func (s *Service) resolve(ctx context.Context, title string) int64 {
 			fetch, cancel := context.WithTimeout(ctx, 15*time.Second)
 			raw, err = s.request(fetch, address, 1<<20)
 			cancel()
-			if err != nil && ctx.Err() != nil {
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
 				return 0
 			}
 		}

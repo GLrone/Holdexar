@@ -11,8 +11,14 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
+
+type prefsPutResponse struct {
+	OK bool `json:"ok"`
+	prefsBaseView
+}
 
 func preferenceDefaults() map[string]any {
 	categories, types, featured := map[string]any{}, map[string]any{}, map[string]any{}
@@ -27,6 +33,7 @@ func preferenceDefaults() map[string]any {
 	}
 	return map[string]any{"enabled": false, "categories": categories, "quietEnabled": false, "quietStart": "23:00", "quietEnd": "08:00", "includeDetails": true, "manualRegion": nil, "digestTime": "08:00", "digestWeekday": json.Number("0"), "types": types, "featured": featured}
 }
+
 func mergePreferences(base, patch map[string]any) map[string]any {
 	result := map[string]any{}
 	for k, v := range base {
@@ -42,6 +49,7 @@ func mergePreferences(base, patch map[string]any) map[string]any {
 	}
 	return result
 }
+
 func ValidateFeatured(patch map[string]any) (map[string]any, error) {
 	defaults := map[string]any{}
 	for _, v := range featuredDefaultKeys {
@@ -96,6 +104,7 @@ func ValidateFeatured(patch map[string]any) (map[string]any, error) {
 	}
 	return p, nil
 }
+
 func validatePreferences(p map[string]any) error {
 	for _, key := range []string{"quietStart", "quietEnd", "digestTime"} {
 		if _, ok := hhmm(p[key]); !ok {
@@ -128,12 +137,13 @@ func validatePreferences(p map[string]any) error {
 	p["featured"], e = ValidateFeatured(p["featured"].(map[string]any))
 	return e
 }
+
 func (h *handler) putPrefs(w http.ResponseWriter, r *http.Request) {
 	var patch map[string]any
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	if e := decoder.Decode(&patch); e != nil {
-		writeJSON(w, 422, map[string]any{"detail": "请求内容必须是对象"})
+		httpx.WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "请求内容必须是对象"})
 		return
 	}
 	var prefs map[string]any
@@ -156,11 +166,11 @@ func (h *handler) putPrefs(w http.ResponseWriter, r *http.Request) {
 		return e
 	})
 	if e != nil {
-		status := 500
+		status := http.StatusInternalServerError
 		if invalid != nil {
-			status = 400
+			status = http.StatusBadRequest
 		}
-		writeJSON(w, status, map[string]any{"detail": e.Error()})
+		httpx.WriteJSON(w, status, map[string]any{"detail": e.Error()})
 		return
 	}
 	if h.options.Bus != nil {
@@ -168,16 +178,11 @@ func (h *handler) putPrefs(w http.ResponseWriter, r *http.Request) {
 	}
 	region, e := EffectiveRegion(r.Context(), h.db, "", prefs, nil)
 	if e != nil {
-		writeJSON(w, 500, map[string]any{"detail": e.Error()})
+		httpx.WriteJSON(w, http.StatusInternalServerError, map[string]any{"detail": e.Error()})
 		return
 	}
-	view := prefsView(prefs, nil, nil, region)
-	result := newOrderedObj()
-	result.set("ok", true)
-	for _, key := range view.keys {
-		if key != "smtp" && key != "lastDelivery" {
-			result.set(key, view.vals[key])
-		}
-	}
-	writeJSON(w, 200, result)
+	httpx.WriteJSON(w, http.StatusOK, prefsPutResponse{
+		OK:            true,
+		prefsBaseView: buildPrefsBaseView(prefs, region),
+	})
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,7 +21,7 @@ func RevalueAffected(ctx context.Context, conn *sql.Conn, touched map[string][]s
 			continue
 		}
 		ordered := append([]string{}, days...)
-		sort.Strings(ordered)
+		slices.Sort(ordered)
 		end, e := time.Parse("2006-01-02", ordered[len(ordered)-1])
 		if e != nil {
 			return nil, e

@@ -34,8 +34,7 @@ type ServiceOptions struct {
 	AfterBind    func(string)
 	APIKey       func(context.Context) (string, error)
 	Summaries    func(context.Context, []string, string) (map[string]wishlist.PlayerSummary, error)
-	// RedeemUsed 该账号 30 分钟窗口内已用激活次数（redeem 域进程内计数器，
-	// 经装配注入防 import 环；nil 恒 0）。
+	// RedeemUsed 进程内 30 分钟激活计数注入点（防 import 环；nil 恒返回 0）。
 	RedeemUsed func(steamID string) int
 }
 
@@ -232,8 +231,6 @@ func publicTime(raw sql.NullString) any {
 	return strings.Replace(raw.String, " ", "T", 1)
 }
 
-// redeemUsed 账号面激活计数读口：注入缺失或计数器异常按 0 处理，
-// 账号视图不因它失败。
 func (s *Service) redeemUsed(steamID string) (used int) {
 	if s.opts.RedeemUsed == nil {
 		return 0
@@ -553,7 +550,8 @@ func (s *Service) syncLocked(ctx context.Context, row accountRow, force bool) (m
 		s.syncProfile(ctx, row)
 		return map[string]any{"ok": false, "error": fetchErr.Error()}, nil
 	}
-	snapshot := map[string]any{"balance": wallet.Balance, "balance_display": wallet.BalanceDisplay, "currency_code": wallet.CurrencyCode, "currency_symbol": wallet.CurrencySymbol, "currency_id": wallet.CurrencyID, "region_code": "", "country_code": "", "steam_id": wallet.SteamID, "checked_at": accountISO(s.now()), "ok_at": accountISO(s.now()), "check_ok": true, "error": ""}
+	regionCode := deriveRegion(ctx, s.db, wallet.CurrencyCode, wallet.CountryCode)
+	snapshot := map[string]any{"balance": wallet.Balance, "balance_display": wallet.BalanceDisplay, "currency_code": wallet.CurrencyCode, "currency_symbol": wallet.CurrencySymbol, "currency_id": wallet.CurrencyID, "region_code": regionCode, "country_code": wallet.CountryCode, "steam_id": wallet.SteamID, "checked_at": accountISO(s.now()), "ok_at": accountISO(s.now()), "check_ok": true, "error": ""}
 	if e = s.saveWallet(ctx, row, snapshot, "", force, false); e != nil {
 		return nil, e
 	}

@@ -4,23 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
+	"slices"
 )
 
-// ItemFlags 监控池条目的工具消费面投影：list_wishlist / list_owned 只取
-// 这两个来源标记（名称/封面由 BriefsFor 另查，不随行带出）。
 type ItemFlags struct {
 	AppID      int64
 	Wishlisted bool
 	Owned      bool
 }
 
-// ListItems 监控池条目并集（Python wishlist.service.list_items 缺省全量路径；
-// steamid 入参工具不传，不移植）：
-// 1) wishlist_items 活跃行按 appid 归并（标记任一账户命中即真）；
-// 2) 监控资格集补入无账户行条目，并挂 family_wishlist / owned 来源标记；
-// 3) 被用户移出（monitor_targets 判定 excluded）的对象剔除；
-// 4) appid 升序返回。
 func ListItems(ctx context.Context, db *sql.DB) ([]ItemFlags, error) {
 	rows, err := db.QueryContext(ctx,
 		"SELECT appid, wishlisted, owned FROM wishlist_items WHERE active = 1")
@@ -78,7 +70,7 @@ func ListItems(ctx context.Context, db *sql.DB) ([]ItemFlags, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := make([]ItemFlags, 0, len(ids))
 	for _, id := range ids {
 		if excluded[id] {
@@ -90,8 +82,6 @@ func ListItems(ctx context.Context, db *sql.DB) ([]ItemFlags, error) {
 	return out, nil
 }
 
-// activeGameIDs 监控资格集（Python monitoring.active_ids）：激活来源且未被
-// 排除的对象；released 不受排除门影响。排序不作输出契约（最终按 appid 排序）。
 func activeGameIDs(ctx context.Context, db *sql.DB) ([]int64, error) {
 	rows, err := db.QueryContext(ctx,
 		"SELECT DISTINCT ms.target_id FROM monitor_sources ms"+
@@ -114,11 +104,9 @@ func activeGameIDs(ctx context.Context, db *sql.DB) ([]int64, error) {
 	return out, rows.Err()
 }
 
-// gameSources 对象来源集（Python monitoring.sources_map，400/批）：
-// map[appid] → 该对象全部激活来源名。
 func gameSources(ctx context.Context, db *sql.DB, ids []int64) (map[int64]map[string]bool, error) {
 	out := map[int64]map[string]bool{}
-	for _, part := range chunkInt64s(ids, 400) {
+	for part := range slices.Chunk(ids, 400) {
 		rows, err := db.QueryContext(ctx,
 			"SELECT target_id, source FROM monitor_sources"+
 				" WHERE target_type = 'game' AND target_id IN ("+placeholders(len(part))+") AND active = 1",
@@ -148,11 +136,10 @@ func gameSources(ctx context.Context, db *sql.DB, ids []int64) (map[int64]map[st
 	return out, nil
 }
 
-// excludedGameIDs 被移出对象集（Python monitor_targets.state 的 excluded 判定：
-// 存在 active 排除行即 excluded；无 monitor_targets 行的对象不在此列）。
+// excludedGameIDs 存在 active 排除行即视作排除（无 monitor_targets 行不排除）。
 func excludedGameIDs(ctx context.Context, db *sql.DB, ids []int64) (map[int64]bool, error) {
 	out := map[int64]bool{}
-	for _, part := range chunkInt64s(ids, 400) {
+	for part := range slices.Chunk(ids, 400) {
 		rows, err := db.QueryContext(ctx,
 			"SELECT mt.target_id FROM monitor_targets mt"+
 				" WHERE mt.target_type = 'game' AND mt.target_id IN ("+placeholders(len(part))+")"+
@@ -180,7 +167,6 @@ func excludedGameIDs(ctx context.Context, db *sql.DB, ids []int64) (map[int64]bo
 	return out, nil
 }
 
-// int64Args []int64 → SQL 参数切片。
 func int64Args(ids []int64) []any {
 	args := make([]any, len(ids))
 	for i, id := range ids {

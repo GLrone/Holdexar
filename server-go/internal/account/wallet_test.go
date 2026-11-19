@@ -35,6 +35,11 @@ func TestWalletParsingLocaleCurrencyAndOwner(t *testing.T) {
 			t.Fatal("unverified wallet accepted")
 		}
 	}
+	nested := `<div class="extra accountBalance accountRow"><span>label</span><div class="price accountData"><div><span>&yen;</span>99.50</div></div></div><script>var g_wallet = {"currency_code":23,"formatted_amount":"\u00a599.50"};</script><a class="playerAvatar user_avatar offline" href="https://steamcommunity.com/profiles/76561198000000001/?snr=1_4"></a>`
+	w, e := ParseWalletPage(nested, sid)
+	if e != nil || w.Balance != 99.5 || w.BalanceDisplay != "¥99.50" || w.SteamID != sid {
+		t.Fatalf("nested DOM wallet: %+v %v", w, e)
+	}
 }
 
 func TestWalletHTTPKeepsAccountCookiesSeparateAndClassifiesFailures(t *testing.T) {

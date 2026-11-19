@@ -4,10 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 )
 
-// Brief 游戏简报（Python games.service.briefs_for 行形状：名称/国区价/折扣/
-// 好评/评测数/中文支持）。指针 = Python None 语义。
 type Brief struct {
 	Name           *string
 	CnyFen         *int64
@@ -17,8 +16,6 @@ type Brief struct {
 	ChineseSupport *string
 }
 
-// BriefsFor appid 批量简报：games 主档 LEFT JOIN 国区 ok 价（region_code='CN'
-// 且 price_status='ok'）；缺失行不出键（上层降级为纯 appid）。
 func BriefsFor(ctx context.Context, db *sql.DB, appids []int64) (map[int64]Brief, error) {
 	out := map[int64]Brief{}
 	ids := make([]int64, 0, len(appids))
@@ -30,7 +27,7 @@ func BriefsFor(ctx context.Context, db *sql.DB, appids []int64) (map[int64]Brief
 	if len(ids) == 0 {
 		return out, nil
 	}
-	for _, part := range chunkInt64s(ids, 500) {
+	for part := range slices.Chunk(ids, 500) {
 		rows, err := db.QueryContext(ctx,
 			"SELECT g.appid, g.name, g.positive_rate, g.review_count, g.chinese_support,"+
 				" cn.cny_fen, cn.discount_percent FROM games g"+
@@ -54,7 +51,6 @@ func BriefsFor(ctx context.Context, db *sql.DB, appids []int64) (map[int64]Brief
 				b := Brief{Name: nullStr(name), ChineseSupport: nullStr(chinese)}
 				b.ReviewCount = reviewCount
 				if positive.Valid {
-					// positive_rate 为万分比，/100 即 Python 真除法浮点。
 					rate := float64(positive.Int64) / 100.0
 					b.PositiveRate = &rate
 				}

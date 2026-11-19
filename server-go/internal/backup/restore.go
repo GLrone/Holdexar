@@ -1,9 +1,9 @@
 package backup
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
-	"compress/gzip"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -19,8 +19,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// RestoreResult 恢复结果。Restarting 表示主库已就位、服务将重启重载
-// （新进程凭恢复保护记录校验通过后解除保护）。
 type RestoreResult struct {
 	Restored   bool   `json:"restored"`
 	Name       string `json:"name"`
@@ -33,13 +31,10 @@ const (
 	replaceRetrySeconds = 300 * time.Millisecond
 )
 
-// ErrRestartPending 句柄已释放后的失败：原库文件完好但本进程数据库已断开，
-// 响应错误后仍须走重启重载（下一进程原样接管）。
+// ErrRestartPending 数据库句柄已关闭后的失败，须重启进程重载。
 var ErrRestartPending = errors.New("恢复中断，服务将重启后继续")
 
-// Restore 三段原位恢复：验档（自带清理）→ 保护记录+回滚快照+停写 → 替换。
-// 成功后主库已是备份内容且服务请求重启；替换成功后的一切失败都不回滚——
-// 保护记录与原库副本保留，交由下一进程校验处置。
+// Restore 验档后停写并固化回滚快照与保护标记再替换；替换成功后失败不回滚，交由下一进程校验处置。
 func (s *Service) Restore(ctx context.Context, name string) (RestoreResult, error) {
 	result := RestoreResult{Name: name}
 	if !backupName(name) {
@@ -53,7 +48,6 @@ func (s *Service) Restore(ctx context.Context, name string) (RestoreResult, erro
 	if err != nil {
 		return result, err
 	}
-	// ── 段 2 起失败一律清保护、恢复写闸、保原库 ──
 	if err := occupancy.BeginMaintenance(occupancy.MaintenanceStorage); err != nil {
 		os.Remove(probe)
 		return result, fmt.Errorf("有写入正在进行，请稍后重试：%w", err)
@@ -97,16 +91,13 @@ func (s *Service) Restore(ctx context.Context, name string) (RestoreResult, erro
 	defer func() {
 		os.Remove(staging)
 		if !replaced {
-			// 替换失败：原库完好，保护记录与回滚副本一并清掉
 			os.Remove(rollback)
 			releaseOnce()
 		}
-		// 替换成功：保护标记按 restored 阶段保留到下一进程校验后清除
 		resume()
 		endOccupancy()
 	}()
 
-	// 回滚快照（含 WAL 已提交事务）+ 保护记录固化；上次残留的回滚副本先清
 	os.Remove(rollback)
 	if err := store.Snapshot(ctx, s.db, rollback); err != nil {
 		os.Remove(probe)
@@ -127,7 +118,6 @@ func (s *Service) Restore(ctx context.Context, name string) (RestoreResult, erro
 		return result, errors.Join(fmt.Errorf("数据库连接未能释放，原库文件完好：%w", err), ErrRestartPending)
 	}
 	if err := replaceFile(probe, src); err != nil {
-		// 替换失败：原库文件在位可读；回滚副本与保护记录由 defer 清理，重启后原样接管
 		return result, errors.Join(fmt.Errorf("主库文件替换未完成，原库已保留：%w", err), ErrRestartPending)
 	}
 	replaced = true
@@ -135,14 +125,13 @@ func (s *Service) Restore(ctx context.Context, name string) (RestoreResult, erro
 	os.Remove(src + "-wal")
 	os.Remove(src + "-shm")
 	if err := store.MarkRestoreReplaced(src, token); err != nil {
-		// 阶段改写失败：标记仍指回原库副本，下一进程按 replacing 拒启并保留现场，
-		// 因此同样走重启交棒（不得在本进程继续服务——句柄已释放）
+		// 阶段改写失败仍保持 replacing 标记供下轮启动拒启，且句柄已释放必须重启。
 		return RestoreResult{Restored: true, Name: name, Restarting: true}, nil
 	}
 	return RestoreResult{Restored: true, Name: name, Restarting: true}, nil
 }
 
-// pauseWrites 等写者位排空进入维护窗口；忙碌时短促重试，直至上下文取消。
+// pauseWrites 在 10s 内按 300ms 重试进入维护窗口，超时或上下文取消时返回。
 func (s *Service) pauseWrites(ctx context.Context) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -161,8 +150,6 @@ func (s *Service) pauseWrites(ctx context.Context) error {
 	}
 }
 
-// stageVerifiedArchive 段 1：哈希比对 → 解档到探针 → 完整性/表集合/版本比对。
-// 失败自带清理（探针不进备份列表）。
 func (s *Service) stageVerifiedArchive(ctx context.Context, name, src string) (string, error) {
 	file, err := s.open(name)
 	if err != nil {
@@ -264,7 +251,6 @@ func (s *Service) stageVerifiedArchive(ctx context.Context, name, src string) (s
 	return probeName, nil
 }
 
-// replaceFile 探针→主库，句柄残留时重试释放窗口。
 func replaceFile(from, src string) error {
 	var last error
 	for attempt := 0; attempt < replaceAttempts; attempt++ {

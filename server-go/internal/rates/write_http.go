@@ -3,8 +3,9 @@ package rates
 import (
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func (s *Service) registerWrites(mux *http.ServeMux) {
@@ -15,10 +16,10 @@ func (s *Service) registerWrites(mux *http.ServeMux) {
 			if errors.Is(e, ErrSourcesUnavailable) {
 				status = 502
 			}
-			writeJSON(w, status, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, status, map[string]any{"detail": e.Error()})
 			return
 		}
-		writeJSON(w, 200, result)
+		httpx.WriteJSON(w, 200, result)
 	})
 	mux.HandleFunc("POST /api/v1/rates/history/repair", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -29,24 +30,30 @@ func (s *Service) registerWrites(mux *http.ServeMux) {
 				dryRun = true
 			case "0", "false", "f", "off", "n", "no":
 			default:
-				writeJSON(w, 422, map[string]any{"detail": []map[string]any{{"type": "bool_parsing", "loc": []string{"query", "dry_run"}, "msg": "Input should be a valid boolean, unable to interpret input", "input": values[0]}}})
+				httpx.WriteValidationError(w, httpx.ValErr{
+					Type:  "bool_parsing",
+					Loc:   []any{"query", "dry_run"},
+					Msg:   "Input should be a valid boolean, unable to interpret input",
+					Input: values[0],
+				})
 				return
 			}
 		}
+		limitN, limitGiven, limitErr := httpx.QueryInt(query, "max_windows", 0, nil, nil)
+		if limitErr != nil {
+			httpx.WriteValidationError(w, *limitErr)
+			return
+		}
 		var limit *int
-		if values, ok := query["max_windows"]; ok {
-			n, e := strconv.Atoi(values[0])
-			if e != nil {
-				writeJSON(w, 422, intParseError("max_windows", values[0]))
-				return
-			}
+		if limitGiven {
+			n := int(limitN)
 			limit = &n
 		}
 		result, e := s.Repair(r.Context(), dryRun, limit)
 		if e != nil {
-			writeJSON(w, 500, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 500, map[string]any{"detail": e.Error()})
 			return
 		}
-		writeJSON(w, 200, result)
+		httpx.WriteJSON(w, 200, result)
 	})
 }

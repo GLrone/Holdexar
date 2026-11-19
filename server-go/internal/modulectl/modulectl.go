@@ -9,18 +9,16 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// 内部模块开关：app_settings 单键布尔（与 Epic 模块键同形）。停用语义由
-// 宿主在执行入口判定——拒新执行、在途一次自然收尾；本包只管读取与落库，
-// 不拥有调度或取消。默认启用（无键 = 模块在役）。读路径直查主键，无缓存。
+// Control 基于 app_settings 单键布尔控制模块开关（无键默认启用，无缓存直查）。
 type Control struct {
 	key string
 }
 
-// New 构造模块开关控制器。
 func New(key string) *Control { return &Control{key: key} }
 
-// Enabled 读当前开关（库行缺失 = 启用）。
-func (c *Control) Enabled(ctx context.Context, q interface{ QueryRowContext(context.Context, string, ...any) *sql.Row }) (bool, error) {
+func (c *Control) Enabled(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (bool, error) {
 	var raw sql.NullString
 	e := q.QueryRowContext(ctx, `SELECT value_json FROM app_settings WHERE key=?`, c.key).Scan(&raw)
 	if errors.Is(e, sql.ErrNoRows) {
@@ -32,7 +30,6 @@ func (c *Control) Enabled(ctx context.Context, q interface{ QueryRowContext(cont
 	return strings.TrimSpace(raw.String) == "true", nil
 }
 
-// SetEnabled 经写闸落库。
 func (c *Control) SetEnabled(ctx context.Context, db *sql.DB, gate *store.WriteGate, enabled bool) error {
 	raw := "false"
 	if enabled {

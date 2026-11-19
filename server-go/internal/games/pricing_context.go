@@ -10,11 +10,9 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-)
 
-// 价格上下文（账单许可证命中条）：截至 date 的当时价 + 历史最低。与历史
-// 走势同一条标准版序列；窗口按裸北京时间比对（snapshot_at 写入侧同一把钟）；
-// date 非法（非 %Y-%m-%d）不报错，回 null 对——调用方静默省略价格段。
+	"holdexar/server-go/internal/httpx"
+)
 
 type priceContextValue struct {
 	CnyFen     int64  `json:"cnyFen"`
@@ -70,9 +68,6 @@ func (h *handler) handlePriceContext(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// priceContext 单条上下文：窗口 = 标准版 ∪ 在售 sub（与历史走势同口径；
-// 并集右支不携带 product_unknown 守卫——与 Python get_price_context 逐字
-// 一致，两侧各自对齐自己的真值源），snapshot_at ≤ date 当日 23:59:59。
 func (h *handler) priceContext(ctx context.Context, appid int64, date, region string) (priceContextItem, error) {
 	empty := priceContextItem{AppID: appid, Region: region, Date: date}
 	if _, err := time.Parse("2006-01-02", date); err != nil {
@@ -155,17 +150,7 @@ func (h *handler) priceContext(ctx context.Context, appid int64, date, region st
 		At: &points[len(points)-1], Lowest: &lowest}, nil
 }
 
-// ── 批量端点 ─────────────────────────────────────────────────────────────
-
-// bodyErr 单条 body 校验错误（loc 含 body 段与列表下标；形状对齐 pydantic
-// venv 实测锚点，含错误累积与宽松整数强转规则）。
-type bodyErr struct {
-	Type  string         `json:"type"`
-	Loc   []any          `json:"loc"`
-	Msg   string         `json:"msg"`
-	Input any            `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type bodyErr = httpx.ValErr
 
 const (
 	bodyMsgIntParsing   = "Input should be a valid integer, unable to parse string as an integer"
@@ -204,7 +189,6 @@ func (h *handler) handlePriceContextBatch(w http.ResponseWriter, r *http.Request
 				Msg: bodyMsgModelType, Input: raw})
 			continue
 		}
-		// 校验不短路：appid 与 date 独立校验，全部错误按序累积（pydantic 同径）。
 		valid := true
 		var appid int64
 		if _, present := item["appid"]; !present {
@@ -238,8 +222,7 @@ func (h *handler) handlePriceContextBatch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// ≤200 对截断；appid 非法 / 日期为空的项直接回 null 对（无 region 键，
-	// 与 Python 批量旁路字典一致），不抛错——调用方按缺价格段渲染。
+	// 超过 200 对截断；appid 非法或日期为空的项直接返回含 null 对的结果。
 	if len(pairs) > 200 {
 		pairs = pairs[:200]
 	}
@@ -262,8 +245,6 @@ func (h *handler) handlePriceContextBatch(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
-// decodeJSONBody 解析 JSON body；不可解码回 json_invalid、非对象回
-// model_attributes_type（loc ["body"]，形状对齐 FastAPI）。
 func decodeJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool) {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
 	dec.UseNumber()
@@ -283,9 +264,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, boo
 	return body, true
 }
 
-// pyIntFromBody JSON 值 → 整数（pydantic lax 同径：bool 0/1、整值浮点收整、
-// 数值字符串收整；null/容器 → int_type，带小数 → int_from_float，坏形状
-// 字符串 → int_parsing）。返回（值, 合法, 错误类型, 错误文案）。
+// pyIntFromBody 允许 bool/整值浮点/整数字符串转为 int64，按值类型区分 422 错误码。
 func pyIntFromBody(v any) (int64, bool, string, string) {
 	switch t := v.(type) {
 	case nil:

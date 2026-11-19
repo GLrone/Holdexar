@@ -1,16 +1,13 @@
 package notifications
 
 import (
-	"html"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
-)
 
-var mailTokens = regexp.MustCompile(`(?s)<!--.*?-->|<![^>]*>|<[^>]+>|[^<]+`)
-var mailHref = regexp.MustCompile(`(?i)\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
+	nethtml "golang.org/x/net/html"
+)
 
 func safeMailURL(value string) string {
 	if value == "" || strings.ContainsAny(value, "\\<>\"") || strings.ContainsFunc(value, func(r rune) bool { return unicode.IsSpace(r) || r < 32 || r == 127 }) {
@@ -34,73 +31,58 @@ func safeMailURL(value string) string {
 	}
 	return ""
 }
+
 func MailText(body string) string {
+	doc, err := nethtml.Parse(strings.NewReader(body))
+	if err != nil {
+		return ""
+	}
 	var parts strings.Builder
-	ignored := []string{}
-	links := []string{}
 	seen := map[string]bool{}
 	blocks := map[string]bool{"p": true, "div": true, "tr": true, "li": true, "h1": true, "h2": true, "h3": true}
-	for _, token := range mailTokens.FindAllString(body, -1) {
-		if !strings.HasPrefix(token, "<") {
-			if len(ignored) == 0 {
-				parts.WriteString(html.UnescapeString(token))
+
+	var walk func(*nethtml.Node)
+	walk = func(node *nethtml.Node) {
+		switch node.Type {
+		case nethtml.TextNode:
+			parts.WriteString(node.Data)
+			return
+		case nethtml.ElementNode:
+			name := strings.ToLower(node.Data)
+			if name == "head" || name == "style" || name == "script" {
+				return
 			}
-			continue
-		}
-		if strings.HasPrefix(token, "<!") {
-			continue
-		}
-		tag := strings.TrimSpace(strings.Trim(token, "<>"))
-		closing := strings.HasPrefix(tag, "/")
-		tag = strings.TrimPrefix(tag, "/")
-		fields := strings.Fields(tag)
-		if len(fields) == 0 {
-			if len(ignored) == 0 {
-				parts.WriteString(token)
+			if blocks[name] || name == "br" {
+				parts.WriteByte('\n')
 			}
-			continue
-		}
-		name := strings.ToLower(strings.TrimRight(fields[0], "/"))
-		if len(ignored) > 0 {
-			if closing && name == ignored[len(ignored)-1] {
-				ignored = ignored[:len(ignored)-1]
-			} else if !closing && (name == "head" || name == "style" || name == "script") {
-				ignored = append(ignored, name)
+			for child := node.FirstChild; child != nil; child = child.NextSibling {
+				walk(child)
 			}
-			continue
-		}
-		if !closing && (name == "head" || name == "style" || name == "script") {
-			ignored = append(ignored, name)
-			continue
-		}
-		if blocks[name] || (!closing && name == "br") {
-			parts.WriteByte('\n')
-		}
-		if closing && (name == "td" || name == "th") {
-			parts.WriteByte(' ')
-		}
-		if name == "a" {
-			if !closing {
-				link := ""
-				if m := mailHref.FindStringSubmatch(token); m != nil {
-					for _, v := range m[1:] {
-						if v != "" {
-							link = safeMailURL(html.UnescapeString(v))
-							break
+			if blocks[name] {
+				parts.WriteByte('\n')
+			}
+			if name == "td" || name == "th" {
+				parts.WriteByte(' ')
+			}
+			if name == "a" {
+				for _, attr := range node.Attr {
+					if strings.EqualFold(attr.Key, "href") {
+						if link := safeMailURL(attr.Val); link != "" && !seen[link] {
+							parts.WriteString(" (" + link + ") ")
+							seen[link] = true
 						}
+						break
 					}
 				}
-				links = append(links, link)
-			} else if len(links) > 0 {
-				link := links[len(links)-1]
-				links = links[:len(links)-1]
-				if link != "" && !seen[link] {
-					parts.WriteString(" (" + link + ") ")
-					seen[link] = true
-				}
 			}
+			return
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
 	}
+	walk(doc)
+
 	lines := []string{}
 	for _, line := range strings.Split(parts.String(), "\n") {
 		if line = strings.Join(strings.Fields(line), " "); line != "" {

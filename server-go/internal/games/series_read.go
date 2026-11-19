@@ -7,9 +7,6 @@ import (
 	"strings"
 )
 
-// 同系列成员（GPW「同系列」区块）。games.series_id 同组全员 LEFT JOIN
-// 国区现价；无系列（未识别 / 落单）或游戏不存在 → 404，前端据此隐藏区块。
-
 type seriesMember struct {
 	AppID          int64   `json:"appid"`
 	Name           string  `json:"name"`
@@ -136,7 +133,6 @@ func (h *handler) seriesMembers(ctx context.Context, appid int64) (*seriesInfo, 
 		}
 	}
 
-	// 本人行排首位，其余按 appid 序保持。
 	members := make([]seriesMember, 0, len(list))
 	if selfIdx >= 0 {
 		members = append(members, row(list[selfIdx]))
@@ -148,7 +144,7 @@ func (h *handler) seriesMembers(ctx context.Context, appid int64) (*seriesInfo, 
 		members = append(members, row(it))
 	}
 
-	// Python [:100] 按字符截断，Go 按字节切会截断 UTF-8 序列。
+	// 按 rune 截断 series_id 至多 100 字符，避免截断 UTF-8 序列。
 	trimmed := []rune(strings.TrimSpace(sid))
 	if len(trimmed) > 100 {
 		trimmed = trimmed[:100]
@@ -165,8 +161,7 @@ func (h *handler) seriesMembers(ctx context.Context, appid int64) (*seriesInfo, 
 	}, nil
 }
 
-// seriesDisplayName 成员展示名的最长公共汉字前缀（≥2 字），否则回落系列标识
-// （Python _display_name_for：仅保留 \u4e00-\u9fff 汉字再逐位比对）。
+// seriesDisplayName 取成员名称仅保留汉字后的最长公共前缀（≥2 字），否则回落系列标识。
 func seriesDisplayName(names []string, fallback string) string {
 	runes := make([][]rune, len(names))
 	for i, n := range names {
@@ -199,7 +194,6 @@ func seriesDisplayName(names []string, fallback string) string {
 	return fallback
 }
 
-// cjkRunes 仅保留 CJK 统一表意文字（对齐 Python _CN_KEEP 正则）。
 func cjkRunes(s string) []rune {
 	out := []rune{}
 	for _, r := range s {

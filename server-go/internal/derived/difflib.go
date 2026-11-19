@@ -1,9 +1,6 @@
 package derived
 
-// difflib SequenceMatcher.ratio 的最小移植（规则 7/8 的名称相似度依赖）：
-// 最长匹配块递归 + 相邻块合并；junk 恒空（调用处不传 junk）。
-// autojunk 仅在 len(b) ≥ 200 时生效（剔除 b 中高频元素）——系列比对对象
-// 是短名称串，正常走不到，但按上游语义完整移植以保一致。
+// SequenceMatcher.ratio 最小实现：最长匹配块递归合并（autojunk 阈值 len(b)>=200）。
 
 type seqMatch struct {
 	aPos, bPos, size int
@@ -33,8 +30,7 @@ func newSeqMatcher(a, b []rune) *seqMatcher {
 	return m
 }
 
-// findLongestMatch [alo,ahi)×[blo,bhi) 窗口内最长公共块；b2j 缺席元素
-// （junk/popular）不参与匹配，块端可经相等延伸吸收它们。
+// findLongestMatch 在窗口内求最长公共块，b2j 缺席元素仅在两端相等延伸时吸收。
 func (m *seqMatcher) findLongestMatch(alo, ahi, blo, bhi int) seqMatch {
 	besti, bestj, bestsize := alo, blo, 0
 	j2len := map[int]int{}
@@ -116,7 +112,6 @@ func sortSeqMatches(blocks []seqMatch) {
 	}
 }
 
-// ratio 相似度 = 2·匹配数/(len(a)+len(b))；双空串 = 1.0。
 func (m *seqMatcher) ratio() float64 {
 	matches := 0
 	for _, b := range m.matchingBlocks() {

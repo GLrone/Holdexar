@@ -1,16 +1,12 @@
 package bundles
 
-// 抓取层纯函数与出网管线用例（对照 Python test_bundle_browse_layer.py）：
-// 未收录不写行、锁区写 locked、分单位原样（零小数货币不 ×100）、
-// best_purchase_option 优先、位置对齐 vs id 对齐、plan 批贪心装批、
-// 南亚拆区、单包身份兜底（force_package 不兜底）。
-
 import (
 	"context"
 	"errors"
 	"math"
 	"net/http"
 	"reflect"
+	"sync"
 	"testing"
 
 	"holdexar/server-go/internal/storebrowse"
@@ -38,9 +34,9 @@ func TestNotListedItemWritesNothing(t *testing.T) {
 
 func TestRestrictedRealItemIsLocked(t *testing.T) {
 	restricted := stubItem(510898, map[string]any{
-		"item_type":      float64(1),
-		"success":        float64(15),
-		"visible":        false,
+		"item_type":                          float64(1),
+		"success":                            float64(15),
+		"visible":                            false,
 		"unvailable_for_country_restriction": true,
 		"best_purchase_option":               nil,
 	})
@@ -125,9 +121,8 @@ func TestDiscountFallsBackToComputed(t *testing.T) {
 }
 
 func TestDiscountEndTSFromOptionActiveDiscounts(t *testing.T) {
-	// 促销截止取自选项级 active_discounts[0]（限时促销），非顶层结构档
 	item := stubItem(13608, map[string]any{
-		"active_discounts": []any{map[string]any{"discount_end_date": float64(999999)}}, // 顶层干扰项
+		"active_discounts": []any{map[string]any{"discount_end_date": float64(999999)}},
 		"best_purchase_option": map[string]any{
 			"final_price_in_cents": float64(4856),
 			"discount_pct":         float64(10),
@@ -139,7 +134,6 @@ func TestDiscountEndTSFromOptionActiveDiscounts(t *testing.T) {
 	if row.DiscountEndTS == nil || *row.DiscountEndTS != 1767199999 {
 		t.Fatalf("discount_end_ts=%v（选项级 active_discounts[0]）", row.DiscountEndTS)
 	}
-	// 无促销 → nil
 	plain := browseRow(stubItem(13608, nil), 13608, "us", "bundleid")
 	if plain.DiscountEndTS != nil {
 		t.Fatalf("discount_end_ts=%v（无促销应为 nil）", plain.DiscountEndTS)
@@ -167,7 +161,6 @@ func TestHeaderImageFromAssetFormat(t *testing.T) {
 }
 
 func TestOptionSelection(t *testing.T) {
-	// best_purchase_option 优先
 	best := stubItem(13608, map[string]any{
 		"best_purchase_option": map[string]any{"final_price_in_cents": float64(4856), "package_group": "default"},
 		"purchase_options":     []any{map[string]any{"final_price_in_cents": float64(9999), "package_group": "default"}},
@@ -176,7 +169,6 @@ func TestOptionSelection(t *testing.T) {
 	if status != "ok" || toInt(opt["final_price_in_cents"]) == nil || *toInt(opt["final_price_in_cents"]) != 4856 {
 		t.Fatalf("best: %s %v", status, opt["final_price_in_cents"])
 	}
-	// 无 best → default 组第一个
 	filtered := stubItem(13608, map[string]any{
 		"best_purchase_option": nil,
 		"purchase_options": []any{
@@ -188,7 +180,6 @@ func TestOptionSelection(t *testing.T) {
 	if status != "ok" || *toInt(opt["final_price_in_cents"]) != 222 {
 		t.Fatalf("default group: %s %v", status, opt["final_price_in_cents"])
 	}
-	// 选项无价 → no_price（选项仍在场）
 	noPrice := stubItem(13608, map[string]any{
 		"best_purchase_option": nil,
 		"purchase_options":     []any{map[string]any{"package_group": "default"}},
@@ -200,7 +191,6 @@ func TestOptionSelection(t *testing.T) {
 }
 
 func TestSemanticShapeSplit(t *testing.T) {
-	// bundle 形态 + 选项级 must_purchase_as_set：形态 0 / 语义 1（实例 63575）
 	bundleMPS := browseRow(stubItem(63575, map[string]any{
 		"best_purchase_option": map[string]any{
 			"final_price_in_cents": float64(10000), "must_purchase_as_set": true, "package_group": "default",
@@ -212,7 +202,6 @@ func TestSemanticShapeSplit(t *testing.T) {
 	if bundleMPS.MPS == nil || *bundleMPS.MPS != 1 {
 		t.Fatalf("mps=%v（语义：必须整包）", bundleMPS.MPS)
 	}
-	// sub 形态：语义恒不可拆，选项 mps 只锦上添花
 	sub := browseRow(stubItem(1066582, map[string]any{
 		"item_type": float64(1),
 		"best_purchase_option": map[string]any{
@@ -222,15 +211,13 @@ func TestSemanticShapeSplit(t *testing.T) {
 	if sub.ItemKind == nil || *sub.ItemKind != 1 || sub.MPS == nil || *sub.MPS != 1 {
 		t.Fatalf("sub kind=%v mps=%v", sub.ItemKind, sub.MPS)
 	}
-	// 普通 bundle 形态：可补齐
 	plain := browseRow(stubItem(13608, nil), 13608, "us", "bundleid")
 	if plain.ItemKind == nil || *plain.ItemKind != 0 || plain.MPS == nil || *plain.MPS != 0 {
 		t.Fatalf("plain kind=%v mps=%v", plain.ItemKind, plain.MPS)
 	}
-	// 锁区行（无真实选项）不投语义票：形态仍有（顶层 item_type 不受锁区影响）
 	locked := browseRow(stubItem(63575, map[string]any{
-		"success":        float64(15),
-		"visible":        false,
+		"success":                            float64(15),
+		"visible":                            false,
 		"unvailable_for_country_restriction": true,
 		"best_purchase_option":               nil,
 		"purchase_options":                   []any{},
@@ -266,7 +253,6 @@ func TestBrowseKindReadsShapeNotSemantics(t *testing.T) {
 }
 
 func TestAlignment(t *testing.T) {
-	// 条数一致按位置（未收录条目回 id=0，位置是唯一可靠映射）
 	items := []storebrowse.Item{{"id": float64(1)}, {"id": float64(0)}, {"id": float64(3)}}
 	pairs := alignItems(items, []int64{1, 2, 3})
 	if len(pairs) != 3 || pairs[0].id != 1 || pairs[1].id != 2 || pairs[2].id != 3 {
@@ -275,7 +261,6 @@ func TestAlignment(t *testing.T) {
 	if toInt(pairs[1].item["id"]) == nil || *toInt(pairs[1].item["id"]) != 0 {
 		t.Fatalf("positional item2=%v", pairs[1].item)
 	}
-	// 条数不符降级按 id 映射
 	short := []storebrowse.Item{{"id": float64(3)}, {"id": float64(1)}}
 	pairs = alignItems(short, []int64{1, 2, 3})
 	if toInt(pairs[0].item["id"]) == nil || *toInt(pairs[0].item["id"]) != 1 {
@@ -316,10 +301,13 @@ func TestFetchRegionsBatchedFansOutMonitoredCCs(t *testing.T) {
 	svc := newRefreshService(t, db, nil)
 	seedCrawlRegion(t, db, "cn", true, 1)
 	seedCrawlRegion(t, db, "pk", true, 5)
+	var seenMu sync.Mutex
 	seen := map[string]bool{}
 	stubBrowse(t, func(q string) (int, any) {
 		spec := parseSpec(t, q)
+		seenMu.Lock()
 		seen[spec.Context.Country] = true
+		seenMu.Unlock()
 		var items []map[string]any
 		for _, id := range specIDs(t, spec, "bundleid") {
 			items = append(items, stubItem(id, nil))
@@ -330,11 +318,14 @@ func TestFetchRegionsBatchedFansOutMonitoredCCs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	seenMu.Lock()
 	for _, cc := range []string{"CN", "PK", "BD"} {
 		if !seen[cc] {
+			seenMu.Unlock()
 			t.Fatalf("seen=%v（整表抓取只对监控区含南亚拆区各发一发）", seen)
 		}
 	}
+	seenMu.Unlock()
 	rows := out[13608]
 	codes := map[string]bool{}
 	for _, r := range rows {
@@ -353,7 +344,7 @@ func TestFetchRegionsBatchedSkipsFailedRegion(t *testing.T) {
 	stubBrowse(t, func(q string) (int, any) {
 		spec := parseSpec(t, q)
 		if spec.Context.Country == "BD" {
-			return http.StatusInternalServerError, map[string]any{} // 该区失败
+			return http.StatusInternalServerError, map[string]any{}
 		}
 		return http.StatusOK, itemsPayload(stubItem(13608, nil))
 	})
@@ -376,7 +367,6 @@ func TestFetchRegionsBatchedMissingItemWritesNothing(t *testing.T) {
 	db, _ := openRefreshDB(t)
 	svc := newRefreshService(t, db, nil)
 	seedCrawlRegion(t, db, "cn", true, 1)
-	// 未收录条目（name/slug 全空）混在位置对齐结果里
 	stubBrowse(t, func(q string) (int, any) {
 		return http.StatusOK, itemsPayload(map[string]any{
 			"id": float64(999999999), "item_type": float64(2), "name": nil,
@@ -450,7 +440,7 @@ func TestFetchBundleRegionsFallsBackToPackageID(t *testing.T) {
 			}))
 		}
 		kinds = append(kinds, "bundleid")
-		return http.StatusOK, itemsPayload() // bundleid 无真实条目
+		return http.StatusOK, itemsPayload()
 	})
 	rows, err := svc.fetchBundleRegions(context.Background(), 13608, false)
 	if err != nil {
@@ -498,8 +488,8 @@ func TestFetchBundleRegionsLockedRowsCountAsSuccess(t *testing.T) {
 	stubBrowse(t, func(q string) (int, any) {
 		rounds++
 		return http.StatusOK, itemsPayload(stubItem(13608, map[string]any{
-			"success":        float64(15),
-			"visible":        false,
+			"success":                            float64(15),
+			"visible":                            false,
 			"unvailable_for_country_restriction": true,
 			"best_purchase_option":               nil,
 		}))

@@ -183,7 +183,6 @@ func seed(t *testing.T, db *sql.DB) {
 
 	ins(`INSERT INTO catalog_removals (appid, reason) VALUES (900004, 'user')`)
 
-	// 影子表经 UDF 回填（与触发器同源）
 	ins(`INSERT INTO games_name_fts (appid, name_bi) SELECT appid, name_bigram(name, name_en) FROM games`)
 
 	ins(`INSERT INTO crawl_regions (code, name, currency, enabled, sort) VALUES
@@ -222,7 +221,6 @@ func getJSON(t *testing.T, srv *httptest.Server, path string) (int, map[string]a
 	return resp.StatusCode, m
 }
 
-// TestSearchCatalogFTS 两字中文与英文查询走 FTS 通道命中。
 func TestSearchCatalogFTS(t *testing.T) {
 	_, db := newTestHandler(t)
 	ctx := context.Background()
@@ -248,7 +246,6 @@ func TestSearchCatalogFTS(t *testing.T) {
 	}
 }
 
-// TestSearchCatalogLikeFallback 单字 / 纯标点查询回退 LIKE 通道；已移除款不出现。
 func TestSearchCatalogLikeFallback(t *testing.T) {
 	_, db := newTestHandler(t)
 	ctx := context.Background()
@@ -274,7 +271,6 @@ func TestSearchCatalogLikeFallback(t *testing.T) {
 	}
 }
 
-// TestSearchCatalogShape 检索行形状：basePriceFen 取国区 cny_fen 快照，positiveRate 0-1。
 func TestSearchCatalogShape(t *testing.T) {
 	_, db := newTestHandler(t)
 	ctx := context.Background()
@@ -299,7 +295,6 @@ func TestSearchCatalogShape(t *testing.T) {
 	}
 }
 
-// TestListDefault 默认排序（史低优先 → 差价梯队）、移除款隐藏、覆盖与矩阵形状。
 func TestListDefault(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	status, body := getJSON(t, srv, "/api/v1/games")
@@ -316,7 +311,6 @@ func TestListDefault(t *testing.T) {
 	if !ok || len(items) != 3 {
 		t.Fatalf("items 异常: %v", body["items"])
 	}
-	// 默认排序：史低(900001) → 差价梯队高者(900003) → (900002)
 	wantOrder := []float64{900001, 900003, 900002}
 	for i, it := range items {
 		if it.(map[string]any)["appid"].(float64) != wantOrder[i] {
@@ -372,7 +366,6 @@ func TestListDefault(t *testing.T) {
 	}
 }
 
-// TestListPagination 分页边界：hasMore 探测、游标续页、坏游标回零。
 func TestListPagination(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	status, p1 := getJSON(t, srv, "/api/v1/games?limit=2")
@@ -409,7 +402,6 @@ func TestListPagination(t *testing.T) {
 	}
 }
 
-// TestListQ 列表 q 过滤走 name/name_en LIKE。
 func TestListQ(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	_, body := getJSON(t, srv, "/api/v1/games?q=Sekiro")
@@ -424,9 +416,6 @@ func TestListQ(t *testing.T) {
 	}
 }
 
-// TestListParamValidation 形状越界回 400。
-// TestListParamValidation 422 形状（venv 实例实测锚点）：type/loc/msg/input/
-// ctx 逐字段一致，多错按字段声明序合并（Pydantic 非短路同径）。
 func TestListParamValidation(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	longQ := strings.Repeat("x", 201)
@@ -474,7 +463,6 @@ func TestListParamValidation(t *testing.T) {
 		{"region=abcdefg", []valErr{{Type: "string_too_long", Loc: []any{"query", "region"},
 			Msg: "String should have at most 6 characters", Input: "abcdefg",
 			Ctx: map[string]any{"max_length": 6}}}},
-		// 合并序 = 字段声明序（q → region → onlyDiscounted → toleranceFen）
 		{"q=" + longQ + "&region=abcdefg&onlyDiscounted=maybe&toleranceFen=-1", []valErr{
 			{Type: "string_too_long", Loc: []any{"query", "q"},
 				Msg: "String should have at most 200 characters", Input: longQ,
@@ -497,7 +485,6 @@ func TestListParamValidation(t *testing.T) {
 		wantDetail(t, body, tc.want)
 	}
 
-	// 字节级锚点：与 Python 实例真实响应逐字节一致（含键序）。
 	resp, err := http.Get(srv.URL + "/api/v1/games?limit=0")
 	if err != nil {
 		t.Fatal(err)
@@ -513,8 +500,6 @@ func TestListParamValidation(t *testing.T) {
 	}
 }
 
-// TestListParamLaxAccepted 宽松解析锚点：空白、下划线、整值小数、
-// pydantic 布尔集合全部接受（200）。
 func TestListParamLaxAccepted(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	for _, query := range []string{
@@ -548,7 +533,6 @@ func wantDetail(t *testing.T, body map[string]any, want []valErr) {
 	}
 }
 
-// TestDetail 详情形状：矩阵、汇率折算、覆盖、标签、版本、捆绑包。
 func TestDetail(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	status, d := getJSON(t, srv, "/api/v1/games/900003")
@@ -622,7 +606,6 @@ func TestDetail(t *testing.T) {
 	}
 }
 
-// TestDetailNotFound 404 文案与线上一致。
 func TestDetailNotFound(t *testing.T) {
 	srv, _ := newTestHandler(t)
 	status, d := getJSON(t, srv, "/api/v1/games/424242")

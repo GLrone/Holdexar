@@ -13,21 +13,13 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// 目录移除（假删除）/ 恢复 / 下架复探。games 行与价格历史全保留；移除挂
-// 监控排除挡爬取主链与账号同步复活，恢复只解除本链路所挂的排除（用户
-// 显式设置的排除语义保留）。写链全部进写闸事务（与 Pool.Remove 的
-// ApplyTx 形态对齐），爬取派发经注入的 StartJob 出口。
-
 const (
 	// catalogRemovalReason 移除链挂的监控排除 reason：恢复只解这一档。
-	catalogRemovalReason = "catalog_removed"
-	// catalogRestoreReason 恢复链解除排除的登记缘由。
-	catalogRestoreReason = "catalog_restored"
-	// catalogRemovalRowReason catalog_removals 行的 reason。
+	catalogRemovalReason    = "catalog_removed"
+	catalogRestoreReason    = "catalog_restored"
 	catalogRemovalRowReason = "user_removed"
 )
 
-// cleanCatalogIDs 入参规整：正整数、去重、保序（批量写入口共用单实现）。
 func cleanCatalogIDs(ids []int64) []int64 {
 	out := []int64{}
 	seen := map[int64]bool{}
@@ -53,9 +45,6 @@ func (h *handler) handleRestore(w http.ResponseWriter, r *http.Request) {
 	h.handleCatalogWrite(w, r, h.restoreGames)
 }
 
-// handleCatalogWrite 批量写端点共用壳：写链依赖校验 + GameIdsRequest body
-// 校验（pydantic 形状：缺 appids / 非 list / 长度 1..500 / 元素整数强转，
-// 长度约束先于元素校验短路）。
 func (h *handler) handleCatalogWrite(w http.ResponseWriter, r *http.Request, run func(context.Context, []int64) (map[string]any, error)) {
 	if h.writes == nil || h.writes.Gate == nil {
 		writeJSON(w, http.StatusInternalServerError, detailNull())
@@ -120,9 +109,6 @@ func parseGameIdsBody(w http.ResponseWriter, r *http.Request) ([]int64, bool) {
 	return ids, true
 }
 
-// removeGames 批量移出游戏商店：catalog_removals 幂等落行（重复移除保留
-// 首次时刻，仅对目录里实际存在的 appid 生效）+ 移出关注语义（脱池、摘
-// manual/favorite/board 来源、挂 catalog_removed 监控排除）。
 func (h *handler) removeGames(ctx context.Context, appids []int64) (map[string]any, error) {
 	clean := cleanCatalogIDs(appids)
 	if len(clean) == 0 {
@@ -160,8 +146,7 @@ func (h *handler) removeGames(ctx context.Context, appids []int64) (map[string]a
 		if len(targets) == 0 {
 			return nil
 		}
-		// 幂等落账本（INSERT OR IGNORE），仅记录事实，恢复即删行回商店。
-		// WHERE 1 是 SELECT 形态下 ON CONFLICT 子句的解析消歧（SQLite 语法要求）。
+		// WHERE 1 用于消歧 SQLite SELECT 形态下的 ON CONFLICT 语法。
 		if _, e = conn.ExecContext(ctx,
 			`INSERT INTO catalog_removals(appid, reason, removed_at)
 			 SELECT CAST(j.value AS INTEGER), ?, ? FROM json_each(?) j WHERE 1
@@ -169,8 +154,6 @@ func (h *handler) removeGames(ctx context.Context, appids []int64) (map[string]a
 			catalogRemovalRowReason, now, catalogJSON(targets)); e != nil {
 			return e
 		}
-		// 移出关注语义（remove_pool_items 同径）：wishlist_items 全行脱池 +
-		// 摘用户来源 + 挂监控排除，排除同时挡爬取主链与账号同步复活。
 		if _, e = conn.ExecContext(ctx,
 			`UPDATE wishlist_items SET active=0, excluded=1, manual=0
 			 WHERE appid IN (SELECT value FROM json_each(?))`, catalogJSON(targets)); e != nil {
@@ -196,9 +179,7 @@ func (h *handler) removeGames(ctx context.Context, appids []int64) (map[string]a
 	return map[string]any{"removed": removed, "missing": len(clean) - removed}, nil
 }
 
-// restoreGames 批量恢复：删 catalog_removals 行即回到商店；只解除本链路
-// 所挂的排除（无排除或 reason=catalog_removed），用户显式排除保留；对
-// 恢复款补一次取价（忙 / 空任务只记日志，恢复已生效）。
+// restoreGames 删 catalog_removals 行并仅解除无排除或 catalog_removed 排除，保留用户显式排除。
 func (h *handler) restoreGames(ctx context.Context, appids []int64) (map[string]any, error) {
 	clean := cleanCatalogIDs(appids)
 	if len(clean) == 0 {
@@ -263,9 +244,6 @@ func (h *handler) restoreGames(ctx context.Context, appids []int64) (map[string]
 	return map[string]any{"restored": restored, "missing": len(clean) - int(restored)}, nil
 }
 
-// handleRetryRemoved 下架游戏手动复探：清 removed_at/removed_strikes +
-// 立即重爬（removed_retry 单点）。404 = 游戏 {appid} 不存在；忙 / 空任务
-// 时清标已生效，note 语义不视为失败。
 func (h *handler) handleRetryRemoved(w http.ResponseWriter, r *http.Request) {
 	appid, err := parseAppID(r.PathValue("appid"))
 	if err != nil {
@@ -309,6 +287,5 @@ func (h *handler) handleRetryRemoved(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "jobId": res["id"], "requeued": true})
 		return
 	}
-	// 忙 / 空任务列表：清标已生效，下一轮关注层刷新自然带上，不视为失败。
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "jobId": nil, "requeued": false, "note": e.Error()})
 }

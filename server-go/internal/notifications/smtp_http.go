@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func decodeSMTP(w http.ResponseWriter, r *http.Request) (*SMTPConfig, bool) {
 	cfg := &SMTPConfig{Port: 465, UseSSL: true}
 	if e := json.NewDecoder(r.Body).Decode(&cfg); e != nil || cfg == nil {
-		writeJSON(w, 422, map[string]any{"detail": "邮件配置必须是有效对象"})
+		httpx.WriteJSON(w, 422, map[string]any{"detail": "邮件配置必须是有效对象"})
 		return nil, false
 	}
 	return cfg, true
@@ -21,10 +23,10 @@ func (h *handler) registerSMTP(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/alerts/smtp", func(w http.ResponseWriter, r *http.Request) {
 		v, e := service.SMTPView(r.Context())
 		if e != nil {
-			writeJSON(w, 500, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 500, map[string]any{"detail": e.Error()})
 			return
 		}
-		writeJSON(w, 200, v)
+		httpx.WriteJSON(w, 200, v)
 	})
 	mux.HandleFunc("PUT /api/v1/alerts/smtp", func(w http.ResponseWriter, r *http.Request) {
 		cfg, ok := decodeSMTP(w, r)
@@ -32,16 +34,16 @@ func (h *handler) registerSMTP(mux *http.ServeMux) {
 			return
 		}
 		if e := service.SaveSMTP(r.Context(), *cfg); e != nil {
-			writeJSON(w, 500, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 500, map[string]any{"detail": e.Error()})
 			return
 		}
 		v, e := service.SMTPView(r.Context())
 		if e != nil {
-			writeJSON(w, 500, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 500, map[string]any{"detail": e.Error()})
 			return
 		}
 		service.options.Log("邮件配置已更新")
-		writeJSON(w, 200, v)
+		httpx.WriteJSON(w, 200, v)
 	})
 	mux.HandleFunc("POST /api/v1/alerts/smtp/test", func(w http.ResponseWriter, r *http.Request) {
 		cfg, ok := decodeSMTP(w, r)
@@ -49,10 +51,10 @@ func (h *handler) registerSMTP(mux *http.ServeMux) {
 			return
 		}
 		if e := service.TestMail(r.Context(), *cfg); e != nil {
-			writeJSON(w, 400, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 400, map[string]any{"detail": e.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true})
+		httpx.WriteJSON(w, 200, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("POST /api/v1/notifications/test", func(w http.ResponseWriter, r *http.Request) {
 		cfg, e := service.ReadSMTP(r.Context())
@@ -60,10 +62,10 @@ func (h *handler) registerSMTP(mux *http.ServeMux) {
 			e = service.TestMail(r.Context(), cfg)
 		}
 		if e != nil {
-			writeJSON(w, 400, map[string]any{"detail": e.Error()})
+			httpx.WriteJSON(w, 400, map[string]any{"detail": e.Error()})
 			return
 		}
-		writeJSON(w, 200, map[string]any{"ok": true})
+		httpx.WriteJSON(w, 200, map[string]any{"ok": true})
 	})
 }
 func (s *DeliveryService) TestMail(ctx context.Context, cfg SMTPConfig) error {
@@ -92,11 +94,9 @@ func (s *DeliveryService) TestMail(ctx context.Context, cfg SMTPConfig) error {
 		s.options.Log("邮箱连通性测试成功")
 		return nil
 	}
-	if strings.HasPrefix(problem, "SMTPAuthenticationError: ") {
-		return fmt.Errorf("%s", strings.TrimPrefix(problem, "SMTPAuthenticationError: "))
-	}
+	s.options.Log("邮箱连通性测试失败 │ detail=%s", problem)
 	if deliveryUnknown(problem) {
 		return fmt.Errorf("邮件发送结果无法确认，请先检查收件箱再决定是否重新测试")
 	}
-	return fmt.Errorf("连接失败：%s", problem)
+	return fmt.Errorf("通知服务器连接失败，请检查地址与端口")
 }

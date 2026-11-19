@@ -25,8 +25,7 @@ type Options struct {
 	Client        *http.Client
 	MembershipURL string
 	SearchURL     string
-	// Proxy 出网代理解析（代理池语义：池可用返回池地址，不可用回落直连）；
-	// nil = 只认系统代理（与 Python 池通道语义对齐的缺口补齐点）
+	// Proxy 返回代理地址及可用标记；nil 时回落系统代理。
 	Proxy     func(context.Context) (string, bool)
 	Now       func() time.Time
 	Crawl     func(context.Context, []int64) (int64, error)
@@ -66,7 +65,7 @@ type state struct {
 	Machine       string         `json:"machineName"`
 	Product       string         `json:"productName"`
 	Marked        int            `json:"marked"`
-	PlatformGames []platformGame `json:"platformGames,omitempty"` // 非 Steam 平台游戏（带平台标识）
+	PlatformGames []platformGame `json:"platformGames,omitempty"`
 }
 
 type mark struct {
@@ -215,7 +214,6 @@ func (s *Service) persist(ctx context.Context, m month, label string, marked []m
 	})
 }
 
-// platformZh 非 Steam 平台的中文展示名（通知文案用）；未知平台回原值。
 var platformZh = map[string]string{
 	"blizzard": "Battle.net 战网", "epic": "Epic", "ubisoft": "育碧", "gog": "GOG",
 	"origin": "Origin", "ea": "EA App", "itch": "itch.io", "drm-free": "直接下载版",
@@ -247,7 +245,6 @@ func recordNotice(ctx context.Context, conn *sql.Conn, m month, label string, ma
 	if err != nil {
 		return err
 	}
-	// 非 Steam 平台游戏一并入通知（名称带平台标注），领取口径=当月全部游戏
 	for _, pg := range m.Others {
 		zh, ok := platformZh[pg.Platform]
 		if !ok {

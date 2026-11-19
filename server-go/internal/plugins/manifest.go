@@ -80,7 +80,6 @@ func (m Manifest) Validate() error {
 		return errors.New("unsupported plugin API or capability")
 	}
 	if m.Kind == "datasource.community_history" {
-		// 数据源：无网络投递面，清单校验到此为止（数据文件在安装时另行校验）。
 		return m.validateDataSourceManifest()
 	}
 	if m.Kind != "notification.webhook" {
@@ -136,8 +135,6 @@ func (m Manifest) Validate() error {
 	return m.validateTemplatesAndSchema()
 }
 
-// validateTemplatesAndSchema headers 与 body 模板校验（notification 专属面；
-// datasource 在 validateDataSourceManifest 已拒空并提前返回）。
 func (m Manifest) validateTemplatesAndSchema() error {
 	names := map[string]bool{}
 	for name, value := range m.Headers {

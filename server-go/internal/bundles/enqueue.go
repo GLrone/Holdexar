@@ -1,8 +1,3 @@
-// enqueue.go 新 AppID 预检入队：捆绑包内游戏的自动入库爬取联动
-// （对齐 Python refresh.py:_enqueue_new_bundle_apps + ensure_game_exists +
-// mark_non_game_type）。候选 = 全部 bundles.app_ids 中 games.type IS NULL 的
-// 行；逐个 appdetails 轻量预检（每轮限量 30，余量顺延下轮），game/dlc 落
-// 占位行后小批量爬取，非游戏打标结案，预检失败不打标（宁重试勿漏）。
 package bundles
 
 import (
@@ -10,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -19,16 +14,14 @@ import (
 )
 
 const (
-	appdetailsURL     = "https://store.steampowered.com/api/appdetails"
-	precheckPerRun    = 30
-	precheckInterval  = 300 * time.Millisecond
-	detailsTimeout    = 15 * time.Second
-	enqueueCrawlKind  = "bundle_apps"
+	appdetailsURL    = "https://store.steampowered.com/api/appdetails"
+	precheckPerRun   = 30
+	precheckInterval = 300 * time.Millisecond
+	detailsTimeout   = 15 * time.Second
+	enqueueCrawlKind = "bundle_apps"
 )
 
-// Discovery 新 AppID 小批量爬取入口（serverd 注入 priceRuntime.RunDiscovery；
-// nil = 只预检落行不启动爬取）。Python 侧直调 run_crawl 且不建 crawl_jobs 行，
-// Go 经 RunDiscovery 走同一执行链（任务账本多一行 kind=bundle_apps，登记差异）。
+// EnqueueNewBundleApps 预检未知 AppID 并落游戏占位行，经 Discovery 触发小批量爬取（nil 时跳过爬取）。
 func (s *Service) EnqueueNewBundleApps(ctx context.Context) (int, int, error) {
 	rows, err := s.DB.QueryContext(ctx, "SELECT app_ids FROM bundles")
 	if err != nil {
@@ -72,7 +65,7 @@ func (s *Service) EnqueueNewBundleApps(ctx context.Context) (int, int, error) {
 	for appid := range all {
 		candidates = append(candidates, appid)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	slices.Sort(candidates)
 	if len(candidates) > precheckPerRun {
 		s.Logf("候选 AppID 超过本轮预检上限，只处理前一批，余量顺延下轮 │ 候选数=%d，本轮上限=%d",
 			len(candidates), precheckPerRun)
@@ -85,7 +78,7 @@ func (s *Service) EnqueueNewBundleApps(ctx context.Context) (int, int, error) {
 	for _, appid := range candidates {
 		appType, name, err := s.fetchAppType(ctx, appid)
 		if err != nil {
-			probeFailed++ // 预检失败：不标不记，下次刷新重试
+			probeFailed++
 			continue
 		}
 		if appType == "game" || appType == "dlc" {
@@ -125,7 +118,6 @@ func (s *Service) EnqueueNewBundleApps(ctx context.Context) (int, int, error) {
 	}
 	if len(crawlPairs) > 0 && s.Discovery != nil {
 		if _, err := s.Discovery(ctx, enqueueCrawlKind, crawlPairs); err != nil {
-			// 占位行已落库，本批未爬取——失败不外溢，未预检余量与占位行下轮自愈
 			s.Logf("新 AppID 爬取任务失败，占位行已落库（本批未爬取）│ 原因=%v", err)
 		} else {
 			s.Logf("新 AppID 爬取完成 │ 总数=%d", len(crawlPairs))
@@ -134,15 +126,14 @@ func (s *Service) EnqueueNewBundleApps(ctx context.Context) (int, int, error) {
 	return len(crawlPairs), skipped, nil
 }
 
-// RefreshWithEnqueue 刷新 + 新 AppID 入队联动（对齐 refresh_bundles 尾段）：
-// 联动失败时结果不含 appsEnqueued/appsSkippedNonGame（对齐 Python 条件键）。
+// RefreshWithEnqueue 刷新关注捆绑包并触发新 AppID 入队，联动失败时不写入入队计数字段。
 func (s *Service) RefreshWithEnqueue(ctx context.Context) (map[string]any, error) {
 	res, err := s.RefreshFollowed(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := refreshResultMap(res)
-	if res.Total > 0 { // 空关注集整轮跳过：零出网也不做预检
+	if res.Total > 0 {
 		enqueued, skipped, err := s.EnqueueNewBundleApps(ctx)
 		if err == nil {
 			out["appsEnqueued"] = enqueued
@@ -152,8 +143,6 @@ func (s *Service) RefreshWithEnqueue(ctx context.Context) (map[string]any, error
 	return out, nil
 }
 
-// refreshResultMap 刷新结果转响应形状：failed 恒为数组，droppedSingletons
-// 仅在刷新真实执行时出现（跳过分支无该键，对齐 Python）。
 func refreshResultMap(res RefreshResult) map[string]any {
 	failed := res.Failed
 	if failed == nil {
@@ -167,8 +156,7 @@ func refreshResultMap(res RefreshResult) map[string]any {
 	return out
 }
 
-// fetchAppType 轻量 appdetails type 预检：只取 filters=basic（单 appid 一次
-// 小请求）；cc=us（type/name 不随区变）。失败 (None, "")。
+// fetchAppType 轻量 appdetails 预检（filters=basic, cc=us），失败返回空串与错误。
 func (s *Service) fetchAppType(ctx context.Context, appid int64) (string, string, error) {
 	url := fmt.Sprintf("%s?appids=%d&cc=us&filters=basic", appdetailsURL, appid)
 	status, body, err := s.detailsClient.GetJSON(ctx, url, "")
@@ -192,9 +180,9 @@ func (s *Service) fetchAppType(ctx context.Context, appid int64) (string, string
 	return lowerASCII(appType), name, nil
 }
 
-// ensureGameExists 确保 games 表有占位行（满足外键约束），同事务派生重算
-// （目录快照先取后插：新行对系列联动视为变化，对齐 Python ensure 链）。
+// ensureGameExists 写入 games 占位行并在同事务重算派生列（须在插入前采目录快照）。
 func (s *Service) ensureGameExists(ctx context.Context, appid int64, name string) error {
+	overrides, order := s.seriesOverrides()
 	return s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		before, err := derived.CatalogInputs(ctx, conn, []int64{appid})
 		if err != nil {
@@ -202,11 +190,11 @@ func (s *Service) ensureGameExists(ctx context.Context, appid int64, name string
 		}
 		now := s.Now().Format(timeLayout)
 		if _, err := conn.ExecContext(ctx,
-			"INSERT INTO games(appid,name,created_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(appid) DO NOTHING",
+			`INSERT INTO games(appid,name,family_sharing,trading_cards,is_epic,is_hb,hl_flag,pp_flag,diff_fen,is_adult,is_visual_novel,removed_strikes,positive_reviews,review_count,view_count,created_at,updated_at)
+			 VALUES(?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,?,?) ON CONFLICT(appid) DO NOTHING`,
 			appid, name, now, now); err != nil {
 			return err
 		}
-		overrides, order := s.seriesOverrides()
 		_, err = derived.UpdatePriceDerived(ctx, conn, []int64{appid}, derived.Options{
 			Now: s.Now(), CatalogBefore: before, Overrides: overrides, OverrideOrder: order,
 		})
@@ -214,9 +202,9 @@ func (s *Service) ensureGameExists(ctx context.Context, appid int64, name string
 	})
 }
 
-// markNonGameType 非游戏类型落 type + updated_at（脱离首爬候选）：只写
-// type/时间戳两列，不碰其他元数据（名字保持挂名值）。
+// markNonGameType 仅更新非游戏条目的 type 与 updated_at，使其脱离首爬候选。
 func (s *Service) markNonGameType(ctx context.Context, appid int64, appType string) error {
+	overrides, order := s.seriesOverrides()
 	return s.Gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		before, err := derived.CatalogInputs(ctx, conn, []int64{appid})
 		if err != nil {
@@ -224,12 +212,12 @@ func (s *Service) markNonGameType(ctx context.Context, appid int64, appType stri
 		}
 		now := s.Now().Format(timeLayout)
 		if _, err := conn.ExecContext(ctx,
-			"INSERT INTO games(appid,name,type,created_at,updated_at) VALUES(?,?,?,?,?)"+
-				" ON CONFLICT(appid) DO UPDATE SET type=excluded.type, updated_at=excluded.updated_at",
+			`INSERT INTO games(appid,name,type,family_sharing,trading_cards,is_epic,is_hb,hl_flag,pp_flag,diff_fen,is_adult,is_visual_novel,removed_strikes,positive_reviews,review_count,view_count,created_at,updated_at)
+			 VALUES(?,?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,?,?)
+			 ON CONFLICT(appid) DO UPDATE SET type=excluded.type, updated_at=excluded.updated_at`,
 			appid, fmt.Sprintf("AppID_%d", appid), upperASCII(appType), now, now); err != nil {
 			return err
 		}
-		overrides, order := s.seriesOverrides()
 		_, err = derived.UpdatePriceDerived(ctx, conn, []int64{appid}, derived.Options{
 			Now: s.Now(), CatalogBefore: before, Overrides: overrides, OverrideOrder: order,
 		})
@@ -237,12 +225,14 @@ func (s *Service) markNonGameType(ctx context.Context, appid int64, appType stri
 	})
 }
 
-// seriesOverrides 系列覆盖表（闸外装填；nil 装填器 = 无覆盖）。
 func (s *Service) seriesOverrides() (map[string][]int64, []string) {
-	if s.LoadOverrides == nil {
-		return nil, nil
+	if s.LoadOverrides != nil {
+		return s.LoadOverrides()
 	}
-	return s.LoadOverrides()
+	if s.DataDir != "" {
+		return derived.LoadSeriesOverrides(s.DataDir)
+	}
+	return nil, nil
 }
 
 func sleepPrecheck(ctx context.Context) error {

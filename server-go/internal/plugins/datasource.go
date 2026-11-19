@@ -4,23 +4,23 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/timeutil"
 )
 
 // 静态数据源只供观测，商品身份与价格合流由核心决定。
 
-// DataSourceData 数据包数据文件（observations.json）。
 type DataSourceData struct {
 	AppID        int64             `json:"appid"`
 	Region       string            `json:"region"`
 	Observations []DataSourcePoint `json:"observations"`
 }
 
-// DataSourcePoint 单条历史观测（日粒度）。
 type DataSourcePoint struct {
-	Date           string `json:"date"`                     // YYYY-MM-DD
-	PriceMinor     *int64 `json:"priceMinor,omitempty"`     // 主单位 × 100，全币种统一
-	CnyFen         *int64 `json:"cnyFen,omitempty"`         // 兼容字段；折算由核心按历史汇率计算
-	ProductUnknown bool   `json:"productUnknown,omitempty"` // 商品身份未知 → 独立序列
+	Date           string `json:"date"`
+	PriceMinor     *int64 `json:"priceMinor,omitempty"`
+	CnyFen         *int64 `json:"cnyFen,omitempty"`
+	ProductUnknown bool   `json:"productUnknown,omitempty"`
 }
 
 // maxDataSourceData 数据文件字节上限（与安装包上限一致）。
@@ -29,7 +29,6 @@ const maxDataSourceData = 256 << 10
 // maxDataSourcePoints 单包观测条目上限（对齐合流写入器单批上限）。
 const maxDataSourcePoints = 5000
 
-// ValidateDataSourceData 解析并校验数据文件原文（严格 JSON；未知字段拒绝）。
 func ValidateDataSourceData(raw []byte) (*DataSourceData, error) {
 	if len(raw) > maxDataSourceData {
 		return nil, fmt.Errorf("数据文件 %d 字节超过上限 %d", len(raw), maxDataSourceData)
@@ -52,7 +51,7 @@ func ValidateDataSourceData(raw []byte) (*DataSourceData, error) {
 		return nil, fmt.Errorf("数据文件观测 %d 条超过上限 %d", len(data.Observations), maxDataSourcePoints)
 	}
 	seen := map[string]struct{}{}
-	beijing := time.FixedZone("UTC+8", 8*3600)
+	beijing := timeutil.ZoneUTC8
 	now := time.Now().In(beijing)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, beijing)
 	for i := range data.Observations {
@@ -81,7 +80,6 @@ func ValidateDataSourceData(raw []byte) (*DataSourceData, error) {
 	return &data, nil
 }
 
-// DataSourceMember 数据源包的数据成员名。
 const DataSourceMember = "observations.json"
 
 // validateDataSourceManifest 数据源 kind 的清单约束：无网络投递面。

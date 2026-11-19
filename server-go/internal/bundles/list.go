@@ -1,5 +1,3 @@
-// 捆绑包列表读面：ListBundles 大 SQL + fast path + ownership，逐条对齐
-// Python app/domains/bundles/service.py::list_bundles / _aggregate / _load_bundles。
 package bundles
 
 import (
@@ -16,23 +14,18 @@ import (
 	"holdexar/server-go/internal/monitoring"
 )
 
-// ── 响应形状（JSON 键与 Python 逐字段对齐） ──
-
-// PriceData 价格观察状态（观察时刻 = 该包全部价格行 MAX(crawled_at)）；
-// 三值全空 = 无任何观察记录（「没有数据」不冒充「数据很旧」）。
+// PriceData 观察时刻取该包价格行 MAX(crawled_at)；三值全空表示无观察记录。
 type PriceData struct {
 	ObservedAt *string  `json:"observedAt"`
 	AgeHours   *float64 `json:"ageHours"`
 	Freshness  *string  `json:"freshness"`
 }
 
-// Ownership 拥有状态：type = null|"owned"|"family"；account 仅 family 时有值。
 type Ownership struct {
 	Type    *string `json:"type"`
 	Account *string `json:"account"`
 }
 
-// ListRegionPrice 列表区价投影（详情的 appIds/lockedCount/formatted 不进列表）。
 type ListRegionPrice struct {
 	PriceMinor      *int64  `json:"priceMinor"`
 	Currency        *string `json:"currency"`
@@ -42,14 +35,12 @@ type ListRegionPrice struct {
 	DiscountEndsAt  *int64  `json:"discountEndsAt"`
 }
 
-// BundleListItem 列表项。
 type BundleListItem struct {
 	bundleSummary
 	RegionPrices map[string]ListRegionPrice `json:"regionPrices"`
 	Ownership    Ownership                  `json:"ownership"`
 }
 
-// ListResult 列表响应；total/completableCount 为全量计数（非页内）。
 type ListResult struct {
 	Bundles          []BundleListItem `json:"bundles"`
 	Total            int64            `json:"total"`
@@ -58,33 +49,30 @@ type ListResult struct {
 	Limit            int              `json:"limit"`
 }
 
-// bundleSummary 列表与详情共用的聚合字段（内嵌展开进 JSON）。
 type bundleSummary struct {
-	BundleID          int64    `json:"bundleId"`
-	Name              string   `json:"name"`
-	HeaderImage       string   `json:"headerImage"`
-	URL               string   `json:"url"`
-	MustPurchaseAsSet int64    `json:"mustPurchaseAsSet"`
-	ItemKind          int64    `json:"itemKind"`
-	AppIDs            []int64  `json:"appIds"`
-	CnCnyFen          *int64   `json:"cnCnyFen"`
-	LowestRegion      string   `json:"lowestRegion"`
-	LowestCnyFen      *int64   `json:"lowestCnyFen"`
-	DiffFen           int64    `json:"diffFen"`
-	SmartScore        float64  `json:"smartScore"`
+	BundleID          int64     `json:"bundleId"`
+	Name              string    `json:"name"`
+	HeaderImage       string    `json:"headerImage"`
+	URL               string    `json:"url"`
+	MustPurchaseAsSet int64     `json:"mustPurchaseAsSet"`
+	ItemKind          int64     `json:"itemKind"`
+	AppIDs            []int64   `json:"appIds"`
+	CnCnyFen          *int64    `json:"cnCnyFen"`
+	LowestRegion      string    `json:"lowestRegion"`
+	LowestCnyFen      *int64    `json:"lowestCnyFen"`
+	DiffFen           int64     `json:"diffFen"`
+	SmartScore        float64   `json:"smartScore"`
 	PriceData         PriceData `json:"priceData"`
 }
 
-// ListOptions 列表参数；PrimarySteamID 由调用方（HTTP 层）解析传入
-// （internal/account 无导出读取函数，对齐 Python service.py 主账户 + settings 兜底的取值来源）。
 type ListOptions struct {
 	Sort            string
 	Offset          int
-	Limit           int // <=0 → 默认 120（Python 签名默认值）
+	Limit           int
 	Removed         bool
 	Query           string
 	Region          string
-	RegionMode      string // cheaper|locked|其它=不过滤
+	RegionMode      string
 	FollowedOnly    bool
 	CompletableOnly bool
 	CnLowestOnly    bool
@@ -96,11 +84,9 @@ type ListOptions struct {
 	PriceMax        *float64
 	DiffMin         *float64
 	DiffMax         *float64
-	DiffType        string // absolute|percent
+	DiffType        string
 	PrimarySteamID  string
 }
-
-// ── 参数绑定辅助（?N 位置参数，与 snapshot.go 同风格） ──
 
 type sqlArgs struct{ args []any }
 
@@ -115,8 +101,6 @@ func boolInt64(v bool) int64 {
 	}
 	return 0
 }
-
-// ── SQL 片段（CTE 逐条对齐 _region_rows_sql / _OWNERSHIP_SQL / _visible_bundle_sql） ──
 
 func jsonArraySQL(column string) string {
 	return "CASE WHEN json_valid(" + column + ") THEN CASE WHEN json_type(" + column + ") = 'array' " +
@@ -169,8 +153,7 @@ WITH targets AS MATERIALIZED (
 )`
 }
 
-// ownershipSQLTemplate 拥有状态 CTE（@primary@ 为占位符）；列表主 SQL 与
-// 页级补算（pageOwnership 的 baseline 前置）共用同一份。
+// ownershipSQLTemplate 拥有状态 CTE（@primary@ 占位符），列表主查询与 pageOwnership 共用。
 const ownershipSQLTemplate = `
 , owned_apps AS MATERIALIZED (
     SELECT w.appid, MAX(@primary@ = '' OR w.steamid = @primary@) AS self_owned,
@@ -204,15 +187,11 @@ func visibleBundleSQL(trackedPH string) string {
 		"OR json_array_length(" + basis + ")=0))"
 }
 
-// blockedBundleSQL 软删/释放可见性子查询：monitor_targets 中 target_type='bundle'
-// 且状态 ∈ {released,excluded}（NON_CRAWL_STATES）。默认视图 = blocked 对 removed 取反。
 func blockedBundleSQL() string {
 	return "(EXISTS (SELECT 1 FROM monitor_targets t WHERE t.target_type = 'bundle' " +
 		"AND t.target_id = b.bundle_id AND " + monitoring.StateExpression +
 		" IN ('released','excluded')))"
 }
-
-// ── ListBundles 主流程 ──
 
 func ListBundles(ctx context.Context, db *sql.DB, opts ListOptions) (*ListResult, error) {
 	tracked := trackedRegionCodes(ctx, db)
@@ -234,7 +213,6 @@ func ListBundles(ctx context.Context, db *sql.DB, opts ListOptions) (*ListResult
 	}
 
 	blocked := blockedBundleSQL()
-	// 目标可见性条件（嵌入 targets CTE 的 WHERE）
 	var a sqlArgs
 	targetConds := []string{"(" + blocked + ") = " + a.add(boolInt64(opts.Removed))}
 	if queryRaw != "" {
@@ -353,7 +331,6 @@ func ListBundles(ctx context.Context, db *sql.DB, opts ListOptions) (*ListResult
 	fastEligible := region == "" && sortKey != "discount" && !opts.CnLowestOnly && !opts.OnlyDiscounted &&
 		!opts.GiftOnly && opts.PriceMin == nil && opts.PriceMax == nil && opts.DiffMin == nil && opts.DiffMax == nil
 
-	// fast path 参数独立分配（占位符编号与慢 SQL 不同链路）
 	var f sqlArgs
 	fastTargetConds := []string{"(" + blocked + ") = " + f.add(boolInt64(opts.Removed))}
 	if queryRaw != "" {
@@ -441,8 +418,6 @@ func ListBundles(ctx context.Context, db *sql.DB, opts ListOptions) (*ListResult
 	}, nil
 }
 
-// pageOwnership 页级补算拥有状态（对齐 Python _page_ownership）：慢路径带
-// ownership 过滤时由主 SQL 直出，其余路径按页补全。
 func pageOwnership(ctx context.Context, q *sql.Tx, items []BundleListItem, primary string) error {
 	if len(items) == 0 {
 		return nil
@@ -502,8 +477,6 @@ func pageOwnership(ctx context.Context, q *sql.Tx, items []BundleListItem, prima
 	return nil
 }
 
-// ── 行装载 ──
-
 type bundleRow struct {
 	BundleID          int64
 	Name              string
@@ -529,7 +502,6 @@ type bundlePriceRow struct {
 	crawledAt          sql.NullString
 }
 
-// loadBundles 主档 + 区价（按 id 排序，对齐 _load_bundles）。
 func loadBundles(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, ids []int64) ([]bundleRow, map[int64][]bundlePriceRow, error) {
@@ -588,8 +560,6 @@ func loadBundles(ctx context.Context, q interface {
 	return bundles, byBundle, nil
 }
 
-// ── 单包聚合（_family_region_prices + _aggregate） ──
-
 type regionEntry struct {
 	code            string
 	priceMinor      *int64
@@ -608,8 +578,7 @@ type bundleAggregate struct {
 	regions []regionEntry
 }
 
-// parseAppIDs app_ids JSON 列 → int 列表（脏数据容错：空/坏 JSON 回空表，
-// 任一元素不可转 int 整体回空，对齐 _parse_app_ids）。
+// parseAppIDs 解析 app_ids JSON 数组；空、坏 JSON 或任一元素不可转整数时整体返回空切片。
 func parseAppIDs(raw sql.NullString) []int64 {
 	out := []int64{}
 	if !raw.Valid || raw.String == "" {
@@ -650,7 +619,6 @@ func nullInt64Ptr(v sql.NullInt64) *int64 {
 	return &value
 }
 
-// truthyIntPtr 0 与 NULL 都回 nil（对齐 int(p.discount_end_ts) if p.discount_end_ts else None）。
 func truthyIntPtr(v sql.NullInt64) *int64 {
 	if !v.Valid || v.Int64 == 0 {
 		return nil
@@ -676,12 +644,11 @@ func aggregateBundle(b bundleRow, prices []bundlePriceRow, tracked map[string]bo
 	if b.ItemKind.Valid {
 		itemKind = b.ItemKind.Int64
 	}
-	// v3 之前的行 item_kind 尚未回填（-1）：形态沿用 mps 旧值兜底
+	// item_kind 缺失(-1) 时沿用 must_purchase_as_set 兜底。
 	if itemKind != 0 && itemKind != 1 {
 		itemKind = mps
 	}
 
-	// 基准行（appids 最多，先到者胜）+ 家族过滤（双产品隔离）
 	type parsedRow struct {
 		row  *bundlePriceRow
 		aids []int64
@@ -756,7 +723,6 @@ func aggregateBundle(b bundleRow, prices []bundlePriceRow, tracked map[string]bo
 		order = append(order, code)
 	}
 
-	// 追踪区过滤（CN 恒保留；PK/BD 同进同出）
 	regions := make([]regionEntry, 0, len(order))
 	for _, code := range order {
 		if !keepRegion(code, tracked) {
@@ -766,7 +732,6 @@ func aggregateBundle(b bundleRow, prices []bundlePriceRow, tracked map[string]bo
 		regions = append(regions, entry)
 	}
 
-	// 锁区数 / 格式化价（详情报文级字段；列表投影不带）
 	baselineSet := map[int64]bool{}
 	for _, aid := range baselineAppIDs {
 		baselineSet[aid] = true
@@ -785,7 +750,6 @@ func aggregateBundle(b bundleRow, prices []bundlePriceRow, tracked map[string]bo
 		}
 	}
 
-	// 最低价/最低区：min(国区价, 非国区最低快照)，展示级查表
 	var cnCnyFen *int64
 	if e, ok := entries["CN"]; ok {
 		cnCnyFen = e.cnyFen
@@ -883,14 +847,10 @@ func stringOrEmpty(v *string) string {
 	return *v
 }
 
-// ── 展示期归一与兜底 ──
-
 var imgCDNHosts = regexp.MustCompile(`(?i)^https?://shared\.(?:fastly\.steamstatic|cdn\.queniuqe)\.com`)
 
 const imgCDNReplacement = "https://shared.akamai.steamstatic.com"
 
-// normalizeImage 图片 CDN 域归一化：fastly/queniuqe → akamai（路径不变）。
-// 空/无匹配回 nil（调用方兜底）。
 func normalizeImage(raw sql.NullString) *string {
 	if !raw.Valid || raw.String == "" {
 		return nil
@@ -918,8 +878,6 @@ func fallbackImage(bundleID, itemKind int64) *string {
 	url := fmt.Sprintf("https://shared.akamai.steamstatic.com/store_item_assets/steam/%s/%d/header.jpg", kind, bundleID)
 	return &url
 }
-
-// ── priceData（freshness_of 同口径；辅助函数与 games/bills 包自持同款） ──
 
 func priceDataOf(prices []bundlePriceRow) PriceData {
 	var maxTime *time.Time
@@ -953,8 +911,6 @@ func priceDataOf(prices []bundlePriceRow) PriceData {
 	return PriceData{ObservedAt: &observedAt, AgeHours: &age, Freshness: &bucket}
 }
 
-// goIsoformat 库内 naive 文本（空格分隔）→ Python datetime.isoformat 形态
-// （T 分隔；微秒为 0 时省略小数段）。无法解析时原样返回。
 func goIsoformat(text string) string {
 	t, ok := parseStoredTime(text)
 	if !ok {
@@ -966,19 +922,16 @@ func goIsoformat(text string) string {
 	return t.Format("2006-01-02T15:04:05.000000")
 }
 
-// pyHours 复刻 Python (reference - observed).total_seconds() / 3600.0 的浮点
-// 路径：微秒整数（datetime 精度）→ /1e6 → /3600 两次除法。
+// pyHours 按微秒整数先除 1e6 再除 3600，保持小时浮点舍入边界一致。
 func pyHours(d time.Duration) float64 {
 	return (float64(int64(d)/1000) / 1e6) / 3600.0
 }
 
-// roundN 四舍六入五成双保留 n 位小数（Python round 口径）。
 func roundN(x float64, n int) float64 {
 	p := math.Pow10(n)
 	return math.RoundToEven(x*p) / p
 }
 
-// parseStoredTime 库内 datetime 文本（naive）解析；按服务器本地时区解释。
 func parseStoredTime(text string) (time.Time, bool) {
 	t, err := time.ParseInLocation("2006-01-02 15:04:05.999999999", text, time.Local)
 	if err != nil {
@@ -987,10 +940,6 @@ func parseStoredTime(text string) (time.Time, bool) {
 	return t, true
 }
 
-// ── formatMinorUnits：cents → 本币字符串（Python pricing.format_minor_units 同式；
-// games 包反向依赖本包，不能 import，自持一份） ──
-
-// displayDecimals 各币种显示小数位（存储统一 2 位小数 cents）；缺省 2。
 var displayDecimals = map[string]int{
 	"CLP": 0, "VND": 0, "IDR": 0, "JPY": 0, "KZT": 0, "UAH": 0,
 	"CNY": 2, "USD": 2, "RUB": 2, "INR": 2, "BRL": 2, "HKD": 2,
@@ -1008,12 +957,10 @@ var currencySymbols = map[string]string{
 	"GBP": "£", "NOK": "kr", "ILS": "₪", "CHF": "CHF",
 }
 
-// suffixCurrencies 符号后置的币种（"55.00 ₽"）。
 var suffixCurrencies = map[string]struct{}{
 	"RUB": {}, "KZT": {}, "UAH": {}, "PLN": {}, "NOK": {},
 }
 
-// formatMinorUnits cents → 本币字符串（"¥42.00" / "608" / "55.00 ₽"）；空值回空串。
 func formatMinorUnits(minor int64, currency string) string {
 	c := strings.ToUpper(currency)
 	symbol := currencySymbols[c]
@@ -1048,7 +995,6 @@ func formatMinorUnits(minor int64, currency string) string {
 	return sign + symbol + formatted
 }
 
-// groupCommas 整数部分千分位逗号分组。
 func groupCommas(s string) string {
 	n := len(s)
 	if n <= 3 {

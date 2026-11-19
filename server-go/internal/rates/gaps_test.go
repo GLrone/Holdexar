@@ -11,17 +11,12 @@ func TestHistoryGapsMixed(t *testing.T) {
 	db, mux := newMux(t)
 	overrideToday(t, "2026-10-31")
 	seedHistory(t, db, []historyRow{
-		// 旧格式行：无 canonical 列，日期取 fetched_at，语义按 source 推导 → carried @10-01
 		{Code: "USD", FetchedAt: "2026-10-01 01:00:00.000000", Source: "backfill"},
-		// 同日 canonical 行 observed，语义更强，胜出
 		{Code: "USD", RateDate: "2026-10-01", Kind: "observed", Source: "frankfurter"},
 		{Code: "USD", RateDate: "2026-10-03", Kind: "observed", Source: "augmentedsteam"},
 		{Code: "USD", RateDate: "2026-10-02", Kind: "carried", Source: "backfill"},
-		// 旧格式行带标记 → observed @10-20
 		{Code: "USD", FetchedAt: "2026-10-20 04:00:00.000000", Kind: "observed", Source: "augmentedsteam"},
-		// 白名单外币种整行跳过
 		{Code: "XXX", RateDate: "2026-10-01", Kind: "observed", Source: "x"},
-		// Bing 源无论原标记一律 carried
 		{Code: "EUR", RateDate: "2026-10-05", Source: "bing.currencyapi"},
 		{Code: "EUR", FetchedAt: "2026-10-06 02:00:00.000000", Kind: "observed", Source: "augmentedsteam"},
 	})
@@ -43,7 +38,7 @@ func TestHistoryGapsMixed(t *testing.T) {
 func TestScanGapsBootstrap(t *testing.T) {
 	cases := []struct {
 		name  string
-		seedX bool // 仅白名单外行：marks 为空仍应触发 bootstrap
+		seedX bool
 	}{
 		{"空库", false},
 		{"仅白名单外行", true},
@@ -82,7 +77,6 @@ func TestScanGapsBootstrap(t *testing.T) {
 			if result.Horizon != "2026-10-30" {
 				t.Fatalf("horizon = %s", result.Horizon)
 			}
-			// 窗口拆分：各窗 ≤365 天、首尾相接、覆盖全区间
 			wantWindows := (spanDays + maxWindowDays - 1) / maxWindowDays
 			if len(result.Windows) != wantWindows {
 				t.Fatalf("窗口数 = %d, want %d", len(result.Windows), wantWindows)
@@ -117,7 +111,6 @@ func TestScanGapsBootstrap(t *testing.T) {
 func TestScanGapsNoPending(t *testing.T) {
 	db, mux := newMux(t)
 	overrideToday(t, "2026-10-31")
-	// 全区间 10-01..10-30 每天都有 observed 行（30 行），无缺口
 	rows := make([]historyRow, 0, 30)
 	for d := 1; d <= 30; d++ {
 		rows = append(rows, historyRow{
@@ -145,7 +138,6 @@ func day202610(d int) string {
 func TestScanGapsFutureOnlyRowSkipped(t *testing.T) {
 	db, mux := newMux(t)
 	overrideToday(t, "2026-10-31")
-	// 唯一历史行在今天（> horizon）：该币种跳过且不算缺口，但 marks 非空不触发 bootstrap
 	seedHistory(t, db, []historyRow{
 		{Code: "USD", RateDate: "2026-10-31", Kind: "observed", Source: "augmentedsteam"},
 	})

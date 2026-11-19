@@ -2,15 +2,51 @@ package notifications
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
-// listCandidates 最近的通知候选（投递账本，只读），按 id 倒序 + limit 截断。
+type candidateDetail struct {
+	Title         any `json:"title"`
+	Price         any `json:"price"`
+	Currency      any `json:"currency"`
+	OriginalPrice any `json:"originalPrice"`
+	Discount      any `json:"discount"`
+	ObservedAt    any `json:"observedAt"`
+	Labels        any `json:"labels"`
+	Summary       any `json:"summary"`
+}
+
+type candidateItem struct {
+	ID              *int64          `json:"id"`
+	EventID         *int64          `json:"eventId"`
+	CycleID         *int64          `json:"cycleId"`
+	AppID           *int64          `json:"appid"`
+	Region          *string         `json:"region"`
+	SourceKind      *string         `json:"sourceKind"`
+	EventType       *string         `json:"eventType"`
+	EventLabel      string          `json:"eventLabel"`
+	Category        *string         `json:"category"`
+	Recipient       *string         `json:"recipient"`
+	Status          *string         `json:"status"`
+	Reason          *string         `json:"reason"`
+	Attempts        *int64          `json:"attempts"`
+	DeliveredAt     *string         `json:"deliveredAt"`
+	DeliveryHistory json.RawMessage `json:"deliveryHistory"`
+	Payload         json.RawMessage `json:"payload"`
+	CreatedAt       *string         `json:"createdAt"`
+	DueAt           *string         `json:"dueAt"`
+	Detail          candidateDetail `json:"detail"`
+}
+
 func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
-	limit, errBody := queryInt(r.URL.Query(), "limit", 50, 1, 500)
-	if errBody != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, errBody)
+	minLimit, maxLimit := int64(1), int64(500)
+	limit, _, verr := httpx.QueryInt(r.URL.Query(), "limit", 50, &minLimit, &maxLimit)
+	if verr != nil {
+		httpx.WriteValidationError(w, *verr)
 		return
 	}
 	rows, err := h.db.QueryContext(r.Context(),
@@ -19,7 +55,7 @@ func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
 			" delivery_history_json, payload_json, CAST(created_at AS TEXT), CAST(due_at AS TEXT)"+
 			" FROM notification_candidates ORDER BY id DESC LIMIT ?", limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	defer rows.Close()
@@ -47,17 +83,16 @@ func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
 			&c.sourceKind, &c.eventType, &c.category, &c.recipient, &c.status,
 			&c.reason, &c.attempts, &c.deliveredAt, &c.deliveryHistory,
 			&c.payload, &c.createdAt, &c.dueAt); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+			httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 			return
 		}
 		cands = append(cands, c)
 	}
 	if err := rows.Err(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 
-	// 游戏名与价格事件 current 快照只对命中的 id 批量取（Python 同构：缺席不回查）
 	appids := map[int64]bool{}
 	var priceIDs []int64
 	for _, c := range cands {
@@ -70,18 +105,18 @@ func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
 	}
 	names, err := h.gameNames(r, appids)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	events, err := h.eventCurrents(r, priceIDs)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 
-	items := make([]*orderedObj, 0, len(cands))
+	items := make([]candidateItem, 0, len(cands))
 	for _, c := range cands {
-		var detail *orderedObj
+		var detail candidateDetail
 		if c.sourceKind.Valid && c.sourceKind.String == "price_event" {
 			var current map[string]any
 			if raw, ok := events[c.eventID.Int64]; ok {
@@ -89,16 +124,16 @@ func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
 					current = parsed
 				}
 			}
-			detail = kvObj(
-				"title", names[appidValue(c.appid)],
-				"price", current["price"],
-				"currency", current["currency"],
-				"originalPrice", current["originalPrice"],
-				"discount", current["discount"],
-				"observedAt", jsonFieldOr(current["observedAt"], current["at"]),
-				"labels", []any{},
-				"summary", nil,
-			)
+			detail = candidateDetail{
+				Title:         names[appidValue(c.appid)],
+				Price:         current["price"],
+				Currency:      current["currency"],
+				OriginalPrice: current["originalPrice"],
+				Discount:      current["discount"],
+				ObservedAt:    jsonFieldOr(current["observedAt"], current["at"]),
+				Labels:        []any{},
+				Summary:       nil,
+			}
 		} else {
 			payload, _ := parseJSONNumber(c.payload.String).(map[string]any)
 			fallback := any(nil)
@@ -109,47 +144,46 @@ func (h *handler) listCandidates(w http.ResponseWriter, r *http.Request) {
 			if truthy(payload["labels"]) {
 				labels = payload["labels"]
 			}
-			detail = kvObj(
-				"title", jsonFieldOr(payload["gameName"], payload["title"], fallback),
-				"price", payload["price"],
-				"currency", payload["currency"],
-				"originalPrice", payload["originalPrice"],
-				"discount", payload["discount"],
-				"observedAt", payload["observedAt"],
-				"labels", labels,
-				"summary", payload["summary"],
-			)
+			detail = candidateDetail{
+				Title:         jsonFieldOr(payload["gameName"], payload["title"], fallback),
+				Price:         payload["price"],
+				Currency:      payload["currency"],
+				OriginalPrice: payload["originalPrice"],
+				Discount:      payload["discount"],
+				ObservedAt:    payload["observedAt"],
+				Labels:        labels,
+				Summary:       payload["summary"],
+			}
 		}
 		eventType := ""
 		if c.eventType.Valid {
 			eventType = c.eventType.String
 		}
-		item := newOrderedObj()
-		item.set("id", nullIntPtr(c.id))
-		item.set("eventId", nullIntPtr(c.eventID))
-		item.set("cycleId", nullIntPtr(c.cycleID))
-		item.set("appid", nullIntPtr(c.appid))
-		item.set("region", nullTextPtr(c.region))
-		item.set("sourceKind", nullTextPtr(c.sourceKind))
-		item.set("eventType", nullTextPtr(c.eventType))
-		item.set("eventLabel", eventLabel(eventType))
-		item.set("category", nullTextPtr(c.category))
-		item.set("recipient", nullTextPtr(c.recipient))
-		item.set("status", nullTextPtr(c.status))
-		item.set("reason", nullTextPtr(c.reason))
-		item.set("attempts", nullIntPtr(c.attempts))
-		item.set("deliveredAt", isoformatPtr(c.deliveredAt))
-		item.set("deliveryHistory", rawOrFallback(c.deliveryHistory.String, "[]"))
-		item.set("payload", rawOrFallback(c.payload.String, "{}"))
-		item.set("createdAt", isoformatPtr(c.createdAt))
-		item.set("dueAt", isoformatPtr(c.dueAt))
-		item.set("detail", detail)
-		items = append(items, item)
+		items = append(items, candidateItem{
+			ID:              nullIntPtr(c.id),
+			EventID:         nullIntPtr(c.eventID),
+			CycleID:         nullIntPtr(c.cycleID),
+			AppID:           nullIntPtr(c.appid),
+			Region:          nullTextPtr(c.region),
+			SourceKind:      nullTextPtr(c.sourceKind),
+			EventType:       nullTextPtr(c.eventType),
+			EventLabel:      eventLabel(eventType),
+			Category:        nullTextPtr(c.category),
+			Recipient:       nullTextPtr(c.recipient),
+			Status:          nullTextPtr(c.status),
+			Reason:          nullTextPtr(c.reason),
+			Attempts:        nullIntPtr(c.attempts),
+			DeliveredAt:     isoformatPtr(c.deliveredAt),
+			DeliveryHistory: rawOrFallback(c.deliveryHistory.String, "[]"),
+			Payload:         rawOrFallback(c.payload.String, "{}"),
+			CreatedAt:       isoformatPtr(c.createdAt),
+			DueAt:           isoformatPtr(c.dueAt),
+			Detail:          detail,
+		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-// appidValue 候选 appid 的查表键；NULL 行回不存在键（-1 恒无游戏名）。
 func appidValue(v sql.NullInt64) int64 {
 	if !v.Valid {
 		return -1
@@ -157,7 +191,6 @@ func appidValue(v sql.NullInt64) int64 {
 	return v.Int64
 }
 
-// gameNames appid → 游戏名；NULL 名按缺席处理（Python dict 值 None 同形）。
 func (h *handler) gameNames(r *http.Request, appids map[int64]bool) (map[int64]any, error) {
 	names := map[int64]any{}
 	if len(appids) == 0 {
@@ -192,7 +225,6 @@ func (h *handler) gameNames(r *http.Request, appids map[int64]bool) (map[int64]a
 	return names, rows.Err()
 }
 
-// eventCurrents price_event id → current_json 文本；缺席 = 无该事件（current 视为空）。
 func (h *handler) eventCurrents(r *http.Request, ids []int64) (map[int64]string, error) {
 	out := map[int64]string{}
 	if len(ids) == 0 {
@@ -220,7 +252,6 @@ func (h *handler) eventCurrents(r *http.Request, ids []int64) (map[int64]string,
 	return out, rows.Err()
 }
 
-// placeholders N 个占位符（IN 子句用）。
 func placeholders(n int) string {
 	if n <= 0 {
 		return ""

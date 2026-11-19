@@ -204,7 +204,6 @@ func (s *SyncService) Recover(ctx context.Context) error {
 	return s.saveSnapshot(ctx, snap)
 }
 
-// flightSnapshot 锁内取当前在飞同步指针（nil = 无在飞）。
 func (s *SyncService) flightSnapshot() *syncFlight {
 	s.mu.Lock()
 	defer s.mu.Unlock()

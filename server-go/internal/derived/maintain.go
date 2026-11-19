@@ -1,10 +1,5 @@
 package derived
 
-// 派生列日切换全库重算（对齐 Python games/derived.py maintain_derived）：
-// 输入版本 = 北京日 + 系列覆盖表。先只读比对版本（一致零重算直接返回），
-// 命中才开写闸——hl_flag=1 全量重算（带历史）、评测零行全量重算（不含历史）
-// + 成员捆绑联动、系列覆盖变化全量重算系列、保存版本提交。
-
 import (
 	"context"
 	"database/sql"
@@ -14,13 +9,12 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
-// maintainBeijing 北京挂钟时区：UTC+8 固定偏移（现行无夏令时）。
-var maintainBeijing = time.FixedZone("UTC+8", 8*3600)
+var maintainBeijing = timeutil.ZoneUTC8
 
-// versionMatches 已存版本与当前输入一致（day + series 全量比对，对齐
-// Python json.loads(saved) == version）；缺行/坏 JSON = 不一致。
+// versionMatches 比对已存版本的 day 与 series；缺行或坏 JSON 视为不一致。
 func versionMatches(saved *string, day string, overrides map[string][]int64) bool {
 	if saved == nil || *saved == "" {
 		return false
@@ -35,9 +29,7 @@ func versionMatches(saved *string, day string, overrides map[string][]int64) boo
 	return seriesVersionEqual(saved, overrides)
 }
 
-// MaintainDerived 日切换维护入口。db 用于闸外只读版本比对，命中才开写闸。
-// now 为挂钟基准（day 判定与派生 era 截点）；overrides/order 由宿主闸外
-// 装填（LoadSeriesOverrides）。返回 nil = 无需重算或重算成功。
+// MaintainDerived 先闸外只读校验版本，不一致才取写闸全库重算（overrides 由宿主闸外装填）。
 func MaintainDerived(ctx context.Context, db *sql.DB, gate *store.WriteGate, now time.Time,
 	overrides map[string][]int64, order []string) error {
 	now = now.In(maintainBeijing)
@@ -49,15 +41,14 @@ func MaintainDerived(ctx context.Context, db *sql.DB, gate *store.WriteGate, now
 		return fmt.Errorf("派生输入版本读取失败: %w", err)
 	}
 	if saved.Valid && versionMatches(&saved.String, day, overrides) {
-		return nil // 版本相同零重算
+		return nil
 	}
 	return gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 		return maintainDerivedTx(ctx, conn, now, day, overrides, order)
 	})
 }
 
-// maintainDerivedTx 写侧核心（闸内事务连接）：闸内复核版本防并发重复重算，
-// 再按 Python maintain_derived 的段落顺序执行。
+// maintainDerivedTx 闸内复核版本防并发重复重算，按日切换与覆盖变更分段执行。
 func maintainDerivedTx(ctx context.Context, conn *sql.Conn, now time.Time, day string,
 	overrides map[string][]int64, order []string) error {
 	saved, err := readSavedVersion(ctx, conn)
@@ -75,7 +66,6 @@ func maintainDerivedTx(ctx context.Context, conn *sql.Conn, now time.Time, day s
 	}
 	oldDay, _ := old["day"].(string)
 	if oldDay != day {
-		// 史低标记全量重算（hl_flag=1 行，带历史）
 		lowIDs, err := queryIDs(ctx, conn, "hl_flag = 1", nil)
 		if err != nil {
 			return err
@@ -87,7 +77,6 @@ func maintainDerivedTx(ctx context.Context, conn *sql.Conn, now time.Time, day s
 				return err
 			}
 		}
-		// 评测零行全量重算（smart_score 时机因子日切换）+ 成员捆绑联动
 		scoreIDs, err := queryIDs(ctx, conn, "COALESCE(review_count,0) = 0", nil)
 		if err != nil {
 			return err
@@ -103,7 +92,6 @@ func maintainDerivedTx(ctx context.Context, conn *sql.Conn, now time.Time, day s
 			return err
 		}
 	}
-	// 系列覆盖变化（含首跑）→ 全量重算系列归属
 	if !seriesVersionEqual(saved, overrides) {
 		if _, err := RefreshSeries(ctx, conn, nil, overrides, order); err != nil {
 			return err

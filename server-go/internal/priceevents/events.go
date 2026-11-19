@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -94,7 +94,7 @@ func (d *Detector) DetectWindow(ctx context.Context, appIDs []int64, regions []s
 	for r := range regionSet {
 		regions = append(regions, r)
 	}
-	sort.Strings(regions)
+	slices.Sort(regions)
 	if len(regions) == 0 {
 		return []Event{}, nil
 	}

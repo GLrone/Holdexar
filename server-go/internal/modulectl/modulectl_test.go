@@ -32,7 +32,6 @@ func TestEnabledDefaultsTrueAndPersistsAcrossControls(t *testing.T) {
 	if enabled, e = ctl.Enabled(ctx, db); e != nil || enabled {
 		t.Fatalf("after disable=%t err=%v", enabled, e)
 	}
-	// 新控制器实例从库读回同一状态（跨进程持久语义）。
 	fresh := New("module.test.enabled")
 	if enabled, e = fresh.Enabled(ctx, db); e != nil || enabled {
 		t.Fatalf("fresh read=%t err=%v", enabled, e)

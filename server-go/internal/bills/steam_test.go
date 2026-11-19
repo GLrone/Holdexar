@@ -112,6 +112,24 @@ func TestHistoryRejectsMalformedInitialCursor(t *testing.T) {
 	}
 }
 
+func TestBillTitleExpiredDetection(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"sign in title", `<html><head><title>Sign In</title></head><body></body></html>`, true},
+		{"chinese login title", `<html><head><title>登录 :: Steam</title></head></html>`, true},
+		{"unclosed title", `<html><head><title>Sign In`, true},
+		{"no title", `<html><head></head><body>wallet</body></html>`, false},
+	}
+	for _, tc := range cases {
+		if got := billTitleExpired([]byte(tc.raw)); got != tc.want {
+			t.Errorf("%s: billTitleExpired=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestSteamBillsRejectsCookieOwnerChangeOnSameStore(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/account/" {

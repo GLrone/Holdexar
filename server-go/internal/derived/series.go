@@ -1,17 +1,15 @@
 package derived
 
-// 游戏系列识别：本地名称聚类，零网络开销。输入 games.name / name_en，
-// 名称相似启发式 + 并查集聚类，写回 games.series_id。
-// 语义约定：NULL = 未计算；'' = 已计算但落单；非空 = 系列标识名。
-// 宁缺毋滥：每条规则带负面词表或长度门槛，防一条错边污染整簇。
+// games.series_id 语义：NULL=未计算，''=已落单，非空=系列标识。
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -24,27 +22,22 @@ const (
 // 参与聚类的类型：正作才有「系列」语义；NULL = 未分类按可聚类处理。
 const clusterableCond = "(type = 'GAME' OR type IS NULL)"
 
-// 分隔符前缀判定的负面中文前缀：二字通用词，撞车率高。
 var badCnBases = map[string]bool{
 	"模拟": true, "我的": true, "传奇": true, "动作": true, "逃离": true,
 	"星际": true, "少女": true, "勇者": true, "我是": true,
 }
 
-// 公共词前缀判定的负面英文首词：冠词与泛用起手词；另含品牌伞人名前缀
-// （旗下是多条平行系列，品牌相同不等于同系列）。
 var badEnStarts = map[string]bool{
 	"the": true, "a": true, "an": true, "i": true, "super": true,
 	"world": true, "of": true, "simulator": true, "vr": true,
 	"project": true, "tom": true, "sid": true,
 }
 
-// 泛用次词：公共前缀恰好 2 词且次词是虚词时证据不足。
 var genericMinor = map[string]bool{
 	"of": true, "the": true, "a": true, "an": true, "and": true,
 	"&": true, "to": true, "am": true,
 }
 
-// 罗马数字 → 阿拉伯（只用于比对归一，不动存储数据）。
 var roman = map[string]string{
 	"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7", "viii": "8",
 	"ix": "9", "xi": "11", "xii": "12", "xiii": "13", "xiv": "14", "xv": "15",
@@ -58,8 +51,7 @@ var romanValues = func() map[string]bool {
 	return m
 }()
 
-// 官定同系的名称改写表：外传官方名不以系列词开头，按 token 串前缀把
-// 系列词置换到开头，让公共前缀规则照常生效。
+// forcedSeriesPrefix 将不以系列词开头的指定外传前缀置换为标准系列词。
 var forcedSeriesPrefix = []struct {
 	head   string
 	series []string
@@ -99,7 +91,6 @@ func cnChars(name string) string {
 	return cnKeepRe.ReplaceAllString(name, "")
 }
 
-// seriesTokens 参与系列判定的英文 token 序列；命中改写表以系列词置换开头。
 func seriesTokens(nameEn *string, name string) []string {
 	base := name
 	if nameEn != nil && *nameEn != "" {
@@ -115,7 +106,6 @@ func seriesTokens(nameEn *string, name string) []string {
 	return toks
 }
 
-// sepBase 分隔符前缀：首个冒号/连字符/破折号前的部分。
 func sepBase(name string) (string, string, bool) {
 	loc := sepRe.FindStringIndex(name)
 	if loc == nil {
@@ -156,7 +146,6 @@ func allDigits(s string) bool {
 	return true
 }
 
-// isVersionTail 规则 5 尾部「版本号」词：纯序号之外容年货式 2K21/2K26。
 func isVersionTail(tok string) bool {
 	return isSequelNumber(tok) || tailVerRe.MatchString(tok)
 }
@@ -169,14 +158,11 @@ func baseWoTailNum(base string) string {
 	return strings.Join(toks, " ")
 }
 
-// enUsable 裸序号名（"2" / "II"）是零证据——两两相似度 1.0 会互连成
-// 枢纽把各自正确的对黏成一大簇。
+// enUsable 排除裸序号名（如 "2"/"II"），防止误连不相关簇。
 func enUsable(toks []string) bool {
 	return len(toks) > 0 && !(len(toks) == 1 && isSequelNumber(toks[0]))
 }
 
-// isSameSeries 两个名字是否同系列（宁缺毋滥，任一规则命中即算）。
-// IsSameSeries 系列判定纯函数导出面（G6 对拍与跨包复用）。
 func IsSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 	return isSameSeries(name1, en1, name2, en2)
 }
@@ -194,8 +180,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 	if en2 != nil && strings.TrimSpace(*en2) != "" {
 		en2All = *en2
 	}
-	// 结构规则剥离开头冠词再比：冠词是装饰，剥掉后 The Witcher 1/2/3
-	// 与 Witcher 1/2/3 的前缀判定同轨
 	s1 := t1
 	if len(s1) > 0 && (s1[0] == "the" || s1[0] == "a" || s1[0] == "an") {
 		s1 = s1[1:]
@@ -205,7 +189,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		s2 = s2[1:]
 	}
 
-	// 1) 英文分隔符前缀一致（≥4 字符；前缀只差尾部序号也算）
 	_, b1n, b1ok := sepBase(en1All)
 	_, b2n, b2ok := sepBase(en2All)
 	if b1ok && b2ok {
@@ -219,7 +202,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		}
 	}
 
-	// 2) 中文分隔符前缀一致，≥2 字且不在负面词表
 	cb1, _, cb1ok := sepBase(name1)
 	cb2, _, cb2ok := sepBase(name2)
 	if cb1ok && cb2ok {
@@ -230,14 +212,11 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		}
 	}
 
-	// 3) 英文连续公共词前缀 ≥2；恰好 2 词时弱证据一档（首词不在负面
-	//    词表且次词非虚词），≥3 词前缀本身已够特异
 	pre := commonPrefixLen(s1, s2)
 	if pre >= 2 && (pre >= 3 || (!badEnStarts[s1[0]] && !genericMinor[s1[1]])) {
 		return true
 	}
 
-	// 4) 纯序号续作：短名是长名的完整词前缀，且前缀后紧跟序号
 	short, long_ := s1, s2
 	if len(s2) < len(s1) {
 		short, long_ = s2, s1
@@ -247,8 +226,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		return true
 	}
 
-	// 5) 同前缀 + 尾部版本号互异（FIFA 22/23、2K25/2K26、Doom 3/2016）；
-	//    前缀 ≥3 字符防编号撞车，2 词时同规则 3 的弱证据门槛
 	if pre >= 1 {
 		rest1, rest2 := s1[pre:], s2[pre:]
 		strong := pre >= 3 || (!badEnStarts[s1[0]] && (pre == 1 || !genericMinor[s1[1]]))
@@ -259,7 +236,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		}
 	}
 
-	// 6) 中文严格前缀（辐射4 → 辐射：新维加斯），≥2 字且不在负面词表
 	if c1 != c2 && len([]rune(c1)) >= 2 && len([]rune(c2)) >= 2 {
 		shortC, longC := c1, c2
 		if len([]rune(c2)) < len([]rune(c1)) {
@@ -270,7 +246,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		}
 	}
 
-	// 7) 中文完全一致 + 英文有佐证（短中文名撞车最频繁，须英文作保）
 	if c1 != "" && c1 == c2 {
 		ratio := sequenceRatio(strings.ToLower(en1All), strings.ToLower(en2All))
 		if commonPrefixLen(s1, s2) >= 1 ||
@@ -279,7 +254,6 @@ func isSameSeries(name1 string, en1 *string, name2 string, en2 *string) bool {
 		}
 	}
 
-	// 8) 高相似度兜底（容错重制版/版本差异的英文写法）
 	if enUsable(s1) && enUsable(s2) {
 		if sequenceRatio(strings.Join(s1, " "), strings.Join(s2, " ")) > 0.90 {
 			return true
@@ -296,8 +270,6 @@ func prefixEqual(long_, short []string) bool {
 	}
 	return true
 }
-
-// ── 聚类 ────────────────────────────────────────────────────────
 
 type seriesMember struct {
 	appid int64
@@ -332,7 +304,6 @@ func (m seriesMember) bucketKeys() [][2]string {
 	return keys
 }
 
-// SeriesRow 聚类输入行（games 表读取投影）。
 type SeriesRow struct {
 	AppID    int64
 	Name     *string
@@ -345,9 +316,7 @@ type seriesCluster struct {
 	ids  []int64
 }
 
-// buildClusters 名称行 → 系列簇；纯启发式簇只含 ≥2 成员。覆盖表成员
-// 先按键预成组（组名以键为准），再叠加名称启发式的边——成员经名称规则
-// 命中的邻居自动并入。
+// buildClusters 覆盖组先按键预连通，再叠加名称规则边合并邻接成员；纯启发式簇至少 2 成员。
 func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder ...[]string) []seriesCluster {
 	var members []seriesMember
 	for _, r := range rows {
@@ -379,7 +348,6 @@ func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder
 		}
 	}
 
-	// 覆盖种子先落：同一键下全部成员互连成一组
 	appidKey := map[int64]string{}
 	keyMembers := map[string][]int{}
 	if len(overrides) > 0 {
@@ -394,7 +362,7 @@ func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder
 			for key := range overrides {
 				keys = append(keys, key)
 			}
-			sort.Strings(keys)
+			slices.Sort(keys)
 		}
 		for _, key := range keys {
 			ids := overrides[key]
@@ -463,7 +431,7 @@ func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder
 			for k := range keysHit {
 				keys = append(keys, k)
 			}
-			sort.Strings(keys)
+			slices.Sort(keys)
 			best := keys[0]
 			for _, k := range keys[1:] {
 				if keysHit[k] > keysHit[best] {
@@ -477,20 +445,19 @@ func buildClusters(rows []SeriesRow, overrides map[string][]int64, overrideOrder
 			}
 			name = seriesName(grp)
 		}
-		sort.Slice(grp, func(i, j int) bool { return grp[i].appid < grp[j].appid })
+		slices.SortFunc(grp, func(a, b seriesMember) int { return cmp.Compare(a.appid, b.appid) })
 		ids := make([]int64, len(grp))
 		for i, m := range grp {
 			ids[i] = m.appid
 		}
 		out = append(out, seriesCluster{name: name, ids: ids})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return strings.ToLower(out[i].name) < strings.ToLower(out[j].name)
+	slices.SortFunc(out, func(a, b seriesCluster) int {
+		return strings.Compare(strings.ToLower(a.name), strings.ToLower(b.name))
 	})
 	return out
 }
 
-// pyTitle 对齐 Python str.title：非字母后随字母大写。
 func pyTitle(s string) string {
 	prevLetter := false
 	var b strings.Builder
@@ -519,8 +486,7 @@ func displayTokens(tokens []string) string {
 	return pyTitle(joined)
 }
 
-// seriesName 系列标识名：成员英文名的逐位众数前缀（剥冠词后计算）。
-// 位 0 只求半数一致（定锚系列词），位 ≥1 须全员一致。
+// seriesName 取剥冠词后英文 token 逐位众数前缀（位 0 过半且 ≥2，位 ≥1 全员一致）。
 func seriesName(grp []seriesMember) string {
 	var tokenLists [][]string
 	for _, m := range grp {
@@ -602,10 +568,6 @@ func truncateRunes(s string, n int) string {
 	return string(rs[:n])
 }
 
-// ── 增量受影响行 ────────────────────────────────────────────────
-
-// affectedRows 覆盖版本未变时的窄化：只重算受 changed 款波及的行
-// （同簇成员 / 同桶名称邻居 / 覆盖成员）。
 func affectedRows(rows []SeriesRow, changed map[int64]string, overrides map[string][]int64) []SeriesRow {
 	byID := map[int64]SeriesRow{}
 	groups := map[string]map[int64]bool{}
@@ -693,16 +655,11 @@ func affectedRows(rows []SeriesRow, changed map[int64]string, overrides map[stri
 	return out
 }
 
-// ── refresh_series ──────────────────────────────────────────────
-
 const savedVersionKey = "games.derived_inputs"
 
-// RefreshSeries 重算系列归属并写回 games.series_id。changed 非 nil 时
-// 走增量窄化（覆盖版本未变）；覆盖版本变更时全量重算并保存版本。
-// 返回更新行数。事务与写闸由调用方持有。
+// RefreshSeries changed 非 nil 且覆盖版本未变时增量重算；否则全量重算并保存版本（须持写闸）。
 func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string, overrides map[string][]int64, overrideOrder ...[]string) (int, error) {
-	// rows 序对齐 Python（无 ORDER BY，同库同计划返回序）——簇首成员
-	// 决定 series_id 锚名，两侧必须同序。
+	// 不加 ORDER BY 以保持既定扫描序（影响 seriesName 簇首锚名平票裁决）。
 	rows, err := querySeriesRows(ctx, conn, clusterableCond, nil)
 	if err != nil {
 		return 0, fmt.Errorf("系列候选行读取失败: %w", err)
@@ -722,7 +679,7 @@ func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string
 		}
 	}
 	if len(listed) > 0 {
-		sort.Slice(listed, func(i, j int) bool { return listed[i] < listed[j] })
+		slices.Sort(listed)
 		extra, err := querySeriesRows(ctx, conn,
 			"appid IN ("+inPlaceholders(listed)+")", listed)
 		if err != nil {
@@ -768,7 +725,6 @@ func RefreshSeries(ctx context.Context, conn *sql.Conn, changed map[int64]string
 		}
 	}
 
-	// 非可聚类行清系列（覆盖点名的除外）
 	exclCond := "(NOT " + clusterableCond + ") AND series_id IS NOT NULL AND series_id != ''"
 	var overrideIDs []int64
 	for _, ids := range overrides {
@@ -830,7 +786,6 @@ func queryIDs(ctx context.Context, conn *sql.Conn, cond string, args []int64) ([
 	return out, rows.Err()
 }
 
-// readSavedVersion 读取派生输入版本（缺行 = nil）。
 func readSavedVersion(ctx context.Context, conn *sql.Conn) (*string, error) {
 	var saved sql.NullString
 	err := conn.QueryRowContext(ctx,
@@ -848,7 +803,6 @@ func readSavedVersion(ctx context.Context, conn *sql.Conn) (*string, error) {
 	return &s, nil
 }
 
-// seriesVersionEqual 已存版本的 series 与当前覆盖表一致（全量→增量的切换判据）。
 func seriesVersionEqual(saved *string, overrides map[string][]int64) bool {
 	var version map[string]any
 	if saved == nil || *saved == "" {
@@ -879,7 +833,6 @@ func seriesVersionEqual(saved *string, overrides map[string][]int64) bool {
 	return true
 }
 
-// saveInputVersion 保存派生输入版本（对齐 json.dumps(sort_keys=True)）。
 func saveInputVersion(ctx context.Context, conn *sql.Conn, saved *string, overrides map[string][]int64) error {
 	version := map[string]any{}
 	if saved != nil && *saved != "" {
@@ -897,8 +850,7 @@ func saveInputVersion(ctx context.Context, conn *sql.Conn, saved *string, overri
 	return nil
 }
 
-// pyJSONSorted 对齐 Python json.dumps(sort_keys=True) 的紧凑渲染
-// （键排序、", "/": " 分隔、ensure_ascii 转义）。
+// pyJSONSorted 按键排序并用 ", "/": " 与 ASCII 转义序列化 JSON。
 func pyJSONSorted(v any) string {
 	var b strings.Builder
 	writePyJSON(&b, v)
@@ -946,7 +898,7 @@ func writePyJSON(b *strings.Builder, v any) {
 		for k := range x {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		b.WriteByte('{')
 		for i, k := range keys {
 			if i > 0 {
@@ -962,7 +914,7 @@ func writePyJSON(b *strings.Builder, v any) {
 		for k := range x {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		b.WriteByte('{')
 		for i, k := range keys {
 			if i > 0 {
@@ -984,7 +936,6 @@ func writePyJSON(b *strings.Builder, v any) {
 	}
 }
 
-// pyJSONStr 对齐 ensure_ascii：控制位与非 ASCII 按 \uXXXX 小写转义。
 func pyJSONStr(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')

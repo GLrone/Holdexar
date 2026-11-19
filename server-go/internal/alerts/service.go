@@ -12,6 +12,7 @@ import (
 	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/notifications"
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 type Options struct {
@@ -36,10 +37,10 @@ func New(db *sql.DB, gate *store.WriteGate, opts Options) *Service {
 	return &Service{db, gate, opts}
 }
 
-var beijing = func() *time.Location { loc, _ := time.LoadLocation("Asia/Shanghai"); return loc }()
+var beijing = timeutil.Beijing
 
 func (s *Service) now() time.Time { return s.opts.Now().In(beijing) }
-func stamp(t time.Time) string    { return t.Format("2006-01-02 15:04:05.000000") }
+func stamp(t time.Time) string    { return timeutil.FormatMicro(t) }
 func iso(v any) any {
 	if v == nil {
 		return nil

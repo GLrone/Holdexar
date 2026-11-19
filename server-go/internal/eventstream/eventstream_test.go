@@ -13,7 +13,6 @@ import (
 	"holdexar/server-go/internal/events"
 )
 
-// newStreamer 短 keep-alive 的测试装配：50ms 节奏，避免真实 15s 等待。
 func newStreamer(t *testing.T) (*Streamer, *events.Bus) {
 	t.Helper()
 	bus := events.NewBus()
@@ -21,7 +20,6 @@ func newStreamer(t *testing.T) (*Streamer, *events.Bus) {
 	return s, bus
 }
 
-// readFrames 从响应流读取 n 帧（以空行分隔的帧块）。
 func readFrames(t *testing.T, body *bufio.Reader, n int) []string {
 	t.Helper()
 	frames := make([]string, 0, n)
@@ -79,7 +77,7 @@ func TestEventsStreamHeadersAndFrames(t *testing.T) {
 }
 
 func TestEventsStreamKeepAliveCadence(t *testing.T) {
-	s, _ := newStreamer(t) // 50ms 节奏
+	s, _ := newStreamer(t)
 	srv := httptest.NewServer(http.HandlerFunc(s.handleEvents))
 	defer srv.Close()
 
@@ -90,16 +88,15 @@ func TestEventsStreamKeepAliveCadence(t *testing.T) {
 	defer resp.Body.Close()
 	body := bufio.NewReader(resp.Body)
 
-	readFrames(t, body, 1) // connected
+	readFrames(t, body, 1)
 	start := time.Now()
-	frames := readFrames(t, body, 3) // 三条 keep-alive
+	frames := readFrames(t, body, 3)
 	elapsed := time.Since(start)
 	for i, f := range frames {
 		if f != ": keep-alive\n\n" {
 			t.Fatalf("第 %d 帧 = %q, want keep-alive", i+1, f)
 		}
 	}
-	// 节奏下限：三条帧至少经历 2 个完整间隔（读帧耗时计入，只验下限不卡上限）
 	if elapsed < 90*time.Millisecond {
 		t.Fatalf("三条 keep-alive 仅耗时 %v，节奏快于注入间隔", elapsed)
 	}
@@ -125,7 +122,6 @@ func TestEventsStreamDisconnectUnsubscribes(t *testing.T) {
 			}
 		}
 	}()
-	// 等 connected 帧被消费后再断连
 	time.Sleep(50 * time.Millisecond)
 	if s.Bus.Len() != 1 {
 		t.Fatalf("连接期间订阅数 = %d, want 1", s.Bus.Len())
@@ -142,7 +138,6 @@ func TestEventsStreamDisconnectUnsubscribes(t *testing.T) {
 }
 
 func TestLogsStreamReplayAndIncremental(t *testing.T) {
-	// 长间隔装配：回放与增量之间不插 keep-alive，避免节奏竞态
 	bus := events.NewBus()
 	s := &Streamer{Bus: bus, Ring: NewRing(2000), KeepAlive: 5 * time.Second}
 	ring := s.Ring
@@ -159,7 +154,6 @@ func TestLogsStreamReplayAndIncremental(t *testing.T) {
 	defer resp.Body.Close()
 	body := bufio.NewReader(resp.Body)
 
-	// 回放恰好 200 行（旧→新，第 5..204 行），随后 synced
 	frames := readFrames(t, body, logReplay+1)
 	if got := frames[0]; got != "data: "+events.PyJSONString("行5")+"\n\n" {
 		t.Fatalf("回放首行形状不符: %q", got)
@@ -167,7 +161,6 @@ func TestLogsStreamReplayAndIncremental(t *testing.T) {
 	if frames[logReplay] != ": synced\n\n" {
 		t.Fatalf("回放后帧 = %q, want synced", frames[logReplay])
 	}
-	// 增量：订阅后写入的行到达
 	ring.Write("增量行")
 	frames = readFrames(t, body, 1)
 	if frames[0] != "data: "+events.PyJSONString("增量行")+"\n\n" {
@@ -213,7 +206,6 @@ func TestLogsStreamDisconnectUnsubscribes(t *testing.T) {
 func TestRingBackpressureDropsOldest(t *testing.T) {
 	ring := NewRing(2000)
 	ch := ring.Subscribe()
-	// 灌满订阅者队列（1000）再灌 10 条：队列里是最新的 1000 条
 	for i := 0; i < 1010; i++ {
 		ring.Write(itoa(i))
 	}
@@ -243,7 +235,6 @@ func TestRingSnapshotWraps(t *testing.T) {
 
 func itoa(i int) string { return strconv.Itoa(i) }
 
-// B10：Ring 写入前过统一脱敏链——缓冲回放与订阅者看到的都是已抹值文本。
 func TestRingWriteRedactsBeforeBuffer(t *testing.T) {
 	ring := NewRing(10)
 	ch := ring.Subscribe()

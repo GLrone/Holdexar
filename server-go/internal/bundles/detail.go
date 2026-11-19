@@ -1,5 +1,3 @@
-// 捆绑包详情：GetBundleDetail = _load_bundles + _aggregate（同追踪区口径）
-// + baseline appids 的 games 元数据与各区现价（对齐 Python service.py:570-628）。
 package bundles
 
 import (
@@ -9,7 +7,6 @@ import (
 	"strings"
 )
 
-// DetailRegionPrice 详情区价：在列表投影上保留 appIds/lockedCount/formatted。
 type DetailRegionPrice struct {
 	PriceMinor      *int64  `json:"priceMinor"`
 	Currency        *string `json:"currency"`
@@ -22,14 +19,12 @@ type DetailRegionPrice struct {
 	Formatted       string  `json:"formatted"`
 }
 
-// DetailGamePrice 包内游戏单区现价（cny_fen 直读快照列，GET 不回算）。
 type DetailGamePrice struct {
 	PriceMinor *int64  `json:"priceMinor"`
 	Currency   *string `json:"currency"`
 	CnyFen     *int64  `json:"cnyFen"`
 }
 
-// DetailGame 包内游戏：未入库时 name 为 null（前端回退 AppID 展示）。
 type DetailGame struct {
 	AppID       int64                      `json:"appid"`
 	Name        *string                    `json:"name"`
@@ -37,14 +32,12 @@ type DetailGame struct {
 	Prices      map[string]DetailGamePrice `json:"prices"`
 }
 
-// BundleDetail 详情响应（列表字段 + games）。
 type BundleDetail struct {
 	bundleSummary
 	RegionPrices map[string]DetailRegionPrice `json:"regionPrices"`
 	Games        []DetailGame                 `json:"games"`
 }
 
-// GetBundleDetail 捆绑包详情；不存在返回 nil（HTTP 层转 404）。
 func GetBundleDetail(ctx context.Context, db *sql.DB, bundleID int64) (*BundleDetail, error) {
 	bundles, pricesByBundle, err := loadBundles(ctx, db, []int64{bundleID})
 	if err != nil {
@@ -53,7 +46,6 @@ func GetBundleDetail(ctx context.Context, db *sql.DB, bundleID int64) (*BundleDe
 	if len(bundles) == 0 {
 		return nil, nil
 	}
-	// 详情与列表同一追踪区口径
 	tracked := trackedRegionCodes(ctx, db)
 	agg := aggregateBundle(bundles[0], pricesByBundle[bundleID], tracked)
 

@@ -238,6 +238,10 @@ func TestMailTextHandlesMalformedTagsAndRejectsUntrustedLinkTargets(t *testing.T
 	if got := MailText(`<p>before</p>< ><p>after</p>`); !strings.Contains(got, "after") {
 		t.Fatal(got)
 	}
+	withAngleInAttr := MailText(`<div data-note="a > b"><a title="折扣 > 50%" href="https://store.steampowered.com/app/620/">Portal 2</a></div>`)
+	if withAngleInAttr != "Portal 2 (https://store.steampowered.com/app/620/)" {
+		t.Fatalf("unexpected MailText for '>' inside attribute: %q", withAngleInAttr)
+	}
 	if safeMailURL("https://store.steampowered.com:99999/app/620/") != "" {
 		t.Fatal("invalid port accepted")
 	}

@@ -2,6 +2,7 @@ package achievements
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,7 +11,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -178,9 +179,17 @@ func steamPercent(raw string) *float64 {
 
 func orderedSteamDefinitions(defs []Definition, sortByPercent bool) []Definition {
 	if sortByPercent {
-		sort.SliceStable(defs, func(i, j int) bool {
-			left, right := defs[i].Percent, defs[j].Percent
-			return left != nil && (right == nil || *left > *right)
+		slices.SortStableFunc(defs, func(a, b Definition) int {
+			if a.Percent == nil {
+				if b.Percent == nil {
+					return 0
+				}
+				return 1
+			}
+			if b.Percent == nil {
+				return -1
+			}
+			return cmp.Compare(*b.Percent, *a.Percent)
 		})
 	}
 	seen := map[string]int{}

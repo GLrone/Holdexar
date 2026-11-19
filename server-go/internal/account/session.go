@@ -29,7 +29,6 @@ func (c *SteamClient) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// rejectHost 被拒下发地址的可读宿主（诊断用；解析失败退原文）。
 func (c *SteamClient) rejectHost(raw string) string {
 	u, e := url.Parse(raw)
 	if e != nil || u.Hostname() == "" {
@@ -164,8 +163,7 @@ func (c *SteamClient) WebCookies(ctx context.Context, refresh, sid string, inher
 			continue
 		}
 		if !c.trustedTransfer(transfer.URL) {
-			// 与 Python 的差异（登记）：非可信域跳过不中断——本应用只消费
-			// store 域令牌，个别域被网络规则拦死不该拖死整个续期。
+			// 非可信域跳过不中断续期，本应用仅消费 store 域令牌。
 			continue
 		}
 		fields := map[string]string{"steamID": sid}

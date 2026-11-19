@@ -83,8 +83,6 @@ type bundleItem struct {
 	DiffFen           int64  `json:"diffFen"`
 }
 
-// gameDetail 游戏详情：元数据 + 全区当前价 + 版本列表 + 关联捆绑包。
-// 返回 nil = 游戏不存在。
 func (h *handler) gameDetail(ctx context.Context, appid int64) (*gameDetail, error) {
 	rates, err := h.loadRates(ctx)
 	if err != nil {
@@ -267,7 +265,6 @@ func (h *handler) gameDetail(ctx context.Context, appid int64) (*gameDetail, err
 	}, nil
 }
 
-// queryDetailPrices 详情全区价格行（保持库内行序：最低区命中取首行）。
 func (h *handler) queryDetailPrices(ctx context.Context, appid int64) ([]priceRow, error) {
 	rows, err := h.db.QueryContext(ctx,
 		"SELECT appid, region_code, currency, price, discount_percent,"+
@@ -288,7 +285,6 @@ func (h *handler) queryDetailPrices(ctx context.Context, appid int64) ([]priceRo
 	return out, rows.Err()
 }
 
-// namedTags 展示面标签：只留至少一个语言对照到名字的标签，票重降序。
 func (h *handler) namedTags(ctx context.Context, appid int64) ([]tagItem, error) {
 	rows, err := h.db.QueryContext(ctx,
 		"SELECT gt.tagid, t.name_zh, t.name_en FROM game_tags gt"+
@@ -322,7 +318,6 @@ func (h *handler) namedTags(ctx context.Context, appid int64) ([]tagItem, error)
 	return out, rows.Err()
 }
 
-// linkedBundles 关联捆绑包：app_ids JSON 逐行命中，差价快照降序，GET 不现算。
 func (h *handler) linkedBundles(ctx context.Context, appid int64) ([]bundleItem, error) {
 	pairs, err := h.db.QueryContext(ctx, "SELECT bundle_id, app_ids FROM bundles")
 	if err != nil {
@@ -493,7 +488,6 @@ func (h *handler) linkedBundles(ctx context.Context, appid int64) ([]bundleItem,
 var bundleImageHosts = regexp.MustCompile(
 	`(?i)^https?://shared\.(?:fastly\.steamstatic|cdn\.queniuqe)\.com`)
 
-// normalizeBundleImage 快置域名归一到 akamai；非命中原样返回 nil。
 func normalizeBundleImage(url *string) *string {
 	if url == nil || *url == "" {
 		return nil
@@ -516,7 +510,6 @@ func bundleFallbackImage(bundleID, itemKind int64) string {
 		kind, bundleID)
 }
 
-// jsonContainsAppID JSON 数组文本是否包含给定 appid。
 func jsonContainsAppID(text string, appid int64) bool {
 	var ids []any
 	if json.Unmarshal([]byte(text), &ids) != nil {
@@ -530,7 +523,6 @@ func jsonContainsAppID(text string, appid int64) bool {
 	return false
 }
 
-// parseJSONList JSON 数组列 → 列表；空 / 解析失败回 []。
 func parseJSONList(v sql.NullString) []any {
 	if !v.Valid || v.String == "" {
 		return []any{}
@@ -550,8 +542,6 @@ func nullableInt64(v sql.NullInt64) *int64 {
 	return &val
 }
 
-// ── 汇率进程内缓存（300s TTL）──
-
 const ratesTTL = 300 * time.Second
 
 var ratesCache struct {
@@ -560,7 +550,6 @@ var ratesCache struct {
 	rates map[string]float64
 }
 
-// loadRates 全表汇率（缺行用兜底表）；查询失败按错误上抛。
 func (h *handler) loadRates(ctx context.Context) (map[string]float64, error) {
 	ratesCache.mu.Lock()
 	defer ratesCache.mu.Unlock()

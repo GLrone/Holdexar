@@ -1,27 +1,25 @@
 package games
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"math"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/rates"
+	"holdexar/server-go/internal/timeutil"
 )
 
-// 历史读端点：GET /api/v1/games/{appid}/history。与 Python games/service.get_game_history
-// 同一契约——标准版序列、指定 sub、product=unknown 三种切片；未知序列独立呈现，
-// 永不并入标准版；时间窗按裸北京时间比对（snapshot_at 写入侧以同一把钟落库）。
-
 // beijingZone 裸北京时间（无时区标注，与库内 snapshot_at 存储口径一致）。
-var beijingZone = time.FixedZone("UTC+8", 8*3600)
+var beijingZone = timeutil.ZoneUTC8
 
-// standardProductCond 标准版谓词（与 derived/priceevents 同口径，空值兼容旧行）。
 const standardProductCond = "(" +
 	"(is_gold IS NULL OR is_gold = 0) " +
 	"AND (version_suffix IS NULL OR version_suffix = '') " +
@@ -77,7 +75,7 @@ type historyResponse struct {
 
 type historyRowRead struct {
 	id         int64
-	snapshotAt string // 库内原文 YYYY-MM-DD HH:MM:SS[.ffffff]
+	snapshotAt string
 	price      *int64
 	cnyFen     *int64
 	discount   *int64
@@ -132,18 +130,16 @@ func (h *handler) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// queryError 对齐 FastAPI 校验错误形状。
 func queryError(field, errType, msg, input string) map[string]any {
-	return map[string]any{"detail": []any{map[string]any{
-		"type": errType, "loc": []any{"query", field}, "msg": msg, "input": input,
+	return map[string]any{"detail": []httpx.ValErr{{
+		Type: errType, Loc: []any{"query", field}, Msg: msg, Input: input,
 	}}}
 }
 
 func (h *handler) gameHistory(ctx context.Context, appid int64, region string, days int, subID *int64, product string) (*historyResponse, error) {
 	regionUpper := strings.ToUpper(region)
 
-	// 在售 sub：当前价 ok 行的最新 sub_id；缺失或 0（db_writer 对 None 的归一值）
-	// 都视同无在售 sub，不进并集。
+	// 缺失或 0 的 sub_id 视同无在售 sub，不进并集。
 	var saleSub sql.NullInt64
 	e := h.db.QueryRowContext(ctx,
 		`SELECT sub_id FROM game_current_prices
@@ -282,8 +278,7 @@ func (h *handler) gameHistory(ctx context.Context, appid int64, region string, d
 	}
 	resp.Highest = &historyHighest{CnyFen: highest, CnyYuan: &highYuan}
 
-	// 史低次数：追平/跌破历史最低的事件数；同一促销期连续同价只计一次，
-	// 回升后再次到达 = 新的一次。
+	// 史低次数：到达全局最低价的独立波次数（连续同价只计一次）。
 	runningLow := lowest
 	inStreak := false
 	for _, p := range points {
@@ -330,15 +325,15 @@ func (h *handler) historyVersions(ctx context.Context, appid int64, regionUpper 
 	if e = rows.Err(); e != nil {
 		return nil, e
 	}
-	sort.Slice(list, func(i, j int) bool {
-		ki := versionSortKey(list[i].suffix, list[i].isGold)
-		kj := versionSortKey(list[j].suffix, list[j].isGold)
+	slices.SortFunc(list, func(a, b versionRow) int {
+		ka := versionSortKey(a.suffix, a.isGold)
+		kb := versionSortKey(b.suffix, b.isGold)
 		for c := 0; c < 3; c++ {
-			if ki[c] != kj[c] {
-				return ki[c] < kj[c]
+			if ka[c] != kb[c] {
+				return cmp.Compare(ka[c], kb[c])
 			}
 		}
-		return false
+		return 0
 	})
 	versions := make([]historyVersion, 0, len(list)+1)
 	for _, it := range list {
@@ -375,9 +370,7 @@ func versionSortKey(suffix *string, isGold bool) [3]string {
 	return [3]string{first, s, gold}
 }
 
-// fillCnyFen 对 cny_fen 缺失的行按 snapshot_at 历史汇率补算 CNY 分（最多回溯
-// 15 天）；历史汇率缺失的行不补——绝不用当前汇率折算历史价格。行级一次批量
-// 取数（按币种聚合窗口），不做逐点查询。
+// fillCnyFen 按 snapshot_at 历史汇率补算缺失 cny_fen（最多回溯 15 天，绝不用当前汇率）。
 func (h *handler) fillCnyFen(ctx context.Context, regionUpper string, read []historyRowRead) (map[int64]int64, error) {
 	type needKey struct {
 		currency, day string
@@ -444,8 +437,7 @@ func (h *handler) fillCnyFen(ctx context.Context, regionUpper string, read []his
 		if !ok {
 			continue
 		}
-		// 回溯上界由加载窗口保证：序列只含 [day-15, maxDay] 的行，
-		// 取「≤day 最近一条」即不会越过 15 天上界。
+		// 加载窗口已限定 [day-15, maxDay]，取 ≤day 最近一条即不越界。
 		rate := rates.PickHistoricalRate(series[currency], currency, day)
 		if rate == nil {
 			continue
@@ -470,7 +462,6 @@ func shiftDay(day string, delta int) string {
 	return t.AddDate(0, 0, delta).Format("2006-01-02")
 }
 
-// isoNaive 裸北京时间 → Python datetime.isoformat 同形（非零微秒保留）。
 func isoNaive(snapshotAt string) string {
 	if len(snapshotAt) < 19 {
 		return snapshotAt

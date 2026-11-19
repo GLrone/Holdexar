@@ -1,13 +1,14 @@
 package family
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
@@ -73,7 +74,7 @@ func steamMemberIDs(members []map[string]any, excluded map[string]bool) string {
 			ids = append(ids, id)
 		}
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 	return packed(ids)
 }
 
@@ -294,11 +295,11 @@ func (s *Service) mergeLibrary(group remoteGroup, shared []sharedApp, members []
 				play = append(play, libraryPlay{AppID: game.AppID, Minutes: game.Minutes, Minutes2w: game.Minutes2w, Last: game.LastPlayed})
 			}
 		}
-		sort.SliceStable(play, func(i, j int) bool {
-			if play[i].Minutes2w != play[j].Minutes2w {
-				return play[i].Minutes2w > play[j].Minutes2w
+		slices.SortStableFunc(play, func(a, b libraryPlay) int {
+			if c := cmp.Compare(b.Minutes2w, a.Minutes2w); c != 0 {
+				return c
 			}
-			return play[i].Minutes > play[j].Minutes
+			return cmp.Compare(b.Minutes, a.Minutes)
 		})
 		data.Play[id] = play
 	}
@@ -316,7 +317,7 @@ func (s *Service) mergeLibrary(group remoteGroup, shared []sharedApp, members []
 			ids = append(ids, id)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	for _, id := range ids {
 		app, isShared := byApp[id]
 		owners := owned[id]

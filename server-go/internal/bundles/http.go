@@ -1,7 +1,3 @@
-// http.go 捆绑包域 9 条端点（对齐 Python domains/bundles/router.py）：
-// 列表/关注清单/关注/取关/移除/恢复/全量刷新/导入/详情。
-// 422 形状逐字段复刻 FastAPI 校验错误（loc/type/msg/input），错误信封统一
-// {"detail": ...}；列表大响应经 json.Encoder 流式直写（gzip 由中间件统一压）。
 package bundles
 
 import (
@@ -13,25 +9,21 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
-// RegisterOptions 装配选项。Accounting = 手动刷新的运行账包装（nil 直接执行），
-// 对齐 Python scheduler_bridge.run_accounted("bundle_refresh", trigger="manual")。
-// MaintainDerived = 列表/详情入口的派生列日切换维护钩子（nil = 跳过），
-// 对齐 Python list_bundles/get_bundle_detail 入口的 maintain_derived()。
+// RegisterOptions 装配选项：Accounting 为手动刷新记账包装，Maintain 为列表/详情入口派生列维护钩子（nil 均跳过）。
 type RegisterOptions struct {
 	Accounting func(ctx context.Context, job string, body func() (map[string]any, error)) (map[string]any, error)
 	Maintain   func(ctx context.Context)
 }
 
 func reply(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 
 func (s *Service) Register(mux *http.ServeMux, opts RegisterOptions) {
-	// 派生列日切换维护（版本一致零重算；失败只记日志不拖垮读取面）
 	maintain := func(ctx context.Context) {
 		if opts.Maintain != nil {
 			opts.Maintain(ctx)
@@ -175,42 +167,32 @@ func replyLifecycle(w http.ResponseWriter, res map[string]any, err error) {
 	reply(w, 200, res)
 }
 
-// ── 参数解析（FastAPI 校验形状复刻） ─────────────────────────────
-
-type validationIssue struct {
-	Loc   []string `json:"loc"`
-	Msg   string   `json:"msg"`
-	Type  string   `json:"type"`
-	Input any      `json:"input"`
+func replyValidation(w http.ResponseWriter, issues []httpx.ValErr) {
+	httpx.WriteValidationError(w, issues...)
 }
 
-func replyValidation(w http.ResponseWriter, issues []validationIssue) {
-	reply(w, 422, map[string]any{"detail": issues})
-}
-
-func issue(loc []string, typ, msg string, input any) validationIssue {
-	return validationIssue{Loc: loc, Type: typ, Msg: msg, Input: input}
+func issue(loc []any, typ, msg string, input any) httpx.ValErr {
+	return httpx.ValErr{Loc: loc, Type: typ, Msg: msg, Input: input}
 }
 
 const (
-	msgIntParsing   = "Input should be a valid integer, unable to parse string as an integer"
 	msgFloatParsing = "Input should be a valid number, unable to parse string as a number"
 	msgBoolParsing  = "Input should be a valid boolean, unable to interpret input"
 )
 
-func parseListOptions(r *http.Request) (ListOptions, []validationIssue) {
+func parseListOptions(r *http.Request) (ListOptions, []httpx.ValErr) {
 	q := r.URL.Query()
 	opts := ListOptions{Sort: "diff", RegionMode: "all", DiffType: "absolute"}
-	var issues []validationIssue
+	var issues []httpx.ValErr
 	if raw := strings.TrimSpace(q.Get("sort")); raw != "" {
 		opts.Sort = raw
 	}
 	if raw := q.Get("offset"); raw != "" {
 		value, err := strconv.Atoi(raw)
 		if err != nil {
-			issues = append(issues, issue([]string{"query", "offset"}, "int_parsing", msgIntParsing, raw))
+			issues = append(issues, issue([]any{"query", "offset"}, "int_parsing", httpx.IntParseMsg, raw))
 		} else if value < 0 {
-			issues = append(issues, issue([]string{"query", "offset"}, "greater_than_equal", "Input should be greater than or equal to 0", raw))
+			issues = append(issues, issue([]any{"query", "offset"}, "greater_than_equal", "Input should be greater than or equal to 0", raw))
 		} else {
 			opts.Offset = value
 		}
@@ -218,11 +200,11 @@ func parseListOptions(r *http.Request) (ListOptions, []validationIssue) {
 	if raw := q.Get("limit"); raw != "" {
 		value, err := strconv.Atoi(raw)
 		if err != nil {
-			issues = append(issues, issue([]string{"query", "limit"}, "int_parsing", msgIntParsing, raw))
+			issues = append(issues, issue([]any{"query", "limit"}, "int_parsing", httpx.IntParseMsg, raw))
 		} else if value < 1 {
-			issues = append(issues, issue([]string{"query", "limit"}, "greater_than_equal", "Input should be greater than or equal to 1", raw))
+			issues = append(issues, issue([]any{"query", "limit"}, "greater_than_equal", "Input should be greater than or equal to 1", raw))
 		} else if value > 200 {
-			issues = append(issues, issue([]string{"query", "limit"}, "less_than_equal", "Input should be less than or equal to 200", raw))
+			issues = append(issues, issue([]any{"query", "limit"}, "less_than_equal", "Input should be less than or equal to 200", raw))
 		} else {
 			opts.Limit = value
 		}
@@ -235,7 +217,7 @@ func parseListOptions(r *http.Request) (ListOptions, []validationIssue) {
 	} {
 		value, ok := parseQueryBool(q.Get(name))
 		if !ok {
-			issues = append(issues, issue([]string{"query", name}, "bool_parsing", msgBoolParsing, q.Get(name)))
+			issues = append(issues, issue([]any{"query", name}, "bool_parsing", msgBoolParsing, q.Get(name)))
 			continue
 		}
 		*target = value
@@ -255,11 +237,11 @@ func parseListOptions(r *http.Request) (ListOptions, []validationIssue) {
 		}
 		value, err := strconv.ParseFloat(raw, 64)
 		if err != nil {
-			issues = append(issues, issue([]string{"query", name}, "float_parsing", msgFloatParsing, raw))
+			issues = append(issues, issue([]any{"query", name}, "float_parsing", msgFloatParsing, raw))
 			continue
 		}
 		if math.IsNaN(value) || math.IsInf(value, 0) {
-			issues = append(issues, issue([]string{"query", name}, "finite_number", "Input should be a finite number", raw))
+			issues = append(issues, issue([]any{"query", name}, "finite_number", "Input should be a finite number", raw))
 			continue
 		}
 		*target = &value
@@ -270,7 +252,6 @@ func parseListOptions(r *http.Request) (ListOptions, []validationIssue) {
 	return opts, issues
 }
 
-// parseQueryBool 布尔查询参数：FastAPI/pydantic 接受 1/0/true/false（大小写不敏感）。
 func parseQueryBool(raw string) (bool, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "":
@@ -283,19 +264,16 @@ func parseQueryBool(raw string) (bool, bool) {
 	return false, false
 }
 
-// pathBundleID 路径参数解析：非整数回 FastAPI int_parsing 形状（422）。
 func pathBundleID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	raw := r.PathValue("bundle_id")
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		replyValidation(w, []validationIssue{issue([]string{"path", "bundle_id"}, "int_parsing", msgIntParsing, raw)})
+		replyValidation(w, []httpx.ValErr{issue([]any{"path", "bundle_id"}, "int_parsing", httpx.IntParseMsg, raw)})
 		return 0, false
 	}
 	return id, true
 }
 
-// primarySteamID 主账号 SteamID64：绑定最早的账号行，无绑定回退设置里的
-// account.steam_id，再无则空串（对齐 Python service.py:432 的解析链）。
 func primarySteamID(ctx context.Context, db *sql.DB) string {
 	var sid string
 	if err := db.QueryRowContext(ctx,
@@ -314,7 +292,6 @@ func primarySteamID(ctx context.Context, db *sql.DB) string {
 	return ""
 }
 
-// importText 导入载荷：{"text": ...}，非字符串按 Python str() 语义字符串化。
 func importText(w http.ResponseWriter, r *http.Request) (string, error) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	decoder.UseNumber()
@@ -324,7 +301,7 @@ func importText(w http.ResponseWriter, r *http.Request) (string, error) {
 		if errors.As(err, &tooLarge) {
 			return "", err
 		}
-		return "", nil // 非法 JSON/空体：对齐 Python「非 dict 按 {} 取 ""」
+		return "", nil
 	}
 	value, exists := payload["text"]
 	if !exists || value == nil {

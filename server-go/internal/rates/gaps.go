@@ -4,22 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/httpx"
 )
 
-// 历史缺口扫描参数（纯本地零网络）。
 const (
-	// clusterGapDays 相邻待修复日间隔 ≤ 该值并入同一窗口段。
 	clusterGapDays = 7
 	// fullHistoryStart 全新安装 bootstrap 锚点 = Provider 全历史起点。
 	fullHistoryStart = "2012-01-01"
-	// maxWindowDays 单窗天数上限。
-	maxWindowDays = 365
+	maxWindowDays    = 365
 )
 
-// gapCurrency 单币种缺口概况。
 type gapCurrency struct {
 	Missing int    `json:"missing"`
 	Carried int    `json:"carried"`
@@ -27,14 +25,12 @@ type gapCurrency struct {
 	Last    string `json:"last"`
 }
 
-// gapWindow 待修复窗口段。
 type gapWindow struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
 	Days  int    `json:"days"`
 }
 
-// gapScan 缺口扫描结果。
 type gapScan struct {
 	Currencies map[string]gapCurrency `json:"currencies"`
 	Windows    []gapWindow            `json:"windows"`
@@ -43,18 +39,16 @@ type gapScan struct {
 	Horizon    string                 `json:"horizon"`
 }
 
-// historyGaps 缺口扫描端点：扫 canonical 缺行日 ∪ carried 日。
 func (h *handler) historyGaps(w http.ResponseWriter, r *http.Request) {
 	result, err := scanHistoryGaps(r.Context(), h.db, beijingTodayFn())
 	if err != nil {
 		http.Error(w, "缺口扫描失败："+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
-// scanHistoryGaps 扫描范围 = 各币种最早历史行 → 昨天；全库零白名单历史行时
-// 以 fullHistoryStart 为每个白名单币种建窗（bootstrap）。
+// scanHistoryGaps 扫描各白名单币种最早记录至昨天；无白名单行时从 fullHistoryStart 启动。
 func scanHistoryGaps(ctx context.Context, db *sql.DB, today time.Time) (*gapScan, error) {
 	horizon := today.AddDate(0, 0, -1).Format("2006-01-02")
 	marks, err := loadMarks(ctx, db)
@@ -80,7 +74,7 @@ func scanHistoryGaps(ctx context.Context, db *sql.DB, today time.Time) (*gapScan
 			codes = append(codes, code)
 		}
 	}
-	sort.Strings(codes)
+	slices.Sort(codes)
 
 	for _, code := range codes {
 		days := marks[code]
@@ -124,9 +118,7 @@ func scanHistoryGaps(ctx context.Context, db *sql.DB, today time.Time) (*gapScan
 	return result, nil
 }
 
-// loadMarks 每币种 {day: source_kind}，兼容新旧两代行格式
-// （canonical 列缺失时日期取 fetched_at 日期部分、语义按 source 推导）；
-// 同 (币种, 日) 多行取语义更强的一条（observed > derived > carried）。
+// loadMarks 兼容无 canonical 列旧行（取 fetched_at 日期），同日多行保留语义更强的一条。
 func loadMarks(ctx context.Context, db *sql.DB) (map[string]map[string]string, error) {
 	rows, err := db.QueryContext(ctx,
 		// CAST 回文本：驱动会按 DATE/DATETIME 声明列解析成 time.Time，读端要的是库内原文
@@ -170,7 +162,6 @@ func loadMarks(ctx context.Context, db *sql.DB) (map[string]map[string]string, e
 	return marks, nil
 }
 
-// dayOf 取时间文本前 10 位日期部分；空值或不可解析为 false。
 func dayOf(v sql.NullString) (string, bool) {
 	if !v.Valid || len(v.String) < 10 {
 		return "", false
@@ -182,8 +173,7 @@ func dayOf(v sql.NullString) (string, bool) {
 	return head, true
 }
 
-// resolveKind 行语义解析：Bing 源一律 carried（纳入待修复）；有标记用标记；
-// 缺失时 backfill / bing 延续值 → carried，其余 → observed。
+// resolveKind bing.currencyapi 一律判 carried；缺 source_kind 时 backfill 判 carried，其余 observed。
 func resolveKind(kind, source sql.NullString) string {
 	if strings.EqualFold(source.String, "bing.currencyapi") {
 		return "carried"
@@ -198,7 +188,6 @@ func resolveKind(kind, source sql.NullString) string {
 	return "observed"
 }
 
-// kindRank 语义可信度：observed > derived > carried，未知为 0。
 func kindRank(kind string) int {
 	switch kind {
 	case "observed":
@@ -211,14 +200,13 @@ func kindRank(kind string) int {
 	return 0
 }
 
-// buildWindows 待修复日并集聚类（相邻间隔 ≤ clusterGapDays 并段）后
-// 拆成 ≤ maxWindowDays 天的窗口。
+// buildWindows 将间隔 ≤ clusterGapDays 的待修复日并段，并按 maxWindowDays 切分。
 func buildWindows(pending map[string]bool) []gapWindow {
 	days := make([]string, 0, len(pending))
 	for d := range pending {
 		days = append(days, d)
 	}
-	sort.Strings(days)
+	slices.Sort(days)
 	windows := []gapWindow{}
 	for i := 0; i < len(days); {
 		j := i
@@ -240,7 +228,6 @@ func buildWindows(pending map[string]bool) []gapWindow {
 	return windows
 }
 
-// minDay 字典序最小日期（ISO 文本字典序即时间序）。
 func minDay(days map[string]string) string {
 	min := ""
 	for d := range days {
@@ -251,7 +238,6 @@ func minDay(days map[string]string) string {
 	return min
 }
 
-// diffDays b − a 的整天数（均为 YYYY-MM-DD，UTC 无夏令时）。
 func diffDays(a, b string) int {
 	ta, errA := time.Parse("2006-01-02", a)
 	tb, errB := time.Parse("2006-01-02", b)
@@ -261,7 +247,6 @@ func diffDays(a, b string) int {
 	return int(tb.Sub(ta).Hours() / 24)
 }
 
-// addDays 日期加 n 天。
 func addDays(day string, n int) string {
 	t, err := time.Parse("2006-01-02", day)
 	if err != nil {

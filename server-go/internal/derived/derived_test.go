@@ -1,8 +1,5 @@
 package derived
 
-// 派生链语义测试：四因子边界、史低判定矩阵、系列聚类与增量窄化。
-// 史低判定经真实 SQLite 链路跑（price_snapshot 与生产同一条 SQL）。
-
 import (
 	"context"
 	"database/sql"
@@ -75,7 +72,6 @@ func insertGame(t *testing.T, db *sql.DB, appid int64, release *string, pr, rc i
 		appid, fmt.Sprintf("游戏%d", appid), release, pr, rc)
 }
 
-// insertCN 现价 + 历史（cny 直算）；snaps = (相对天数, 价格, 原价)。
 func insertCN(t *testing.T, db *sql.DB, id *int64, appid int64, price int64, discount int64, snaps ...[3]int64) {
 	t.Helper()
 	mustExec(t, db, `INSERT INTO game_current_prices (appid, region_code, currency, price,
@@ -99,8 +95,6 @@ func insertRegion(t *testing.T, db *sql.DB, appid int64, region string, price in
 		attempt_outcome, updated_at) VALUES (?, ?, 'USD', ?, ?, 0, 0, 'ok', 0, ?, 'success', ?)`,
 		appid, region, price, price, fen, cmpNow)
 }
-
-// ── 四因子边界 ──────────────────────────────────────────────────
 
 func i64(v int64) *int64    { return &v }
 func strp(s string) *string { return &s }
@@ -135,7 +129,7 @@ func TestSaveScoreBoundaries(t *testing.T) {
 		want float64
 	}{
 		{nil, 0}, {i64(0), 0}, {i64(-500), 0},
-		{i64(200000), 1.0}, // ¥200 封顶
+		{i64(200000), 1.0},
 		{i64(2000000), 1.0},
 	}
 	for _, c := range cases {
@@ -143,7 +137,6 @@ func TestSaveScoreBoundaries(t *testing.T) {
 			t.Fatalf("SaveScore(%v) = %v, want %v", c.in, got, c.want)
 		}
 	}
-	// ¥20（2000 分）: ln(2)/ln(11) ≈ 0.289
 	want20 := math.Log(2) / math.Log(11)
 	if got := SaveScore(i64(2000)); math.Abs(got-want20) > 1e-12 {
 		t.Fatalf("SaveScore(¥20) = %v, want %v", got, want20)
@@ -151,37 +144,29 @@ func TestSaveScoreBoundaries(t *testing.T) {
 }
 
 func TestQualityScoreBoundaries(t *testing.T) {
-	// 有评测但好评率缺失 = 中性
 	if got := QualityScore(nil, i64(100), nil, cmpNow); got != 0.5 {
 		t.Fatalf("好评率缺失应为 0.5，实际 %v", got)
 	}
-	// 好评率 50% 恒中性（收缩不改变中性点）
 	if got := QualityScore(i64(5000), i64(10), nil, cmpNow); math.Abs(got-0.5) > 1e-12 {
 		t.Fatalf("50%% 好评应为 0.5，实际 %v", got)
 	}
-	// 满好评 + 巨量评测 → 趋近 1
 	if got := QualityScore(i64(10000), i64(1000000), nil, cmpNow); got < 0.99 {
 		t.Fatalf("十万级满好评应趋近 1，实际 %v", got)
 	}
-	// 零评价 + 无发行日 = 刚发行 = 中性 0.5
 	if got := QualityScore(nil, i64(0), nil, cmpNow); math.Abs(got-0.5) > 1e-12 {
 		t.Fatalf("零评价无日期应为 0.5，实际 %v", got)
 	}
-	// 零评价 + 未来日期 = 未发售 = 0.5
 	if got := QualityScore(nil, i64(0), strp("2030-01-01"), cmpNow); math.Abs(got-0.5) > 1e-12 {
 		t.Fatalf("未来日期应为 0.5，实际 %v", got)
 	}
-	// 零评价 + 不可解析 = 0.5
 	if got := QualityScore(nil, i64(0), strp("not-a-date"), cmpNow); math.Abs(got-0.5) > 1e-12 {
 		t.Fatalf("不可解析日期应为 0.5，实际 %v", got)
 	}
-	// 零评价 + 两年（730 天 / 365.25 年化）= 0.2 + 0.3·exp(-1.0007)
 	wantAge := 730.0 / 365.25 / 2.0
 	want := 0.20 + 0.30*math.Exp(-wantAge)
 	if got := QualityScore(nil, i64(0), strp("2024-10-31"), cmpNow); math.Abs(got-want) > 1e-12 {
 		t.Fatalf("两年零评价应 ≈ %v，实际 %v", want, got)
 	}
-	// 零评价 + 远古 → 地板 0.2
 	if got := QualityScore(nil, i64(0), strp("2000-01-01"), cmpNow); got > 0.21 {
 		t.Fatalf("远古零评价应近地板，实际 %v", got)
 	}
@@ -211,19 +196,15 @@ func TestTimingAndFamiliarityBoundaries(t *testing.T) {
 }
 
 func TestSmartScoreWeightedSum(t *testing.T) {
-	// 全零输入 = 0.28·0.5（零评价中性） = 0.14
 	got := SmartScore(i64(0), nil, i64(0), i64(0), i64(0), nil, cmpNow)
 	if math.Abs(got-0.14) > 1e-12 {
 		t.Fatalf("全零输入应 0.14，实际 %v", got)
 	}
-	// 因子和恒 ≤ 权重和
 	full := SmartScore(i64(200000), i64(10000), i64(100000), i64(1), i64(90), strp("2026-10-01"), cmpNow)
 	if full <= 0.99 || full > 1.0 {
 		t.Fatalf("全满分应近 1，实际 %v", full)
 	}
 }
-
-// ── 史低判定矩阵（真实 SQL 链路） ─────────────────────────────
 
 func runDerived(t *testing.T, db *sql.DB, ids []int64, opts Options) {
 	t.Helper()
@@ -259,25 +240,20 @@ func TestPriceHistoryLowMatrix(t *testing.T) {
 		return cmpNow.Add(-time.Duration(d) * 24 * time.Hour).Format("2006-01-02")
 	}
 
-	// 2001 新史低（降价 + 有折扣，era 起点在 30 天窗内）：5000→6000 原价永降
 	insertGame(t, db, 2001, strp(days(400)), 8000, 500)
 	insertCN(t, db, &hid, 2001, 5000, 50, [3]int64{40, 6000, 6000}, [3]int64{10, 5000, 5000})
 	insertRegion(t, db, 2001, "US", 999, 999)
 
-	// 2002 平史低（长期同价，era 在 30 天窗外，有折扣 → 2）
 	insertGame(t, db, 2002, strp(days(700)), 8000, 500)
 	insertCN(t, db, &hid, 2002, 3000, 50,
 		[3]int64{60, 3000, 3000}, [3]int64{50, 3000, 3000}, [3]int64{10, 3000, 3000})
 
-	// 2003 降价但无折扣 → prior 更高仍记新史低 1（原价持平不触发 pp）
 	insertGame(t, db, 2003, strp(days(400)), 8000, 500)
 	insertCN(t, db, &hid, 2003, 4000, 0, [3]int64{40, 5000, 4000}, [3]int64{10, 4000, 4000})
 
-	// 2004 涨价回非史低（prior 更低 → 无折扣 0）
 	insertGame(t, db, 2004, strp(days(400)), 8000, 500)
 	insertCN(t, db, &hid, 2004, 3000, 0, [3]int64{40, 2900, 2900}, [3]int64{10, 3000, 3000})
 
-	// 2005 无国区有效价（missing）→ hl 0、diff 0；非 CN 锚最低价仍记
 	insertGame(t, db, 2005, strp(days(400)), 8000, 500)
 	mustExec(t, db, `INSERT INTO game_current_prices (appid, region_code, currency, price,
 		original_price, discount_percent, sub_id, price_status, fail_count, cny_fen,
@@ -285,7 +261,6 @@ func TestPriceHistoryLowMatrix(t *testing.T) {
 		'missing', 1, NULL, 'failed', ?)`, cmpNow)
 	insertRegion(t, db, 2005, "JP", 1500, 800)
 
-	// 2006 无任何非 CN 价 → min NULL、diff 0
 	insertGame(t, db, 2006, strp(days(400)), 8000, 500)
 	insertCN(t, db, &hid, 2006, 19900, 0, [3]int64{10, 19900, 19900})
 
@@ -311,7 +286,6 @@ func TestPriceHistoryLowMatrix(t *testing.T) {
 	if _, _, changed, minFen, diff, _ := gameCols(t, db, 2006); changed != nil || minFen != -1 || diff != 0 {
 		t.Fatalf("2006 无外区价：changed=%v min=%d diff=%d", changed, minFen, diff)
 	}
-	// smart_score 随输入单调：新史低+差价大的 2001 高于无折扣平价 2003
 	_, _, _, _, _, s1 := gameCols(t, db, 2001)
 	_, _, _, _, _, s3 := gameCols(t, db, 2003)
 	if s1 <= s3 || s1 <= 0 {
@@ -337,24 +311,22 @@ func TestPriceSnapshotNonHistoryKeepsFlags(t *testing.T) {
 	}
 }
 
-// ── 系列聚类 ────────────────────────────────────────────────────
-
 func TestIsSameSeriesRules(t *testing.T) {
 	cases := []struct {
 		n1, e1, n2, e2 string
 		want           bool
 	}{
-		{"传送门", "Portal", "传送门 2", "Portal 2", true},                                 // 规则 4
-		{"巫师 3：狂猎", "The Witcher 3: Wild Hunt", "巫师", "The Witcher", true},           // 规则 1
-		{"使命召唤：二战", "Call of Duty: WWII", "使命召唤：先锋", "Call of Duty: Vanguard", true}, // 规则 1
-		{"FIFA 22", "FIFA 22", "FIFA 23", "FIFA 23", true},                           // 规则 5
-		{"辐射4", "", "辐射：新维加斯", "", true},                                             // 规则 6
-		{"塞尔达传说", "The Legend of Zelda", "塞尔达传说", "The Legend of Zelda: TotK", true}, // 规则 3
-		{"NBA 2K25", "NBA 2K25", "NBA 2K26", "NBA 2K26", true},                       // 规则 5
+		{"传送门", "Portal", "传送门 2", "Portal 2", true},
+		{"巫师 3：狂猎", "The Witcher 3: Wild Hunt", "巫师", "The Witcher", true},
+		{"使命召唤：二战", "Call of Duty: WWII", "使命召唤：先锋", "Call of Duty: Vanguard", true},
+		{"FIFA 22", "FIFA 22", "FIFA 23", "FIFA 23", true},
+		{"辐射4", "", "辐射：新维加斯", "", true},
+		{"塞尔达传说", "The Legend of Zelda", "塞尔达传说", "The Legend of Zelda: TotK", true},
+		{"NBA 2K25", "NBA 2K25", "NBA 2K26", "NBA 2K26", true},
 		{"赛博朋克2077", "Cyberpunk 2077", "巫师 3", "The Witcher 3", false},
-		{"空洞骑士", "Hollow Knight", "丝之歌", "Hollow Knight: Silksong", true}, // 规则 4
+		{"空洞骑士", "Hollow Knight", "丝之歌", "Hollow Knight: Silksong", true},
 		{"星露谷物语", "Stardew Valley", "牧场物语", "Story of Seasons", false},
-		{"Call of Juarez", "", "Call of Duty", "", false}, // 泛用次词
+		{"Call of Juarez", "", "Call of Duty", "", false},
 		{"Portal", "", "Portal 2", "Portal 2", true},
 	}
 	for _, c := range cases {
@@ -412,7 +384,6 @@ func TestRefreshSeriesIncremental(t *testing.T) {
 	insert(5001, "传送门", "Portal")
 	insert(5002, "传送门 2", "Portal 2")
 
-	// 首轮（changed 非空、版本未存 → 全量重算）：两簇成员落名，app_settings 存版本
 	if n, err := RefreshSeries(ctx, conn, map[int64]string{5001: "", 5002: ""}, nil); err != nil || n != 2 {
 		t.Fatalf("首轮应更新 2 行: n=%d err=%v", n, err)
 	}
@@ -428,7 +399,6 @@ func TestRefreshSeriesIncremental(t *testing.T) {
 		t.Fatalf("版本应存 {\"series\": {}}: %q (%v)", version, err)
 	}
 
-	// 增量路径：未受影响的落单新行保持 NULL（全量重算会写成 ''）
 	insert(5003, "星露谷物语", "Stardew Valley")
 	if _, err := RefreshSeries(ctx, conn, map[int64]string{5001: "Portal"}, nil); err != nil {
 		t.Fatalf("增量刷新失败: %v", err)
@@ -438,7 +408,6 @@ func TestRefreshSeriesIncremental(t *testing.T) {
 		t.Fatalf("未受影响行应保持未计算 NULL: %v (%v)", sid, err)
 	}
 
-	// 增量路径吃掉新邻居：与 Portal 同名的行进 changed 后并入簇
 	insert(5004, "传送门 3", "Portal 3")
 	if _, err := RefreshSeries(ctx, conn, map[int64]string{5004: ""}, nil); err != nil {
 		t.Fatalf("增量刷新失败: %v", err)
@@ -447,7 +416,6 @@ func TestRefreshSeriesIncremental(t *testing.T) {
 		t.Fatalf("新邻居应并入 Portal 簇: %v (%v)", sid, err)
 	}
 
-	// 非可聚类类型清系列
 	mustExec(t, db, `UPDATE games SET type='DLC', series_id='Portal' WHERE appid=5002`)
 	if _, err := RefreshSeries(ctx, conn, map[int64]string{}, nil); err != nil {
 		t.Fatalf("清系刷新失败: %v", err)

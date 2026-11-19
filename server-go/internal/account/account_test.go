@@ -10,8 +10,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// testSchema 与 Python ORM create_all 的真实建表 DDL 逐列一致
-// （metadata CreateTable 导出，含唯一索引）。
 const testSchema = `
 CREATE TABLE steam_accounts (
 	steam_id VARCHAR(20) NOT NULL,
@@ -169,9 +167,9 @@ func seedAccount(t *testing.T, db *sql.DB, sid, persona string, active int, boun
 }
 
 const (
-	sidA = "76561197960265730" // 好友码 2
-	sidB = "76561197960265731" // 好友码 3
-	sidC = "76561197960265732" // 好友码 4
+	sidA = "76561197960265730"
+	sidB = "76561197960265731"
+	sidC = "76561197960265732"
 )
 
 func TestFriendCode(t *testing.T) {
@@ -195,10 +193,9 @@ func TestListAccounts(t *testing.T) {
 	db := newAccountDB(t)
 	ctx := context.Background()
 	seedAccount(t, db, sidA, "大号", 1, "2026-01-02 10:00:00")
-	seedAccount(t, db, sidB, "小号", 0, nil) // bound_at 空值排最前
+	seedAccount(t, db, sidB, "小号", 0, nil)
 	seedAccount(t, db, sidC, "", 0, "2026-01-01 10:00:00")
 
-	// 计数分支：活跃愿望单/拥有、非活跃不计、未知账号不计、双账号并集
 	seedItem := func(sid string, appid int64, active, owned, wishlisted int) {
 		mustExec(t, db,
 			"INSERT INTO wishlist_items (steamid, appid, active, owned, manual, wishlisted,"+
@@ -210,9 +207,9 @@ func TestListAccounts(t *testing.T) {
 	seedItem(sidB, 12, 1, 1, 0)
 	seedItem(sidB, 13, 1, 1, 0)
 	seedItem(sidB, 14, 1, 1, 0)
-	seedItem(sidB, 15, 0, 0, 1) // 非活跃不计
+	seedItem(sidB, 15, 0, 0, 1)
 	seedItem(sidC, 16, 1, 0, 1)
-	seedItem("76561197960265799", 17, 1, 0, 1) // 不在账号清单内
+	seedItem("76561197960265799", 17, 1, 0, 1)
 
 	got, err := ListAccounts(ctx, db)
 	if err != nil {
@@ -267,17 +264,17 @@ func TestListItems(t *testing.T) {
 			sid, appid, active, owned, wishlisted)
 	}
 
-	seedItem(sidA, 100, 1, 0, 1)                         // 纯愿望单
-	seedItem(sidA, 200, 1, 1, 0)                         // 账户 A：拥有
-	seedItem(sidB, 200, 1, 0, 1)                         // 账户 B：愿望单 → 并集双标
-	seedItem(sidA, 300, 1, 0, 0)                         // 无标记 + monitor favorite
-	seedItem(sidA, 400, 1, 0, 1)                         // 被 excluded 剔除
-	seedItem(sidA, 700, 0, 0, 1)                         // 非活跃行不计
-	seedItem(sidA, 800, 1, 0, 0)                         // 无任何标记无来源
-	seedItem(sidA, 900, 1, 0, 1)                         // monitor 目标 released 态不剔除
-	seedItem(sidA, 1000, 1, 0, 1)                        // 排除行但无 monitor_targets 行 → 不剔除
-	seedMonitor(t, db, 300, []string{"favorite"}, false) // followed 来源不进两清单
-	seedMonitor(t, db, 400, []string{"favorite"}, true)  // active_ids 与 states_of 双剔除
+	seedItem(sidA, 100, 1, 0, 1)
+	seedItem(sidA, 200, 1, 1, 0)
+	seedItem(sidB, 200, 1, 0, 1)
+	seedItem(sidA, 300, 1, 0, 0)
+	seedItem(sidA, 400, 1, 0, 1)
+	seedItem(sidA, 700, 0, 0, 1)
+	seedItem(sidA, 800, 1, 0, 0)
+	seedItem(sidA, 900, 1, 0, 1)
+	seedItem(sidA, 1000, 1, 0, 1)
+	seedMonitor(t, db, 300, []string{"favorite"}, false)
+	seedMonitor(t, db, 400, []string{"favorite"}, true)
 	seedMonitor(t, db, 500, []string{"family_wishlist"}, false)
 	seedMonitor(t, db, 600, []string{"owned"}, false)
 	seedMonitor(t, db, 900, nil, false)
@@ -311,7 +308,6 @@ func TestBriefsFor(t *testing.T) {
 			"INSERT INTO games (appid, name, family_sharing, trading_cards, is_epic, is_hb,"+
 				" hl_flag, pp_flag, diff_fen, is_adult, is_visual_novel, removed_strikes,"+
 				" positive_reviews, review_count, view_count, positive_rate, chinese_support)"+
-				// 常量依次为 family_sharing…positive_reviews 共 11 列，review_count 走参数
 				" VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, 0, ?, ?)",
 			appid, name, 5, positive, chinese)
 	}
@@ -327,7 +323,7 @@ func TestBriefsFor(t *testing.T) {
 	seedGame(200, "游戏二", nil, nil)
 	seedPrice(200, "ok", nil, 0)
 	seedGame(300, "游戏三", 7500, "界面")
-	seedPrice(300, "locked", 1, 10) // 非 ok 不进 join
+	seedPrice(300, "locked", 1, 10)
 	seedGame(350, "游戏四", 0, nil)
 	seedPrice(350, "ok", 1000, 0)
 

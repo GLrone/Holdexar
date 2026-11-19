@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	xhtml "golang.org/x/net/html"
 )
 
 type WalletError struct{ Kind, Message string }
@@ -25,21 +27,108 @@ func (e *WalletError) Error() string         { return e.Message }
 func walletError(kind, message string) error { return &WalletError{kind, message} }
 
 type Wallet struct {
-	Balance                                               float64
-	BalanceDisplay, CurrencyCode, CurrencySymbol, SteamID string
-	CurrencyID                                            int
+	Balance                                                            float64
+	BalanceDisplay, CurrencyCode, CurrencySymbol, CountryCode, SteamID string
+	CurrencyID                                                         int
 }
 type steamCurrency struct{ code, symbol string }
 
 var steamCurrencies = map[int]steamCurrency{
 	1: {"USD", "$"}, 2: {"GBP", "£"}, 3: {"EUR", "€"}, 5: {"RUB", "₽"}, 6: {"PLN", "zł"}, 7: {"BRL", "R$"}, 8: {"JPY", "¥"}, 9: {"NOK", "kr"}, 10: {"IDR", "Rp"}, 11: {"MYR", "RM"}, 12: {"PHP", "₱"}, 13: {"SGD", "S$"}, 14: {"THB", "฿"}, 15: {"VND", "₫"}, 16: {"KRW", "₩"}, 17: {"TRY", "₺"}, 18: {"UAH", "₴"}, 19: {"MXN", "Mex$"}, 20: {"CAD", "C$"}, 21: {"AUD", "A$"}, 22: {"NZD", "NZ$"}, 23: {"CNY", "¥"}, 24: {"INR", "₹"}, 25: {"CLP", "CLP$"}, 26: {"PEN", "S/"}, 27: {"COP", "COL$"}, 28: {"ZAR", "R"}, 29: {"HKD", "HK$"}, 30: {"TWD", "NT$"}, 31: {"SAR", "SR"}, 32: {"AED", "AED"}, 34: {"ARS", "ARS$"}, 35: {"ILS", "₪"}, 37: {"KZT", "₸"}, 38: {"KWD", "KD"}, 39: {"QAR", "QR"},
 }
-var balancePattern = regexp.MustCompile(`(?s)class=["']accountRow accountBalance["'][^>]*>\s*<div[^>]*class=["']accountData price["'][^>]*>(.*?)</div>`)
 var currencyPattern = regexp.MustCompile(`"currency_code"\s*:\s*(\d+)\s*,\s*"formatted_amount"\s*:\s*"((?:\\.|[^"\\])*)"`)
-var tagsPattern = regexp.MustCompile(`<[^>]+>`)
-var anchorPattern = regexp.MustCompile(`(?i)<a\b[^>]*>`)
-var hrefPattern = regexp.MustCompile(`(?i)href=["']([^"']+)["']`)
 var profileOwnerPattern = regexp.MustCompile(`^/profiles/([0-9]{17,})/?$`)
+var regionNotePattern = regexp.MustCompile(`（([^，）]{2,6})、(\d{1,2})）`)
+var countryCodePattern = regexp.MustCompile(`^[A-Z]{2}$`)
+
+func htmlAttrVal(n *xhtml.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func htmlHasClasses(n *xhtml.Node, want ...string) bool {
+	fields := strings.Fields(htmlAttrVal(n, "class"))
+	for _, w := range want {
+		found := false
+		for _, f := range fields {
+			if f == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func htmlTextContent(n *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(cur *xhtml.Node) {
+		if cur.Type == xhtml.TextNode {
+			b.WriteString(cur.Data)
+			return
+		}
+		if cur.Type == xhtml.ElementNode && (cur.Data == "script" || cur.Data == "style") {
+			return
+		}
+		for ch := cur.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+func extractWalletDOM(page string) (balanceRaw string, hasBalance bool, owner string) {
+	doc, err := xhtml.Parse(strings.NewReader(page))
+	if err != nil {
+		return "", false, ""
+	}
+	var findPrice func(*xhtml.Node) *xhtml.Node
+	findPrice = func(n *xhtml.Node) *xhtml.Node {
+		if n.Type == xhtml.ElementNode && n.Data == "div" && htmlHasClasses(n, "accountData", "price") {
+			return n
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			if hit := findPrice(ch); hit != nil {
+				return hit
+			}
+		}
+		return nil
+	}
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n.Type == xhtml.ElementNode {
+			if !hasBalance && n.Data == "div" && htmlHasClasses(n, "accountRow", "accountBalance") {
+				if priceNode := findPrice(n); priceNode != nil {
+					balanceRaw = strings.TrimSpace(htmlTextContent(priceNode))
+					hasBalance = true
+				}
+			}
+			if owner == "" && n.Data == "a" && htmlHasClasses(n, "user_avatar") {
+				if href := htmlAttrVal(n, "href"); href != "" {
+					if u, e := url.Parse(href); e == nil && strings.EqualFold(u.Hostname(), "steamcommunity.com") {
+						if match := profileOwnerPattern.FindStringSubmatch(u.Path); len(match) > 1 {
+							owner = match[1]
+						}
+					}
+				}
+			}
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(doc)
+	return balanceRaw, hasBalance, owner
+}
 
 func moneyNumber(raw string) (float64, error) {
 	var b strings.Builder
@@ -94,9 +183,9 @@ func groupedAmount(v float64, whole bool) string {
 }
 func ParseWalletPage(page, expected string) (Wallet, error) {
 	var result Wallet
-	bal := balancePattern.FindStringSubmatch(page)
+	raw, hasBalance, owner := extractWalletDOM(page)
 	cur := currencyPattern.FindStringSubmatch(html.UnescapeString(page))
-	if len(bal) < 2 || len(cur) < 3 {
+	if !hasBalance || len(cur) < 3 {
 		return result, walletError("format", "无法获取 Steam 钱包余额（账户页缺少余额或币种）")
 	}
 	id, e := strconv.Atoi(cur[1])
@@ -107,7 +196,6 @@ func ParseWalletPage(page, expected string) (Wallet, error) {
 	if !ok {
 		return result, walletError("currency", fmt.Sprintf("未知 Steam 钱包币种 ID: %d", id))
 	}
-	raw := strings.TrimSpace(html.UnescapeString(tagsPattern.ReplaceAllString(bal[1], "")))
 	var formatted string
 	if json.Unmarshal([]byte(`"`+cur[2]+`"`), &formatted) != nil || !strings.Contains(formatted, currency.symbol) || !strings.Contains(raw, currency.symbol) {
 		return result, walletError("currency", "余额符号与 Steam 钱包币种不一致")
@@ -115,25 +203,6 @@ func ParseWalletPage(page, expected string) (Wallet, error) {
 	amount, e := moneyNumber(raw)
 	if e != nil {
 		return result, e
-	}
-	owner := ""
-	for _, a := range anchorPattern.FindAllString(page, -1) {
-		if !strings.Contains(a, "user_avatar") {
-			continue
-		}
-		match := hrefPattern.FindStringSubmatch(a)
-		if len(match) < 2 {
-			continue
-		}
-		u, e := url.Parse(html.UnescapeString(match[1]))
-		if e != nil || !strings.EqualFold(u.Hostname(), "steamcommunity.com") {
-			continue
-		}
-		match = profileOwnerPattern.FindStringSubmatch(u.Path)
-		if len(match) > 1 {
-			owner = match[1]
-			break
-		}
 	}
 	if owner == "" || owner != expected {
 		return result, walletError("owner", "无法确认钱包属于该 Steam 账号，本次保留已有余额")
@@ -143,12 +212,13 @@ func ParseWalletPage(page, expected string) (Wallet, error) {
 }
 
 type SteamOptions struct {
-	HTTPClient                          *http.Client
-	AccountURL, ProfileURL, FinalizeURL string
-	ProfileXMLURL                       string
-	AuthBaseURL, CheckDeviceURL         string
-	Proxy                               func(context.Context) (string, error)
-	Sleep                               func(context.Context, time.Duration) error
+	HTTPClient                  *http.Client
+	AccountURL, HistoryURL      string
+	ProfileURL, FinalizeURL     string
+	ProfileXMLURL               string
+	AuthBaseURL, CheckDeviceURL string
+	Proxy                       func(context.Context) (string, error)
+	Sleep                       func(context.Context, time.Duration) error
 }
 type SteamClient struct {
 	opts    SteamOptions
@@ -159,6 +229,13 @@ type SteamClient struct {
 func NewSteamClient(opts SteamOptions) *SteamClient {
 	if opts.AccountURL == "" {
 		opts.AccountURL = "https://store.steampowered.com/account/"
+	}
+	if opts.HistoryURL == "" {
+		if opts.AccountURL == "https://store.steampowered.com/account/" {
+			opts.HistoryURL = "https://store.steampowered.com/account/history/"
+		} else {
+			opts.HistoryURL = strings.TrimRight(opts.AccountURL, "/") + "/history/"
+		}
 	}
 	if opts.ProfileURL == "" {
 		opts.ProfileURL = "https://steamcommunity.com/miniprofile/%s/json"
@@ -218,6 +295,43 @@ func (c *SteamClient) StoreHTTPClient(ctx context.Context) (*http.Client, error)
 	return &http.Client{Transport: client.Transport, Timeout: 30 * time.Second}, nil
 }
 
+func normalizeCountry(v string) string {
+	code := strings.ToUpper(strings.TrimSpace(v))
+	if countryCodePattern.MatchString(code) {
+		return code
+	}
+	return ""
+}
+
+func (c *SteamClient) fetchHistoryRegion(ctx context.Context, client *http.Client, cookies string) string {
+	if strings.TrimSpace(c.opts.HistoryURL) == "" {
+		return ""
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.opts.HistoryURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Cookie", FilterCookies(cookies)+"; birthtime=283993201; wants_mature_content=1")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return ""
+	}
+	if match := regionNotePattern.FindSubmatch(body); len(match) > 1 {
+		return strings.TrimSpace(string(match[1]))
+	}
+	return ""
+}
+
 func (c *SteamClient) FetchWallet(ctx context.Context, cookies string) (Wallet, error) {
 	sid := CookieSteamID(cookies)
 	if sid == "" {
@@ -266,7 +380,17 @@ func (c *SteamClient) FetchWallet(ctx context.Context, cookies string) (Wallet, 
 		if readErr != nil {
 			return Wallet{}, walletError("network", "Steam 账户响应中断，本次保留已有余额")
 		}
-		return ParseWalletPage(string(body), sid)
+		wallet, err := ParseWalletPage(string(body), sid)
+		if err != nil {
+			return Wallet{}, err
+		}
+		country := c.fetchHistoryRegion(ctx, client, cookies)
+		if country == "" {
+			rawCountry, _, _ := strings.Cut(ParseCookies(cookies)["steamCountry"], "|")
+			country = normalizeCountry(rawCountry)
+		}
+		wallet.CountryCode = country
+		return wallet, nil
 	}
 	return Wallet{}, walletError("network", "无法连接 Steam")
 }

@@ -1,17 +1,17 @@
 package plugins
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 func failure(w http.ResponseWriter, e error) {
 	writeJSON(w, http.StatusBadRequest, map[string]string{"detail": e.Error()})
@@ -64,7 +64,40 @@ func (m *Manager) Register(mux *http.ServeMux) {
 		writeJSON(w, 200, value)
 	})
 	mux.HandleFunc("GET /api/v1/plugins/discover", func(w http.ResponseWriter, r *http.Request) {
-		value, e := m.Discover(r.Context(), r.URL.Query().Get("source"), r.URL.Query().Get("q"))
+		value, e := m.QueryCatalog(r.Context(), r.URL.Query().Get("q"))
+		if e != nil {
+			failure(w, e)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"items": catalogPresentation(value.Plugins), "source": value.Source, "cached": value.Cached, "error": value.Error})
+	})
+	mux.HandleFunc("POST /api/v1/plugins/discover", func(w http.ResponseWriter, r *http.Request) {
+		source := r.URL.Query().Get("source")
+		q := r.URL.Query().Get("q")
+		if r.Body != nil {
+			b, e := io.ReadAll(http.MaxBytesReader(w, r.Body, maxManifest))
+			if e != nil {
+				failure(w, errors.New("plugin request is too large"))
+				return
+			}
+			if len(bytes.TrimSpace(b)) > 0 {
+				var input struct {
+					Source *string `json:"source"`
+					Q      *string `json:"q"`
+				}
+				if e := strictJSON(b, &input); e != nil {
+					failure(w, e)
+					return
+				}
+				if input.Source != nil {
+					source = *input.Source
+				}
+				if input.Q != nil {
+					q = *input.Q
+				}
+			}
+		}
+		value, e := m.Discover(r.Context(), source, q)
 		if e != nil {
 			failure(w, e)
 			return

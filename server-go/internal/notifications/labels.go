@@ -1,8 +1,5 @@
 package notifications
 
-// typeLabels 通知类型 → 用户标签与所属类别；键序对齐 Python TYPE_LABELS 的插入序
-// （源 server/app/domains/notifications/policy.py + crawl/events.py 事件常量）。
-// 区服清单增减事件类型映射时须与 Python 侧同步。
 var typeLabels = []struct {
 	key      string
 	label    string
@@ -30,7 +27,6 @@ var typeLabels = []struct {
 	{"SYSTEM_ALERT", "系统运行提醒", "system"},
 }
 
-// categoryLabels 用户类别 → 标签与事件类型数；键序对齐 Python CATEGORIES 元组序。
 var categoryLabels = []struct {
 	key        string
 	label      string
@@ -46,8 +42,6 @@ var categoryLabels = []struct {
 	{"system", "运行提醒", 2},
 }
 
-// regionToCurrency 区码（大写）→ 货币代号，源 server/app/crawler/config.py CC_LIST；
-// 与 games 域 REGION_TO_CURRENCY 同一清单，区服增减时同步。
 var regionToCurrency = map[string]string{
 	"CN": "CNY", "RU": "RUB", "KZ": "KZT", "UA": "UAH", "PK": "USD",
 	"TR": "USD", "AR": "USD", "AZ": "USD", "VN": "VND", "ID": "IDR",
@@ -60,8 +54,6 @@ var regionToCurrency = map[string]string{
 	"CH": "CHF",
 }
 
-// eventLabels 事件类型 → 账本展示标签（缺省「价格变化」），
-// 与 mail.py EVENT_LABELS 同一套措辞（注意与 TYPE_LABELS 措辞不同源）。
 var eventLabels = map[string]string{
 	"PRICE_DROP":             "价格下降",
 	"PRICE_INCREASE":         "价格上涨",
@@ -76,7 +68,6 @@ var eventLabels = map[string]string{
 	"REMOVED":                "游戏下架",
 }
 
-// eventLabel 事件类型 → 展示标签；未登记类型一律按价格变化。
 func eventLabel(eventType string) string {
 	if label, ok := eventLabels[eventType]; ok {
 		return label

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/sched"
 )
 
@@ -69,9 +70,5 @@ func (s *Service) Register(mux *http.ServeMux) {
 }
 
 func (s *Service) reply(w http.ResponseWriter, code int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		s.opts.Log("Steam 活动日历响应未发出 │ 原因=%v", err)
-	}
+	httpx.WriteJSON(w, code, body)
 }

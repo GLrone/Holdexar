@@ -1,9 +1,5 @@
 package derived
 
-// 价格派生主链：对齐现网 update_price_derived——现价/历史/游戏行就绪后
-// 在同一事务连接上重算六列（hl_flag/pp_flag/pp_changed_at/min_cny_fen/
-// diff_fen/smart_score），目录输入变化时联动系列重算（series_id）。
-
 import (
 	"context"
 	"database/sql"
@@ -17,7 +13,6 @@ const standardProductSQL = "(is_gold IS NULL OR is_gold = 0) " +
 	"AND (is_bundle IS NULL OR is_bundle = 0) " +
 	"AND (product_unknown IS NULL OR product_unknown = 0)"
 
-// CatalogRow 目录输入快照（系列联动与联动范围的判定输入）。
 type CatalogRow struct {
 	Name, NameEn, Type        *string
 	PositiveRate, ReviewCount *int64
@@ -25,9 +20,7 @@ type CatalogRow struct {
 	SeriesID                  *string
 }
 
-// Options 派生调用参数。Now = era_cutoff/发行年龄基准挂钟；Overrides =
-// 系列覆盖表（宿主在闸外装填，闸内零文件 IO）；CatalogBefore = 目录输入
-// 快照（nil = 不做系列联动）。
+// Options 派生参数：Overrides 须在写闸外装填；CatalogBefore 为 nil 时跳过系列与捆绑联动。
 type Options struct {
 	Now           time.Time
 	Overrides     map[string][]int64
@@ -36,7 +29,6 @@ type Options struct {
 	CatalogBefore map[int64]CatalogRow
 }
 
-// CatalogInputs 读取目录输入快照（写入前的旧值；新行无键）。
 func CatalogInputs(ctx context.Context, conn *sql.Conn, appids []int64) (map[int64]CatalogRow, error) {
 	ids := dedupIDs(appids)
 	if len(ids) == 0 {
@@ -66,8 +58,7 @@ func CatalogInputs(ctx context.Context, conn *sql.Conn, appids []int64) (map[int
 	return out, rows.Err()
 }
 
-// UpdatePriceDerived 重算派生列并按需联动系列重算。必须在调用方事务
-// 连接与写闸内执行（前置写入已在同一连接生效）。返回 UPDATE 覆盖行数。
+// UpdatePriceDerived 须在调用方事务连接与写闸内执行（前置写入须已在同连接生效），返回覆盖行数。
 func UpdatePriceDerived(ctx context.Context, conn *sql.Conn, appids []int64, opts Options) (int64, error) {
 	if appids != nil && len(appids) == 0 {
 		return 0, nil
@@ -102,8 +93,6 @@ func UpdatePriceDerived(ctx context.Context, conn *sql.Conn, appids []int64, opt
 				return 0, err
 			}
 		}
-		// 评测/发行日变化的捆绑包排序缓存联动（对齐 derived.py:129-137：
-		// (positive_rate, review_count, release_date) 任一变化或新行触发）
 		bundleChanged := make([]int64, 0, len(current))
 		for aid, cur := range current {
 			old, ok := before[aid]
@@ -126,7 +115,6 @@ func SaveInputVersion(ctx context.Context, conn *sql.Conn, now time.Time, overri
 	return err
 }
 
-// catalogIdentChanged 系列联动判定：(name, name_en, type) 任一变化。
 func catalogIdentChanged(cur, old CatalogRow) bool {
 	return !strEqual(cur.Name, old.Name) ||
 		!strEqual(cur.NameEn, old.NameEn) ||
@@ -146,8 +134,6 @@ func strEqual(a, b *string) bool {
 	}
 	return *a == *b
 }
-
-// ── price_snapshot：六列一次 UPDATE ────────────────────────────
 
 func priceSnapshot(ctx context.Context, conn *sql.Conn, appids []int64, now time.Time, history bool) (int64, error) {
 	ids := dedupIDs(appids)
@@ -247,7 +233,7 @@ func priceSnapshot(ctx context.Context, conn *sql.Conn, appids []int64, now time
 	return n, nil
 }
 
-// pyIsoDateTime 对齐 datetime.isoformat(" ")：微秒非零才带小数节。
+// pyIsoDateTime 格式化为 "YYYY-MM-DD HH:MM:SS[.ffffff]"，微秒全零时省略小数。
 func pyIsoDateTime(t time.Time) string {
 	s := t.Format("2006-01-02 15:04:05")
 	if ns := t.Nanosecond(); ns != 0 {

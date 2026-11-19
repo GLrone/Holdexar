@@ -12,16 +12,20 @@ import (
 	"holdexar/server-go/internal/secretbox"
 )
 
-// smtpPasswordKey SMTP 授权码的 KV 键（加密存储）。
 const smtpPasswordKey = "smtp.password"
 
-// dataDirResolver secretbox 密钥材料落点，读时解析（对齐 Python
-// get_settings().data_dir 的取值时机）；测试可替换。
 var dataDirResolver = config.ResolveDataDir
 
-// smtpView SMTP 出口的可公开投影：不含密码与授权码，只给「是否已配置」。
-// 行缺席与行内 NULL 语义分开（Python get_value 缺席回默认、NULL 回 None）。
-func (h *handler) smtpView(r *http.Request) (*orderedObj, error) {
+type smtpSummaryView struct {
+	Configured  bool   `json:"configured"`
+	Host        any    `json:"host"`
+	Port        int64  `json:"port"`
+	UserMasked  string `json:"userMasked"`
+	HasPassword bool   `json:"hasPassword"`
+	UseSSL      bool   `json:"useSsl"`
+}
+
+func (h *handler) smtpView(r *http.Request) (*smtpSummaryView, error) {
 	ctx := r.Context()
 	host, hasHost, err := h.settingValue(ctx, "smtp.host")
 	if err != nil {
@@ -54,20 +58,17 @@ func (h *handler) smtpView(r *http.Request) (*orderedObj, error) {
 		useSsl = true
 	}
 
-	v := newOrderedObj()
-	// configured = 收件地址与服务器都非空（Python bool() 语义）
-	v.set("configured", truthy(toAddr) && truthy(host))
-	v.set("host", host)
-	v.set("port", pyInt(portRaw, 465))
-	v.set("userMasked", maskAccount(user))
-	v.set("hasPassword", pwdConfigured)
-	v.set("useSsl", truthy(useSsl))
-	return v, nil
+	return &smtpSummaryView{
+		Configured:  truthy(toAddr) && truthy(host),
+		Host:        host,
+		Port:        pyInt(portRaw, 465),
+		UserMasked:  maskAccount(user),
+		HasPassword: pwdConfigured,
+		UseSSL:      truthy(useSsl),
+	}, nil
 }
 
-// passwordConfigured SMTP 授权码是否已配置，判定对齐 Python get_secret_value：
-// 键缺席/空值/NULL 回无凭据；存量明文（无 enc1: 前缀）原样算已配置；密文
-// 解密失败（篡改、用途不符、keyring 锁定态、换钥窗口外）一律按无凭据降级。
+// passwordConfigured 存量明文算已配置；密文解密失败一律按未配置降级。
 func (h *handler) passwordConfigured(ctx context.Context) (bool, error) {
 	stored, present, err := h.settingValue(ctx, smtpPasswordKey)
 	if err != nil || !present {
@@ -78,7 +79,6 @@ func (h *handler) passwordConfigured(ctx context.Context) (bool, error) {
 	}
 	s, isStr := stored.(string)
 	if !isStr {
-		// 非字符串值：Python str() 后必非密文前缀 → 原样返回，按真值判定
 		return truthy(stored), nil
 	}
 	if s == "" {
@@ -98,7 +98,6 @@ func (h *handler) passwordConfigured(ctx context.Context) (bool, error) {
 	return plain != "", nil
 }
 
-// maskAccount 邮箱账号脱敏：保留首尾各 1 位与域名（按 Unicode 字符切，对齐 Python 切片）。
 func maskAccount(user any) string {
 	s, ok := user.(string)
 	if !ok || s == "" {
@@ -115,7 +114,6 @@ func maskAccount(user any) string {
 	return string(runes[0]) + "***" + string(runes[len(runes)-1]) + "@" + domain
 }
 
-// pyInt Python int() 的窄化读取：数值/数字串 → 截断整数；零值类回缺省端口。
 func pyInt(v any, def int64) int64 {
 	if !truthy(v) {
 		return def

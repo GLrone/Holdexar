@@ -3,7 +3,6 @@ package achievements
 import (
 	"cmp"
 	"context"
-	"log/slog"
 	"slices"
 	"strings"
 )
@@ -37,11 +36,11 @@ func (r Reader) accounts(ctx context.Context) ([]readDisplayAccount, error) {
 		}
 	}
 	if err := r.readFamilyDisplayAccounts(ctx, primary, add); err != nil {
-		slog.Warn("读取成就家庭账号失败", "error", err)
+		warnLog(r.Log, "读取成就家庭账号失败", err)
 	}
 	if len(items) > 0 {
 		if err := r.fillTrackedProfiles(ctx, items, index); err != nil {
-			slog.Warn("读取成就账号档案失败", "error", err)
+			warnLog(r.Log, "读取成就账号档案失败", err)
 		}
 	}
 	slices.SortStableFunc(items, func(a, b readDisplayAccount) int {

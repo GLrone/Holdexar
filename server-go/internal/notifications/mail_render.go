@@ -2,13 +2,14 @@ package notifications
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"sort"
+	"slices"
 	"strings"
 
 	"holdexar/server-go/internal/config"
@@ -259,7 +260,7 @@ func (s *DeliveryService) render(ctx context.Context, candidates []DeliveryCandi
 			deferred++
 		}
 	}
-	sort.SliceStable(order, func(i, j int) bool { return counts[order[i]] > counts[order[j]] })
+	slices.SortStableFunc(order, func(a, b string) int { return cmp.Compare(counts[b], counts[a]) })
 	subtitle := fmt.Sprintf("这一轮价格刷新共产生 %d 条变化，涉及 %d 款游戏。", len(candidates), len(gamesSet))
 	if deferred > 0 {
 		subtitle += fmt.Sprintf("其中 %d 条来自更早的轮次（静默期顺延）。", deferred)

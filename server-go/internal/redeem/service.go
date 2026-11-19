@@ -1,10 +1,3 @@
-// service.go redeem 域：Steam CDK 批量激活（store 登录态通道）。
-//
-// 对齐 Python domains/redeem/service.py：单码激活 → Steam 商店
-// ajaxregisterkey 端点；错误码 9=已拥有单列 own；每次收到的响应都计一次
-// 激活尝试（传输失败不计——Steam 未收到）；结果无论成败落激活账本
-// redeem_activations 一行；额度按账号维度滑动窗口计数（10 次/30 分钟，
-// Steam 官方限制，本端计数仅作前端节奏指引）。
 package redeem
 
 import (
@@ -21,9 +14,8 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// registerkey 错误码 → 中文语义。该表按社区语义，勿按「官方文档」纠正——
-// 53=次数上限（30 分钟 10 次尝试窗口）不是锁区；配额用尽时 Steam 不查 key
-// 直接返 53，任何码都一样。
+// registerkey 错误码映射（53 表示 30 分钟 10 次上限，
+// 配额耗尽时商店不查 key 直接返回 53）。
 var errorCodes = map[int]string{
 	9:  "已拥有",
 	13: "地区限制",
@@ -35,10 +27,8 @@ var errorCodes = map[int]string{
 	53: "次数上限（30 分钟内最多 10 次激活尝试，请稍后再试）",
 }
 
-// Steam 回执原文入库上限（超出截断，防单行膨胀；回执主体信息在前列字段）。
 const rawMax = 8000
 
-// 结果原文展示上限（前端「展开原文」核对口径；入库另有 rawMax 兜底）。
 const rawDisplayMax = 2000
 
 // 批量激活节奏：同批 9 个并发、组间串行（防误操作一把梭 50 个 key 打爆限额）。
@@ -47,15 +37,12 @@ const batchChunkSize = 9
 const ledgerStamp = "2006-01-02 15:04:05.000000"
 
 type ServiceOptions struct {
-	// Accounts 登录态来源（当前 active 账号 Cookie，临期自动换发）。
 	Accounts *account.Service
-	// Proxy 每次出网解析代理 URL；解析失败按直连处理（后台链路语义）。
-	Proxy func(context.Context) (string, error)
-	Log   func(string, ...any)
-	Now   func() time.Time
+	Proxy    func(context.Context) (string, error)
+	Log      func(string, ...any)
+	Now      func() time.Time
 }
 
-// InputError 用户可纠正的输入问题（对齐 Python ValueError → 路由 400）。
 type InputError struct{ Message string }
 
 func (e *InputError) Error() string { return e.Message }
@@ -77,10 +64,8 @@ func NewService(db *sql.DB, gate *store.WriteGate, opts ServiceOptions) *Service
 	return &Service{db: db, gate: gate, opts: opts, counter: newCounter(ACTWindowSeconds*time.Second, opts.Now)}
 }
 
-// AccountUsage 该账号当前 30 分钟窗口内已用激活次数（注入 account.RedeemUsed）。
 func (s *Service) AccountUsage(steamID string) int { return s.counter.usage(steamID) }
 
-// Result 单码激活结果（ok|own|fail）。
 type Result struct {
 	Status  string `json:"status"`
 	Detail  string `json:"detail"`
@@ -89,13 +74,11 @@ type Result struct {
 	Raw     string `json:"raw"`
 }
 
-// BatchRow 批量结果行：code 为原始激活码。
 type BatchRow struct {
 	Code string `json:"code"`
 	Result
 }
 
-// BatchOutcome 批量激活汇总（ok/own/fail 计数 + 逐码结果）。
 type BatchOutcome struct {
 	Results []BatchRow `json:"results"`
 	OK      int        `json:"ok"`
@@ -103,7 +86,6 @@ type BatchOutcome struct {
 	Fail    int        `json:"fail"`
 }
 
-// Quota 激活前提状态（Cookie 可用性 + 账号维度节奏计数）。
 type Quota struct {
 	HasCookie    bool   `json:"hasCookie"`
 	HasSessionID bool   `json:"hasSessionId"`
@@ -112,15 +94,12 @@ type Quota struct {
 	Limit        int    `json:"limit"`
 }
 
-// ActivateKey 激活单个 CDK。登录态缺失/缺 sessionid 以 *InputError 返回（路由 400），
-// 其余异常原样上抛（路由 502 兜底）；传输层失败与各失败分支都返回 fail 结果。
 func (s *Service) ActivateKey(ctx context.Context, productKey string) (Result, error) {
 	session, err := s.opts.Accounts.StoreSession(ctx, "", false)
 	if err != nil {
 		var wallet *account.WalletError
 		if errors.As(err, &wallet) && wallet.Kind == "expired" {
-			// 过期登录态：Go 不放行过期 Cookie 出网（账单同步同款），直接给
-			// 激活端点 401 分支同款文案；Steam 未收到，不计激活次数。
+			// 过期登录态不出网请求，直接返回失败且不计激活次数。
 			steamID := session.SteamID
 			if steamID == "" {
 				steamID = "unknown"
@@ -159,8 +138,6 @@ func (s *Service) ActivateKey(ctx context.Context, productKey string) (Result, e
 	return result, nil
 }
 
-// ActivateBatch 批量激活：每 9 个一组并发、组间串行。任一异常上抛（与
-// asyncio.gather 语义一致，路由层统一兜底）。
 func (s *Service) ActivateBatch(ctx context.Context, keys []string) (BatchOutcome, error) {
 	if len(keys) == 0 {
 		return BatchOutcome{}, &InputError{"激活码列表为空"}
@@ -204,17 +181,14 @@ func (s *Service) ActivateBatch(ctx context.Context, keys []string) (BatchOutcom
 	return outcome, nil
 }
 
-// QuotaStatus 激活前提状态：Cookie 三件套可用性 + 账号维度激活计数
-// （切换绑定 Cookie 即换号重计；不能用全局计数——跨账号共享计数是错误语义）。
+// QuotaStatus 返回当前账号维度 Cookie 与激活额度（禁止跨账号共享计数）。
 func (s *Service) QuotaStatus(ctx context.Context) (Quota, error) {
 	quota := Quota{Limit: ACTLimit}
 	session, err := s.opts.Accounts.StoreSession(ctx, "", false)
 	if err != nil {
 		var wallet *account.WalletError
 		if errors.As(err, &wallet) && wallet.Kind == "expired" {
-			// 过期登录态：Python 原样返回旧 Cookie 解析（hasCookie 仍为真，
-			// 供前端引导重绑）；Go StoreSession 不放行过期 Cookie，按已有
-			// 账号行身份回答，sessionid 视为在（绑定 Cookie 常态）。
+			// StoreSession 拒绝放行过期 Cookie；按账号身份回填状态以引导重绑。
 			quota.HasCookie = true
 			quota.HasSessionID = true
 			quota.SteamID = session.SteamID
@@ -239,15 +213,10 @@ func (s *Service) QuotaStatus(ctx context.Context) (Quota, error) {
 	return quota, nil
 }
 
-// activationsSearchWindow 检索窗：SearchActivations 经既有分页读取聚合的全量检索窗。
-// shortcut: 2000 条≈本地激活账本全量（账本增速约数十条/日）；账本超窗后把
-// 筛选下推为参数化 SQL（status/q/key），本函数契约不变。
+// activationsSearchWindow 检索上限。
+// shortcut: 2000 条≈本地激活账本全量，超窗后将 status/q/key 筛选下推为参数化 SQL。
 const activationsSearchWindow = 2000
 
-// SearchActivations 激活历史检索：筛选+搜索+按码回查，覆盖检索窗内全部库内记录。
-// 复用既有 ListActivations 分页读取聚合检索窗（零 SQL 构建）：status=ok/own/fail
-// 按结果过滤；key=激活码精确匹配（结果表失败码回查历史成功记录）；q 不分
-// 大小写子串匹配激活码/版本名/说明/账号。返回过滤后总数与分页行。
 func (s *Service) SearchActivations(ctx context.Context, status, q, key string, limit, offset int) (ActivationPage, error) {
 	limit = max(1, min(limit, 200))
 	offset = max(0, offset)
@@ -294,7 +263,6 @@ func (s *Service) SearchActivations(ctx context.Context, status, q, key string, 
 	return page, nil
 }
 
-// ActivationRow 激活历史行（不含 raw 回执原文，控制载荷）。
 type ActivationRow struct {
 	ID        int64  `json:"id"`
 	CreatedAt string `json:"createdAt"`
@@ -307,13 +275,11 @@ type ActivationRow struct {
 	SteamID   string `json:"steamId"`
 }
 
-// ActivationPage 激活历史分页（时间倒序，同秒按 id 倒序）。
 type ActivationPage struct {
 	Total int64           `json:"total"`
 	Rows  []ActivationRow `json:"rows"`
 }
 
-// ListActivations 激活历史：limit 夹取 1..200，offset 不为负；无过滤参数仅分页。
 func (s *Service) ListActivations(ctx context.Context, limit, offset int) (ActivationPage, error) {
 	limit = max(1, min(limit, 200))
 	offset = max(0, offset)
@@ -337,8 +303,6 @@ func (s *Service) ListActivations(ctx context.Context, limit, offset int) (Activ
 	}
 	return page, rows.Err()
 }
-
-// ── 激活账本（redeem_activations，成功/已拥有/失败都记） ──────────────
 
 type ledgerRow struct {
 	Kind, Status, ProductKey, SubID, SubName, Detail, Raw, SteamID string
@@ -382,8 +346,6 @@ func kindLabel(kind string) string {
 	return "免费领取"
 }
 
-// ── 文本工具（对齐 Python str 切片语义：按字符截断） ─────────────────
-
 func truncateRunes(s string, n int) string {
 	if n < 0 || utf8.RuneCountInString(s) <= n {
 		return s
@@ -392,7 +354,6 @@ func truncateRunes(s string, n int) string {
 	return string(runes[:n])
 }
 
-// maskKey 激活码日志掩码：留首段与尾 2 位，中段以 * 代替。
 func maskKey(key string) string {
 	runes := []rune(key)
 	if len(runes) <= 7 {
@@ -401,7 +362,6 @@ func maskKey(key string) string {
 	return string(runes[:5]) + strings.Repeat("*", len(runes)-7) + string(runes[len(runes)-2:])
 }
 
-// pyStamp 激活账本时间戳（本地 naive 微秒）转展示格式 "YYYY-MM-DD HH:MM:SS"。
 func pyStamp(raw sql.NullString) string {
 	if !raw.Valid || raw.String == "" {
 		return ""

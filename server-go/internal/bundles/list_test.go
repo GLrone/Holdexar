@@ -14,15 +14,14 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// 合成探针（对齐 tests/test_bundles_api.py 夹具语义）。
 const (
-	bidA = int64(990101) // 可补齐包（mps=0）
-	bidB = int64(990102) // 无任何区域价 → 列表应过滤
-	bidC = int64(990103) // 双轨混写包：bundle 3 appids + 同号 sub 单 appid 污染行
+	bidA = int64(990101)
+	bidB = int64(990102)
+	bidC = int64(990103)
 	app1 = int64(990111)
 	app2 = int64(990112)
-	app3 = int64(990113) // 不入库：详情 games 里 name=null
-	appS = int64(990114) // 污染行的异种 appid
+	app3 = int64(990113)
+	appS = int64(990114)
 )
 
 func execSeed(t *testing.T, db *sql.DB, query string, args ...any) {
@@ -32,7 +31,6 @@ func execSeed(t *testing.T, db *sql.DB, query string, args ...any) {
 	}
 }
 
-// openListDB 建最小表集（列对齐列表/详情 SQL 实际触碰面）。
 func openListDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "bundles-list.db"))
@@ -60,7 +58,6 @@ func openListDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// seedBaseListDB 三探针包：A 区价齐（jp/JP 大小写并存）、B 无价、C 双轨混写。
 func seedBaseListDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db := openListDB(t)
@@ -175,7 +172,6 @@ func TestListAggregation(t *testing.T) {
 	if a.URL != "https://store.steampowered.com/bundle/990101/" {
 		t.Fatalf("A url=%s", a.URL)
 	}
-	// 列表区价投影不携带详情级字段（结构性：marshal 后核对键集）
 	raw, err := json.Marshal(a.RegionPrices["US"])
 	if err != nil {
 		t.Fatal(err)
@@ -192,7 +188,6 @@ func TestListAggregation(t *testing.T) {
 	if len(keys) != 6 {
 		t.Fatalf("list entry keys=%v", keys)
 	}
-	// 顶层 item 键集（嵌入结构体字段提升后与 Python 报文逐键对齐）
 	itemRaw, err := json.Marshal(*a)
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +208,6 @@ func TestListAggregation(t *testing.T) {
 	if c == nil {
 		t.Fatal("bundle C missing")
 	}
-	// 双产品隔离：RU 污染行整行剔除，不进区域表也不带偏最低价
 	if _, ok := c.RegionPrices["RU"]; ok {
 		t.Fatalf("C keeps pollution row: %v", c.RegionPrices)
 	}
@@ -229,7 +223,6 @@ func TestListAggregation(t *testing.T) {
 	if itemByID(res, bidB) != nil {
 		t.Fatal("无价包不应出现在列表")
 	}
-	// 差价下限 0
 	for _, item := range res.Bundles {
 		if item.DiffFen < 0 {
 			t.Fatalf("negative diff %d", item.DiffFen)
@@ -275,7 +268,6 @@ func TestListRegionAnchorAndDiscountSort(t *testing.T) {
 		VALUES(9,990103,'US','USD',6000,0,10,'ok',6000,'[990111,990112,990113]')`)
 	refreshSnapshots(t, db, []int64{bidA, bidC}, nil)
 
-	// 无地区锚的 smart 排序读快照：C（差 140 元）> A（差 90 元）
 	smart := mustList(t, db, ListOptions{Sort: "smart", Limit: 1})
 	if len(smart.Bundles) != 1 || smart.Bundles[0].BundleID != bidC {
 		t.Fatalf("smart first=%v", listIDs(smart))
@@ -299,7 +291,6 @@ func TestRemovedViewExclusive(t *testing.T) {
 	db := seedBaseListDB(t)
 	execSeed(t, db, `INSERT INTO monitor_targets(target_type,target_id) VALUES('bundle',990101),('bundle',990103)`)
 	execSeed(t, db, `INSERT INTO monitor_exclusions(target_type,target_id,active,reason) VALUES('bundle',990101,1,'bundle_removed')`)
-	// A = excluded（bundle_removed），C = released（仅 target 行）→ 默认视图两者都不出现
 	if got := mustList(t, db, ListOptions{Limit: 10}).Total; got != 0 {
 		t.Fatalf("default total=%d", got)
 	}
@@ -325,7 +316,6 @@ func TestTrackedRegionFilter(t *testing.T) {
 		t.Fatalf("A lowest=%s diff=%d", a.LowestRegion, a.DiffFen)
 	}
 
-	// PK/BD 同进同出：启用含 pk 才放行两行
 	execSeed(t, db, `INSERT INTO bundle_region_prices(id,bundle_id,region_code,currency,price,discount_percent,bundle_base_discount,price_status,cny_fen,app_ids)
 		VALUES(11,990103,'pk','USD',100,0,10,'ok',100,'[990111,990112,990113]'),
 		      (12,990103,'BD','USD',90,0,10,'ok',90,'[990111,990112,990113]')`)
@@ -354,7 +344,6 @@ func TestTrackedRegionFilter(t *testing.T) {
 		t.Fatal("不含 pk 时 BD 行应剔除")
 	}
 
-	// 未追踪的便宜区不参与最低价
 	execSeed(t, db, `INSERT INTO bundle_region_prices(id,bundle_id,region_code,currency,price,discount_percent,bundle_base_discount,price_status,cny_fen,app_ids)
 		VALUES(13,990103,'TR','USD',100,0,10,'ok',5,'[990111,990112,990113]')`)
 	refreshSnapshots(t, db, []int64{bidC}, []string{"CN", "US"})
@@ -391,7 +380,6 @@ func TestOwnershipFiltersCountAllMembersBeforeLimit(t *testing.T) {
 		t.Fatalf("C account=%v", second.Bundles[0].Ownership.Account)
 	}
 
-	// 过滤在全量计数后分页：hide_owned 只剩 C
 	ownedHidden := mustList(t, db, ListOptions{HideOwned: true, Limit: 1, PrimarySteamID: "bundle-self"})
 	if ownedHidden.Total != 1 || ownedHidden.Bundles[0].BundleID != bidC {
 		t.Fatalf("hide_owned=%d %v", ownedHidden.Total, listIDs(ownedHidden))
@@ -409,7 +397,6 @@ func TestOwnershipFiltersCountAllMembersBeforeLimit(t *testing.T) {
 	if got := mustList(t, db, ListOptions{HideOwned: true, HideFamily: true, PrimarySteamID: "bundle-self"}).Total; got != 0 {
 		t.Fatalf("both hidden total=%d", got)
 	}
-	// 不过滤但存在拥有行：慢路径 + 页级补算仍然下发 ownership
 	plain := mustList(t, db, ListOptions{Limit: 10, PrimarySteamID: "bundle-self"})
 	a := itemByID(plain, bidA)
 	if got := a.Ownership.Type; got == nil || *got != "owned" {

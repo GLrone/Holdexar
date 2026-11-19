@@ -1,6 +1,7 @@
 package bills
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 	"golang.org/x/net/publicsuffix"
 	"holdexar/server-go/internal/account"
 )
@@ -31,7 +34,6 @@ var (
 	errStoreExpired = errors.New("Steam 商店会话已失效，请重新绑定后同步账单")
 	errStoreOwner   = errors.New("Steam 账单会话与目标账号不一致")
 	historyCursor   = regexp.MustCompile(`\bg_historyCursor\s*=\s*\{`)
-	billPageTitle   = regexp.MustCompile(`(?is)<title\b[^>]*>(.*?)</title>`)
 )
 
 type billSteamClient struct {
@@ -166,13 +168,30 @@ func (c *billSteamClient) get(ctx context.Context, target *url.URL, form url.Val
 	if err := checkStoreOwner(c.client.Jar, target, c.owner); err != nil {
 		return "", err
 	}
-	if title := billPageTitle.FindSubmatch(raw[:min(len(raw), 8192)]); len(title) == 2 {
-		text := strings.ToLower(string(title[1]))
-		if strings.Contains(text, "sign in") || strings.Contains(text, "登录") || strings.Contains(text, "登入") {
-			return "", errStoreExpired
-		}
+	if billTitleExpired(raw) {
+		return "", errStoreExpired
 	}
 	return string(raw), nil
+}
+
+// billTitleExpired 只扫响应前 8192 字节内的 <title> 文本判断是否返回登录页。
+func billTitleExpired(raw []byte) bool {
+	doc, err := html.Parse(bytes.NewReader(raw[:min(len(raw), 8192)]))
+	if err != nil {
+		return false
+	}
+	title := firstBillElement(doc, func(n *html.Node) bool { return n.DataAtom == atom.Title })
+	if title == nil {
+		return false
+	}
+	var text strings.Builder
+	for n := range title.Descendants() {
+		if n.Type == html.TextNode {
+			text.WriteString(n.Data)
+		}
+	}
+	lowered := strings.ToLower(text.String())
+	return strings.Contains(lowered, "sign in") || strings.Contains(lowered, "登录") || strings.Contains(lowered, "登入")
 }
 
 func (c *billSteamClient) probe(ctx context.Context, known string) (first string, unchanged bool, err error) {

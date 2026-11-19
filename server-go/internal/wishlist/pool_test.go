@@ -202,8 +202,6 @@ func TestPoolItemsMergeAccountFlagsAndKeepAccountFilters(t *testing.T) {
 	}
 }
 
-// reason 参数化回归：目录移除链传 catalog_removed 与恢复侧配对；默认路由
-// 仍写 pool_removed，行为不变。
 func TestPoolRemoveReasonParameterized(t *testing.T) {
 	p, db := poolFixture(t)
 	ctx := context.Background()

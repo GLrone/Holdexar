@@ -1,8 +1,5 @@
 package events
 
-// 跨语言帧等价对照：真实 venv 里 Python Event.as_sse() 与 Go AsSSE() 逐字节
-// 比对（ts 冻结）。无 venv 时自动跳过。
-
 import (
 	"bytes"
 	"context"
@@ -35,7 +32,7 @@ func TestAsSSECrossLanguage(t *testing.T) {
 		name   string
 		evType string
 		ts     float64
-		kwargs string // Python 字典字面量内容（可为空）
+		kwargs string
 		data   []KV
 	}{
 		{"状态事件", "job.started", 1730367300.123456,

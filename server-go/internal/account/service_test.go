@@ -87,7 +87,7 @@ func TestAccountBindingEncryptsAndKeepsPrimaryActiveAndWalletsSeparate(t *testin
 	}
 	status, e = s.Status(ctx)
 	wallet := status["wallet"].(map[string]any)
-	if e != nil || status["primary_steam_id"] != a || wallet["balance"] != float64(11) || wallet["region_code"] != "" {
+	if e != nil || status["primary_steam_id"] != a || wallet["balance"] != float64(11) || wallet["region_code"] != "cn" || wallet["country_code"] != "US" {
 		t.Fatalf("%v %v", status, e)
 	}
 	okAt := wallet["ok_at"]

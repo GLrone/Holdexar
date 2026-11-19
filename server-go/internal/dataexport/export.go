@@ -1,7 +1,3 @@
-// Package dataexport 敏感数据加密导出：本机用户数据打包为口令加密的单文件。
-// 只导出用户侧数据（凭据/关注/提醒/设置/订阅/账单等）；随包种子与公共目录、
-// 价格数据由发布包与爬虫重建。正文以导出口令经 scrypt 派生密钥做 AES-256-GCM
-// 加密；导出需当前主密钥可用（库内密文先解密再重新封装）。
 package dataexport
 
 import (
@@ -15,7 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,7 +35,6 @@ const (
 	seedKeyPrefix  = "seed."
 )
 
-// 用户侧数据表（导出白名单）；凭据类列解密后落盘。
 var userTables = []string{
 	"steam_accounts", "tracked_accounts", "wishlist_items",
 	"monitor_targets", "monitor_sources", "monitor_exclusions",
@@ -68,14 +63,12 @@ var excludesLabels = []string{
 	"插件凭据（恢复后需重新填写并启用插件）",
 }
 
-// ExportDir 导出目录（内含凭据副本）。
 func ExportDir(dataDir string) string {
 	path := filepath.Join(dataDir, exportDirName)
 	_ = os.MkdirAll(path, 0o700)
 	return path
 }
 
-// SafeExportPath 路径穿越防护：文件名仅限合法字符且必须落在导出目录内。
 func SafeExportPath(dataDir, name string) (string, error) {
 	if name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
 		return "", fmt.Errorf("非法导出文件名: %q", name)
@@ -100,8 +93,7 @@ func SafeExportPath(dataDir, name string) (string, error) {
 }
 
 type Result struct {
-	// Path 服务器绝对路径：仅内部使用（落盘/清理），不进 HTTP 响应
-	// （P0 审计：路径回显曾泄露服务器目录结构）。
+	// Path 为本机绝对路径，仅用于内部读写与清理，禁止输出到 HTTP 响应。
 	Path      string         `json:"-"`
 	Name      string         `json:"name"`
 	SizeBytes int64          `json:"sizeBytes"`
@@ -110,13 +102,11 @@ type Result struct {
 	Excludes  []string       `json:"excludes"`
 }
 
-// ValidationError 入参校验失败：HTTP 层映射为 400（不落 500）。
 type ValidationError struct{ err error }
 
 func (e ValidationError) Error() string { return e.err.Error() }
 func (e ValidationError) Unwrap() error { return e.err }
 
-// Create 组装 → 加密 → 落盘。口令过短 400，凭据锁定 409（由 HTTP 层映射）。
 func Create(ctx context.Context, db *sql.DB, dataDir, password string) (Result, error) {
 	var result Result
 	if len(password) < minPasswordLen {
@@ -167,9 +157,6 @@ type payload struct {
 	Tables        map[string][]map[string]any `json:"tables"`
 }
 
-// buildPayload 组装导出正文：app_settings 剔除种子 marker 并解密凭据键，
-// 用户表整表导出，steam_accounts.cookies / proxy_subscriptions.url 解密。
-// 凭据处于锁定态（口令模式未解锁）报 SecretBoxError 语义错误。
 func buildPayload(ctx context.Context, db *sql.DB, dataDir string) (payload, error) {
 	out := payload{
 		Format: Format, FormatVersion: FormatVersion,
@@ -294,11 +281,10 @@ func decryptOrRaw(dataDir string, value any, purpose string) any {
 	return text
 }
 
-// dumpTable 整表导出；表缺失（版本差异）按空表处理。
 func dumpTable(ctx context.Context, db *sql.DB, table string) ([]map[string]any, error) {
 	rows, err := db.QueryContext(ctx, `SELECT * FROM "`+table+`"`)
 	if err != nil {
-		return nil, nil // 表缺失：跳过
+		return nil, nil
 	}
 	defer rows.Close()
 	cols, err := rows.Columns()
@@ -324,7 +310,6 @@ func dumpTable(ctx context.Context, db *sql.DB, table string) ([]map[string]any,
 	return out, rows.Err()
 }
 
-// jsonValue 驱动原生类型 → JSON 安全类型（BLOB 走 base64 文本）。
 func jsonValue(value any) any {
 	switch typed := value.(type) {
 	case []byte:
@@ -390,7 +375,6 @@ func encryptPayload(body payload, password string) (envelope, error) {
 	}, nil
 }
 
-// List 已有导出文件（新→旧）。
 func List(dataDir string) []map[string]any {
 	entries, err := os.ReadDir(ExportDir(dataDir))
 	if err != nil {
@@ -410,7 +394,7 @@ func List(dataDir string) []map[string]any {
 			found = append(found, entry{item.Name(), info.Size(), info.ModTime()})
 		}
 	}
-	sort.Slice(found, func(i, j int) bool { return found[i].modified.After(found[j].modified) })
+	slices.SortFunc(found, func(a, b entry) int { return b.modified.Compare(a.modified) })
 	items := make([]map[string]any, 0, len(found))
 	for _, item := range found {
 		items = append(items, map[string]any{
@@ -421,7 +405,6 @@ func List(dataDir string) []map[string]any {
 	return items
 }
 
-// marshalJSON 紧凑序列化（不转义 UTF-8 之外的 HTML 字符）。
 func marshalJSON(value any) ([]byte, error) {
 	buffer := &strings.Builder{}
 	encoder := json.NewEncoder(buffer)

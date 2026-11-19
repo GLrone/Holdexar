@@ -1,16 +1,15 @@
 package games
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 )
 
-// 全版本 × 全区最新价（走势抽屉「全部版本」区块）。聚合 history 每
-// (region_code, sub_id) 的最新 ok 行（snapshot_at,id 升序扫描后覆盖 =
-// 最新胜出）；is_bundle 行整组剔除（捆绑包由「关联捆绑包」区块承接）。
+// 按 (region_code, sub_id) 聚合最新 ok 行，剔除 is_bundle 行。
 
 type versionRegionPrice struct {
 	Cents     int64  `json:"cents"`
@@ -75,7 +74,7 @@ func (h *handler) gameVersions(ctx context.Context, appid int64) (map[string]any
 	}
 	latest := map[pairKey]versionHistoryRow{}
 	metas := map[int64]*subMeta{}
-	var subOrder []int64 // 非 bundle sub 的首次出现序（版本组顺序）
+	var subOrder []int64
 	for rows.Next() {
 		var it versionHistoryRow
 		var gold, bundle sql.NullBool
@@ -95,7 +94,6 @@ func (h *handler) gameVersions(ctx context.Context, appid int64) (map[string]any
 				subOrder = append(subOrder, it.subID)
 			}
 		} else if it.suffix != nil && *it.suffix != "" && (meta.suffix == nil || *meta.suffix == "") {
-			// 行间版本元信息以非空者为准（理论上同 sub 恒定）
 			meta.suffix = it.suffix
 		}
 	}
@@ -120,7 +118,7 @@ func (h *handler) gameVersions(ctx context.Context, appid int64) (map[string]any
 	for key, row := range latest {
 		i, ok := idx[key.subID]
 		if !ok {
-			continue // bundle 行改道「关联捆绑包」区块
+			continue
 		}
 		cnyFen := row.cnyFen
 		if cnyFen == nil {
@@ -147,16 +145,22 @@ func (h *handler) gameVersions(ctx context.Context, appid int64) (map[string]any
 		}
 	}
 
-	// 排序：标准版（无后缀非 gold）→ 有后缀 → gold；稳定排序保留首现序。
-	sort.SliceStable(versions, func(i, j int) bool {
-		a, b := versionPriceKey(versions[i]), versionPriceKey(versions[j])
-		if a.first != b.first {
-			return a.first < b.first
+	// 排序：标准版优先，其余按 (suffix, isGold) 升序，稳定保留首现序。
+	slices.SortStableFunc(versions, func(a, b gameVersionPrices) int {
+		ka, kb := versionPriceKey(a), versionPriceKey(b)
+		if c := cmp.Compare(ka.first, kb.first); c != 0 {
+			return c
 		}
-		if a.suffix != b.suffix {
-			return a.suffix < b.suffix
+		if c := cmp.Compare(ka.suffix, kb.suffix); c != 0 {
+			return c
 		}
-		return !a.gold && b.gold
+		if ka.gold != kb.gold {
+			if !ka.gold {
+				return -1
+			}
+			return 1
+		}
+		return 0
 	})
 	return map[string]any{"versions": versions}, nil
 }

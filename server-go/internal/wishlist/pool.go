@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -331,7 +331,7 @@ func (p *Pool) Items(ctx context.Context, steamid *string) ([]map[string]any, er
 	for id := range merged {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	out := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, merged[id])

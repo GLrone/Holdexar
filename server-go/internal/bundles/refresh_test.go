@@ -1,9 +1,5 @@
 package bundles
 
-// 刷新链测试夹具与流程用例（对照 Python test_bundle_refresh_scope.py +
-// test_bundle_browse_layer.py 的落库断言）。出网打桩：browse 端点覆盖到
-// 本地 httptest 服务器；限流/熔断/汇率缓存随测试 Service 实例隔离。
-
 import (
 	"context"
 	"database/sql"
@@ -23,7 +19,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// openRefreshDB 建刷新/导入链所需的最小表集（列对齐 bootstrap_schema 实际触碰面）。
 func openRefreshDB(t *testing.T) (*sql.DB, *store.WriteGate) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "bundles-refresh.db")
@@ -63,7 +58,6 @@ func openRefreshDB(t *testing.T) (*sql.DB, *store.WriteGate) {
 	return db, store.NewWriteGate(db, path)
 }
 
-// newRefreshService 测试档刷新服务：时钟冻结、快失败客户端、限流/熔断实例隔离。
 func newRefreshService(t *testing.T, db *sql.DB, gate *store.WriteGate) *Service {
 	t.Helper()
 	mon := monitoring.New(db, gate)
@@ -81,7 +75,6 @@ func newRefreshService(t *testing.T, db *sql.DB, gate *store.WriteGate) *Service
 	return svc
 }
 
-// browseStub browse 端点打桩：记录每次请求的 input_json，按注册的回调应答。
 type browseStub struct {
 	mu      sync.Mutex
 	queries []string
@@ -115,7 +108,6 @@ func (st *browseStub) count() int {
 	return len(st.queries)
 }
 
-// stubSpec input_json 请求体的对齐解析面。
 type stubSpec struct {
 	IDs []struct {
 		AppID     int64 `json:"appid"`
@@ -136,7 +128,6 @@ func parseSpec(t *testing.T, raw string) stubSpec {
 	return spec
 }
 
-// specIDs 按 bundleid/packageid 键取请求的业务编号。
 func specIDs(t *testing.T, spec stubSpec, kind string) []int64 {
 	t.Helper()
 	out := make([]int64, 0, len(spec.IDs))
@@ -154,22 +145,21 @@ func specIDs(t *testing.T, spec stubSpec, kind string) []int64 {
 	return out
 }
 
-// stubItem browse 条目构造（对齐 Python test_bundle_browse_layer._item）。
 func stubItem(id int64, kw map[string]any) map[string]any {
 	base := map[string]any{
-		"id":             float64(id),
-		"item_type":      float64(2),
-		"name":           "Overcooked! 2 - Complete the Set",
-		"store_url_slug": "Overcooked_2_Complete_the_Set",
-		"success":        float64(1),
-		"visible":        true,
+		"id":              float64(id),
+		"item_type":       float64(2),
+		"name":            "Overcooked! 2 - Complete the Set",
+		"store_url_slug":  "Overcooked_2_Complete_the_Set",
+		"success":         float64(1),
+		"visible":         true,
 		"included_appids": []any{float64(728880), float64(858240)},
 		"best_purchase_option": map[string]any{
-			"final_price_in_cents":   float64(4856),
+			"final_price_in_cents":    float64(4856),
 			"original_price_in_cents": float64(5396),
-			"discount_pct":           float64(10),
-			"bundle_discount_pct":    float64(10),
-			"package_group":          "default",
+			"discount_pct":            float64(10),
+			"bundle_discount_pct":     float64(10),
+			"package_group":           "default",
 		},
 		"assets": map[string]any{
 			"asset_url_format": "steam/bundles/13608/${FILENAME}",
@@ -182,7 +172,6 @@ func stubItem(id int64, kw map[string]any) map[string]any {
 	return base
 }
 
-// itemsPayload 逐 id 生成 store_items 应答（与请求 ids 位置对齐）。
 func itemsPayload(items ...map[string]any) any {
 	if items == nil {
 		items = []map[string]any{}
@@ -264,11 +253,10 @@ func assertZeroSkip(t *testing.T, res RefreshResult) {
 	}
 }
 
-// refreshScopeIDs 候选集探针（对齐 test_bundle_refresh_scope.py 的三包布局）。
 const (
-	scopeA = int64(99710401) // 星标关注
-	scopeB = int64(99710402) // 手动导入
-	scopeC = int64(99710403) // 无监控记录（发现桩形态）
+	scopeA = int64(99710401)
+	scopeB = int64(99710402)
+	scopeC = int64(99710403)
 )
 
 func seedScopeBundles(t *testing.T, db *sql.DB) {
@@ -289,7 +277,6 @@ func TestRefreshOnlyCoversWatchedBundles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 每个 bundleid 请求回对齐条目；出现 packageid 或 scopeC 即失败
 	asked := map[int64]bool{}
 	st := stubBrowse(t, func(q string) (int, any) {
 		spec := parseSpec(t, q)
@@ -325,11 +312,9 @@ func TestRefreshOnlyCoversWatchedBundles(t *testing.T) {
 	if !asked[scopeA] || !asked[scopeB] {
 		t.Fatalf("watched=%v", asked)
 	}
-	// 关注集每区一发（同区同形态一批发完），不是每包每区
 	if n := st.count(); n != 1 {
 		t.Fatalf("requests=%d", n)
 	}
-	// 落库核对：主档 name/updated_at 与区价行
 	var name string
 	var updated sql.NullString
 	if err := db.QueryRow(`SELECT name,CAST(updated_at AS TEXT) FROM bundles WHERE bundle_id=?`, scopeA).Scan(&name, &updated); err != nil {
@@ -348,7 +333,6 @@ func TestRefreshOnlyCoversWatchedBundles(t *testing.T) {
 	if got := mustInt(t, db, `SELECT must_purchase_as_set FROM bundles WHERE bundle_id=?`, scopeA); got != 0 {
 		t.Fatalf("A mps=%d（bundle 形态有选项未标整包 → 可补齐）", got)
 	}
-	// 排序快照已随链尾重建（无价包 C 仍为 NULL）
 	if got := mustInt(t, db, `SELECT diff_fen FROM bundles WHERE bundle_id=?`, scopeA); got != 0 {
 		t.Fatalf("A diff=%d", got)
 	}
@@ -421,7 +405,6 @@ func TestRefreshSingletonPurgedAndCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 单品有抓取结果 → 不进 failed；ok 仍为 true（对齐 Python ok = not failed）
 	if !res.OK || res.Updated != 0 || res.Total != 1 || res.RegionPrices != 0 ||
 		len(res.Failed) != 0 || res.DroppedSingletons == nil || *res.DroppedSingletons != 1 {
 		t.Fatalf("result=%+v", res)
@@ -437,7 +420,7 @@ func TestRefreshSingletonPurgedAndCounted(t *testing.T) {
 func TestRefreshFlipsShapeWhenPrimaryKindMisses(t *testing.T) {
 	db, gate := openRefreshDB(t)
 	svc := newRefreshService(t, db, gate)
-	seedBundleRow(t, db, scopeA, "错形态导入", -1, 0) // 库内形态 bundle
+	seedBundleRow(t, db, scopeA, "错形态导入", -1, 0)
 	watchBundle(t, svc, scopeA, "import")
 	seedCrawlRegion(t, db, "cn", true, 1)
 	var bundleidRounds, packageRounds int
@@ -446,16 +429,16 @@ func TestRefreshFlipsShapeWhenPrimaryKindMisses(t *testing.T) {
 		if len(specIDs(t, spec, "packageid")) > 0 {
 			packageRounds++
 			return http.StatusOK, itemsPayload(stubItem(scopeA, map[string]any{
-				"name":             "真身是 sub",
-				"item_type":        float64(1),
-				"included_appids":  []any{float64(99710411), float64(99710412)},
+				"name":            "真身是 sub",
+				"item_type":       float64(1),
+				"included_appids": []any{float64(99710411), float64(99710412)},
 				"best_purchase_option": map[string]any{
 					"final_price_in_cents": float64(1499), "package_group": "default",
 				},
 			}))
 		}
 		bundleidRounds++
-		return http.StatusOK, itemsPayload() // bundleid 一条真实条目都没有
+		return http.StatusOK, itemsPayload()
 	})
 
 	res, err := svc.RefreshFollowed(context.Background())
@@ -520,9 +503,8 @@ func TestUpsertStaleCleanupAndLowercaseAuthority(t *testing.T) {
 func TestUpsertTieVoteKeepsStoredSemantics(t *testing.T) {
 	db, gate := openRefreshDB(t)
 	svc := newRefreshService(t, db, gate)
-	seedBundleRow(t, db, 990401, "旧名", 1, 0) // 库内 mps=1（必须整包）、形态 bundle
+	seedBundleRow(t, db, 990401, "旧名", 1, 0)
 	rateMap := map[string]float64{"CNY": 1.0}
-	// 两区 mps 票 {0,1} 平票、kind 票 {1,0} 平票 → 均不改写库内值
 	regions := []regionRow{
 		{BundleID: 990401, RegionCode: "cn", Currency: "CNY", Price: iptr(10000), AppIDs: []int64{728880, 858240},
 			PriceStatus: "ok", MPS: iptr(0), ItemKind: iptr(1), Kind: "bundleid"},
@@ -539,7 +521,6 @@ func TestUpsertTieVoteKeepsStoredSemantics(t *testing.T) {
 	if got := mustInt(t, db, `SELECT item_kind FROM bundles WHERE bundle_id=990401`); got != 0 {
 		t.Fatalf("kind=%d（平票不改写）", got)
 	}
-	// 条目未带 name → 主档名不改写（有值才覆盖）
 	var name string
 	if err := db.QueryRow(`SELECT name FROM bundles WHERE bundle_id=990401`).Scan(&name); err != nil {
 		t.Fatal(err)
@@ -553,16 +534,14 @@ func TestUpsertMajorityWinsAndNewRowDefaults(t *testing.T) {
 	db, gate := openRefreshDB(t)
 	svc := newRefreshService(t, db, gate)
 	rateMap := map[string]float64{"CNY": 1.0}
-	// 三区 kind 票 {1,1,0} → 1；mps 票全 1 → 1（Sub 形态恒不可拆）
 	regions := []regionRow{
 		{BundleID: 990402, RegionCode: "cn", Currency: "CNY", Price: iptr(10000), AppIDs: []int64{728880, 858240},
-			PriceStatus: "locked", ItemKind: iptr(1), Kind: "bundleid"}, // 锁区行 mps=nil 不投票
+			PriceStatus: "locked", ItemKind: iptr(1), Kind: "bundleid"},
 		{BundleID: 990402, RegionCode: "us", Currency: "USD", Price: nil,
-			PriceStatus: "locked", ItemKind: iptr(1), MPS: iptr(1), Kind: "packageid"}, // 锁区行无 included_appids
+			PriceStatus: "locked", ItemKind: iptr(1), MPS: iptr(1), Kind: "packageid"},
 		{BundleID: 990402, RegionCode: "jp", Currency: "JPY", Price: iptr(499500), AppIDs: []int64{728880, 858240},
 			PriceStatus: "ok", MPS: iptr(1), ItemKind: iptr(1), Kind: "packageid"},
 	}
-	// 锁区行（无真实选项）AppIDs 为 nil → 落 "[]"（Python or [] 语义）
 	stored, err := svc.upsertBundleRows(context.Background(), 990402, regions, rateMap, "2026-11-14 12:00:00.000000", false)
 	if err != nil || !stored {
 		t.Fatalf("stored=%v err=%v", stored, err)
@@ -573,7 +552,6 @@ func TestUpsertMajorityWinsAndNewRowDefaults(t *testing.T) {
 	if got := mustInt(t, db, `SELECT must_purchase_as_set FROM bundles WHERE bundle_id=990402`); got != 1 {
 		t.Fatalf("mps=%d", got)
 	}
-	// 新行 region 行逐列核对（locked 行照写、无价行 cny NULL）
 	var currency sql.NullString
 	var price, originalPrice, cny sql.NullInt64
 	var status string
@@ -597,7 +575,6 @@ func TestUpsertMajorityWinsAndNewRowDefaults(t *testing.T) {
 	if appIDs != "[]" {
 		t.Fatalf("us app_ids=%q（无 included_appids 落空数组）", appIDs)
 	}
-	// 排序快照列未被 upsert 触碰（is_lowest/diff_fen 缺省）
 	if got := mustInt(t, db, `SELECT is_lowest FROM bundles WHERE bundle_id=990402`); got != 0 {
 		t.Fatalf("is_lowest=%d", got)
 	}
@@ -633,5 +610,39 @@ func TestErrRegionsDisabledSentinel(t *testing.T) {
 	}
 	if err.Error() != "未启用任何区服：请先在「我」页勾选要爬取的地区" {
 		t.Fatalf("msg=%q", err.Error())
+	}
+}
+
+func TestEnqueueEnsureGameExistsUsesSeriesOverridesFromDataDir(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "holdexar.db")
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := store.InitializeFreshDatabase(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO app_settings(key,value_json) VALUES('games.derived_inputs', '{"day":"2026-11-06","series":{}}')
+		ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json`); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(db, store.NewWriteGate(db, dbPath), monitoring.New(db, store.NewWriteGate(db, dbPath)))
+	called := 0
+	svc.LoadOverrides = func() (map[string][]int64, []string) {
+		called++
+		return map[string][]int64{"CustomSeries": {777}}, []string{"CustomSeries"}
+	}
+	if err := svc.ensureGameExists(ctx, 777, "Override Game"); err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("expected LoadOverrides to be called once, got %d", called)
+	}
+	var series string
+	if err := db.QueryRow(`SELECT COALESCE(series_id,'') FROM games WHERE appid=777`).Scan(&series); err != nil || series != "CustomSeries" {
+		t.Fatalf("series_id=%q err=%v", series, err)
 	}
 }

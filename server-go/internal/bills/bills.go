@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// ImportRecord 单次账单导入的聚合行（金额口径：人民币分）。
 type ImportRecord struct {
 	ID            int64
 	SteamID       sql.NullString
@@ -20,8 +19,6 @@ type ImportRecord struct {
 	FxMissing     int64
 }
 
-// PyIsoformat 对齐 datetime.isoformat：空格→T 分隔、微秒为 0 时省略小数段、
-// 解析失败原样返回（与 games 包 goIsoformat 同径，bills 包自持）。
 func PyIsoformat(v string) string {
 	if v == "" {
 		return v
@@ -32,9 +29,6 @@ func PyIsoformat(v string) string {
 	return strings.TrimSuffix(v, ".000000")
 }
 
-// ListImports 已导入账单列表（新→旧）：BillImport LEFT JOIN 按区交易账本，
-// spend=非退款 cny_fen 合计、refund=退款 |cny_fen| 合计、orders=非退款笔数、
-// fxMissing=cny_fen 缺失笔数（含退款行）。
 func ListImports(ctx context.Context, db *sql.DB) ([]ImportRecord, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT b.id, b.steam_id, b.nickname, b.source_file, CAST(b.imported_at AS TEXT),

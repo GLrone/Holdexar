@@ -2,7 +2,7 @@ package games
 
 import (
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -102,7 +102,6 @@ func derefInt(v *int64) any {
 	return *v
 }
 
-// derefZero NULL → 0（矩阵第二位口径）。
 func derefZero(v *int64) int64 {
 	if v == nil {
 		return 0
@@ -110,8 +109,6 @@ func derefZero(v *int64) int64 {
 	return *v
 }
 
-// pyFloat Python float 的 JSON 形态：整值浮点必须带一位小数（96.0 而非 96），
-// 与 json.dumps 的浮点 repr 对齐。
 type pyFloat float64
 
 func (f pyFloat) MarshalJSON() ([]byte, error) {
@@ -122,7 +119,6 @@ func (f pyFloat) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.FormatFloat(v, 'g', -1, 64)), nil
 }
 
-// rateRatio positive_rate / 100（Python 同款口径）。
 func rateRatio(v *int64) *pyFloat {
 	if v == nil {
 		return nil
@@ -140,7 +136,6 @@ func buildSteamStoreURL(appid int64) string {
 	return "https://store.steampowered.com/app/" + strconv.FormatInt(appid, 10) + "/"
 }
 
-// buildListItem 列表项：cnyFen 只读快照列（GET 不回算汇率）；覆盖分母 = 启用区服。
 func buildListItem(g gameRow, cn *cnRow, prices []priceRow, regionsExpected []string, pendingUnits map[string]bool) listItem {
 	var baseCnPrice *int64
 	if cn != nil {
@@ -250,8 +245,7 @@ func cnDiscountEnds(cn *cnRow) *int64 {
 	return cn.discountEndTs
 }
 
-// buildCoverage 覆盖（唯一事实源 = 活表尝试状态）：分母 = 启用区服；
-// regions 只点名非成功区。启用区为空时不给覆盖。
+// buildCoverage 以启用区服为分母统计活表尝试状态，regions 仅列非成功区。
 func buildCoverage(rows []priceRow, regionsExpected []string) map[string]any {
 	if len(regionsExpected) == 0 {
 		return nil
@@ -315,7 +309,6 @@ const (
 	laggingHours = 12.0
 )
 
-// regionalFreshness 同一份价格行生成地区明细与对象新鲜度（纯函数，不取价）。
 func regionalFreshness(rows []priceRow, regions []string, pendingUnits map[string]bool) map[string]any {
 	indexed := map[string]*priceRow{}
 	for i := range rows {
@@ -343,7 +336,6 @@ func regionalFreshness(rows []priceRow, regions []string, pendingUnits map[strin
 			units[code] = map[string]any{
 				"status": "notAttempted", "outcome": "notAttempted", "answer": nil,
 				"lastSuccessAt": nil, "lastAttemptAt": nil, "ageHours": nil, "freshness": nil,
-				// pending 集来自爬取域（deferred），恒走降级表达式
 				"pending": true, "needsUpdate": true,
 			}
 			continue
@@ -392,8 +384,6 @@ func regionalFreshness(rows []priceRow, regions []string, pendingUnits map[strin
 	}
 }
 
-// goIsoformat 库内 naive 文本（空格分隔）→ Python datetime.isoformat 形态
-// （T 分隔；微秒为 0 时省略小数段）。无法解析时原样返回。
 func goIsoformat(text string) string {
 	t, ok := parseStoredTime(text)
 	if !ok {
@@ -405,9 +395,7 @@ func goIsoformat(text string) string {
 	return t.Format("2006-01-02T15:04:05.000000")
 }
 
-// pyHours 复刻 Python (reference - observed).total_seconds() / 3600.0 的浮点
-// 路径：微秒整数（datetime 精度）→ /1e6 → /3600 两次除法，避免单次除法在
-// 舍入边界产生末位分歧。
+// pyHours 按微秒整数先除 1e6 再除 3600，保持小时浮点舍入边界一致。
 func pyHours(d time.Duration) float64 {
 	return (float64(int64(d)/1000) / 1e6) / 3600.0
 }
@@ -420,7 +408,6 @@ func goIsoformatPtr(v *string) *string {
 	return &s
 }
 
-// freshnessOf 观察时刻 → (observedAt, ageHours, freshness)；无数据三者皆空。
 func freshnessOf(observedAt *string, now time.Time) (any, *float64, any) {
 	if observedAt == nil {
 		return nil, nil, nil
@@ -470,6 +457,6 @@ func minNonNil(a, b *int64) *int64 {
 func sortedStrings(s []string) []string {
 	out := make([]string, len(s))
 	copy(out, s)
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }

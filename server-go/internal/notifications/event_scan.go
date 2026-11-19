@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 
 	"holdexar/server-go/internal/store"
 )
@@ -265,7 +265,7 @@ func (s *DeliveryService) ResumeEventScans(ctx context.Context, cycleID *int64) 
 		if e != nil {
 			return 0, e
 		}
-		sort.Slice(watched, func(i, j int) bool { return watched[i] < watched[j] })
+		slices.Sort(watched)
 	}
 	var created int64
 	for _, id := range ids {

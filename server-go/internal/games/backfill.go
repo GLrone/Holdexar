@@ -13,21 +13,14 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// 社区历史源回填派发：同键在飞直接返回运行态，不重复派发。执行者经
-// HistorySource 注入（数据源插件 / 本地适配器）；nil = 未安装，端点显式
-// 拒绝并给用户语言原因。派发只改历史事实与同步状态，不动价格事件/告警管线；
-// 前端轮询本地只读的 /history 拿新点。
-
-// HistorySource 社区历史源执行者契约：只负责按 appid×region 取回观测批次；
-// 校验、佐证去重与统一写入全部由核心执行。
+// HistorySource 按 appid×region 取回观测批次，去重与合流写入由核心执行。
 type HistorySource interface {
 	Fetch(ctx context.Context, appid int64, region string) ([]dbwriter.CommunityObservation, error)
 }
 
 var ErrHistorySourceUnavailable = errors.New("社区历史数据源未安装，可在设置 → 插件中添加")
 
-// HistoryBackfill 回填派发与同步状态管理。上下文用进程级后台 ctx——
-// 请求断开不中断在途回填。
+// HistoryBackfill 持有进程级后台上下文，请求断开不中断在途回填。
 type HistoryBackfill struct {
 	background context.Context
 	db         *sql.DB
@@ -40,7 +33,6 @@ type HistoryBackfill struct {
 	inflight map[string]struct{}
 }
 
-// NewHistoryBackfill 构造回填管理器（source 缺省 nil = 数据源未安装）。
 func NewHistoryBackfill(ctx context.Context, db *sql.DB, gate *store.WriteGate, log func(format string, args ...any)) *HistoryBackfill {
 	writer := dbwriter.NewWriter(db, gate)
 	writer.Log = log
@@ -50,7 +42,6 @@ func NewHistoryBackfill(ctx context.Context, db *sql.DB, gate *store.WriteGate, 
 	}
 }
 
-// SetSource 注册/替换社区历史源执行者；nil = 卸载数据源（已合流历史保留）。
 func (b *HistoryBackfill) SetSource(source HistorySource) {
 	b.mu.Lock()
 	b.source = source
@@ -67,8 +58,6 @@ func backfillKey(appid int64, regionUpper string) string {
 	return strconv.FormatInt(appid, 10) + "|" + regionUpper
 }
 
-// Start 派发一次回填。返回 started=false 且 state="running" 表示同键在飞；
-// 未安装数据源返回用户语言错误（端点转 409）。
 func (b *HistoryBackfill) Start(appid int64, region string) (bool, string, error) {
 	regionUpper := strings.ToUpper(strings.TrimSpace(region))
 	if regionUpper == "" {
@@ -139,8 +128,7 @@ func (b *HistoryBackfill) run(ctx context.Context, appid int64, regionUpper stri
 	}
 }
 
-// recordState 整轮回填末尾写一次同步状态（行为状态，非事实账本；丢失可安全
-// 重建——重抓幂等去重，不回拨本地观测）。整轮全量替换：状态只描述最近一轮。
+// recordState 全量覆写最近一轮同步状态（非事实账本，丢失可重抓幂等重建）。
 func (b *HistoryBackfill) recordState(appid int64, regionUpper string, pointsStored int, failure string) {
 	now := b.writer.Now().Format("2006-01-02 15:04:05")
 	var lastOk, lastEmpty, lastErrAt, lastErr any
@@ -171,7 +159,6 @@ func (b *HistoryBackfill) recordState(appid int64, regionUpper string, pointsSto
 	}
 }
 
-// Brief 图表只读接口附带的最小同步状态（行为状态，非事实）。
 func (b *HistoryBackfill) Brief(ctx context.Context, appid int64, regionUpper string) historyBrief {
 	b.mu.Lock()
 	_, busy := b.inflight[backfillKey(appid, regionUpper)]
@@ -185,7 +172,6 @@ func (b *HistoryBackfill) Brief(ctx context.Context, appid int64, regionUpper st
 		 FROM history_backfill_state WHERE appid=? AND region_code=?`,
 		appid, regionUpper).Scan(&lastOk, &lastEmpty, &lastErrAt, &lastErr)
 	if e != nil {
-		// 无状态行 / 读失败都按 idle 呈现：状态可丢失重建，不是事实账本。
 		return historyBrief{State: "idle"}
 	}
 	state := "ok"

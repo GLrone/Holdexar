@@ -1,9 +1,5 @@
 package eventstream
 
-// 整栈集成：与 serverd 同构的 access 闸 + Register 装配，验证 SSE 端点
-// 受本地会话闸保护（无会话 401）且带会话可流式——EventSource 靠 Cookie
-// 携带凭据，这正是会话令牌以 Cookie 为主承载的原因。
-
 import (
 	"bufio"
 	"context"
@@ -29,7 +25,6 @@ func TestStackSessionGatesStream(t *testing.T) {
 	srv := httptest.NewServer(gate.Middleware(mux))
 	defer srv.Close()
 
-	// 无会话：两条流端点均 401
 	for _, path := range []string{"/api/v1/events/stream", "/api/v1/system/logs/stream"} {
 		resp, err := http.Get(srv.URL + path)
 		if err != nil {
@@ -42,7 +37,6 @@ func TestStackSessionGatesStream(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	// 取会话 Cookie（等价 dev 通道发放；发放路由本身归 systemx 测试）
 	rec := httptest.NewRecorder()
 	gate.Issue(rec)
 	cookie := rec.Result().Cookies()[0]

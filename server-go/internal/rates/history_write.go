@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/url"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +24,7 @@ func (s *Service) fetchHistory(ctx context.Context, window gapWindow) (map[strin
 			quotes = append(quotes, code)
 		}
 	}
-	sort.Strings(quotes)
+	slices.Sort(quotes)
 	params := url.Values{"from": {window.Start}, "to": {window.End}, "base": {"USD"}, "quotes": {strings.Join(quotes, ",")}}
 	data, err := s.opts.Fetch(ctx, HistoryURL+"?"+params.Encode(), 30*time.Second)
 	if err != nil {
@@ -104,13 +104,13 @@ func (s *Service) writeHistory(ctx context.Context, data map[string]map[string]f
 	for day := range data {
 		days = append(days, day)
 	}
-	sort.Strings(days)
+	slices.Sort(days)
 	for _, day := range days {
 		codes := []string{}
 		for code := range data[day] {
 			codes = append(codes, code)
 		}
-		sort.Strings(codes)
+		slices.Sort(codes)
 		for _, code := range codes {
 			if allowedCurrencies[code] {
 				values = append(values, map[string]any{"date": day, "code": code, "rate": data[day][code]})

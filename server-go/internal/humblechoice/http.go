@@ -2,10 +2,10 @@ package humblechoice
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/sched"
 )
 
@@ -17,9 +17,7 @@ type game struct {
 	OriginalPriceFen *int64  `json:"originalPriceFen"`
 	Discount         int     `json:"discount"`
 	LowestCnyFen     *int64  `json:"lowestCnyFen"`
-	// Platform 非 Steam 平台标识（blizzard/epic/ubisoft/gog/origin/ea/itch/
-	// drm-free…原值下发，展示层本地化）；Steam 游戏无此字段。
-	Platform string `json:"platform,omitempty"`
+	Platform         string  `json:"platform,omitempty"`
 }
 
 func (s *Service) Offers(ctx context.Context) (map[string]any, error) {
@@ -51,8 +49,7 @@ func (s *Service) Offers(ctx context.Context) (map[string]any, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// 非 Steam 平台游戏：appid 不存在（games 账本是 Steam appid 主导），
-	// 以状态记录里的平台标识直接下发（appid=0，前端按平台徽章渲染）
+	// 非 Steam 平台游戏无 appid，以 appid=0 与平台标识下发。
 	for _, pg := range previous.PlatformGames {
 		thumb := pg.Thumbnail
 		games = append(games, game{
@@ -89,11 +86,10 @@ func (s *Service) Register(mux *http.ServeMux) {
 }
 
 func (s *Service) respond(w http.ResponseWriter, result map[string]any, err error) {
-	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		s.opts.Log("Humble Choice 请求未完成：%v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		result = map[string]any{"detail": "暂时无法更新 Humble Choice"}
+		httpx.WriteJSON(w, http.StatusInternalServerError, map[string]any{"detail": "暂时无法更新 Humble Choice"})
+		return
 	}
-	_ = json.NewEncoder(w).Encode(result)
+	httpx.WriteJSON(w, http.StatusOK, result)
 }

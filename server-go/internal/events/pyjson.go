@@ -1,13 +1,12 @@
 package events
 
-// Python json.dumps 缺省参数的线格式渲染（ensure_ascii=False、分隔符 ", "/": "、
-// 浮点 repr）。本包专用副本：与 rates/dbwriter 的存储格式 pyformat 同源不同
-// profile（这里是线格式，非 ASCII 原样 UTF-8），包间禁 import 各自持有。
+// 线格式 JSON 编码（ensure_ascii=False、", "/": " 分隔、浮点兼容 repr），与存储序列化独立维护。
+// SSE 帧字节格式为跨端对齐面，与 Python 实现逐字节对照。
 
 import (
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -69,12 +68,11 @@ func pyValue(b *strings.Builder, v any) {
 	case []KV:
 		pyObject(b, x)
 	case map[string]any:
-		// 兜底：Go map 无序，按键排序保证输出确定；需保持键序的调用方用 []KV
 		keys := make([]string, 0, len(x))
 		for k := range x {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		b.WriteByte('{')
 		for i, k := range keys {
 			if i > 0 {
@@ -90,8 +88,6 @@ func pyValue(b *strings.Builder, v any) {
 	}
 }
 
-// pyString ensure_ascii=False 转义：双引号/反斜杠/五类控制短写，其余控制位
-// \uXXXX 小写 hex；非 ASCII（含增补平面）原样 UTF-8。
 func pyString(b *strings.Builder, s string) {
 	b.WriteByte('"')
 	for _, r := range s {
@@ -124,8 +120,6 @@ func pyString(b *strings.Builder, s string) {
 	b.WriteByte('"')
 }
 
-// pyFloat 对齐 Python repr(float)：最短往返十进制，小数点指数位 -4 < decpt <= 16
-// 用定点（整值补 .0），否则科学计数（指数带符号、最少两位）。
 func pyFloat(b *strings.Builder, f float64) {
 	if math.IsNaN(f) {
 		b.WriteString("NaN")

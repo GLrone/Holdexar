@@ -62,7 +62,6 @@ func TestForgetLifecycleRefusalAndErasure(t *testing.T) {
 	ctx := context.Background()
 	on, off := true, false
 
-	// 仅 favorite 来源且激活中：拒绝，数据不动
 	if _, e := s.Apply(ctx, "bundle", []int64{1}, Change{Sources: map[int64][]string{1: {"favorite"}}, AddOnly: true}); e != nil {
 		t.Fatal(e)
 	}
@@ -71,7 +70,6 @@ func TestForgetLifecycleRefusalAndErasure(t *testing.T) {
 	}
 	assertCounts(t, db, 1, 1, 0)
 
-	// favorite+import 多来源：摘星后 import 仍激活 → 拒绝；全摘 released 后 → 允许
 	if _, e := s.Apply(ctx, "bundle", []int64{2}, Change{Sources: map[int64][]string{2: {"favorite", "import"}}, AddOnly: true}); e != nil {
 		t.Fatal(e)
 	}
@@ -87,9 +85,8 @@ func TestForgetLifecycleRefusalAndErasure(t *testing.T) {
 	if applied, e := s.Forget(ctx, "bundle", 2); e != nil || !applied {
 		t.Fatalf("released 后 forget=%v err=%v", applied, e)
 	}
-	assertCounts(t, db, 1, 1, 0) // target 行与来源历史行（含 inactive）全部消失
+	assertCounts(t, db, 1, 1, 0)
 
-	// 激活排除：拒绝
 	if _, e := s.Apply(ctx, "bundle", []int64{3}, Change{Excluded: &on, Reason: "bundle_removed"}); e != nil {
 		t.Fatal(e)
 	}
@@ -98,13 +95,11 @@ func TestForgetLifecycleRefusalAndErasure(t *testing.T) {
 	}
 	assertCounts(t, db, 2, 1, 1)
 
-	// 无记录：直接成功
 	if applied, e := s.Forget(ctx, "bundle", 99); e != nil || !applied {
 		t.Fatalf("无记录 forget=%v err=%v", applied, e)
 	}
 	assertCounts(t, db, 2, 1, 1)
 
-	// 排除历史行保留：排除过又解除、来源已 released → 删 target+来源，排除行留档
 	if _, e := s.Apply(ctx, "bundle", []int64{4}, Change{Sources: map[int64][]string{4: {"favorite"}}, Excluded: &on, Reason: "用户移除"}); e != nil {
 		t.Fatal(e)
 	}
@@ -114,7 +109,7 @@ func TestForgetLifecycleRefusalAndErasure(t *testing.T) {
 	if applied, e := s.Forget(ctx, "bundle", 4); e != nil || !applied {
 		t.Fatalf("排除历史态 forget=%v err=%v", applied, e)
 	}
-	assertCounts(t, db, 2, 1, 2) // bundle3 的 active 排除与 bundle4 的历史排除都保留
+	assertCounts(t, db, 2, 1, 2)
 }
 
 func TestActiveBundleIDsOrderingAndExclusionFilter(t *testing.T) {
@@ -122,12 +117,12 @@ func TestActiveBundleIDsOrderingAndExclusionFilter(t *testing.T) {
 	ctx := context.Background()
 	on := true
 	feed := map[int64][]string{
-		3:  {"favorite"},        // priority 100
-		10: {"favorite"},        // 同档按 target_id 升序排在 3 后
-		5:  {"import"},          // priority 30
-		7:  {"board", "manual"}, // MAX(priority)=60
-		9:  {"favorite"},        // 激活来源但被排除 → 过滤
-		8:  {"favorite"},        // 稍后摘成 released → 过滤
+		3:  {"favorite"},
+		10: {"favorite"},
+		5:  {"import"},
+		7:  {"board", "manual"},
+		9:  {"favorite"},
+		8:  {"favorite"},
 	}
 	if _, e := s.Apply(ctx, "bundle", []int64{3, 5, 7, 8, 9, 10}, Change{Sources: feed, AddOnly: true}); e != nil {
 		t.Fatal(e)
@@ -138,11 +133,9 @@ func TestActiveBundleIDsOrderingAndExclusionFilter(t *testing.T) {
 	if _, e := s.Apply(ctx, "bundle", []int64{8}, Change{Sources: map[int64][]string{}}); e != nil {
 		t.Fatal(e)
 	}
-	// 孤儿来源：无 target 行，JOIN 后不入选
 	if _, e := db.Exec(`INSERT INTO monitor_sources(target_type,target_id,source,priority,active,created_at,updated_at) VALUES('bundle',11,'import',30,1,'2026-01-01 00:00:00','2026-01-01 00:00:00')`); e != nil {
 		t.Fatal(e)
 	}
-	// game 来源不串台
 	if _, e := s.Apply(ctx, "game", []int64{20}, Change{Sources: map[int64][]string{20: {"favorite"}}, AddOnly: true}); e != nil {
 		t.Fatal(e)
 	}

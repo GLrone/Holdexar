@@ -7,9 +7,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/timeutil"
 )
 
-var accountZone = time.FixedZone("Beijing", 8*60*60)
+var accountZone = timeutil.ZoneBeijing
 var loginCookieKeys = []string{"sessionid", "steamCountry", "steamLoginSecure", "steamRefresh_steam", "steamRememberLogin"}
 
 func ParseCookies(raw string) map[string]string {

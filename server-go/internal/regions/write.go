@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -75,7 +75,7 @@ func (h *handler) requested(r *http.Request, field string, owned bool) ([]string
 		wanted = append(wanted, code)
 	}
 	if len(bad) > 0 {
-		sort.Strings(bad)
+		slices.Sort(bad)
 		return nil, false, &regionRequestError{400, fmt.Sprintf("未知区服代码: %s", strings.Join(bad, ", "))}
 	}
 	if owned && len(wanted) == 0 {

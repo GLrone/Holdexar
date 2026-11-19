@@ -456,3 +456,61 @@ func TestLoginEmailCodeAndTrustedDevicePaths(t *testing.T) {
 		waitLoginState(t, f.service, "done")
 	})
 }
+
+func TestRecoveryLoginOneShotAndNormalLoginIsolation(t *testing.T) {
+	f := newLoginFixture(t, []int{3})
+	ctx := context.Background()
+
+	// Normal login in flight must not be mutated by concurrent StartRecoveryLogin(busy=true).
+	if result, e := f.service.StartLogin(ctx, "fixture-user", "fixture-password"); e != nil || result["ok"] != true {
+		t.Fatalf("normal start=%v %v", result, e)
+	}
+	guardCalled := false
+	failCalled := false
+	busyRes, e := f.service.StartRecoveryLogin(ctx, "fixture-user", "fixture-password", func(string) error {
+		guardCalled = true
+		return fmt.Errorf("should not run on normal login")
+	}, func() {
+		failCalled = true
+	})
+	if e != nil || busyRes["busy"] != true {
+		t.Fatalf("expected busy recovery start=%v %v", busyRes, e)
+	}
+	if codeRes, e := f.service.SubmitRecoveryLoginCode(ctx, "RIGHT"); e != nil || codeRes["no_session"] != true {
+		t.Fatalf("recovery code must not attach to normal login: %v %v", codeRes, e)
+	}
+	f.service.CancelRecoveryLogin()
+	if f.service.LoginStatus().State == "idle" {
+		t.Fatal("CancelRecoveryLogin must not cancel normal login")
+	}
+	if result, e := f.service.SubmitLoginCode(ctx, "RIGHT"); e != nil || result["ok"] != true {
+		t.Fatalf("normal code=%v %v", result, e)
+	}
+	waitLoginState(t, f.service, "done")
+	if guardCalled || failCalled {
+		t.Fatalf("normal login mutated by busy recovery attempt: guard=%t fail=%t", guardCalled, failCalled)
+	}
+	if sid, ok := f.service.ConsumeRecoverySteamID(); ok || sid != "" {
+		t.Fatalf("normal login must not satisfy ConsumeRecoverySteamID: sid=%q ok=%t", sid, ok)
+	}
+
+	// Recovery login succeeds once and ConsumeRecoverySteamID is one-shot.
+	f.rotated.Store(false)
+	f.accept.Store(true)
+	if result, e := f.service.StartRecoveryLogin(ctx, "fixture-user", "fixture-password", func(sid string) error {
+		if sid != loginFixtureSID {
+			return fmt.Errorf("unexpected sid %s", sid)
+		}
+		return nil
+	}, nil); e != nil || result["ok"] != true {
+		t.Fatalf("recovery start=%v %v", result, e)
+	}
+	waitLoginState(t, f.service, "done")
+	sid, ok := f.service.ConsumeRecoverySteamID()
+	if !ok || sid != loginFixtureSID {
+		t.Fatalf("first ConsumeRecoverySteamID=%q %t", sid, ok)
+	}
+	if sid2, ok2 := f.service.ConsumeRecoverySteamID(); ok2 || sid2 != "" {
+		t.Fatalf("second ConsumeRecoverySteamID must fail: sid=%q ok=%t", sid2, ok2)
+	}
+}

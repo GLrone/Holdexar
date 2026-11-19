@@ -1,11 +1,3 @@
-// 捆绑包抓取层：IStoreBrowseService/GetItems/v1（与 app 链路 storebrowse 同源）。
-//
-// 抓取区 = 监控启用区（与游戏侧同口径，全禁用区返回 ErrRegionsDisabled 让
-// 上层区分 400 与跳过）；南亚（CC_LIST 的 pk 聚合位）按 Steam 实际拆
-// 巴基斯坦（pk）/ 孟加拉（bd）两区各发一次。出网直连（browse 按
-// country_code 返回各区数据，出口 IP 不参与判定）+ 进程级限流（与 app 爬取
-// 链共享 200 发/300 秒窗口）。价格单位一律「分」：final_price_in_cents 对
-// 零小数货币同样不 ×100（cny_fen 按「分 → 分」折算，存量归一见迁移 v2）。
 package bundles
 
 import (
@@ -14,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,25 +15,20 @@ import (
 	"holdexar/server-go/internal/storebrowse"
 )
 
-// 全禁用区错误（对齐 regions.service.effective_regions 的 ValueError 文案）：
-// 手动导入转 400、链尾按跳过语义处理。
 var ErrRegionsDisabled = errors.New("未启用任何区服：请先在「我」页勾选要爬取的地区")
 
-// browseEndpoint Steam browse 端点（包级 var：测试覆盖到本地打桩服务器）。
 var browseEndpoint = storebrowse.BrowseURL
 
 const (
-	browseLang    = "english"        // 名称与 app 链路同口径，区域价与语言无关
-	browseTimeout = 20 * time.Second // 单发请求超时（关注集每区一发，超长自动再切）
-	ratesTTL      = 5 * time.Minute  // 汇率进程内缓存（对齐 get_rates 300s）
+	browseLang    = "english"
+	browseTimeout = 20 * time.Second
+	ratesTTL      = 5 * time.Minute
 	cdnPrefix     = "https://shared.akamai.steamstatic.com/store_item_assets/"
 )
 
-// southAsiaExtra 南亚拆区：pk 聚合位 → Steam 侧 pk/bd 两个独立区。
-// bd 不是独立追踪位，币种随南亚位（USD）。
+// southAsiaExtra 将南亚追踪位 pk 展开为 pk/bd 两个请求区，均按 USD 计价。
 var southAsiaExtra = map[string][]string{"pk": {"bd"}}
 
-// ccCurrency cc（小写）→ 货币：对齐 crawler/config.py CC_LIST 的静态清单。
 var ccCurrency = map[string]string{
 	"cn": "CNY", "ru": "RUB", "kz": "KZT", "ua": "UAH",
 	"pk": "USD", "tr": "USD", "ar": "USD", "az": "USD",
@@ -61,8 +48,6 @@ func init() {
 	}
 }
 
-// defaultExchangeRates 汇率兜底表（fx_rates 缺失币种沿用；对齐
-// games/pricing.py DEFAULT_EXCHANGE_RATES）。
 var defaultExchangeRates = map[string]float64{
 	"CNY": 1.0, "USD": 7.25, "RUB": 0.079, "KZT": 0.015,
 	"UAH": 0.175, "TRY": 0.22, "ARS": 0.0083, "VND": 0.00029,
@@ -76,14 +61,11 @@ var defaultExchangeRates = map[string]float64{
 	"GBP": 9.20, "NOK": 0.66, "ILS": 1.95, "CHF": 8.10,
 }
 
-// wantEntry 一次整表抓取的候选：(bundle_id, 库内形态)。Kind 为 nil 表示
-// 形态未知（按 bundleid 问）。
 type wantEntry struct {
 	BundleID int64
 	Kind     *int64
 }
 
-// regionRow browse 条目 → 区域行（价格统一「分」）。
 type regionRow struct {
 	BundleID        int64
 	RegionCode      string
@@ -98,11 +80,10 @@ type regionRow struct {
 	Name            string
 	HeaderImage     string
 	MPS             *int64 // 购买语义票：nil = 锁区/无选项不投票
-	ItemKind        *int64 // 形态票：nil = 条目未报 item_type
-	Kind            string // 请求形态（bundleid/packageid）
+	ItemKind        *int64
+	Kind            string
 }
 
-// fetchCCs 本次捆绑包抓取的 cc 列表：监控启用区（sort,code 序）+ 南亚拆区展开。
 func (s *Service) fetchCCs(ctx context.Context) ([]string, error) {
 	rows, err := s.DB.QueryContext(ctx, "SELECT code FROM crawl_regions WHERE enabled=1 ORDER BY sort, code")
 	if err != nil {
@@ -131,7 +112,6 @@ func (s *Service) fetchCCs(ctx context.Context) ([]string, error) {
 	return ccs, nil
 }
 
-// loadRates 汇率表：fx_rates 覆盖兜底表 + CNY=1.0，TTL 缓存对齐 get_rates。
 func (s *Service) loadRates(ctx context.Context) (map[string]float64, error) {
 	s.ratesMu.Lock()
 	defer s.ratesMu.Unlock()
@@ -151,7 +131,7 @@ func (s *Service) loadRates(ctx context.Context) (map[string]float64, error) {
 		var code string
 		var rate float64
 		if err := rows.Scan(&code, &rate); err != nil {
-			continue // 转换失败跳过该行（对齐 Python try/except continue）
+			continue
 		}
 		rates[strings.ToUpper(code)] = rate
 	}
@@ -164,12 +144,6 @@ func (s *Service) loadRates(ctx context.Context) (map[string]float64, error) {
 	return rates, nil
 }
 
-// fetchRegionsBatched 整表逐区一发：want → {bundle_id: 区域行}。
-//
-// 抓取区每区按形态（bundleid/packageid）分组各发；单发超 300 条或 URL 超长由
-// PlanIDBatches 自动再切。全部（区 × 形态 × 批）请求一次 fan-out 并发，结果按
-// 计划序合并（对齐 asyncio.gather 保序）。请求失败的区不写行（下轮重试），
-// 锁区照写 locked，未收录（伪造 id）不写行。
 func (s *Service) fetchRegionsBatched(ctx context.Context, want []wantEntry, ccs []string) (map[int64][]regionRow, error) {
 	if ccs == nil {
 		resolved, err := s.fetchCCs(ctx)
@@ -178,7 +152,6 @@ func (s *Service) fetchRegionsBatched(ctx context.Context, want []wantEntry, ccs
 		}
 		ccs = resolved
 	}
-	// 形态分组（保持 want 首现顺序，对齐 Python dict 插入序）
 	groups := map[string][]storebrowse.ID{}
 	var kindOrder []string
 	for _, w := range want {
@@ -208,15 +181,13 @@ func (s *Service) fetchRegionsBatched(ctx context.Context, want []wantEntry, ccs
 	results := make([][]storebrowse.Item, len(tasks))
 	var wg sync.WaitGroup
 	for i, task := range tasks {
-		wg.Add(1)
-		go func(i int, task fetchTask) {
-			defer wg.Done()
+		wg.Go(func() {
 			items, err := s.fetchBrowseRegion(ctx, task.ids, task.cc)
 			if err != nil {
-				return // 请求失败：该区该批不写行（下轮重试）
+				return
 			}
 			results[i] = items
-		}(i, task)
+		})
 	}
 	wg.Wait()
 	out := map[int64][]regionRow{}
@@ -231,7 +202,6 @@ func (s *Service) fetchRegionsBatched(ctx context.Context, want []wantEntry, ccs
 	return out, nil
 }
 
-// idSpec bundle_id 按形态填进对应字段（另一形态留 0 → omitempty 不编码）。
 func idSpec(bundleID int64, kind string) storebrowse.ID {
 	if kind == "packageid" {
 		return storebrowse.ID{PackageID: bundleID}
@@ -239,7 +209,6 @@ func idSpec(bundleID int64, kind string) storebrowse.ID {
 	return storebrowse.ID{BundleID: bundleID}
 }
 
-// idOfKind 取 ID 结构体在请求形态下的业务编号。
 func idOfKind(id storebrowse.ID, kind string) int64 {
 	if kind == "packageid" {
 		return id.PackageID
@@ -247,9 +216,7 @@ func idOfKind(id storebrowse.ID, kind string) int64 {
 	return id.BundleID
 }
 
-// fetchBrowseRegion 单区一发。返回 store_items（与请求 ids 位置对齐）；
-// 请求失败返回 nil。失败（nil）与「条目锁区」严格区分：前者不写行（下轮
-// 刷新重试），后者照写 locked（该区不售，不进补抓账本）。
+// fetchBrowseRegion 失败返错/nil（不写行，留待重试）；条目锁区仍写 locked 行。
 func (s *Service) fetchBrowseRegion(ctx context.Context, ids []storebrowse.ID, cc string) ([]storebrowse.Item, error) {
 	url := browseEndpoint + strings.TrimPrefix(storebrowse.BuildIDsURL(ids, cc, browseLang, true), storebrowse.BrowseURL)
 	_, body, err := s.client.GetJSON(ctx, url, "")
@@ -262,17 +229,11 @@ func (s *Service) fetchBrowseRegion(ctx context.Context, ids []storebrowse.ID, c
 		} `json:"response"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.Response == nil {
-		return nil, nil // 形状异常按空表处理：该区不写行
+		return nil, nil
 	}
 	return payload.Response.StoreItems, nil
 }
 
-// fetchBundleRegions 整包抓取（单包出口：手动导入共用，抓取区=监控启用区）。
-//
-// 形态：forcePackage（/sub/ 链接）→ 直接按 packageid 问；其余先按 bundleid
-// 问，一条真实条目都没有（未收录）再按 packageid 兜一次——数字 ID 空间
-// bundle/sub 并存，同号可能两侧都有产品。真实存在但全区锁区仍算成功
-// （写 locked 行），与「抓取失败（空表）」严格区分。
 func (s *Service) fetchBundleRegions(ctx context.Context, bundleID int64, forcePackage bool) ([]regionRow, error) {
 	primary := int64(0)
 	if forcePackage {
@@ -298,9 +259,7 @@ func (s *Service) fetchBundleRegions(ctx context.Context, bundleID int64, forceP
 	return out, nil
 }
 
-// browseKind 形态 → ids 键：item_kind=1（Sub 形态）用 packageid，其余
-// bundleid。判据是形态不是购买语义——mps（必须整包）在形态为 bundle 的包上
-// 也会是 1，拿 mps 选键会按 packageid 去问一个 bundle 产品。
+// browseKind 按形态 item_kind（1=Sub 用 packageid，其余 bundleid）而非购买语义 mps 选键。
 func browseKind(kind *int64) string {
 	if kind != nil && *kind == 1 {
 		return "packageid"
@@ -308,15 +267,11 @@ func browseKind(kind *int64) string {
 	return "bundleid"
 }
 
-// isRealItem 条目是否对应真实商品。未收录（伪造 id / 已下架）也回
-// success=15 + visible=false，与「真实存在但本区不售」同形——区分点在
-// name / store_url_slug：真实商品两者皆有，未收录两者全空。
+// isRealItem 以 name 或 store_url_slug 非空区分真实商品与未收录/伪造 id（两者均可能回 success=15 + visible=false）。
 func isRealItem(item storebrowse.Item) bool {
 	return item != nil && (pyStr(item["name"]) != "" || pyStr(item["store_url_slug"]) != "")
 }
 
-// browseOption 条目 → (price_status, 购买选项)。锁区/无选项语义对齐
-// browse_store.evaluate。
 func browseOption(item storebrowse.Item) (string, storebrowse.Item) {
 	if success := toInt(item["success"]); success == nil || *success != 1 || !pyTruthy(item["visible"]) {
 		return "locked", nil
@@ -337,7 +292,7 @@ func browseOption(item storebrowse.Item) (string, storebrowse.Item) {
 		}
 	}
 	if opt == nil {
-		return "locked", nil // 可见但无购买选项 = 该区不售
+		return "locked", nil
 	}
 	if toInt(opt["final_price_in_cents"]) == nil {
 		return "no_price", opt
@@ -364,7 +319,6 @@ func defaultGroup(opts []storebrowse.Item) []storebrowse.Item {
 	return out
 }
 
-// browseRow browse 条目 → 区域行。未收录/条目缺失 → nil（不写行）。
 func browseRow(item storebrowse.Item, bundleID int64, cc, kind string) *regionRow {
 	if item == nil || !isRealItem(item) {
 		return nil
@@ -384,8 +338,7 @@ func browseRow(item storebrowse.Item, bundleID int64, cc, kind string) *regionRo
 	if discount == 0 && original != nil && price != nil && *original > *price {
 		discount = int64(math.RoundToEven(float64(*original-*price) * 100 / float64(*original)))
 	}
-	// 促销截止：active_discounts[0] 是当前叠加在基础档上的限时促销
-	// （bundle_discount_pct 是无时限的结构档），Unix 秒；无促销 = nil
+	// active_discounts[0] 为当前限时促销截止（Unix 秒），区别于无时限结构折扣 bundle_discount_pct。
 	var discountEndTS *int64
 	if active := itemList(option["active_discounts"]); len(active) > 0 {
 		discountEndTS = toInt(active[0]["discount_end_date"])
@@ -399,19 +352,17 @@ func browseRow(item storebrowse.Item, bundleID int64, cc, kind string) *regionRo
 		zero := int64(0)
 		itemKind = &zero
 	}
-	// 购买语义（是否必须整包）：Sub 形态恒不可拆；bundle 形态以选项级
-	// must_purchase_as_set 为准（形态与语义解耦，不能只看 item_type）。
-	// 锁区行（无真实选项）不投语义票（mps=nil）：逐区选项不一致时由落库层
-	// 多数决归位，不能让锁区行伪装成「可补齐」的反对票
+	// Sub 形态恒不可拆；bundle 形态取选项级 must_purchase_as_set。
+	// 锁区行不投语义票（mps=nil），防止无选项区伪装成可补齐反对票。
 	var mps *int64
 	one, zero := int64(1), int64(0)
 	switch {
 	case itemKind != nil && *itemKind == 1:
-		mps = &one // Sub 形态恒不可拆
+		mps = &one
 	case hasOpt && pyTruthy(option["must_purchase_as_set"]):
 		mps = &one
 	case itemKind != nil && *itemKind == 0 && hasOpt:
-		mps = &zero // 有真实选项且未标必须整包 → 可补齐
+		mps = &zero
 	}
 	var appIDs []int64
 	if raw, ok := item["included_appids"].([]any); ok {
@@ -444,7 +395,6 @@ func browseRow(item storebrowse.Item, bundleID int64, cc, kind string) *regionRo
 	return row
 }
 
-// headerImageURL 条目资产 → 头图 URL（捆绑包链路复用同一资产约定）。
 func headerImageURL(item storebrowse.Item) string {
 	if item == nil {
 		return ""
@@ -458,14 +408,12 @@ func headerImageURL(item storebrowse.Item) string {
 	return cdnPrefix + strings.ReplaceAll(format, "${FILENAME}", filename)
 }
 
-// alignedPair 条目 ↔ 请求 id 的对齐对；条目缺失为 nil。
 type alignedPair struct {
 	id   int64
 	item storebrowse.Item
 }
 
-// alignItems 条目 ↔ 请求 id 对齐：条数一致按位置（未收录条目回 id=0，位置
-// 是唯一可靠映射）；条数不符降级按 id 映射。
+// alignItems 条目 ↔ 请求 id 对齐：条数一致按位置（未收录条目 id=0 须靠位置映射）；否则降级按 id 映射。
 func alignItems(items []storebrowse.Item, ids []int64) []alignedPair {
 	if len(items) == len(ids) {
 		out := make([]alignedPair, len(ids))
@@ -494,10 +442,7 @@ func alignItems(items []storebrowse.Item, ids []int64) []alignedPair {
 	return out
 }
 
-// rowCnyFen 分 → CNY 分：所有币种统一 cents，直接 × 汇率（与 games/pricing
-// 同约定）。无小数货币（JPY/KRW/VND…）不可按「除数 1 再 ×100」折算——
-// *_in_cents 对所有币种都是「分」，那样会把分当元再乘 100，cny_fen 虚高
-// 100 倍（存量已由迁移 v2 归位）。无价/无汇率 → nil。
+// rowCnyFen 所有币种均以分为单位直接乘汇率（零小数币种同口径，不可再 ×100）。
 func rowCnyFen(row regionRow, rateMap map[string]float64) *int64 {
 	if row.Price == nil || *row.Price == 0 {
 		return nil
@@ -533,7 +478,6 @@ func majority(votes []int64) *int64 {
 	return &result
 }
 
-// dedupInt64 去重计数用（单品甄别判 len(set(appids))）。
 func dedupInt64(ids []int64) []int64 {
 	seen := map[int64]bool{}
 	out := ids[:0]
@@ -546,10 +490,6 @@ func dedupInt64(ids []int64) []int64 {
 	return out
 }
 
-// ── Python 动态值取数助手（JSON 反序列化值形态：nil/bool/string/float64/
-// []any/map[string]any）───────────────────────────────────────────────
-
-// toInt 对齐 _to_int：int()/int(float) 截断、整数字符串可转，其余 None。
 func toInt(v any) *int64 {
 	switch t := v.(type) {
 	case int64:
@@ -568,7 +508,6 @@ func toInt(v any) *int64 {
 	return nil
 }
 
-// orInt Python `a or b`：a 非 nil 且非 0 取 a，否则取 b。
 func orInt(a, b *int64) *int64 {
 	if a != nil && *a != 0 {
 		return a
@@ -576,7 +515,6 @@ func orInt(a, b *int64) *int64 {
 	return b
 }
 
-// pyTruthy Python truthy 判定（bool/数字/字符串/容器）。
 func pyTruthy(v any) bool {
 	switch t := v.(type) {
 	case nil:
@@ -599,19 +537,16 @@ func pyTruthy(v any) bool {
 	return true
 }
 
-// pyStr Python `v or ""` 的字符串取值：非字符串一律空串。
 func pyStr(v any) string {
 	s, _ := v.(string)
 	return s
 }
 
-// itemMap 字段 → 选项对象（非对象回 nil）。
 func itemMap(v any) storebrowse.Item {
 	m, _ := v.(map[string]any)
 	return m
 }
 
-// itemList 字段 → 条目数组（非数组元素跳过）。
 func itemList(v any) []storebrowse.Item {
 	raw, _ := v.([]any)
 	out := make([]storebrowse.Item, 0, len(raw))
@@ -623,8 +558,7 @@ func itemList(v any) []storebrowse.Item {
 	return out
 }
 
-// pyJSONInts 整数数组 → Python json.dumps 缺省分隔符（", "）文本。
-// 包内自持同源副本（与 dbwriter/rates 同源，包间禁 import）。
+// pyJSONInts 将整数切片格式化为 ", " 分隔的 JSON 数组文本。
 func pyJSONInts(ids []int64) string {
 	var b strings.Builder
 	b.WriteByte('[')
@@ -638,17 +572,15 @@ func pyJSONInts(ids []int64) string {
 	return b.String()
 }
 
-// sortedKeys map 键排序（快照 tracked 参数序列化前归一）。
 func sortedKeys(m map[string]bool) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 
-// nullInt64 SQL NULL → 指针；invalid → nil。
 func bundleNullKind(v sql.NullInt64) *int64 {
 	if !v.Valid {
 		return nil

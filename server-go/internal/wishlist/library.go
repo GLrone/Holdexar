@@ -1,11 +1,12 @@
 package wishlist
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sort"
+	"slices"
 )
 
 func (s *Service) primary(ctx context.Context, legacy bool) (string, error) {
@@ -95,7 +96,6 @@ func (s *Service) OwnedLibrary(ctx context.Context) (map[string]any, error) {
 	if e != nil {
 		return nil, e
 	}
-	// Stable creation order is preserved for accounts with equal ownership counts.
 	for i, j := 0, len(accounts)-1; i < j; i, j = i+1, j-1 {
 		accounts[i], accounts[j] = accounts[j], accounts[i]
 	}
@@ -174,12 +174,14 @@ func (s *Service) OwnedLibrary(ctx context.Context) (map[string]any, error) {
 			return nil, e
 		}
 	}
-	sort.SliceStable(accounts, func(i, j int) bool {
-		a, b := accounts[i], accounts[j]
+	slices.SortStableFunc(accounts, func(a, b map[string]any) int {
 		if a["isPrimary"] != b["isPrimary"] {
-			return a["isPrimary"].(bool)
+			if a["isPrimary"].(bool) {
+				return -1
+			}
+			return 1
 		}
-		return a["ownedCount"].(int) > b["ownedCount"].(int)
+		return cmp.Compare(b["ownedCount"].(int), a["ownedCount"].(int))
 	})
 	return map[string]any{"accounts": accounts, "games": games, "generatedAt": s.now().Format("2006-01-02T15:04:05.000000")}, nil
 }

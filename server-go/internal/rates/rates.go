@@ -1,20 +1,18 @@
-// Package rates：汇率快照、日线历史与缺口修复。
 package rates
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/httpx"
+	"holdexar/server-go/internal/timeutil"
 )
 
-// allowedCurrencies 币种白名单：41 区清单币种去重（37 币，源清单
-// server/app/crawler/config.py CC_LIST）加永久预留 TRY/ARS；
-// 缺口扫描与历史查询过滤只认这批，区服清单增减时须同步。
+// allowedCurrencies 参与缺口扫描、历史修复与汇率刷新清理的 39 个白名单币种。
 var allowedCurrencies = map[string]bool{
 	"AED": true, "ARS": true, "AUD": true, "BRL": true, "CAD": true,
 	"CHF": true, "CLP": true, "CNY": true, "COP": true, "CRC": true,
@@ -26,10 +24,8 @@ var allowedCurrencies = map[string]bool{
 	"USD": true, "UYU": true, "VND": true, "ZAR": true,
 }
 
-// rangeMonths 时间范围档位 → 月数。
 var rangeMonths = map[string]int{"1mo": 1, "6mo": 6, "1y": 12, "5y": 60, "10y": 120}
 
-// rangeCutoffDays 月数折算天数：round(月数 × 30.44)，窗口过滤无需日历级月末精确。
 var rangeCutoffDays = func() map[string]int {
 	m := make(map[string]int, len(rangeMonths))
 	for k, months := range rangeMonths {
@@ -38,17 +34,14 @@ var rangeCutoffDays = func() map[string]int {
 	return m
 }()
 
-// beijingZone 北京时区现行无夏令时，固定 +8 与 Asia/Shanghai 等价。
-var beijingZone = time.FixedZone("CST", 8*3600)
+var beijingZone = timeutil.ZoneCST
 
-// beijingToday 北京日历日（UTC 零点归一，便于日差运算）。
 func beijingToday() time.Time {
 	t := time.Now().In(beijingZone)
 	y, m, d := t.Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-// beijingTodayFn 时钟入口，测试可替换。
 var beijingTodayFn = beijingToday
 
 func Register(mux *http.ServeMux, db *sql.DB, services ...*Service) {
@@ -60,7 +53,7 @@ func Register(mux *http.ServeMux, db *sql.DB, services ...*Service) {
 		services[0].registerWrites(mux)
 	}
 	for _, p := range []string{"/api/v1/rates", "/api/v1/rates/history", "/api/v1/rates/history/gaps"} {
-		mux.HandleFunc(p, methodNotAllowed("GET"))
+		mux.HandleFunc(p, httpx.MethodNotAllowed("GET"))
 	}
 }
 
@@ -68,10 +61,9 @@ type handler struct {
 	db *sql.DB
 }
 
-// rateItem 汇率快照行。
 type rateItem struct {
 	Currency  string  `json:"currency"`
-	RateToCny pyFloat `json:"rateToCny"`
+	RateToCny float64 `json:"rateToCny"`
 	FetchedAt *string `json:"fetchedAt"`
 }
 
@@ -79,7 +71,6 @@ type ratesResponse struct {
 	Rates []rateItem `json:"rates"`
 }
 
-// listRates 全部币种快照，按币种代码排序。
 func (h *handler) listRates(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.QueryContext(r.Context(),
 		// CAST 回文本：DATETIME 声明列会被驱动解析成 time.Time
@@ -104,35 +95,29 @@ func (h *handler) listRates(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("汇率读取失败：%v", err), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, ratesResponse{Rates: items})
+	httpx.WriteJSON(w, http.StatusOK, ratesResponse{Rates: items})
 }
 
-// historyItem 日线历史行。
 type historyItem struct {
 	Date       string  `json:"date"`
-	RateToCny  pyFloat `json:"rateToCny"`
+	RateToCny  float64 `json:"rateToCny"`
 	Source     *string `json:"source"`
 	SourceKind *string `json:"sourceKind"`
 	FetchedAt  *string `json:"fetchedAt"`
 }
 
-// rateHistory 单币种日线序列，按 rate_date 升序；range 六档窗口过滤，
-// limit > 0 再取尾段 limit 天。
 func (h *handler) rateHistory(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	currency := "USD"
 	if vals, ok := q["currency"]; ok {
 		currency = strings.ToUpper(vals[0])
 	}
-	limit := 0
-	if vals, ok := q["limit"]; ok {
-		n, err := strconv.Atoi(vals[0])
-		if err != nil {
-			writeJSON(w, http.StatusUnprocessableEntity, intParseError("limit", vals[0]))
-			return
-		}
-		limit = n
+	limitN, _, limitErr := httpx.QueryInt(q, "limit", 0, nil, nil)
+	if limitErr != nil {
+		httpx.WriteValidationError(w, *limitErr)
+		return
 	}
+	limit := int(limitN)
 	rangeArg := ""
 	hasRange := false
 	if vals, ok := q["range"]; ok {
@@ -172,7 +157,7 @@ func (h *handler) rateHistory(w http.ResponseWriter, r *http.Request) {
 		key := strings.ToLower(rangeArg)
 		days, ok := rangeCutoffDays[key]
 		if !ok && key != "all" {
-			writeJSON(w, http.StatusBadRequest,
+			httpx.WriteJSON(w, http.StatusBadRequest,
 				map[string]string{"detail": fmt.Sprintf("无效的时间范围: %s", rangeArg)})
 			return
 		}
@@ -190,30 +175,9 @@ func (h *handler) rateHistory(w http.ResponseWriter, r *http.Request) {
 	if limit > 0 && len(items) > limit {
 		items = items[len(items)-limit:]
 	}
-	writeJSON(w, http.StatusOK, items)
+	httpx.WriteJSON(w, http.StatusOK, items)
 }
 
-// validationError 查询参数校验失败明细（对齐 pydantic v2 形态）。
-type validationError struct {
-	Type  string   `json:"type"`
-	Loc   []string `json:"loc"`
-	Msg   string   `json:"msg"`
-	Input string   `json:"input"`
-}
-
-// intParseError 整数解析失败的 422 响应体。
-func intParseError(field, input string) map[string]any {
-	return map[string]any{
-		"detail": []validationError{{
-			Type:  "int_parsing",
-			Loc:   []string{"query", field},
-			Msg:   "Input should be a valid integer, unable to parse string as an integer",
-			Input: input,
-		}},
-	}
-}
-
-// nullStrPtr 文本列 NULL → nil，空串也视为缺失。
 func nullStrPtr(v sql.NullString) *string {
 	if !v.Valid || v.String == "" {
 		return nil
@@ -222,7 +186,6 @@ func nullStrPtr(v sql.NullString) *string {
 	return &s
 }
 
-// isoformatPtr SQLite 时间文本 → Python naive isoformat 形态；NULL → nil。
 func isoformatPtr(v sql.NullString) *string {
 	if !v.Valid {
 		return nil
@@ -234,9 +197,7 @@ func isoformatPtr(v sql.NullString) *string {
 	return &s
 }
 
-// pyIsoformat 「YYYY-MM-DD[ T]HH:MM:SS[.frac]」→ T 分隔 ISO 文本：
-// 微秒整零省略，非整零恒 6 位（Python isoformat 语义）。
-// 不可解析的文本原样返回。
+// pyIsoformat 转为 T 分隔 ISO 文本，微秒全零省略、非零补足 6 位，不可解析原文返回。
 func pyIsoformat(s string) (string, bool) {
 	if len(s) < 19 {
 		return s, false
@@ -261,24 +222,4 @@ func pyIsoformat(s string) (string, bool) {
 		}
 	}
 	return out, true
-}
-
-// methodNotAllowed 非声明方法的回退响应（与 regions 包各自持有同款工具，包间不互引）。
-func methodNotAllowed(allow string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Allow", allow)
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"detail": "Method Not Allowed"})
-	}
-}
-
-// writeJSON JSON 响应体不带尾随换行。
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
 }

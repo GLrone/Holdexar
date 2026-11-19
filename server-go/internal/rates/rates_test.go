@@ -42,7 +42,6 @@ CREATE UNIQUE INDEX ux_frh_currency_date ON fx_rate_history (currency_code, rate
 	return db
 }
 
-// historyRow 历史行种子；空串字段写入 NULL。
 type historyRow struct {
 	Code      string
 	Rate      float64
@@ -89,7 +88,6 @@ func do(t *testing.T, h http.Handler, method, target string) *httptest.ResponseR
 	return rec
 }
 
-// overrideToday 固定扫描/窗口过滤用的「今天」。
 func overrideToday(t *testing.T, day string) {
 	t.Helper()
 	parsed, err := time.Parse("2006-01-02", day)
@@ -127,7 +125,7 @@ func TestListRatesShape(t *testing.T) {
 		t.Fatalf("状态码 = %d, want 200", rec.Code)
 	}
 	want := `{"rates":[` +
-		`{"currency":"CNY","rateToCny":1.0,"fetchedAt":"2026-10-31T12:00:00"},` +
+		`{"currency":"CNY","rateToCny":1,"fetchedAt":"2026-10-31T12:00:00"},` +
 		`{"currency":"EUR","rateToCny":0.85,"fetchedAt":null},` +
 		`{"currency":"USD","rateToCny":0.14,"fetchedAt":"2026-10-31T12:00:00.123456"}]}`
 	if got := rec.Body.String(); got != want {
@@ -155,7 +153,7 @@ func seedHistoryDefaults(t *testing.T, db *sql.DB) {
 		{Code: "USD", Rate: 0.138, RateDate: "2026-10-05", Kind: "derived",
 			Source: "frankfurter", FetchedAt: "2026-10-05 06:00:00.000000"},
 		{Code: "EUR", Rate: 0.85, RateDate: "2026-10-01", Kind: "observed", Source: "augmentedsteam"},
-		{Code: "USD", Rate: 0.2, FetchedAt: "2026-10-03 08:00:00.000000"}, // rate_date NULL，不进日线
+		{Code: "USD", Rate: 0.2, FetchedAt: "2026-10-03 08:00:00.000000"},
 	})
 }
 
@@ -266,28 +264,7 @@ func TestMethodFallbacksAndExcludedRoutes(t *testing.T) {
 			t.Fatalf("%s Allow = %q", path, allow)
 		}
 	}
-	// 刷新/修复为写端点，未注册：路由不存在。
 	if rec := do(t, mux, http.MethodPost, "/api/v1/rates/refresh"); rec.Code != http.StatusNotFound {
 		t.Fatalf("refresh 未迁移应为 404, got %d", rec.Code)
-	}
-}
-
-func TestFormatPyFloat(t *testing.T) {
-	cases := map[float64]string{
-		1.0:    "1.0",
-		0.85:   "0.85",
-		0.14:   "0.14",
-		0:      "0.0",
-		-1.5:   "-1.5",
-		123.0:  "123.0",
-		1e15:   "1000000000000000.0",
-		1e16:   "1e+16",
-		1e-4:   "0.0001",
-		2.8e-5: "2.8e-05",
-	}
-	for in, want := range cases {
-		if got := formatPyFloat(in); got != want {
-			t.Fatalf("formatPyFloat(%v) = %s, want %s", in, got, want)
-		}
 	}
 }

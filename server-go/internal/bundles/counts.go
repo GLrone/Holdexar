@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"time"
 
+	"holdexar/server-go/internal/httpx"
+	"holdexar/server-go/internal/metadata"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/settings"
@@ -36,14 +38,26 @@ type countsState struct {
 type Counts struct {
 	db       *sql.DB
 	gate     *store.WriteGate
+	dataDir  string
 	now      func() time.Time
 	fetch    func(context.Context) (map[int64]int64, error)
 	slot     chan struct{}
 	nextPull time.Time
 }
 
-func NewCounts(db *sql.DB, gate *store.WriteGate) *Counts {
+type CountsOption func(*Counts)
+
+func WithCountsDataDir(dir string) CountsOption {
+	return func(c *Counts) { c.dataDir = dir }
+}
+
+func NewCounts(db *sql.DB, gate *store.WriteGate, opts ...CountsOption) *Counts {
 	s := &Counts{db: db, gate: gate, now: time.Now, slot: make(chan struct{}, 1)}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = func(r *http.Request) (*url.URL, error) {
 		proxy, err := netenv.ResolveSystemProxy(r.Context())
@@ -192,8 +206,7 @@ func (s *Counts) Register(mux *http.ServeMux) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
+		httpx.WriteJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/v1/metadata/status", s.status)
 }
@@ -211,8 +224,16 @@ func (s *Counts) status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	base := r.URL.Query().Get("source_dir")
-	if base == "" {
+	rawDir := r.URL.Query().Get("source_dir")
+	base := ""
+	if rawDir != "" {
+		constrained, err := metadata.ConstrainSourceDir(s.dataDir, rawDir)
+		if err != nil {
+			httpx.WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": err.Error()})
+			return
+		}
+		base = constrained
+	} else {
 		base = os.Getenv("METADATA_DATA_DIR")
 	}
 	base = filepath.Clean(base)
@@ -220,8 +241,7 @@ func (s *Counts) status(w http.ResponseWriter, r *http.Request) {
 	if state.FetchedAt != "" {
 		fetchedAt = state.FetchedAt
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"sourceDir": base,
 		"files": map[string]string{
 			"epic": filepath.Join(base, "epic_free_games_clean_final.json"), "xgpTiered": filepath.Join(base, "xgp_tiered_steam.json"),

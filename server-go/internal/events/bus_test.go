@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// ctxFor 测试取事件的超时上下文：取不到即失败，不等出悬挂。
 func ctxFor(t *testing.T) context.Context {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -24,7 +23,6 @@ func TestPublishNormalDelivery(t *testing.T) {
 	bus.Publish("crawl.progress", KV{"done", 1})
 	bus.Publish("job.status", KV{"status", "stopped"})
 
-	// critical 优先：两条 critical 先出，进度最后（阻塞 select 前有非阻塞快路径）
 	got := make([]string, 0, 3)
 	for range 3 {
 		ev, err := sub.Get(ctxFor(t))
@@ -50,8 +48,6 @@ func TestBackpressureProgressDropsNewest(t *testing.T) {
 	for i := 0; i < ProgressMax+10; i++ {
 		bus.Publish("crawl.progress", KV{"done", i})
 	}
-	// progress 满丢新事件（对齐 put_nowait 满即丢）：通道保留最旧 64 条
-	// done=0..63，最新的 10 条被丢。读出恰好 64 条且首 done=0 末 done=63。
 	first, err := sub.Get(ctxFor(t))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -82,7 +78,6 @@ func TestBackpressureCriticalEvictsOldest(t *testing.T) {
 	for i := 0; i < CriticalMax+10; i++ {
 		bus.Publish("job.status", KV{"seq", i})
 	}
-	// 挤旧保新：首条应为 seq=10，末条 seq=266，共可读 256 条
 	ev, err := sub.Get(ctxFor(t))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -112,7 +107,7 @@ func TestGetBlocksUntilEvent(t *testing.T) {
 			done <- ev
 		}
 	}()
-	time.Sleep(30 * time.Millisecond) // 让 Get 先进入阻塞
+	time.Sleep(30 * time.Millisecond)
 	bus.Publish("job.started", KV{"job_id", 1})
 	select {
 	case ev := <-done:
@@ -125,7 +120,6 @@ func TestGetBlocksUntilEvent(t *testing.T) {
 }
 
 func TestGetRacingCriticalNeverLost(t *testing.T) {
-	// 阻塞期两侧先后到达：两次 Get 必须各取一条，critical 不丢（竞速补投语义）
 	bus := NewBus()
 	sub := bus.Subscribe()
 	res := make(chan Event, 2)
@@ -166,7 +160,6 @@ func TestUnsubscribeNoLeak(t *testing.T) {
 	if bus.Len() != 0 {
 		t.Fatalf("注销后订阅数 = %d, want 0", bus.Len())
 	}
-	// 重复注销与注销后发布都不得 panic、不得复活订阅
 	bus.Unsubscribe(subs[0])
 	bus.Publish("job.status", KV{"status", "ok"})
 	if bus.Len() != 0 {

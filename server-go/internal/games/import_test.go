@@ -9,9 +9,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// TestImportAppidsClassifies 分类口径钉住（等价 crawl_service.import_appids，
-// 缺口判定与 boards 反哺同口径）：updated_at 非空或已有价格行 → own；
-// games 无行 / 挂名孤儿 → ok；无法按整数解析或 ≤0 → fail 保留原值。
 func TestImportAppidsClassifies(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "import.db"))
 	if err != nil {
@@ -36,11 +33,11 @@ func TestImportAppidsClassifies(t *testing.T) {
 	seed(`INSERT INTO game_current_prices (appid, region_code) VALUES (2, 'CN'), (3, 'US')`)
 
 	result, err := ImportAppids(context.Background(), db, []any{
-		int64(1),     // updated_at 非空、无价格行 → own
-		int64(2),     // updated_at 空、已有价格行 → own（挂名孤儿有价不算缺口）
-		int64(4),     // updated_at 空、无价格行 → ok（挂名孤儿=缺口）
-		int64(99),    // 库外 → ok
-		"77",         // 整数字符串 → ok
+		int64(1),
+		int64(2),
+		int64(4),
+		int64(99),
+		"77",
 		json.Number("88"), int64(0), "abc", int64(-5),
 	})
 	if err != nil {
@@ -50,7 +47,6 @@ func TestImportAppidsClassifies(t *testing.T) {
 		t.Fatalf("计数=%v", result)
 	}
 	results := result["results"].([]map[string]any)
-	// 顺序与 Python 同构：无效项在首个循环先落行，分类项按 clean 序在后。
 	want := []struct {
 		appid  any
 		status string
@@ -63,7 +59,7 @@ func TestImportAppidsClassifies(t *testing.T) {
 		{int64(2), "own", "已在库"},
 		{int64(4), "ok", "待首爬入库"},
 		{int64(99), "ok", "待首爬入库"},
-		{int64(77), "ok", "待首爬入库"}, // Python 分类行回显转换后的整数
+		{int64(77), "ok", "待首爬入库"},
 		{int64(88), "ok", "待首爬入库"},
 	}
 	if len(results) != len(want) {

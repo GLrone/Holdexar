@@ -4,14 +4,17 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
+	"holdexar/server-go/internal/logredact"
 )
 
 type Reader struct {
@@ -19,6 +22,7 @@ type Reader struct {
 	Account  func(context.Context, string) (sid string, hasCredential bool, err error)
 	Snapshot func(context.Context) (owner, syncedAt string, running bool, err error)
 	Warm     func(string)
+	Log      func(string, ...any)
 }
 
 func (r Reader) Register(mux *http.ServeMux) {
@@ -39,9 +43,9 @@ func (r Reader) Register(mux *http.ServeMux) {
 		raw := req.PathValue("appid")
 		appid, err := parseReadAppID(raw)
 		if err != nil {
-			readJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []map[string]any{{
-				"type": "int_parsing", "loc": []string{"path", "appid"},
-				"msg": "Input should be a valid integer, unable to parse string as an integer", "input": raw,
+			readJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []httpx.ValErr{{
+				Type: "int_parsing", Loc: []any{"path", "appid"},
+				Msg: "Input should be a valid integer, unable to parse string as an integer", Input: raw,
 			}}})
 			return
 		}
@@ -82,9 +86,16 @@ func readReply(w http.ResponseWriter, body any, err error) {
 }
 
 func readJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	httpx.WriteJSON(w, status, body)
+}
+
+func warnLog(logFn func(string, ...any), msg string, err error) {
+	text := logredact.Redact(err.Error())
+	if logFn != nil {
+		logFn("%s：%s", msg, text)
+		return
+	}
+	slog.Warn(msg, "error", text)
 }
 
 func (r Reader) readAccount(ctx context.Context, target string) (string, bool, error) {

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -311,7 +311,7 @@ func EvaluateFeatured(config, current, history, membership map[string]any) (map[
 	for source := range sources {
 		sorted = append(sorted, source)
 	}
-	sort.Strings(sorted)
+	slices.Sort(sorted)
 	member["sources"] = sorted
 	result["membership"] = member
 	return result, nil

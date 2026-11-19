@@ -5,12 +5,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func reply(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	httpx.WriteJSON(w, status, v)
 }
 func result(w http.ResponseWriter, v any, e error) {
 	if e == nil {

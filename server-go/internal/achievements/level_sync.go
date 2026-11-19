@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -130,7 +130,6 @@ func syncLevelXP(ctx context.Context, conn *sql.Conn, sid string, existing map[l
 			return false
 		}
 		if baseline {
-			// Markers reserve the references for facts already included in the baseline.
 			baselineXP += int(math.Floor(float64(base)*rarity + 0.5))
 			entries = append(entries, levelXPEvent{levelXPKey: key, multiplier: 1, note: &marker})
 			return false
@@ -222,7 +221,7 @@ func addStreakXP(awarded []levelUnlock, days map[time.Time]struct{}, add func(st
 	for day := range eligible {
 		ordered = append(ordered, day)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Before(ordered[j]) })
+	slices.SortFunc(ordered, func(a, b time.Time) int { return a.Compare(b) })
 	for _, day := range ordered {
 		add(xpStreak, day.Format(time.DateOnly), 20, 1)
 	}

@@ -188,3 +188,23 @@ func assertEpicCount(t *testing.T, db *sql.DB, query string, want int) {
 		t.Fatalf("%s: got=%d want=%d err=%v", query, got, want, err)
 	}
 }
+
+func TestTitleIdentityUsesAppIDWhenPresent(t *testing.T) {
+	id := int64(220)
+	if got := titleIdentity(Offer{Title: "Half-Life 2", AppID: &id}); got != "appid:220" {
+		t.Fatalf("got %q, want appid:220", got)
+	}
+	if got := titleIdentity(Offer{Title: "  Free Game  "}); got != "title:free game" {
+		t.Fatalf("got %q, want title:free game", got)
+	}
+	db, gate := epicServiceDB(t)
+	ctx := context.Background()
+	s := New(ctx, db, gate, Options{})
+	defer s.Close(ctx)
+	if n, err := s.recordNotices(ctx, []Offer{{Title: "Localized V1", AppID: &id}}, time.Now()); err != nil || n != 1 {
+		t.Fatalf("first appid notice: n=%d err=%v", n, err)
+	}
+	if n, err := s.recordNotices(ctx, []Offer{{Title: "Localized V2", AppID: &id}}, time.Now()); err != nil || n != 0 {
+		t.Fatalf("same appid with changed title should dedupe: n=%d err=%v", n, err)
+	}
+}

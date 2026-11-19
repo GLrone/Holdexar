@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/games"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/notifications"
 	"holdexar/server-go/internal/steamhttp"
@@ -19,9 +20,7 @@ import (
 )
 
 func reply(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	httpx.WriteJSON(w, status, v)
 }
 func failure(w http.ResponseWriter, status int, e error) {
 	reply(w, status, map[string]any{"detail": e.Error()})
@@ -212,7 +211,13 @@ func (s *Service) Events(ctx context.Context, limit int) ([]map[string]any, erro
 		if n == 0 {
 			r["price"] = nil
 		} else {
-			currency := notifications.CurrencyForRegion(text(r["region"]))
+			currency := ""
+			if dm, ok := details.(map[string]any); ok {
+				currency = strings.TrimSpace(text(dm["currency"]))
+			}
+			if currency == "" {
+				currency = notifications.CurrencyForRegion(text(r["region"]))
+			}
 			if currency == "" {
 				currency = "CNY"
 			}

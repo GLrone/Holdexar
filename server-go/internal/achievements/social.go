@@ -14,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
@@ -143,12 +144,12 @@ func readSocialNoteInput(w http.ResponseWriter, req *http.Request) (socialNoteIn
 }
 
 func socialInvalid(w http.ResponseWriter, section, field, code, message string, input any) {
-	loc := []string{section}
+	loc := []any{section}
 	if field != "" {
 		loc = append(loc, field)
 	}
-	readJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []map[string]any{{
-		"type": code, "loc": loc, "msg": message, "input": input,
+	readJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []httpx.ValErr{{
+		Type: code, Loc: loc, Msg: message, Input: input,
 	}}})
 }
 

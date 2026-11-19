@@ -46,8 +46,6 @@ func udfStr(v driver.Value) *string {
 	}
 }
 
-// smartScoreUDF game_smart_score(difference, positive_rate, review_count,
-// hl_flag, discount, release_date)：派生 UPDATE 语句内联调用的评分函数。
 func smartScoreUDF(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 	var release *string
 	if len(args) > 5 {
@@ -87,8 +85,6 @@ func init() {
 		}
 		return "", nil
 	})
-	// bundle_save_score：单参省钱因子（列表地区重锚排序在 SQL 内联调用；
-	// 与 bundle_smart_score 内联的 SaveScore 同式）。
 	sqlite.MustRegisterDeterministicScalarFunction("bundle_save_score", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 		return SaveScore(udfInt(args[0])), nil
 	})

@@ -97,7 +97,7 @@ func TestListRegionsEmpty(t *testing.T) {
 func TestListRegionsOwnedVariants(t *testing.T) {
 	cases := []struct {
 		name string
-		json string // app_settings value_json 原文；"" 表示不写行
+		json string
 		want string
 	}{
 		{"无行", "", `null`},
@@ -112,7 +112,6 @@ func TestListRegionsOwnedVariants(t *testing.T) {
 			db := newTestDB(t)
 			Register(mux, db)
 			if tc.json == "" {
-				// 不写行
 			} else if tc.json == "NULL" {
 				if _, err := db.Exec(
 					"INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, NULL, NULL)",

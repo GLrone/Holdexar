@@ -9,10 +9,7 @@ import (
 const ftsAppidCap = 1000
 const ftsMaxTokens = 32
 
-// SearchCatalog 目录名检索：name/name_en 检索，不做价格 JOIN——未爬价 /
-// 锁区游戏同样可见。检索通道：优先 games_name_fts（CJK bigram 影子列，
-// token 间 OR + 评测数排序），FTS 无命中或不可用退回 LIKE。
-// Python 侧无 HTTP 端点（agent 工具消费）；供后续 agent 工具迁移调用。
+// SearchCatalog 检索目录名（不做价格 JOIN）：优先 games_name_fts，无命中或不可用时退回 LIKE。
 func SearchCatalog(ctx context.Context, db *sql.DB, term string, limit int) ([]map[string]any, error) {
 	q := strings.TrimSpace(term)
 	if q == "" || limit <= 0 {
@@ -20,7 +17,6 @@ func SearchCatalog(ctx context.Context, db *sql.DB, term string, limit int) ([]m
 	}
 	appids, err := ftsAppids(ctx, db, q)
 	if err != nil {
-		// 影子表缺失 / 异常（未跑迁移的库）→ LIKE 通道仍可用
 		appids = nil
 	}
 	if len(appids) > 0 {
@@ -35,8 +31,7 @@ func SearchCatalog(ctx context.Context, db *sql.DB, term string, limit int) ([]m
 	return catalogRows(ctx, db, nil, q, limit)
 }
 
-// ftsAppids FTS 命中 appid 集；查询词变换走 name_bigram UDF（单一实现），
-// 无可用 token（纯标点 / 单字 CJK）返回空集。
+// ftsAppids 经 name_bigram 分词匹配 FTS；无可用 token 时返回空集。
 func ftsAppids(ctx context.Context, db *sql.DB, q string) ([]int64, error) {
 	var bi string
 	if err := db.QueryRowContext(ctx, "SELECT name_bigram(?, '')", q).Scan(&bi); err != nil {
@@ -73,8 +68,6 @@ func ftsAppids(ctx context.Context, db *sql.DB, q string) ([]int64, error) {
 	return appids, rows.Err()
 }
 
-// catalogRows 目录检索取数：命中集为空时按 q 走 LIKE 兜底；
-// 排序恒为评测数降序，排除已移除款。
 func catalogRows(ctx context.Context, db *sql.DB, appids []int64, q string, limit int) ([]map[string]any, error) {
 	base := "SELECT g.appid, g.name, g.name_en, g.positive_rate, g.review_count," +
 		" cp.cny_fen, cp.discount_percent FROM games g" +
@@ -127,7 +120,6 @@ func catalogRows(ctx context.Context, db *sql.DB, appids []int64, q string, limi
 	return out, rows.Err()
 }
 
-// discountValue int(disc or 0) if disc else 0 的等价：NULL 与 0 都归 0。
 func discountValue(d *int64) int64 {
 	if d == nil {
 		return 0

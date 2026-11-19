@@ -15,13 +15,14 @@ import (
 	"holdexar/server-go/internal/sched"
 	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 const syncKey = "bills.sync_snapshot"
 
 func snapshotKey(sid string) string { return syncKey + ":" + sid }
 
-var billZone = time.FixedZone("Beijing", 8*60*60)
+var billZone = timeutil.ZoneBeijing
 
 type SyncOptions struct {
 	Accounts *account.Service
@@ -44,7 +45,7 @@ type Service struct {
 	jobs     sync.WaitGroup
 	closing  bool
 	owners   map[string]*billSyncLock
-	bindings map[string]bool // A live worker consumes one pending follow-up.
+	bindings map[string]bool
 }
 
 type billSyncLock struct {

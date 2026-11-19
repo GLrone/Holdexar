@@ -110,7 +110,6 @@ func TestPyFloatRepr(t *testing.T) {
 }
 
 func TestPyJSONPayloadTypes(t *testing.T) {
-	// map 兜底按键排序、list 混型、null
 	var b strings.Builder
 	pyValue(&b, map[string]any{"b": 1, "a": nil})
 	if b.String() != `{"a": null, "b": 1}` {

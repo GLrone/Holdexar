@@ -12,12 +12,12 @@ import (
 	"strconv"
 	"strings"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
 const billViewPrefix = "/api/v1/bills"
 
-// RegisterViews serves persisted bill views and manual edits.
 func RegisterViews(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
 	mux.HandleFunc("GET "+billViewPrefix+"/imports", func(w http.ResponseWriter, r *http.Request) {
 		value, err := billImportViews(r.Context(), db)
@@ -109,25 +109,17 @@ func billViewByID(param, resource string, run func(*http.Request, int64) (any, e
 	}
 }
 
-type billViewInputError struct {
-	Type  string   `json:"type"`
-	Loc   []string `json:"loc"`
-	Msg   string   `json:"msg"`
-	Input any      `json:"input"`
-}
-
-func (e *billViewInputError) Error() string { return e.Msg }
-
 func writeBillView(w http.ResponseWriter, value any, err error, missing string) {
 	status := http.StatusOK
 	if err != nil {
+		var input *httpx.ValErr
+		if errors.As(err, &input) {
+			httpx.WriteValidationError(w, *input)
+			return
+		}
 		status = http.StatusInternalServerError
-		var detail any = "账单操作失败"
-		var input *billViewInputError
-		switch {
-		case errors.As(err, &input):
-			status, detail = http.StatusUnprocessableEntity, []any{input}
-		case missing != "" && errors.Is(err, sql.ErrNoRows):
+		detail := "账单操作失败"
+		if missing != "" && errors.Is(err, sql.ErrNoRows) {
 			status, detail = http.StatusNotFound, missing
 		}
 		value = map[string]any{"detail": detail}
@@ -136,9 +128,7 @@ func writeBillView(w http.ResponseWriter, value any, err error, missing string) 
 }
 
 func writeBillJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 
 func billQueryValue(values []string) string {
@@ -158,8 +148,7 @@ func parseBillInt(value, scope, name string) (int64, error) {
 			return number, nil
 		}
 	}
-	return 0, &billViewInputError{"int_parsing", []string{scope, name},
-		"Input should be a valid integer, unable to parse string as an integer", value}
+	return 0, &httpx.ValErr{Type: "int_parsing", Loc: []any{scope, name}, Msg: httpx.IntParseMsg, Input: value}
 }
 
 func billPagination(r *http.Request, defaultLimit int64) (int64, int64, error) {
@@ -188,11 +177,11 @@ func readBillPrice(w http.ResponseWriter, r *http.Request) (*int64, error) {
 	var body, extra any
 	err := decoder.Decode(&body)
 	if err == io.EOF || (err == nil && body == nil) {
-		return nil, &billViewInputError{"missing", []string{"body"}, "Field required", nil}
+		return nil, &httpx.ValErr{Type: "missing", Loc: []any{"body"}, Msg: "Field required", Input: nil}
 	}
 	data, isObject := body.(map[string]any)
 	if err != nil || !isObject || decoder.Decode(&extra) != io.EOF {
-		return nil, &billViewInputError{"model_attributes_type", []string{"body"}, "Input should be a valid dictionary or object to extract fields from", body}
+		return nil, &httpx.ValErr{Type: "model_attributes_type", Loc: []any{"body"}, Msg: "Input should be a valid dictionary or object to extract fields from", Input: body}
 	}
 	key := "manualFen"
 	value, exists := data[key]
@@ -200,7 +189,7 @@ func readBillPrice(w http.ResponseWriter, r *http.Request) (*int64, error) {
 		key = "manual_fen"
 		value = data[key]
 	}
-	loc := []string{"body", key}
+	loc := []any{"body", key}
 	var fen int64
 	switch v := value.(type) {
 	case nil:
@@ -219,13 +208,13 @@ func readBillPrice(w http.ResponseWriter, r *http.Request) (*int64, error) {
 				return &fen, nil
 			}
 		}
-		return nil, &billViewInputError{"int_from_float", loc, "Input should be a valid integer, got a number with a fractional part", value}
+		return nil, &httpx.ValErr{Type: "int_from_float", Loc: loc, Msg: "Input should be a valid integer, got a number with a fractional part", Input: value}
 	case bool:
 		if v {
 			fen = 1
 		}
 	default:
-		return nil, &billViewInputError{"int_type", loc, "Input should be a valid integer", value}
+		return nil, &httpx.ValErr{Type: "int_type", Loc: loc, Msg: "Input should be a valid integer", Input: value}
 	}
 	return &fen, nil
 }

@@ -5,12 +5,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 func reply(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	httpx.WriteJSON(w, status, value)
 }
 func (s *Service) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/monitoring/stats", func(w http.ResponseWriter, r *http.Request) {

@@ -1,19 +1,3 @@
-// 捆绑包联动挂点：评测/发行日变化触发 bundles 排序缓存刷新（对齐现网
-// update_member_bundles → refresh_bundle_sort_cache 链）。
-//
-// 现网触发条件（两处）：
-//  1. update_price_derived 携目录快照时——(positive_rate, review_count,
-//     release_date) 任一变化（目录快照 values[3:6] 元组比较；快照无键的新行
-//     视为变化，已删行不触发），对受影响 appid 集触发；
-//  2. maintain_derived 日切换（derived_inputs.day 变化）——对全部
-//     COALESCE(review_count,0)=0 的行触发一次（评分未定型的行随日刷新）。
-//
-// 影响面：受影响 appid 出现在 bundle_region_prices.app_ids（JSON 数组）中的
-// 捆绑包，其排序缓存（bundle 域 service 层）在调用方事务连接内刷新。
-//
-// bundles 域未迁移：RefreshBundleSortCache 保持默认 nil（空操作），本文件只
-// 落 appid → bundle_id 解析与回调挂点；退出条件 = bundles 域迁移批次以真实
-// 排序缓存实现注入回调，并在调用侧接通（目录联动分支与日切换两处）。
 package derived
 
 import (
@@ -23,12 +7,9 @@ import (
 	"fmt"
 )
 
-// RefreshBundleSortCache 捆绑包排序缓存刷新回调；bundles 域迁移批次注入，
-// 默认 nil = 空操作。在调用方事务连接与写闸内执行。
+// RefreshBundleSortCache 捆绑包排序缓存刷新回调（nil = 空操作），须在调用方事务连接与写闸内执行。
 var RefreshBundleSortCache func(ctx context.Context, conn *sql.Conn, bundleIDs []int64) error
 
-// UpdateMemberBundles 解析受影响 appid 所在捆绑包并触发排序缓存刷新
-// （无关联捆绑包或回调未注入时为空操作）。
 func UpdateMemberBundles(ctx context.Context, conn *sql.Conn, appids []int64) error {
 	if len(appids) == 0 {
 		return nil
@@ -61,9 +42,6 @@ func UpdateMemberBundles(ctx context.Context, conn *sql.Conn, appids []int64) er
 	return RefreshBundleSortCache(ctx, conn, ids)
 }
 
-// ReviewReleaseChanged 评测/发行日联动判定：目录行 (positive_rate,
-// review_count, release_date) 任一变化。调用方对快照无键的行直接视为变化
-// （Python 空元组比较同径）。
 func ReviewReleaseChanged(cur, old CatalogRow) bool {
 	return !intPtrEqual(cur.PositiveRate, old.PositiveRate) ||
 		!intPtrEqual(cur.ReviewCount, old.ReviewCount) ||

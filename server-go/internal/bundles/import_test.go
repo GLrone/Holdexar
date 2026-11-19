@@ -1,9 +1,5 @@
 package bundles
 
-// 导入链用例（对照 Python refresh.py import_bundle / _parse_bundle_ref）：
-// 链接识别正则、双轨抓取（/sub/ 直问 packageid）、全空报错、单品例外保留、
-// 监控登记与排序快照失败不影响导入结果。
-
 import (
 	"context"
 	"database/sql"
@@ -42,15 +38,15 @@ func TestParseBundleRef(t *testing.T) {
 func TestImportSubFlowDirectPackage(t *testing.T) {
 	db, gate := openRefreshDB(t)
 	svc := newRefreshService(t, db, gate)
-	seedCrawlRegion(t, db, "us", true, 30) // USD 区：验证 cny_fen 汇率折算
+	seedCrawlRegion(t, db, "us", true, 30)
 	var kinds []string
 	stubBrowse(t, func(q string) (int, any) {
 		spec := parseSpec(t, q)
 		if len(specIDs(t, spec, "packageid")) > 0 {
 			kinds = append(kinds, "packageid")
 			return http.StatusOK, itemsPayload(stubItem(1066582, map[string]any{
-				"item_type": float64(1),
-				"name":      "Overcooked! 2 - Gourmet Edition",
+				"item_type":       float64(1),
+				"name":            "Overcooked! 2 - Gourmet Edition",
 				"included_appids": []any{float64(440)},
 				"best_purchase_option": map[string]any{
 					"final_price_in_cents": float64(1499), "package_group": "default",
@@ -70,11 +66,9 @@ func TestImportSubFlowDirectPackage(t *testing.T) {
 		outcome.Name != "Overcooked! 2 - Gourmet Edition" {
 		t.Fatalf("outcome=%+v", outcome)
 	}
-	// /sub/ 链接 force_package：直接按 packageid 问，不先探 bundleid
 	if len(kinds) != 1 || kinds[0] != "packageid" {
 		t.Fatalf("kinds=%v", kinds)
 	}
-	// 落库核对：主档 + 区价 + cny（round(1499×7.25)）
 	if got := mustInt(t, db, `SELECT count(*) FROM bundles WHERE bundle_id=1066582`); got != 1 {
 		t.Fatalf("bundles=%d", got)
 	}
@@ -92,7 +86,6 @@ func TestImportSubFlowDirectPackage(t *testing.T) {
 	if !price.Valid || price.Int64 != 1499 || !cny.Valid || cny.Int64 != 10868 {
 		t.Fatalf("price=%v cny=%v（round(1499×7.25)）", price, cny)
 	}
-	// 监控登记：import 来源已挂、无排除
 	var source string
 	if err := db.QueryRow(`SELECT source FROM monitor_sources WHERE target_type='bundle'
 		AND target_id=1066582 AND active=1`).Scan(&source); err != nil {
@@ -124,7 +117,6 @@ func TestImportBundleLinkProbesBothKinds(t *testing.T) {
 	if !outcome.OK || outcome.Kind != "bundle" || outcome.RegionPrices != 1 {
 		t.Fatalf("outcome=%+v", outcome)
 	}
-	// bundleid 一发即中：不落 packageid 兜底
 	if len(kinds) != 1 || kinds[0] != "bundleid" {
 		t.Fatalf("kinds=%v", kinds)
 	}
@@ -208,7 +200,6 @@ func TestImportExistingBundleMarked(t *testing.T) {
 	if !outcome.Existed {
 		t.Fatalf("existed=%v", outcome.Existed)
 	}
-	// 重新导入 = 单包刷新：名称随本轮条目覆盖
 	var name string
 	if err := db.QueryRow(`SELECT name FROM bundles WHERE bundle_id=21478`).Scan(&name); err != nil {
 		t.Fatal(err)
@@ -225,7 +216,6 @@ func TestImportSortCacheFailureDoesNotBreakImport(t *testing.T) {
 	stubBrowse(t, func(q string) (int, any) {
 		return http.StatusOK, itemsPayload(stubItem(21478, nil))
 	})
-	// games 表缺列会让排序快照 SQL 失败——导入结果不受影响
 	if _, err := db.Exec(`DROP TABLE games`); err != nil {
 		t.Fatal(err)
 	}

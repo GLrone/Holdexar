@@ -110,6 +110,7 @@ type ChallengeService struct {
 	Gate    *store.WriteGate
 	Account func(context.Context, string) (string, bool, error)
 	Now     func() time.Time
+	Log     func(string, ...any)
 }
 
 var (
@@ -144,7 +145,7 @@ func (s ChallengeService) account(ctx context.Context, sid string) (string, erro
 	if sid = strings.TrimSpace(sid); sid != "" {
 		return sid, nil
 	}
-	sid, _, err := (Reader{DB: s.DB, Account: s.Account}).readAccount(ctx, "")
+	sid, _, err := (Reader{DB: s.DB, Account: s.Account, Log: s.Log}).readAccount(ctx, "")
 	return sid, err
 }
 

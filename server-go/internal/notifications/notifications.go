@@ -1,6 +1,4 @@
-// Package notifications provides notification preferences and delivery records.
-// 候选状态是投递状态不是事实状态：pending/suppressed 未投递，sending/unknown
-// 结果未确认（禁止自动重发），delivered 已投递，failed 失败（可重试判定见 stats）。
+// 投递状态语义：pending/suppressed 待投递，sending/unknown 禁止自动重发。
 package notifications
 
 import (
@@ -11,16 +9,15 @@ import (
 	"strings"
 
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
-// prefsKey 用户通知偏好的 KV 键（app_settings.value_json，结构对齐 Python DEFAULT_PREFS）。
 const prefsKey = "notifications.prefs"
 
-// maxAttempts 单条候选投递次数上限；超过即永久失败。
+// maxAttempts 单条候选最大投递尝试次数（达到即不再重试）。
 const maxAttempts = 3
 
-// statusUnknown 投递结果未知（进程中断时可能已发出，不自动重发）。
 const statusUnknown = "unknown"
 
 type Options struct {
@@ -50,7 +47,7 @@ func Register(mux *http.ServeMux, db *sql.DB, options ...Options) {
 		"/api/v1/notifications/stats",
 		"/api/v1/notifications/facts",
 	} {
-		mux.HandleFunc(p, methodNotAllowed("GET"))
+		mux.HandleFunc(p, httpx.MethodNotAllowed("GET"))
 	}
 }
 
@@ -59,62 +56,114 @@ type handler struct {
 	options Options
 }
 
-// getPrefs 通知偏好投影 + SMTP 出口状态 + 最近一次投递结果（设置页一屏）。
+type featuredPrefsView struct {
+	Scope           any `json:"scope"`
+	MinDiscount     any `json:"minDiscount"`
+	MinSavings      any `json:"minSavings"`
+	MaxPrice        any `json:"maxPrice"`
+	LowMode         any `json:"lowMode"`
+	AllowFullPrice  any `json:"allowFullPrice"`
+	MinPositiveRate any `json:"minPositiveRate"`
+	MinReviews      any `json:"minReviews"`
+	MissingReviews  any `json:"missingReviews"`
+	IncludeOwned    any `json:"includeOwned"`
+	IncludeIgnored  any `json:"includeIgnored"`
+	Sort            any `json:"sort"`
+	WindowDays      any `json:"windowDays"`
+}
+
+type lastDeliveryView struct {
+	Status    *string `json:"status"`
+	At        *string `json:"at"`
+	Attempts  *int64  `json:"attempts"`
+	Reason    *string `json:"reason"`
+	Retryable bool    `json:"retryable"`
+}
+
+type deliveryChannelView struct {
+	Kind       string `json:"kind"`
+	Configured bool   `json:"configured"`
+	Name       string `json:"name,omitempty"`
+}
+
+type prefsBaseView struct {
+	Enabled        any               `json:"enabled"`
+	QuietEnabled   any               `json:"quietEnabled"`
+	QuietStart     any               `json:"quietStart"`
+	QuietEnd       any               `json:"quietEnd"`
+	IncludeDetails any               `json:"includeDetails"`
+	MaxAttempts    int               `json:"maxAttempts"`
+	ManualRegion   any               `json:"manualRegion"`
+	DigestTime     any               `json:"digestTime"`
+	DigestWeekday  any               `json:"digestWeekday"`
+	Featured       featuredPrefsView `json:"featured"`
+	Region         RegionSelection   `json:"region"`
+	Types          []typeEntry       `json:"types"`
+	Categories     []categoryEntry   `json:"categories"`
+}
+
+type prefsGetResponse struct {
+	prefsBaseView
+	SMTP         *smtpSummaryView     `json:"smtp"`
+	LastDelivery *lastDeliveryView    `json:"lastDelivery"`
+	Delivery     *deliveryChannelView `json:"delivery,omitempty"`
+}
+
 func (h *handler) getPrefs(w http.ResponseWriter, r *http.Request) {
 	prefs, err := h.readPrefs(r)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	smtp, err := h.smtpView(r)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	last, err := h.lastDelivery(r)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	region, err := EffectiveRegion(r.Context(), h.db, "", prefs, nil)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
-	view := prefsView(prefs, smtp, last, region)
+	resp := prefsGetResponse{
+		prefsBaseView: buildPrefsBaseView(prefs, region),
+		SMTP:          smtp,
+		LastDelivery:  last,
+	}
 	if h.options.Delivery != nil && h.options.Delivery.options.Plugins != nil {
 		active, problem := h.options.Delivery.options.Plugins.Active(r.Context())
 		if problem != nil {
-			view.set("delivery", map[string]any{"kind": "plugin", "configured": false})
+			resp.Delivery = &deliveryChannelView{Kind: "plugin", Configured: false}
 		} else if active != nil {
-			view.set("delivery", map[string]any{"kind": "plugin", "configured": true, "name": active.Manifest.Name})
+			resp.Delivery = &deliveryChannelView{Kind: "plugin", Configured: true, Name: active.Manifest.Name}
 		}
 	}
-	writeJSON(w, http.StatusOK, view)
+	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
-// prefsView 偏好投影；字段值 = 库内补丁值优先，缺省用 Python 默认（逐字段覆盖语义）。
-func prefsView(p map[string]any, smtp *orderedObj, last *orderedObj, region RegionSelection) *orderedObj {
-	v := newOrderedObj()
-	v.set("enabled", patched(p, "enabled", false))
-	v.set("quietEnabled", patched(p, "quietEnabled", false))
-	v.set("quietStart", patched(p, "quietStart", "23:00"))
-	v.set("quietEnd", patched(p, "quietEnd", "08:00"))
-	v.set("includeDetails", patched(p, "includeDetails", true))
-	v.set("maxAttempts", maxAttempts)
-	v.set("manualRegion", patched(p, "manualRegion", nil))
-	v.set("digestTime", patched(p, "digestTime", "08:00"))
-	v.set("digestWeekday", patched(p, "digestWeekday", json.Number("0")))
-	v.set("featured", featuredView(p))
-	v.set("region", region)
-	v.set("types", typeEntries(p))
-	v.set("categories", categoryEntries(p))
-	v.set("smtp", smtp)
-	v.set("lastDelivery", last)
-	return v
+func buildPrefsBaseView(p map[string]any, region RegionSelection) prefsBaseView {
+	return prefsBaseView{
+		Enabled:        patched(p, "enabled", false),
+		QuietEnabled:   patched(p, "quietEnabled", false),
+		QuietStart:     patched(p, "quietStart", "23:00"),
+		QuietEnd:       patched(p, "quietEnd", "08:00"),
+		IncludeDetails: patched(p, "includeDetails", true),
+		MaxAttempts:    maxAttempts,
+		ManualRegion:   patched(p, "manualRegion", nil),
+		DigestTime:     patched(p, "digestTime", "08:00"),
+		DigestWeekday:  patched(p, "digestWeekday", json.Number("0")),
+		Featured:       featuredView(p),
+		Region:         region,
+		Types:          typeEntries(p),
+		Categories:     categoryEntries(p),
+	}
 }
 
-// patched 补丁值优先的标量取值（Python _merge_dict 的标量分支）。
 func patched(p map[string]any, key string, def any) any {
 	if raw, ok := p[key]; ok {
 		return raw
@@ -122,7 +171,6 @@ func patched(p map[string]any, key string, def any) any {
 	return def
 }
 
-// featuredDefaultKeys 精选配置的键序（对齐 Python DEFAULT_FEATURED 的插入序）。
 var featuredDefaultKeys = []struct {
 	key string
 	def any
@@ -134,21 +182,25 @@ var featuredDefaultKeys = []struct {
 	{"sort", "discount"}, {"windowDays", nil},
 }
 
-// featuredView 精选配置 = 默认骨架 + 库内补丁逐键覆盖。
-func featuredView(p map[string]any) *orderedObj {
+func featuredView(p map[string]any) featuredPrefsView {
 	patch, _ := p["featured"].(map[string]any)
-	v := newOrderedObj()
-	for _, kv := range featuredDefaultKeys {
-		val := any(kv.def)
-		if raw, ok := patch[kv.key]; ok {
-			val = raw
-		}
-		v.set(kv.key, val)
+	return featuredPrefsView{
+		Scope:           patched(patch, "scope", []any{"followed", "wishlist"}),
+		MinDiscount:     patched(patch, "minDiscount", json.Number("50")),
+		MinSavings:      patched(patch, "minSavings", nil),
+		MaxPrice:        patched(patch, "maxPrice", nil),
+		LowMode:         patched(patch, "lowMode", "any"),
+		AllowFullPrice:  patched(patch, "allowFullPrice", false),
+		MinPositiveRate: patched(patch, "minPositiveRate", nil),
+		MinReviews:      patched(patch, "minReviews", nil),
+		MissingReviews:  patched(patch, "missingReviews", "include"),
+		IncludeOwned:    patched(patch, "includeOwned", false),
+		IncludeIgnored:  patched(patch, "includeIgnored", false),
+		Sort:            patched(patch, "sort", "discount"),
+		WindowDays:      patched(patch, "windowDays", nil),
 	}
-	return v
 }
 
-// typeEntry 单个通知类型的偏好投影。
 type typeEntry struct {
 	Key       string `json:"key"`
 	Label     string `json:"label"`
@@ -157,7 +209,6 @@ type typeEntry struct {
 	Frequency any    `json:"frequency"`
 }
 
-// typeEntries 全部通知类型（键序对齐 Python TYPE_LABELS 的插入序）。
 func typeEntries(p map[string]any) []typeEntry {
 	patch, _ := p["types"].(map[string]any)
 	out := make([]typeEntry, 0, len(typeLabels))
@@ -176,7 +227,6 @@ func typeEntries(p map[string]any) []typeEntry {
 	return out
 }
 
-// categoryEntry 单个用户类别的偏好投影。
 type categoryEntry struct {
 	Key        string `json:"key"`
 	Label      string `json:"label"`
@@ -184,7 +234,6 @@ type categoryEntry struct {
 	EventTypes int    `json:"eventTypes"`
 }
 
-// categoryEntries 全部用户类别（键序对齐 Python CATEGORIES 元组序）。
 func categoryEntries(p map[string]any) []categoryEntry {
 	patch, _ := p["categories"].(map[string]any)
 	out := make([]categoryEntry, 0, len(categoryLabels))
@@ -199,9 +248,7 @@ func categoryEntries(p map[string]any) []categoryEntry {
 	return out
 }
 
-// lastDelivery 最近一次投递结果：三种已终态候选中 updated_at 最新的一行；
-// 无终态行回 nil（字段整体缺省为 null）。
-func (h *handler) lastDelivery(r *http.Request) (*orderedObj, error) {
+func (h *handler) lastDelivery(r *http.Request) (*lastDeliveryView, error) {
 	var status, deliveredAt, updatedAt, reason, lastError sql.NullString
 	var attempts sql.NullInt64
 	filter := ""
@@ -230,21 +277,20 @@ func (h *handler) lastDelivery(r *http.Request) (*orderedObj, error) {
 	if at == nil {
 		at = isoformatPtr(updatedAt)
 	}
-	v := newOrderedObj()
-	v.set("status", nullTextPtr(status))
-	v.set("at", at)
-	v.set("attempts", nullIntPtr(attempts))
-	v.set("reason", nullTextPtr(reason))
-	v.set("retryable", isRetryable(lastError.String))
-	return v, nil
+	return &lastDeliveryView{
+		Status:    nullTextPtr(status),
+		At:        at,
+		Attempts:  nullIntPtr(attempts),
+		Reason:    nullTextPtr(reason),
+		Retryable: isRetryable(lastError.String),
+	}, nil
 }
 
-// readPrefs 读偏好补丁：value_json 解析为无序映射（仅作键值查表，不再输出）。
 func (h *handler) readPrefs(r *http.Request) (map[string]any, error) {
 	return LoadPrefs(r.Context(), h.db)
 }
 
-// settingValue 读单个设置的 value_json；行缺席回 (def, false)，NULL 回 (nil, true)。
+// settingValue 读单个设置的 value_json；行缺席回 (nil, false)，NULL 回 (nil, true)。
 func (h *handler) settingValue(ctx context.Context, key string) (any, bool, error) {
 	var raw sql.NullString
 	err := h.db.QueryRowContext(ctx,

@@ -1,10 +1,11 @@
 package alerts
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
-	"sort"
+	"slices"
 
 	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/notifications"
@@ -119,18 +120,19 @@ func (s *Service) featuredResults(ctx context.Context, q query, config map[strin
 		}
 		results = append(results, result)
 	}
-	sort.SliceStable(results, func(i, j int) bool {
-		a, b := results[i], results[j]
+	slices.SortStableFunc(results, func(a, b map[string]any) int {
 		if a["matched"] != b["matched"] {
-			return a["matched"] == true
+			if a["matched"] == true {
+				return -1
+			}
+			return 1
 		}
-		av, bv := featuredValue(a, text(config["sort"])), featuredValue(b, text(config["sort"]))
-		if av != bv {
-			return av < bv
+		if c := cmp.Compare(featuredValue(a, text(config["sort"])), featuredValue(b, text(config["sort"]))); c != 0 {
+			return c
 		}
 		ai, _ := number(obj(a["observed"])["appid"])
 		bi, _ := number(obj(b["observed"])["appid"])
-		return ai < bi
+		return cmp.Compare(ai, bi)
 	})
 	return results, nil
 }

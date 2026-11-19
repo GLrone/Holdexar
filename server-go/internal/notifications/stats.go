@@ -6,10 +6,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"holdexar/server-go/internal/httpx"
 )
 
-// 临时故障判据：异常类型名优先、英文措辞其次、中文措辞兜底（源
-// notifications/service.py _RETRYABLE_HINTS / _PERMANENT_HINTS，两清单须同步）。
 var retryableHints = []string{
 	"smtpserverdisconnected", "smtpconnecterror", "smtpresponsenotready",
 	"connectionrefusederror", "connectionreseterror", "timeouterror", "gaierror",
@@ -18,7 +18,6 @@ var retryableHints = []string{
 	"拒绝", "无法连接", "超时", "网络", "重置", "断开",
 }
 
-// 永久失败判据：凭据/地址/配置类，重试只会重复发出同一封失败邮件。
 var permanentHints = []string{
 	"smtpauthenticationerror", "authentication", "535", "534", "530",
 	"username and password", "login", "未配置",
@@ -26,7 +25,6 @@ var permanentHints = []string{
 	"553", "550", "554", "552", "551", "no such",
 }
 
-// 投递出口的结构化错误前缀（源 alerts/notify.py，前缀改动须两处同步）。
 const (
 	unknownDeliveryPrefix = "SMTPDeliveryUnknown:"
 	rejectedDeliveryExpr  = `^SMTPRejected: ([45][0-9]{2})(?: |$)`
@@ -34,12 +32,10 @@ const (
 
 var rejectedDeliveryRe = regexp.MustCompile(rejectedDeliveryExpr)
 
-// deliveryUnknown 结果是否无法确认（进程中断时可能已发出）。
 func deliveryUnknown(errText string) bool {
 	return strings.HasPrefix(errText, unknownDeliveryPrefix) || strings.HasPrefix(errText, "PluginDeliveryUnknown:")
 }
 
-// deliveryRejectionCode 服务器拒绝码；无结构化码回 (0, false)。
 func deliveryRejectionCode(errText string) (int, bool) {
 	m := rejectedDeliveryRe.FindStringSubmatch(errText)
 	if m == nil {
@@ -71,33 +67,48 @@ func isRetryable(errText string) bool {
 	return false
 }
 
-// getStats 投递生产指标：按候选状态聚合计数与尝试次数。
+type statusStat struct {
+	Count    int64 `json:"count"`
+	Attempts int64 `json:"attempts"`
+}
+
+type statsResponse struct {
+	Total       int64                 `json:"total"`
+	Delivered   int64                 `json:"delivered"`
+	Pending     int64                 `json:"pending"`
+	Suppressed  int64                 `json:"suppressed"`
+	Sending     int64                 `json:"sending"`
+	Unknown     int64                 `json:"unknown"`
+	Failed      int64                 `json:"failed"`
+	Retryable   int64                 `json:"retryable"`
+	Permanent   int64                 `json:"permanent"`
+	Attempts    int64                 `json:"attempts"`
+	MaxAttempts int                   `json:"maxAttempts"`
+	ByStatus    map[string]statusStat `json:"byStatus"`
+}
+
 func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.db.QueryContext(r.Context(),
 		"SELECT status, COUNT(id), COALESCE(SUM(attempts), 0)"+
 			" FROM notification_candidates GROUP BY status")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
-	type bucket struct {
-		count    int64
-		attempts int64
-	}
-	counts := map[string]*bucket{}
-	byStatus := newOrderedObj()
+	byStatus := map[string]statusStat{}
 	for rows.Next() {
 		var status string
 		var count, attempts int64
 		if err := rows.Scan(&status, &count, &attempts); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+			rows.Close()
+			httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 			return
 		}
-		counts[status] = &bucket{count: count, attempts: attempts}
-		byStatus.set(status, kvObj("count", count, "attempts", attempts))
+		byStatus[status] = statusStat{Count: count, Attempts: attempts}
 	}
 	if err := rows.Err(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		rows.Close()
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	rows.Close()
@@ -105,7 +116,7 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 	failedRows, err := h.db.QueryContext(r.Context(),
 		"SELECT attempts, last_error FROM notification_candidates WHERE status = 'failed'")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 	defer failedRows.Close()
@@ -114,7 +125,7 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 		var attempts sql.NullInt64
 		var lastError sql.NullString
 		if err := failedRows.Scan(&attempts, &lastError); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+			httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 			return
 		}
 		if attemptsOrZero(attempts) < maxAttempts && isRetryable(lastError.String) {
@@ -122,38 +133,28 @@ func (h *handler) getStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := failedRows.Err(); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
+		httpx.WriteJSON(w, http.StatusInternalServerError, httpx.DetailNull())
 		return
 	}
 
-	failed := int64(0)
-	if b, ok := counts["failed"]; ok {
-		failed = b.count
-	}
+	failed := byStatus["failed"].Count
 	total, totalAttempts := int64(0), int64(0)
-	for _, b := range counts {
-		total += b.count
-		totalAttempts += b.attempts
+	for _, b := range byStatus {
+		total += b.Count
+		totalAttempts += b.Attempts
 	}
-	statusCount := func(status string) int64 {
-		if b, ok := counts[status]; ok {
-			return b.count
-		}
-		return 0
-	}
-	writeJSON(w, http.StatusOK, kvObj(
-		"total", total,
-		"delivered", statusCount("delivered"),
-		"pending", statusCount("pending"),
-		"suppressed", statusCount("suppressed"),
-		"sending", statusCount("sending"),
-		"unknown", statusCount(statusUnknown),
-		"failed", failed,
-		// 失败里还能再试的（临时故障且未到次数上限）与已经永久放弃的
-		"retryable", canRetry,
-		"permanent", failed-canRetry,
-		"attempts", totalAttempts,
-		"maxAttempts", maxAttempts,
-		"byStatus", byStatus,
-	))
+	httpx.WriteJSON(w, http.StatusOK, statsResponse{
+		Total:       total,
+		Delivered:   byStatus["delivered"].Count,
+		Pending:     byStatus["pending"].Count,
+		Suppressed:  byStatus["suppressed"].Count,
+		Sending:     byStatus["sending"].Count,
+		Unknown:     byStatus[statusUnknown].Count,
+		Failed:      failed,
+		Retryable:   canRetry,
+		Permanent:   failed - canRetry,
+		Attempts:    totalAttempts,
+		MaxAttempts: maxAttempts,
+		ByStatus:    byStatus,
+	})
 }

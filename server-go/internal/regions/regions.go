@@ -1,5 +1,3 @@
-// Package regions：区服元数据与抓取范围配置。
-// 数据源：crawl_regions 表（区服配置唯一事实）+ app_settings 已购抓取区键。
 package regions
 
 import (
@@ -8,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
 	"math"
@@ -16,7 +15,6 @@ import (
 	"strings"
 )
 
-// ownedRegionsKey 已购游戏专用抓取区设置键；缺省/空 = 跟随全局启用集。
 const ownedRegionsKey = "crawl.owned_regions"
 
 type Options struct {
@@ -30,7 +28,7 @@ func Register(mux *http.ServeMux, db *sql.DB, options ...Options) {
 		h.options = options[0]
 	}
 	mux.HandleFunc("GET /api/v1/regions", h.listRegions)
-	mux.HandleFunc("/api/v1/regions", methodNotAllowed("GET"))
+	mux.HandleFunc("/api/v1/regions", httpx.MethodNotAllowed("GET"))
 	if h.options.Gate != nil {
 		mux.HandleFunc("PUT /api/v1/regions/enabled", h.updateEnabled)
 		mux.HandleFunc("PUT /api/v1/regions/owned", h.updateOwned)
@@ -42,7 +40,6 @@ type handler struct {
 	options Options
 }
 
-// regionItem 区服元数据行（crawl_regions 投影）。
 type regionItem struct {
 	Code     string `json:"code"`
 	Name     string `json:"name"`
@@ -57,7 +54,6 @@ type regionsResponse struct {
 	OwnedRegions *[]string `json:"ownedRegions"`
 }
 
-// listRegions 全量区服（含禁用标记，按 sort 排）+ 已购抓取区。
 func (h *handler) listRegions(w http.ResponseWriter, r *http.Request) {
 	items, err := h.regionItems(r.Context())
 	if err != nil {
@@ -95,7 +91,6 @@ func (h *handler) regionItems(ctx context.Context) ([]regionItem, error) {
 	return items, nil
 }
 
-// ownedRegions 读 app_settings 的已购抓取区键：非空列表归一为小写串，其余为 null。
 func (h *handler) ownedRegions(ctx context.Context) (*[]string, error) {
 	var raw sql.NullString
 	err := h.db.QueryRowContext(ctx,
@@ -124,8 +119,7 @@ func (h *handler) ownedRegions(ctx context.Context) (*[]string, error) {
 	return &out, nil
 }
 
-// pyStr JSON 标量转 Python str() 语义字符串。写入侧保证元素为字符串，
-// 数值/布尔/null 为越界数据，按近似语义兜底。
+// pyStr 将越界的 JSON 标量（bool/null/数值）按字符串语义兜底转换。
 func pyStr(v any) string {
 	switch x := v.(type) {
 	case string:
@@ -147,22 +141,6 @@ func pyStr(v any) string {
 	}
 }
 
-// methodNotAllowed 非声明方法的回退响应（对齐 {"detail": ...} 形态）。
-func methodNotAllowed(allow string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Allow", allow)
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"detail": "Method Not Allowed"})
-	}
-}
-
-// writeJSON JSON 响应体不带尾随换行。
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	httpx.WriteJSON(w, status, payload)
 }

@@ -1,27 +1,90 @@
-// Package metadata 外部元数据导入：Epic / XGP / Humble Choice 三源数据文件
-// 一次性打标进 games 库内已有行（等价 Python domains/metadata/service.py 的
-// import_epic / import_xgp / import_hb / import_all）。只更新库内已有 appid，
-// 不新建目录行。
 package metadata
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"holdexar/server-go/internal/config"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
-// 外部数据文件名（Python service.py 常量同值）。
+var ErrSourceDirRejected = errors.New("导入目录不存在或不可用")
+
+type RegisterOption func(*registerConfig)
+
+type registerConfig struct {
+	dataDir string
+}
+
+func WithDataDir(dir string) RegisterOption {
+	return func(c *registerConfig) { c.dataDir = dir }
+}
+
+func resolvePathBestEffort(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	cur := abs
+	var tail []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append([]string{filepath.Base(cur)}, tail...)
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			parts := append([]string{resolved}, tail...)
+			return filepath.Join(parts...), nil
+		}
+		cur = parent
+	}
+}
+
+// ConstrainSourceDir constrains a request-supplied source_dir inside dataRoot (defaulting to config.ResolveDataDir).
+// Empty sourceDir falls back to METADATA_DATA_DIR without entering the request path check.
+func ConstrainSourceDir(dataRoot, sourceDir string) (string, error) {
+	if strings.TrimSpace(sourceDir) == "" {
+		return os.Getenv("METADATA_DATA_DIR"), nil
+	}
+	root := strings.TrimSpace(dataRoot)
+	if root == "" {
+		var err error
+		root, err = config.ResolveDataDir()
+		if err != nil || strings.TrimSpace(root) == "" {
+			return "", ErrSourceDirRejected
+		}
+	}
+	resolvedRoot, err := resolvePathBestEffort(root)
+	if err != nil {
+		return "", ErrSourceDirRejected
+	}
+	resolvedTarget, err := resolvePathBestEffort(sourceDir)
+	if err != nil {
+		return "", ErrSourceDirRejected
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedTarget)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", ErrSourceDirRejected
+	}
+	return resolvedTarget, nil
+}
+
 const (
 	epicFile     = "epic_free_games_clean_final.json"
 	xgpTiered    = "xgp_tiered_steam.json"
@@ -29,8 +92,7 @@ const (
 	historicalDB = "steam_historical_lows.db"
 )
 
-// resolveSourcePath 导入文件定位：显式 source_dir 优先，缺省走环境变量
-// METADATA_DATA_DIR（Python DEFAULT_SOURCE_DIR 同语义，未设置即相对路径）。
+// resolveSourcePath 显式 source_dir 优先，缺省回退 METADATA_DATA_DIR。
 func resolveSourcePath(sourceDir, filename string) string {
 	base := sourceDir
 	if base == "" {
@@ -39,12 +101,22 @@ func resolveSourcePath(sourceDir, filename string) string {
 	return filepath.Join(base, filename)
 }
 
-// Register 装配导入端点：POST /api/v1/metadata/import。
-func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
+func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, opts ...RegisterOption) {
+	var cfg registerConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
 	mux.HandleFunc("POST /api/v1/metadata/import", func(w http.ResponseWriter, r *http.Request) {
 		source, sourceDir, verrs := decodeImportRequest(w, r)
 		if verrs != nil {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": verrs})
+			httpx.WriteValidationError(w, verrs...)
+			return
+		}
+		constrained, err := ConstrainSourceDir(cfg.dataDir, sourceDir)
+		if err != nil {
+			httpx.WriteJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": err.Error()})
 			return
 		}
 		switch source {
@@ -53,33 +125,26 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate) {
 			for _, importer := range []func(context.Context, *sql.DB, *store.WriteGate, string) map[string]any{
 				ImportEpic, ImportXGP, ImportHB,
 			} {
-				results = append(results, importer(r.Context(), db, gate, sourceDir))
+				results = append(results, importer(r.Context(), db, gate, constrained))
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"results": results})
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results})
 			return
 		case "epic":
-			writeJSON(w, http.StatusOK, ImportEpic(r.Context(), db, gate, sourceDir))
+			httpx.WriteJSON(w, http.StatusOK, ImportEpic(r.Context(), db, gate, constrained))
 		case "xgp":
-			writeJSON(w, http.StatusOK, ImportXGP(r.Context(), db, gate, sourceDir))
+			httpx.WriteJSON(w, http.StatusOK, ImportXGP(r.Context(), db, gate, constrained))
 		case "hb":
-			writeJSON(w, http.StatusOK, ImportHB(r.Context(), db, gate, sourceDir))
+			httpx.WriteJSON(w, http.StatusOK, ImportHB(r.Context(), db, gate, constrained))
 		default:
-			writeJSON(w, http.StatusOK, map[string]any{
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
 				"error": fmt.Sprintf("未知来源: %s（可选 epic/xgp/hb/all）", source)})
 		}
 	})
 }
 
-// valErr 校验错误项（形状对齐 FastAPI/Pydantic venv 实测锚点）。
-type valErr struct {
-	Type  string `json:"type"`
-	Loc   []any  `json:"loc"`
-	Msg   string `json:"msg"`
-	Input any    `json:"input"`
-}
+type valErr = httpx.ValErr
 
-// decodeImportRequest 请求体校验：missing source / 非串 source / 非对象体
-// 三类 422；通过校验后返回 strip+lower 的 source 与原样 source_dir。
+// decodeImportRequest 校验 JSON 对象体、必填 string source 及可选 string source_dir，其余返回 422。
 func decodeImportRequest(w http.ResponseWriter, r *http.Request) (string, string, []valErr) {
 	fail := func(errs []valErr) (string, string, []valErr) { return "", "", errs }
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
@@ -120,14 +185,11 @@ func decodeImportRequest(w http.ResponseWriter, r *http.Request) (string, string
 	return strings.ToLower(strings.TrimSpace(source)), sourceDir, nil
 }
 
-// missingFile 找不到数据文件的标准错误形状。
 func missingFile(source, path string) map[string]any {
 	return map[string]any{"source": source, "ok": false,
 		"error": fmt.Sprintf("找不到数据文件: %s", path)}
 }
 
-// ImportEpic applist → (appid, free_period) 映射，仅打标库内已有行：
-// is_epic=1 + epic_date（无赠送期的 appid 落 NULL）。
 func ImportEpic(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDir string) map[string]any {
 	path := resolveSourcePath(sourceDir, epicFile)
 	raw, err := os.ReadFile(path)
@@ -166,7 +228,6 @@ func ImportEpic(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDi
 		"inSource": len(periods), "updated": updated}
 }
 
-// ImportXGP tiered 文件（+ 可选 links 文件名称匹配）→ xgp_tier 批量打标。
 func ImportXGP(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDir string) map[string]any {
 	tieredPath := resolveSourcePath(sourceDir, xgpTiered)
 	raw, err := os.ReadFile(tieredPath)
@@ -211,7 +272,6 @@ func ImportXGP(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDir
 		"inSource": len(tiers), "updated": updated, "nameMatched": nameMatched}
 }
 
-// ImportHB 历史低价 SQLite 的 game_lows.humble_choice 列 → is_hb + hb_data 批量打标。
 func ImportHB(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDir string) map[string]any {
 	path := resolveSourcePath(sourceDir, historicalDB)
 	if _, err := os.Stat(path); err != nil {
@@ -238,8 +298,7 @@ func ImportHB(ctx context.Context, db *sql.DB, gate *store.WriteGate, sourceDir 
 		"inSource": len(values), "updated": updated}
 }
 
-// markExisting 写闸单事务批量打标：先数库内命中行（updated 口径），再经
-// UPDATE..FROM 全量覆盖写（FROM 联接天然只触库内已有行）。
+// markExisting 在写闸单事务内先统计命中行数，再 UPDATE..FROM 覆盖库内已有行。
 func markExisting(ctx context.Context, db *sql.DB, gate *store.WriteGate,
 	values map[int64]*string, buildSQL func(string) string, pairs string) (int, error) {
 	if len(values) == 0 {
@@ -261,7 +320,6 @@ func markExisting(ctx context.Context, db *sql.DB, gate *store.WriteGate,
 	return updated, nil
 }
 
-// pairsJSON (appid, value) 对序列：null 值也照写（Python case() 同形）。
 func pairsJSON(values map[int64]*string) string {
 	pairs := make([]string, 0, len(values))
 	for id, value := range values {
@@ -276,7 +334,6 @@ func pairsJSON(values map[int64]*string) string {
 	return "[" + strings.Join(pairs, ",") + "]"
 }
 
-// asInt64 Python int() 语义的宽松收数（数字串/整值浮点收下）。
 func asInt64(v any) (int64, bool) {
 	switch x := v.(type) {
 	case int64:
@@ -300,7 +357,6 @@ func asInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-// readHBLows 只读打开外部低价库，抽 Humble Choice 行 → {appid: 标记文案}。
 func readHBLows(path string) (map[int64]string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -366,7 +422,6 @@ var hbMonthMap = map[string]string{
 	"Sep": "9", "Oct": "10", "Nov": "11", "Dec": "12",
 }
 
-// fmtHBData 月份标注格式化（Python _fmt_hb_data 同构）。
 func fmtHBData(raw string) string {
 	if m := hbRe.FindStringSubmatch(raw); m != nil {
 		name := strings.ToLower(m[1])
@@ -386,8 +441,6 @@ func fmtHBData(raw string) string {
 	return "HB慈善包"
 }
 
-// ─── XGP 名称匹配（Python _clean_name / _build_links_map 同构）──────────────
-
 var (
 	xgpTrademarkRe = regexp.MustCompile(`\s*\-\s*pc edition|\s*\(pc\)|\s*\(windows\)|\s*windows edition|\s*xbox one|\s*xbox series x\|s`)
 	xgpEditionRe   = regexp.MustCompile(`(?i)\s*standard edition|\s*game of the year edition|\s*anniversary edition|\s*complete edition` +
@@ -396,7 +449,6 @@ var (
 	xgpSpacesRe  = regexp.MustCompile(`\s+`)
 )
 
-// cleanNameXGP XGP 条目名清洗（Python _clean_name 同构）。
 func cleanNameXGP(n string) string {
 	if n == "" {
 		return ""
@@ -416,7 +468,6 @@ type xgpLinksEntry struct {
 	appID string
 }
 
-// buildLinksMap name→appid 三级查找表（exact / clean / 罗马数字互换）。
 func buildLinksMap(entries []struct {
 	Name  any `json:"game_name"`
 	AppID any `json:"steam_appid"`
@@ -439,7 +490,6 @@ func buildLinksMap(entries []struct {
 	return m
 }
 
-// matchAppIDByName 三级查找（exact / clean / alt）。
 func matchAppIDByName(name string, links map[string]map[string]string) string {
 	exact := strings.ToLower(strings.TrimSpace(name))
 	cleaned := cleanNameXGP(name)
@@ -455,19 +505,16 @@ func matchAppIDByName(name string, links map[string]map[string]string) string {
 	return ""
 }
 
-// collectXGPTiers 扁平化 tiered JSON；PC Collection 优先。
 func collectXGPTiers(data map[string]any) map[int64]string {
 	return collectXGPEntries(data, nil, nil)
 }
 
-// collectXGPWithLinks 缺 appid 条目走名称匹配，返回匹配计数。
 func collectXGPWithLinks(data map[string]any, links map[string]map[string]string) (map[int64]string, int) {
 	matched := 0
 	return collectXGPEntries(data, links, &matched), matched
 }
 
-// collectXGPEntries 共同扁平化逻辑：tier 名取内层键名，同 appid 冲突时
-// PC Collection 后到者胜（Python _collect_xgp_* 同构）。
+// collectXGPEntries 扁平化分档列表，同 appid 时 PC Collection 覆盖其余分组。
 func collectXGPEntries(data map[string]any, links map[string]map[string]string, matched *int) map[int64]string {
 	tiers := map[int64]string{}
 	for collectionType, tierGroup := range data {
@@ -519,10 +566,4 @@ func pyStr(v any) string {
 		return strconv.FormatFloat(x, 'f', -1, 64)
 	}
 	return ""
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
 }

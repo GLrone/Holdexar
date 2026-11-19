@@ -108,3 +108,35 @@ func TestBundleArchiveValidation(t *testing.T) {
 		t.Fatalf("counts=%v err=%v", counts, err)
 	}
 }
+
+func TestMetadataStatusConstrainsSourceDir(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "holdexar.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = store.InitializeFreshDatabase(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	service := NewCounts(db, store.NewWriteGate(db, path), WithCountsDataDir(dataDir))
+	mux := http.NewServeMux()
+	service.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/metadata/status?source_dir="+filepath.Join(t.TempDir(), "outside"), nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 422 {
+		t.Fatalf("outside source_dir status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	inside := filepath.Join(dataDir, "imports")
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/metadata/status?source_dir="+inside, nil)
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("inside source_dir status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}

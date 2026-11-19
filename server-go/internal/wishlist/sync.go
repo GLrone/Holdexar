@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	"holdexar/server-go/internal/store"
@@ -160,7 +160,7 @@ func (s *Service) syncAccount(parent context.Context, sid string, autoCrawl, res
 		for id := range items {
 			ids = append(ids, id)
 		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		slices.Sort(ids)
 		updates := [][7]any{}
 		for _, id := range ids {
 			row := items[id]

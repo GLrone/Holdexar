@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/jobrun"
+	"holdexar/server-go/internal/timeutil"
 )
 
 var ErrAccountMissing = errors.New("追踪账户不存在或已更新")
-var wishlistZone = time.FixedZone("Beijing", 8*60*60)
+var wishlistZone = timeutil.ZoneBeijing
 
 type ServiceOptions struct {
 	Steam     *Steam

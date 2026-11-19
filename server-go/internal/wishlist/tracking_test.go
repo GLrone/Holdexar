@@ -450,3 +450,47 @@ func TestPendingSyncSurvivesRemoveAndReaddAndClose(t *testing.T) {
 		t.Fatalf("coalescing/close %d", calls.Load())
 	}
 }
+
+func TestSyncAllStampsUncrawledMissingAndPreventsRebackfill(t *testing.T) {
+	pool, db := poolFixture(t)
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"response":{"items":[{"appid":220},{"appid":221}]}}`)
+	}))
+	defer upstream.Close()
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, wishlistZone)
+	var crawled [][]int64
+	s := NewService(ctx, pool, ServiceOptions{
+		Steam: NewSteam(SteamOptions{HTTPClient: upstream.Client(), WishlistURL: upstream.URL}),
+		Now:   func() time.Time { return now },
+		Crawl: func(_ context.Context, w, _ []int64) (bool, error) {
+			crawled = append(crawled, append([]int64(nil), w...))
+			_, err := db.Exec(`INSERT INTO games(appid,name,family_sharing,trading_cards,is_epic,is_hb,hl_flag,pp_flag,diff_fen,is_adult,is_visual_novel,removed_strikes,positive_reviews,review_count,view_count)
+				VALUES(220,'Visible Game',0,0,0,0,0,0,0,0,0,0,0,0,0) ON CONFLICT(appid) DO NOTHING`)
+			return err == nil, err
+		},
+	})
+	t.Cleanup(func() { s.Close(ctx) })
+	if _, e := db.Exec(`UPDATE crawl_regions SET enabled=(code='cn');
+		INSERT INTO tracked_accounts(steamid,kinds_json,created_at) VALUES('a','{"wishlist":true,"owned":false}','2026-11-01');`); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.SyncAll(ctx); e != nil {
+		t.Fatal(e)
+	}
+	if len(crawled) == 0 || fmt.Sprint(crawled[0]) != "[220 221]" {
+		t.Fatalf("unexpected backfill batches: %v", crawled)
+	}
+	var status string
+	if e := db.QueryRow(`SELECT price_status FROM game_current_prices WHERE appid=221 AND region_code=''`).Scan(&status); e != nil || status != "missing" {
+		t.Fatalf("expected missing stamp for 221: status=%q err=%v", status, e)
+	}
+	var count220 int
+	db.QueryRow(`SELECT COUNT(*) FROM game_current_prices WHERE appid=220 AND region_code=''`).Scan(&count220)
+	if count220 != 0 {
+		t.Fatalf("catalogued game 220 should not be stamped missing: %d", count220)
+	}
+	if wished, _, _ := s.backfillTargets(ctx); fmt.Sprint(wished) != "[220]" {
+		t.Fatalf("221 should be suppressed from immediate rebackfill, got %v", wished)
+	}
+}

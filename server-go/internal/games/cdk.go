@@ -14,12 +14,8 @@ import (
 	"time"
 )
 
-// CDK 第三方平台（SteamPY / SteamCICI）查价的终端化承接。不读任何本地业务
-// 表（激活账本属 redeem 域写链），只从库内解析标准版 sub_id 后并发查询双
-// 平台；进程内 TTL 缓存带 stale-while-revalidate 单飞后台刷新，失败结果用
-// 更短 TTL（瞬时故障不钉满整窗），容量 256 FIFO 淘汰。
+// 第三方 CDK 查价：只读库内标准版 sub_id，进程内 TTL 缓存（256 FIFO，错误短 TTL + 单飞 SWR）。
 
-// 平台端点包级 var：测试打桩点。
 var (
 	cdkSteampyURL       = "https://steampy.com/xboot/common/plugIn/getGame"
 	cdkSteampyGameURL   = "https://steampy.com/game/%d"
@@ -67,7 +63,7 @@ type cdkFetcher struct {
 
 	mu         sync.Mutex
 	cache      map[cdkCacheKey]cdkEntry
-	order      []cdkCacheKey // FIFO 淘汰序（插入序）
+	order      []cdkCacheKey
 	refreshing map[cdkCacheKey]bool
 }
 
@@ -105,8 +101,7 @@ func (h *handler) handleCDK(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// resolveSubID 从 current 表取标准版 sub_id（CN 优先，回退任意区 sub_id
-// 升序）。sub_id 是包元数据，不依赖当前价格状态（missing 行同样有效）。
+// resolveSubID 取 CN 优先、回退任意区最小 sub_id（missing 行同样有效）。
 func (f *cdkFetcher) resolveSubID(ctx context.Context, appid int64) (*int64, error) {
 	var sub sql.NullInt64
 	err := f.db.QueryRowContext(ctx,
@@ -139,7 +134,6 @@ func (f *cdkFetcher) fetch(ctx context.Context, appid int64, subID *int64) (cdkR
 			f.mu.Unlock()
 			return entry.data, nil
 		}
-		// 过期有旧值：立即回旧值，同键的后台刷新只挂一个（单飞）。
 		if !f.refreshing[key] {
 			f.refreshing[key] = true
 			bgCtx := context.Background()
@@ -154,7 +148,6 @@ func (f *cdkFetcher) fetch(ctx context.Context, appid int64, subID *int64) (cdkR
 					}
 					f.cache[key] = cdkEntry{at: time.Now(), data: fresh}
 				} else if _, ok := f.cache[key]; ok {
-					// 刷新失败保留旧值并前移时间戳
 					f.cache[key] = cdkEntry{at: time.Now(), data: f.cache[key].data}
 				}
 				delete(f.refreshing, key)
@@ -180,7 +173,6 @@ func (f *cdkFetcher) fetch(ctx context.Context, appid int64, subID *int64) (cdkR
 	return fresh, nil
 }
 
-// fetchUncached 实时查询：sub 解析 + 双平台并发。
 func (f *cdkFetcher) fetchUncached(ctx context.Context, appid int64, subID *int64) (cdkResult, error) {
 	if subID == nil {
 		resolved, err := f.resolveSubID(ctx, appid)
@@ -210,7 +202,6 @@ func (f *cdkFetcher) fetchUncached(ctx context.Context, appid int64, subID *int6
 	return cdkResult{AppID: appid, SubID: subID, Steampy: steampy, Steamcici: cici}, nil
 }
 
-// cdkTruthy Python 布尔语境：nil/0/空串为假，其余为真。
 func cdkTruthy(v any) bool {
 	switch t := v.(type) {
 	case nil:
@@ -228,14 +219,12 @@ func cdkTruthy(v any) bool {
 	return true
 }
 
-// cdkDecodeJSON 数字保留原字面（json.Number，f-string 渲染同 Python str）。
 func cdkDecodeJSON(body []byte, out any) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	return dec.Decode(out)
 }
 
-// cdkScalar JSON 标量 → f-string 同形文本（数字保留原字面，字符串原样）。
 func cdkScalar(v any) string {
 	switch t := v.(type) {
 	case json.Number:
@@ -289,7 +278,6 @@ func (f *cdkFetcher) httpGet(ctx context.Context, rawURL, proxyURL, referer stri
 	return io.ReadAll(resp.Body)
 }
 
-// fetchSteampy SteamPY 查价：success ∧ result → keyPrice 挂牌价 + id 详情页。
 func (f *cdkFetcher) fetchSteampy(ctx context.Context, appid int64, subID *int64, proxyURL string) cdkPlatformResult {
 	empty := cdkPlatformResult{
 		URL: fmt.Sprintf(cdkSteampyGameURL, appid),
@@ -328,7 +316,6 @@ func (f *cdkFetcher) fetchSteampy(ctx context.Context, appid int64, subID *int64
 	return out
 }
 
-// fetchSteamcici SteamCICI 查价：rows 内 gameId 命中 sub → lastLowSellPrice。
 func (f *cdkFetcher) fetchSteamcici(ctx context.Context, appid int64, subID *int64, proxyURL string) cdkPlatformResult {
 	empty := cdkPlatformResult{URL: cdkCiciHomeURL}
 	if subID == nil || *subID == 0 {
@@ -378,7 +365,6 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
-// cdkHadError 任一平台带 error 字段 → 错误短 TTL。
 func cdkHadError(data cdkResult) bool {
 	return data.Steampy.Error != "" || data.Steamcici.Error != ""
 }

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -174,7 +174,7 @@ func validateEvents(rows []parsedEvent, today time.Time) error {
 			seasonal = append(seasonal, row)
 		}
 	}
-	sort.SliceStable(seasonal, func(i, j int) bool { return seasonal[i].Start.Before(seasonal[j].Start) })
+	slices.SortStableFunc(seasonal, func(a, b parsedEvent) int { return a.Start.Compare(b.Start) })
 	var problems []error
 	if len(seasonal) < 1 || len(seasonal) > 6 {
 		problems = append(problems, fmt.Errorf("seasonal_sale count=%d out of range 1-6", len(seasonal)))
