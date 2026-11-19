@@ -1,14 +1,13 @@
-// tools_catalog_price.go：目录榜单 / 价格事实 / 捆绑包 / 优惠 / 汇率 / 日历
-// 读面 16 工具（MCP 批次一）。纯 GET 薄包装（进程内 fetch 主通道）+ 少量
-// db 直查小件，载荷形状对齐 Python builtin 对应工具；零新增注入。
 package agent
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +16,6 @@ import (
 	"holdexar/server-go/internal/sched"
 )
 
-// ─── 公共小件 ────────────────────────────────────────────────────────────────
-
-// pyMedian Python statistics.median（非空升序 int 序列）等位：奇数取中位；
-// 偶数取中间两值算术平均（真除法浮点）后 int() 截断。
 func pyMedian(sorted []int64) int64 {
 	mid := len(sorted) / 2
 	if len(sorted)%2 == 1 {
@@ -33,7 +28,6 @@ func pyMedian(sorted []int64) int64 {
 	return int64(float64(sum) / 2.0)
 }
 
-// pyCut 字符串截断（Python s[:n] 语义：按码点切）。
 func pyCut(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -45,8 +39,7 @@ func pyCut(s string, n int) string {
 	return string(runes[:n])
 }
 
-// isoNaiveAt 库内时间文本 → Python datetime.isoformat() 裸形态（空格换 T，
-// 小数位去尾零）；解析不动原样返回。
+// isoNaiveAt 格式化时间文本（空格换 T，小数去尾零）；长度不足 19 返回 nil。
 func isoNaiveAt(s string) any {
 	if len(s) < 19 {
 		return nil
@@ -60,17 +53,13 @@ func isoNaiveAt(s string) any {
 	return base
 }
 
-// trendPoint 历史端点行投影字段（走势只消费 timestamp/cnyFen）。
 type trendPoint struct {
 	Timestamp string `json:"timestamp"`
 	CnyFen    int64  `json:"cnyFen"`
 }
 
-// trendMaxPoints 价格走势抽样上限（Python _TREND_MAX_POINTS）。
 const trendMaxPoints = 72
 
-// trendSeries 对齐 Python prices._trend_series：同日取末值、只保留价格发生
-// 变化的日点 [YYYY-MM-DD, 分]（阶梯图无损），超上限等距抽样并保最低点与末点。
 func trendSeries(points []trendPoint) []any {
 	byDay := map[string]int64{}
 	for _, p := range points {
@@ -79,14 +68,14 @@ func trendSeries(points []trendPoint) []any {
 			if len(day) > 10 {
 				day = day[:10]
 			}
-			byDay[day] = p.CnyFen // 同日赋值 = 取末值
+			byDay[day] = p.CnyFen
 		}
 	}
 	days := make([]string, 0, len(byDay))
 	for d := range byDay {
 		days = append(days, d)
 	}
-	sort.Strings(days)
+	slices.Sort(days)
 	var dates []string
 	var fens []int64
 	for _, d := range days {
@@ -118,7 +107,7 @@ func trendSeries(points []trendPoint) []any {
 		for i := range keep {
 			idx = append(idx, i)
 		}
-		sort.Ints(idx)
+		slices.Sort(idx)
 	}
 	out := make([]any, 0, len(idx))
 	for _, i := range idx {
@@ -127,8 +116,6 @@ func trendSeries(points []trendPoint) []any {
 	return out
 }
 
-// offerRow 对齐 Python _shared.offer_row：现价/史低带 data，类型键取
-// offerLow/offerPrice，折扣以 extra 键值对覆盖。
 func offerRow(name string, priceFen, lowFen *int64, extraKey string, extraVal any) *Obj {
 	data := newObj()
 	hasPrice := priceFen != nil && *priceFen > 0
@@ -144,7 +131,7 @@ func offerRow(name string, priceFen, lowFen *int64, extraKey string, extraVal an
 		vKey = "offerLow"
 	}
 	if extraKey != "" {
-		vKey = extraKey // extra 键优先于默认值键（Python extra_key or default_key）
+		vKey = extraKey
 	}
 	row := newObj()
 	row.set("k", name)
@@ -156,24 +143,18 @@ func offerRow(name string, priceFen, lowFen *int64, extraKey string, extraVal an
 	return row
 }
 
-// briefNoteItem 对齐 Python _shared.brief_item 的 note 变体（事件注记）。
 func briefNoteItem(appid int64, brief account.Brief, hasBrief bool, note *Obj) *Obj {
 	item := briefItem(appid, brief, hasBrief)
 	item.set("note", note)
 	return item
 }
 
-// ─── 目录/榜单 ───────────────────────────────────────────────────────────────
-
-// topGames 热销榜 topsellers 库内前 8（榜单缓存零外网，顺序即榜序）。
-// Python: top_games → games_boards.get_board("topsellers") + briefs_for。
 func topGames(c *CallContext) (*ToolResult, error) {
 	status, body, err := c.fetch(c.Ctx, "/api/v1/games/boards/topsellers")
 	if err != nil {
 		return nil, err
 	}
 	if status == http.StatusBadGateway {
-		// 榜单源完全失败（无缓存无 stale）→ Python get_board 回 [] 的空态
 		return emptyResult("no_data"), nil
 	}
 	if status != http.StatusOK {
@@ -213,16 +194,12 @@ func topGames(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: gamesCard("top", items, total)}, nil
 }
 
-// ─── 价格事实 ────────────────────────────────────────────────────────────────
-
-// priceCtxValue 价格上下文值（price-context 端点 at/lowest 元素）。
 type priceCtxValue struct {
 	CnyFen     int64  `json:"cnyFen"`
 	Discount   int64  `json:"discount"`
 	SnapshotAt string `json:"snapshotAt"`
 }
 
-// factsData 单游戏价格事实内部形态（briefing 与 compare 共用一份组装）。
 type factsData struct {
 	appid        int64
 	name         string
@@ -230,13 +207,12 @@ type factsData struct {
 	reviewCount  int64
 	cnFen        any // nil = 国区不可买（矩阵无 CN 列且无上下文兜底）
 	cnDiscount   int64
-	alt          *Obj // {region, cnyFen, discount} | nil
-	lowest       *Obj // {cnyFen, snapshotAt} | nil
-	year         *Obj // {minFen, maxFen, medianFen, count} | nil
+	alt          *Obj
+	lowest       *Obj
+	year         *Obj
 	trend        []any
 }
 
-// matrixColumn 详情价格矩阵列解码（[display, cnyFen, cents, discount]）。
 func matrixColumn(raw json.RawMessage) []any {
 	var col []any
 	if json.Unmarshal(raw, &col) != nil {
@@ -245,7 +221,6 @@ func matrixColumn(raw json.RawMessage) []any {
 	return col
 }
 
-// columnDiscount 矩阵列折扣位（col[3]；越界/非数回 0）。
 func columnDiscount(col []any) int64 {
 	if len(col) > 3 {
 		if n, err := pyIntOr(col[3]); err == nil {
@@ -255,8 +230,6 @@ func columnDiscount(col []any) int64 {
 	return 0
 }
 
-// priceFacts 单游戏价格事实（Python prices.price_facts 等位）。
-// 返回 nil = 游戏不存在（detail 404）。
 func (c *CallContext) priceFacts(appid int64) (*factsData, error) {
 	d, err := c.fetchDetail(appid)
 	if err != nil || d == nil {
@@ -287,7 +260,6 @@ func (c *CallContext) priceFacts(appid int64) (*factsData, error) {
 		f.cnFen = ctx.At.CnyFen
 		f.cnDiscount = ctx.At.Discount
 	}
-	// 国区不可买（锁区/未爬）→ 最低可购区兜底（详情 lowest 事实 + 矩阵折扣）
 	if f.cnFen == nil && d.LowestCnyFen != nil && *d.LowestCnyFen > 0 && d.LowestRegionCode != "" {
 		alt := newObj()
 		alt.set("region", strings.ToUpper(d.LowestRegionCode))
@@ -308,7 +280,7 @@ func (c *CallContext) priceFacts(appid int64) (*factsData, error) {
 		}
 	}
 	if len(yearFens) > 0 {
-		sort.Slice(yearFens, func(i, j int) bool { return yearFens[i] < yearFens[j] })
+		slices.Sort(yearFens)
 		year := newObj()
 		year.set("minFen", yearFens[0])
 		year.set("maxFen", yearFens[len(yearFens)-1])
@@ -320,7 +292,6 @@ func (c *CallContext) priceFacts(appid int64) (*factsData, error) {
 	return f, nil
 }
 
-// priceFactsObj 事实 → briefing 载荷（键序对齐 Python）。
 func priceFactsObj(f *factsData) *Obj {
 	out := newObj()
 	out.set("kind", "price")
@@ -339,7 +310,6 @@ func priceFactsObj(f *factsData) *Obj {
 	return out
 }
 
-// getPriceBriefing 单游戏价格事实：国区现价+史低+近一年区间+走势。
 func getPriceBriefing(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -355,7 +325,6 @@ func getPriceBriefing(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: priceFactsObj(f)}, nil
 }
 
-// getRegionPrices 全区现价清单（priceMatrix 唯一事实源），主账号结算区置顶。
 func getRegionPrices(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -377,7 +346,7 @@ func getRegionPrices(c *CallContext) (*ToolResult, error) {
 	for code := range d.PriceMatrix {
 		codes = append(codes, code)
 	}
-	sort.Strings(codes)
+	slices.Sort(codes)
 	type regionRow struct {
 		obj    *Obj
 		region string
@@ -400,16 +369,18 @@ func getRegionPrices(c *CallContext) (*ToolResult, error) {
 		row.set("discount", columnDiscount(col))
 		items = append(items, regionRow{obj: row, region: strings.ToUpper(code), cny: cny})
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		a, b := items[i], items[j]
+	slices.SortStableFunc(items, func(a, b regionRow) int {
 		am, bm := strings.ToLower(a.region) != accountRegion, strings.ToLower(b.region) != accountRegion
 		if am != bm {
-			return !am // 主账号结算区置顶
+			if !am {
+				return -1
+			}
+			return 1
 		}
-		if a.region != b.region {
-			return a.region < b.region
-		}
-		return a.cny < b.cny
+		return cmp.Or(
+			strings.Compare(a.region, b.region),
+			cmp.Compare(a.cny, b.cny),
+		)
 	})
 	rows := make([]any, 0, len(items))
 	for _, it := range items {
@@ -425,10 +396,8 @@ func getRegionPrices(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// compareMax 并排对比上限（Python _COMPARE_MAX）。
 const compareMax = 3
 
-// compareItem 事实 → 对比行（CN 不可买取最低可购区）。
 func compareItem(f *factsData) *Obj {
 	useAlt := f.cnFen == nil && f.alt != nil
 	var cnyFen any = f.cnFen
@@ -462,7 +431,6 @@ func compareItem(f *factsData) *Obj {
 	return obj
 }
 
-// compareGames 2~3 款并排对比（每款复用 price_facts 同一份事实）。
 func compareGames(c *CallContext) (*ToolResult, error) {
 	rawList, _ := c.Args["appids"].([]any)
 	ids := make([]int64, 0, len(rawList))
@@ -508,9 +476,6 @@ func compareGames(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 价格诊断 ────────────────────────────────────────────────────────────────
-
-// diagnosePrice 价格异常归因：appid≤0 投影最近失败任务，正常走覆盖诊断。
 func diagnosePrice(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -522,7 +487,6 @@ func diagnosePrice(c *CallContext) (*ToolResult, error) {
 	return diagnoseGame(c, appid)
 }
 
-// diagnoseRecentFailures appid≤0：最近失败任务投影（前 5）。
 func diagnoseRecentFailures(c *CallContext) (*ToolResult, error) {
 	var jobs []map[string]any
 	if err := c.getJSON("/api/v1/crawl/jobs?limit=10", &jobs); err != nil {
@@ -552,7 +516,6 @@ func diagnoseRecentFailures(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("jobs", rows, len(failed))}, nil
 }
 
-// diagPriceRow 活表价行（诊断消费字段）。
 type diagPriceRow struct {
 	region      string
 	price       sql.NullInt64
@@ -563,8 +526,6 @@ type diagPriceRow struct {
 	lastSuccess sql.NullString
 }
 
-// diagnoseGame 覆盖口径诊断：现价 + 启用区覆盖（outcome/answer/lastSuccessAt）。
-// 覆盖计算与游戏卡同一口径（分母 = 启用区服，成功观察 = attempt_outcome='success'）。
 func diagnoseGame(c *CallContext, appid int64) (*ToolResult, error) {
 	var name string
 	var minCny sql.NullInt64
@@ -597,7 +558,6 @@ func diagnoseGame(c *CallContext, appid int64) (*ToolResult, error) {
 		return nil, err
 	}
 
-	// 启用区服 = 覆盖分母（与 effective_regions 同源）
 	var regionsExpected []string
 	regionRows, err := c.db.QueryContext(c.Ctx,
 		"SELECT code FROM crawl_regions WHERE enabled = 1 ORDER BY sort")
@@ -729,9 +689,6 @@ func diagnoseGame(c *CallContext, appid int64) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 历史与版本 ──────────────────────────────────────────────────────────────
-
-// histLowestView 历史端点史低值。
 type histLowestView struct {
 	CnyFen         int64    `json:"cnyFen"`
 	CnyYuan        *float64 `json:"cnyYuan"`
@@ -740,13 +697,11 @@ type histLowestView struct {
 	FormattedPrice string   `json:"formattedPrice"`
 }
 
-// histHighestView 历史端点史高值。
 type histHighestView struct {
 	CnyFen  int64    `json:"cnyFen"`
 	CnyYuan *float64 `json:"cnyYuan"`
 }
 
-// histVersionView 历史端点版本条目。
 type histVersionView struct {
 	SubID   *int64  `json:"subId"`
 	Suffix  *string `json:"suffix"`
@@ -754,7 +709,6 @@ type histVersionView struct {
 	Product string  `json:"product"`
 }
 
-// histLowestObj 史低值 → Obj（nil 保持 null）。
 func histLowestObj(v *histLowestView) *Obj {
 	if v == nil {
 		return nil
@@ -768,7 +722,6 @@ func histLowestObj(v *histLowestView) *Obj {
 	return obj
 }
 
-// histHighestObj 史高值 → Obj。
 func histHighestObj(v *histHighestView) *Obj {
 	if v == nil {
 		return nil
@@ -779,7 +732,6 @@ func histHighestObj(v *histHighestView) *Obj {
 	return obj
 }
 
-// histVersionObjs 版本条目 → Obj 列表。
 func histVersionObjs(list []histVersionView) []any {
 	out := make([]any, 0, len(list))
 	for _, v := range list {
@@ -793,7 +745,6 @@ func histVersionObjs(list []histVersionView) []any {
 	return out
 }
 
-// gamePriceHistory 历史价格走势：全量点位 → trend 抽样，极值与版本透传。
 func gamePriceHistory(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -819,14 +770,14 @@ func gamePriceHistory(c *CallContext) (*ToolResult, error) {
 	}
 	queryDays := days
 	if queryDays < 0 {
-		// 负窗 = 全部时间（Python if days > 0 才开窗）
+		// days <= 0 表示全量时间窗口。
 		queryDays = 0
 	}
-	q := urlValues()
-	q.set("region", region)
-	q.set("days", strconv.FormatInt(queryDays, 10))
+	q := url.Values{}
+	q.Set("region", region)
+	q.Set("days", strconv.FormatInt(queryDays, 10))
 	if subID != nil {
-		q.set("subId", strconv.FormatInt(*subID, 10))
+		q.Set("subId", strconv.FormatInt(*subID, 10))
 	}
 	var hist struct {
 		Region   string            `json:"region"`
@@ -836,7 +787,7 @@ func gamePriceHistory(c *CallContext) (*ToolResult, error) {
 		Count    int64             `json:"count"`
 		Versions []histVersionView `json:"versions"`
 	}
-	if err := c.getJSON("/api/v1/games/"+strconv.FormatInt(appid, 10)+"/history?"+q.encode(), &hist); err != nil {
+	if err := c.getJSON("/api/v1/games/"+strconv.FormatInt(appid, 10)+"/history?"+q.Encode(), &hist); err != nil {
 		return nil, err
 	}
 	if len(hist.Points) == 0 {
@@ -868,7 +819,6 @@ func gamePriceHistory(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// gameVersions 全版本 × 全区最新价（逐区压成 原币价/折扣/折合）。
 func gameVersions(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -902,7 +852,7 @@ func gameVersions(c *CallContext) (*ToolResult, error) {
 		for code := range v.Regions {
 			codes = append(codes, code)
 		}
-		sort.Strings(codes)
+		slices.Sort(codes)
 		regions := newObj()
 		for _, code := range codes {
 			var r struct {
@@ -929,12 +879,8 @@ func gameVersions(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 捆绑包 ──────────────────────────────────────────────────────────────────
-
-// bundleMembersLimit 成员截断线（超出只给 memberTotal）。
 const bundleMembersLimit = 30
 
-// bundleDetailView 捆绑包详情端点投影字段。
 type bundleDetailView struct {
 	BundleID          int64                      `json:"bundleId"`
 	Name              string                     `json:"name"`
@@ -953,7 +899,6 @@ type bundleDetailView struct {
 	DiffFen      int64  `json:"diffFen"`
 }
 
-// fetchBundle 进程内取捆绑包详情；404 回 nil（包不存在，非错误）。
 func (c *CallContext) fetchBundle(id int64) (*bundleDetailView, error) {
 	status, body, err := c.fetch(c.Ctx, "/api/v1/bundles/"+strconv.FormatInt(id, 10))
 	if err != nil {
@@ -972,7 +917,6 @@ func (c *CallContext) fetchBundle(id int64) (*bundleDetailView, error) {
 	return &d, nil
 }
 
-// regionPriceObj 区价行（剥离 appIds；键序对齐端点声明序）。
 func regionPriceObj(raw json.RawMessage) (*Obj, error) {
 	var r struct {
 		PriceMinor      *int64  `json:"priceMinor"`
@@ -1001,7 +945,6 @@ func regionPriceObj(raw json.RawMessage) (*Obj, error) {
 	return obj, nil
 }
 
-// memberPriceObj 成员单区价（priceMinor/currency/cnyFen）。
 func memberPriceObj(raw json.RawMessage) (*Obj, error) {
 	var r struct {
 		PriceMinor *int64  `json:"priceMinor"`
@@ -1020,7 +963,6 @@ func memberPriceObj(raw json.RawMessage) (*Obj, error) {
 	return obj, nil
 }
 
-// bundleDetail 捆绑包详情：各区包价 + 包内成员（各区现价）。
 func bundleDetail(c *CallContext) (*ToolResult, error) {
 	if !pyBool(c.Args["bundle_id"]) {
 		return emptyResult("no_bundle"), nil
@@ -1040,7 +982,7 @@ func bundleDetail(c *CallContext) (*ToolResult, error) {
 	for code := range d.RegionPrices {
 		codes = append(codes, code)
 	}
-	sort.Strings(codes)
+	slices.Sort(codes)
 	regionPrices := newObj()
 	for _, code := range codes {
 		obj, err := regionPriceObj(d.RegionPrices[code])
@@ -1062,7 +1004,7 @@ func bundleDetail(c *CallContext) (*ToolResult, error) {
 		for code := range m.Prices {
 			pcodes = append(pcodes, code)
 		}
-		sort.Strings(pcodes)
+		slices.Sort(pcodes)
 		prices := newObj()
 		for _, code := range pcodes {
 			po, err := memberPriceObj(m.Prices[code])
@@ -1093,7 +1035,6 @@ func bundleDetail(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// listBundles 捆绑包列表前列（diff 差价降序，缓存聚合零外网）。
 func listBundles(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Bundles []struct {
@@ -1128,7 +1069,6 @@ func listBundles(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("bundlesAll", rows, int(resp.Total))}, nil
 }
 
-// bundleNames 包名映射（Python bundles_service.names_for 等位：缺名回 Bundle N）。
 func (c *CallContext) bundleNames(ids []int64) (map[int64]string, error) {
 	out := map[int64]string{}
 	for start := 0; start < len(ids); start += 500 {
@@ -1169,7 +1109,6 @@ func (c *CallContext) bundleNames(ids []int64) (map[int64]string, error) {
 	return out, nil
 }
 
-// listBundleFollows 关注的捆绑包清单。
 func listBundleFollows(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		BundleIDs []int64 `json:"bundleIds"`
@@ -1194,9 +1133,6 @@ func listBundleFollows(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("bundles", rows, len(resp.BundleIDs))}, nil
 }
 
-// ─── 优惠 / 汇率 / 日历 ──────────────────────────────────────────────────────
-
-// hbMonthly 当月 HB 慈善包 contents（库内已爬快照）。
 func hbMonthly(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Games []struct {
@@ -1207,8 +1143,9 @@ func hbMonthly(c *CallContext) (*ToolResult, error) {
 			LowestCnyFen *int64 `json:"lowestCnyFen"`
 		} `json:"games"`
 	}
-	if err := c.getJSON("/api/v1/metadata/hb/offers", &resp); err != nil {
-		return nil, err
+	if dis, err := c.getJSONOrDisabled("hb_monthly", "/api/v1/metadata/hb/offers",
+		"module.humble_choice.enabled", "Humble Choice 每月合集功能已停用", &resp); dis != nil || err != nil {
+		return dis, err
 	}
 	rows := make([]any, 0, len(resp.Games))
 	for _, g := range resp.Games {
@@ -1226,13 +1163,10 @@ func hbMonthly(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("hb", rows, len(rows))}, nil
 }
 
-// epicOfferURLDefault 清单条目缺 url 的兑底（Epic 免费游戏页）。
 const epicOfferURLDefault = "https://store.epicgames.com/en-US/free-games"
 
-// epicMobileURLDefault 移动商店页入口（App 内领取）。
 const epicMobileURLDefault = "https://store.epicgames.com/mobile"
 
-// epicFree Epic 当期 + 预告白送（库快照/缓存，不触发外网）。
 func epicFree(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Offers []struct {
@@ -1257,8 +1191,9 @@ func epicFree(c *CallContext) (*ToolResult, error) {
 		} `json:"mobile"`
 		FetchedAt *string `json:"fetchedAt"`
 	}
-	if err := c.getJSON("/api/v1/metadata/epic/offers", &resp); err != nil {
-		return nil, err
+	if dis, err := c.getJSONOrDisabled("epic_free", "/api/v1/metadata/epic/offers",
+		"module.epic_free.enabled", "Epic 免费游戏功能已停用", &resp); dis != nil || err != nil {
+		return dis, err
 	}
 	offers := make([]any, 0, len(resp.Offers))
 	rows := make([]any, 0, len(resp.Offers))
@@ -1336,7 +1271,6 @@ func epicFree(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// steamFree Steam 限时免费清单（库内 promo 快照）。
 func steamFree(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Offers []struct {
@@ -1358,7 +1292,6 @@ func steamFree(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("steamFree", rows, len(rows))}, nil
 }
 
-// priceDrops 最近价格事件（price_events 账本只读投影 + 简报）。
 func priceDrops(c *CallContext) (*ToolResult, error) {
 	var events []map[string]any
 	if err := c.getJSON("/api/v1/crawl/price-events?limit=20", &events); err != nil {
@@ -1396,7 +1329,6 @@ func priceDrops(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: gamesCard("drops", items, len(items))}, nil
 }
 
-// ratesOverview 汇率快照（fx_rates 本地库，零外网）。
 func ratesOverview(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Rates []struct {
@@ -1420,7 +1352,6 @@ func ratesOverview(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("rates", rows, len(rows))}, nil
 }
 
-// steamEventView 活动日历条目投影字段。
 type steamEventView struct {
 	Key      string  `json:"key"`
 	Category string  `json:"category"`
@@ -1430,13 +1361,10 @@ type steamEventView struct {
 	End      string  `json:"end"`
 }
 
-// calendarUpcomingRowsLimit 日历行上限（live+upcoming 合计）。
 const calendarUpcomingRowsLimit = 12
 
-// seasonalSaleCategory 季节大促类目（置顶优先）。
 const seasonalSaleCategory = "seasonal_sale"
 
-// calendarEventName 行名：中文名 → 英文名 → key → 占位。
 func calendarEventName(e steamEventView) string {
 	if e.NameZh != nil && *e.NameZh != "" {
 		return *e.NameZh
@@ -1450,7 +1378,6 @@ func calendarEventName(e steamEventView) string {
 	return "—"
 }
 
-// calendarLiveRow 进行中行。
 func calendarLiveRow(e steamEventView) *Obj {
 	row := newObj()
 	row.set("k", calendarEventName(e))
@@ -1460,7 +1387,6 @@ func calendarLiveRow(e steamEventView) *Obj {
 	return row
 }
 
-// calendarUpcomingRow 预告行。
 func calendarUpcomingRow(e steamEventView) *Obj {
 	row := newObj()
 	row.set("k", calendarEventName(e))
@@ -1469,7 +1395,6 @@ func calendarUpcomingRow(e steamEventView) *Obj {
 	return row
 }
 
-// calendarEvents Steam 官方活动日历（库内已爬，进行中在前）。
 func calendarEvents(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Events   []steamEventView `json:"events"`
@@ -1481,7 +1406,6 @@ func calendarEvents(c *CallContext) (*ToolResult, error) {
 	}
 	upcoming := resp.Upcoming
 	if len(upcoming) == 0 {
-		// 端点未给 upcoming 时由全量 events 按开始日派生（北京时间日历日）
 		today := time.Now().In(sched.DefaultLoc).Format("2006-01-02")
 		for _, e := range resp.Events {
 			if e.Start > today {
@@ -1521,10 +1445,6 @@ func calendarEvents(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 注册 ────────────────────────────────────────────────────────────────────
-
-// RegisterCatalogPriceTools 登记目录/价格读面 16 工具（批次一）；重名即错。
-// 预算按 budgetFor 逐工具取档（60 重扫聚合 / 40 网络往返 / 默认 20）。
 func RegisterCatalogPriceTools(r *ToolRegistry) error {
 	for _, spec := range []*ToolSpec{
 		{

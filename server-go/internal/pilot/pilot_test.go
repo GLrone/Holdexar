@@ -1,5 +1,3 @@
-//go:build windows
-
 package pilot
 
 import (
@@ -11,11 +9,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"holdexar/server-go/internal/store"
 )
 
-// newTestPilotService 构造带写闸的最小服务（模块开关联通用）。
 func newTestPilotService(t *testing.T, dbPath string) *Service {
 	t.Helper()
 	db, e := openPilotTestDB(dbPath)
@@ -52,8 +50,8 @@ func TestIntentRouting(t *testing.T) {
 		{"怎么设置提醒", IntentHowTo},
 		{"打开设置", IntentNavigate},
 		{"今天天气怎么样", IntentChat},
-		{"值得关注的新游戏", IntentChat}, // 块词：评价语不是关注动作
-		{"批量删除我的关注", IntentChat}, // 守卫词不进写意图
+		{"值得关注的新游戏", IntentChat},
+		{"批量删除我的关注", IntentChat},
 	}
 	for _, tc := range cases {
 		if got := Route(tc.q); got != tc.want {
@@ -87,7 +85,6 @@ func TestSessionStoreLifecycle(t *testing.T) {
 	if !ValidSID(sid) || ValidSID("../evil") {
 		t.Fatal("sid 白名单错误")
 	}
-	// 落两轮 + 改名 + 置顶
 	if !store.AppendTurn(sid, map[string]any{"t": "turn", "tid": "t1", "q": "Portal 2 现在多少钱？", "resp": map[string]any{"answer": "42 元", "source": "llm"}}) {
 		t.Fatal("首轮落账失败")
 	}
@@ -111,14 +108,12 @@ func TestSessionStoreLifecycle(t *testing.T) {
 	if state.Title != "自定义标题" || !state.Pinned {
 		t.Fatalf("标题/置顶折叠错误：%v", state)
 	}
-	// feedback
 	if reason := store.SetTurnFeedback(sid, "t1", "accepted"); reason != "" {
 		t.Fatalf("评价写入失败：%s", reason)
 	}
 	if reason := store.SetTurnFeedback(sid, "gone", "accepted"); reason != "turn_gone" {
 		t.Fatalf("不存在轮评价应 turn_gone：%s", reason)
 	}
-	// 列表投影（置顶在前）
 	items := store.ListRecent(50, "")
 	if len(items) != 1 || items[0]["pinned"] != true {
 		t.Fatalf("列表投影错误：%v", items)
@@ -126,12 +121,10 @@ func TestSessionStoreLifecycle(t *testing.T) {
 	if items[0]["title"] != "自定义标题" {
 		t.Fatalf("列表标题错误：%v", items[0]["title"])
 	}
-	// 检索命中回答正文
 	items = store.ListRecent(50, "史低")
 	if len(items) != 1 || items[0]["snippet"] == "" {
 		t.Fatalf("检索投影错误：%v", items)
 	}
-	// 分叉
 	newSid := "def456"
 	if !store.Fork(sid, newSid, 1) {
 		t.Fatal("分叉失败")
@@ -143,7 +136,6 @@ func TestSessionStoreLifecycle(t *testing.T) {
 	if store.Fork(sid, newSid, 1) {
 		t.Fatal("目标已存在应拒绝")
 	}
-	// 软截断
 	if !store.Truncate(newSid, 0) {
 		t.Fatal("截断失败")
 	}
@@ -151,7 +143,6 @@ func TestSessionStoreLifecycle(t *testing.T) {
 	if len(forked.Turns) != 0 {
 		t.Fatalf("截断后轮数错误：%d", len(forked.Turns))
 	}
-	// 删除
 	if reason := store.DeleteWithReason(sid); reason != "deleted" {
 		t.Fatalf("删除失败：%s", reason)
 	}
@@ -269,7 +260,7 @@ func TestFlywheelStatsAndPurge(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "sessions")
 	store := NewSessionStore(base)
 	store.AppendTurn("fw01", map[string]any{"t": "turn", "tid": "f1", "q": "问题", "resp": map[string]any{"answer": "答", "source": "llm"}})
-	_ = store.SetTurnFeedback("fw01", "f1", "accepted") // 明确评价 → labeled
+	_ = store.SetTurnFeedback("fw01", "f1", "accepted")
 	entry := map[string]any{"ts": nowISO(), "question": "问题", "intent": "price_analysis",
 		"mode": "agent", "source": "llm", "tid": "f1", "sid": "fw01"}
 	if !AppendDecision(base, entry) {
@@ -286,7 +277,6 @@ func TestFlywheelStatsAndPurge(t *testing.T) {
 	if labeled != 1 {
 		t.Fatalf("反馈关联计数错误：%v", stats["labeled"])
 	}
-	// purge：删除会话时决策日志同步清理
 	if !purgeFlywheelSession(base, "fw01") {
 		t.Fatal("飞轮清理失败")
 	}
@@ -310,7 +300,6 @@ func TestDeriveTitleStripsQuoteMarkers(t *testing.T) {
 }
 
 func TestConfigPayloadJSONShape(t *testing.T) {
-	// PilotConfigPayload 的 JSON 形状自检（前端契约：字段名与类型）
 	payload := map[string]any{
 		"protocol": "openai", "enabled": false, "base_url": "", "model": "",
 		"has_api_key": false, "monthly_cap": 0, "context_window": nil,
@@ -330,7 +319,6 @@ func TestConfigPayloadJSONShape(t *testing.T) {
 	}
 }
 
-// anthropicConvert：消息转换与连续角色合并（append 切片头曾丢失致 messages 恒空）。
 func TestAnthropicConvertShapes(t *testing.T) {
 	msgs := []map[string]any{
 		{"role": "system", "content": "S1"},
@@ -383,7 +371,6 @@ func TestSetEnabledWaitsForInflightTurn(t *testing.T) {
 	dbPath := filepath.Join(dir, "holdexar.db")
 	service := newTestPilotService(t, dbPath)
 
-	// 占一个在飞轮（同包直接登记，模拟进行中的一轮问答）。
 	service.mu.Lock()
 	service.inflight["sess-1"] = 1
 	service.mu.Unlock()
@@ -397,7 +384,6 @@ func TestSetEnabledWaitsForInflightTurn(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// 在飞轮收尾后 SetEnabled 才返回。
 	service.releaseTurn("sess-1")
 	select {
 	case err := <-done:
@@ -410,5 +396,81 @@ func TestSetEnabledWaitsForInflightTurn(t *testing.T) {
 	enabled, running, err := service.State(ctx)
 	if err != nil || enabled || running {
 		t.Fatalf("state=%t/%t err=%v", enabled, running, err)
+	}
+}
+
+func TestAddUsageInsertsAndAccumulates(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "usage.db")
+	db, err := openPilotTestDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	svc := New(Deps{
+		DB:      db,
+		DataDir: t.TempDir(),
+		KVGet: func(key string) (json.RawMessage, bool) {
+			var raw string
+			if err := db.QueryRow(`SELECT value_json FROM app_settings WHERE key=?`, key).Scan(&raw); err != nil || raw == "" {
+				return nil, false
+			}
+			return json.RawMessage(raw), true
+		},
+	}, nil)
+	svc.SetGate(store.NewWriteGate(db, dbPath))
+
+	svc.AddUsage(ctx, 120, 35)
+	u1 := svc.UsageMonth()
+	if u1["inp"] != 120 || u1["out"] != 35 || u1["calls"] != 1 || u1["total"] != 155 {
+		t.Fatalf("首次写入用量不符: %v", u1)
+	}
+
+	svc.AddUsage(ctx, 80, 15)
+	u2 := svc.UsageMonth()
+	if u2["inp"] != 200 || u2["out"] != 50 || u2["calls"] != 2 || u2["total"] != 250 {
+		t.Fatalf("累加后用量不符: %v", u2)
+	}
+
+	if _, err := db.Exec(`UPDATE app_settings SET value_json='300' WHERE key=?`, usageKey()); err != nil {
+		t.Fatal(err)
+	}
+	svc.AddUsage(ctx, 25, 10)
+	u3 := svc.UsageMonth()
+	if u3["inp"] != 325 || u3["out"] != 10 || u3["calls"] != 1 || u3["total"] != 335 {
+		t.Fatalf("存量整数升级后用量不符: %v", u3)
+	}
+}
+
+func TestClipUTF8AndChineseSearchSnippet(t *testing.T) {
+	chinese := "星露谷物语国区历史最低价二十四元"
+	for limit := 0; limit <= len(chinese)+2; limit++ {
+		got := clip(chinese, limit)
+		if !utf8.ValidString(got) {
+			t.Fatalf("clip(%d) 截断了多字节 UTF-8: %q", limit, got)
+		}
+		if utf8.RuneCountInString(got) > limit {
+			t.Fatalf("clip(%d) 超出字符上限: %q", limit, got)
+		}
+	}
+
+	store := NewSessionStore(filepath.Join(t.TempDir(), "sessions"))
+	sid := "cnsnip01"
+	answer := strings.Repeat("前文铺垫信息", 12) + "星露谷物语史低只要二十四元" + strings.Repeat("后续补充说明", 20)
+	if !store.AppendTurn(sid, map[string]any{
+		"tid":  "t1",
+		"q":    "推荐游戏",
+		"resp": map[string]any{"answer": answer},
+	}) {
+		t.Fatal("AppendTurn 失败")
+	}
+	items := store.ListRecent(10, "史低")
+	if len(items) != 1 {
+		t.Fatalf("中文检索未命中: %v", items)
+	}
+	snippet, _ := items[0]["snippet"].(string)
+	if !utf8.ValidString(snippet) || !strings.Contains(snippet, "史低") {
+		t.Fatalf("中文摘要偏移错误，未包含命中词: %q", snippet)
 	}
 }

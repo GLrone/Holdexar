@@ -28,6 +28,7 @@ func TestLiveSubscriptionSchedulePromotesAndStartsPriceRepair(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(bundleDir, clashkernel.KernelFilename())); err != nil {
 		t.Skip("bundled proxy kernel unavailable")
 	}
+	t.Cleanup(proxypool.SetDirectDialerForTest((&net.Dialer{Timeout: 8 * time.Second}).DialContext))
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	dataDir := t.TempDir()

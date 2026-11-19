@@ -1,8 +1,3 @@
-//go:build windows
-
-// session.go 领航员会话账本：sid.jsonl 追加式记录 + 折叠投影（后者胜）。
-// 语义对齐 pilot/session.py：turn/summary/title/proposal/truncate/pin/
-// archive/fork/feedback 九类记录，坏行跳过，缓存带 stat 键失配即重折叠。
 package pilot
 
 import (
@@ -12,10 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -34,7 +30,6 @@ func ValidSID(sid string) bool { return sidRe.MatchString(sid) }
 
 var quoteMarkerRe = regexp.MustCompile(`【[^】\d]*\d+】`)
 
-// DeriveTitle 首问 → 标题：剥引用标号、压平空白、截断。
 func DeriveTitle(q string) string {
 	text := strings.Join(strings.Fields(quoteMarkerRe.ReplaceAllString(q, "")), " ")
 	if text == "" {
@@ -47,7 +42,6 @@ func DeriveTitle(q string) string {
 	return text
 }
 
-// SessionState 账本折叠态。
 type SessionState struct {
 	Sid             string
 	Turns           []map[string]any
@@ -64,7 +58,6 @@ type SessionState struct {
 	ForkedFrom      string
 }
 
-// ProposalStateOf 提议的有效状态：记录 pending 但已不是当前待定项 = withdrawn。
 func (s *SessionState) ProposalStateOf(pid string) string {
 	recorded, _ := s.Proposals[pid]["state"].(string)
 	if recorded == "pending" {
@@ -75,13 +68,11 @@ func (s *SessionState) ProposalStateOf(pid string) string {
 	return recorded
 }
 
-// SessionStore 会话账本存取（目录 = <data>/pilot/sessions）。
 type SessionStore struct {
 	base string
 	mu   sync.Mutex
 }
 
-// NewSessionStore 构造存储并做文件数清扫（超上限删最旧）。
 func NewSessionStore(base string) *SessionStore {
 	_ = os.MkdirAll(base, 0o755)
 	store := &SessionStore{base: base}
@@ -89,14 +80,12 @@ func NewSessionStore(base string) *SessionStore {
 	return store
 }
 
-// Base 会话文件目录（flywheel 投影输入）。
 func (st *SessionStore) Base() string { return st.base }
 
 func (st *SessionStore) path(sid string) string {
 	return filepath.Join(st.base, sid+".jsonl")
 }
 
-// Load 载入折叠态；无文件返回 nil。
 func (st *SessionStore) Load(sid string) *SessionState {
 	if !ValidSID(sid) {
 		return nil
@@ -114,7 +103,6 @@ func (st *SessionStore) Load(sid string) *SessionState {
 	return state
 }
 
-// RawRecords 原始记录行（不折叠，坏行已滤）：决策飞轮反馈投影输入。
 func (st *SessionStore) RawRecords(sid string) []map[string]any {
 	if !ValidSID(sid) {
 		return nil
@@ -128,7 +116,6 @@ func (st *SessionStore) RawRecords(sid string) []map[string]any {
 	return readLines(raw)
 }
 
-// LoadOrNew 载入或新建（内存态，首写落盘）。
 func (st *SessionStore) LoadOrNew(sid string) *SessionState {
 	if state := st.Load(sid); state != nil {
 		return state
@@ -136,7 +123,6 @@ func (st *SessionStore) LoadOrNew(sid string) *SessionState {
 	return &SessionState{Sid: sid}
 }
 
-// AppendTurn 落一轮问答；首问自动起名。返回是否落账成功。
 func (st *SessionStore) AppendTurn(sid string, record map[string]any) bool {
 	if !ValidSID(sid) {
 		return false
@@ -157,7 +143,6 @@ func (st *SessionStore) AppendTurn(sid string, record map[string]any) bool {
 	return st.append(sid, payload)
 }
 
-// SetTurnFeedback 追加用户评价；返回错误码（nil=成功）。
 func (st *SessionStore) SetTurnFeedback(sid, tid, label string) string {
 	if !ValidSID(sid) || tid == "" || (label != "accepted" && label != "rejected") {
 		return "bad_request"
@@ -187,7 +172,6 @@ func (st *SessionStore) SetTurnFeedback(sid, tid, label string) string {
 	return "write_failed"
 }
 
-// SetTitle 追加改名记录（后者胜）。
 func (st *SessionStore) SetTitle(sid, text string) bool {
 	text = strings.Join(strings.Fields(text), " ")
 	if runes := []rune(text); len(runes) > titleMaxLen {
@@ -199,7 +183,6 @@ func (st *SessionStore) SetTitle(sid, text string) bool {
 	return st.append(sid, map[string]any{"t": "title", "text": text})
 }
 
-// AppendSummary 压缩落账：摘要 + 边界事实（对话流分隔线由此还原）。
 func (st *SessionStore) AppendSummary(sid, text string, through int, trigger string, preTokens, postTokens any) bool {
 	record := map[string]any{"t": "summary", "text": text, "through": through,
 		"trigger": trigger, "after_turn": through}
@@ -212,7 +195,6 @@ func (st *SessionStore) AppendSummary(sid, text string, through int, trigger str
 	return st.append(sid, record)
 }
 
-// AppendProposal 批量提议落账（同 pid 后者胜）。
 func (st *SessionStore) AppendProposal(sid string, record map[string]any) bool {
 	payload := map[string]any{"t": "proposal"}
 	for key, value := range record {
@@ -229,7 +211,6 @@ func (st *SessionStore) Truncate(sid string, keep int) bool {
 	return st.append(sid, map[string]any{"t": "truncate", "keep": keep})
 }
 
-// SetPinned 置顶开/关。
 func (st *SessionStore) SetPinned(sid string, on bool) bool {
 	if !ValidSID(sid) {
 		return false
@@ -237,7 +218,6 @@ func (st *SessionStore) SetPinned(sid string, on bool) bool {
 	return st.append(sid, map[string]any{"t": "pin", "on": on})
 }
 
-// SetArchived 归档开/关。
 func (st *SessionStore) SetArchived(sid string, on bool) bool {
 	if !ValidSID(sid) {
 		return false
@@ -302,7 +282,6 @@ func (st *SessionStore) Fork(srcSid, newSid string, keep int) bool {
 	return ok
 }
 
-// DeleteWithReason 删除会话及飞轮影子记录、附件；返回终态机器码。
 func (st *SessionStore) DeleteWithReason(sid string) string {
 	if !ValidSID(sid) {
 		return "no_session"
@@ -320,7 +299,6 @@ func (st *SessionStore) DeleteWithReason(sid string) string {
 	return "deleted"
 }
 
-// TitleOf 生效标题：账本 title 行优先，无则首问兜底。
 func (st *SessionStore) TitleOf(state *SessionState) string {
 	if state.Title != "" {
 		return state.Title
@@ -333,7 +311,6 @@ func (st *SessionStore) TitleOf(state *SessionState) string {
 	return ""
 }
 
-// ListRecent 最近会话投影：mtime 倒序、置顶在前；q 命中标题或问答正文。
 func (st *SessionStore) ListRecent(limit int, q string) []map[string]any {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -361,7 +338,7 @@ func (st *SessionStore) ListRecent(limit int, q string) []map[string]any {
 		}
 		files = append(files, fileEntry{path: st.path(sid), sid: sid, mtime: info.ModTime()})
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].mtime.After(files[j].mtime) })
+	slices.SortFunc(files, func(a, b fileEntry) int { return b.mtime.Compare(a.mtime) })
 	needle := strings.ToLower(strings.TrimSpace(q))
 	if needle == "" && len(files) > limit {
 		files = files[:limit]
@@ -389,10 +366,16 @@ func (st *SessionStore) ListRecent(limit int, q string) []map[string]any {
 			"snippet": snippet,
 		})
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		pi, _ := out[i]["pinned"].(bool)
-		pj, _ := out[j]["pinned"].(bool)
-		return !pi && pj
+	slices.SortStableFunc(out, func(a, b map[string]any) int {
+		pi, _ := a["pinned"].(bool)
+		pj, _ := b["pinned"].(bool)
+		if pi != pj {
+			if pi {
+				return -1
+			}
+			return 1
+		}
+		return 0
 	})
 	if needle != "" && len(out) > limit {
 		out = out[:limit]
@@ -407,19 +390,43 @@ func forkedFromOrEmpty(state *SessionState) any {
 	return state.ForkedFrom
 }
 
+func indexRunesFold(text, lowerNeedle string) (int, int) {
+	nRunes := []rune(lowerNeedle)
+	if len(nRunes) == 0 {
+		return 0, 0
+	}
+	tRunes := []rune(text)
+	if len(tRunes) < len(nRunes) {
+		return -1, 0
+	}
+	for i := 0; i <= len(tRunes)-len(nRunes); i++ {
+		match := true
+		for j, nr := range nRunes {
+			if unicode.ToLower(tRunes[i+j]) != nr {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i, len(nRunes)
+		}
+	}
+	return -1, 0
+}
+
 func matchState(state *SessionState, title, needle string) (bool, string) {
-	if strings.Contains(strings.ToLower(title), needle) {
+	if pos, _ := indexRunesFold(title, needle); pos >= 0 {
 		return true, ""
 	}
 	for _, turn := range state.Turns {
 		q, _ := turn["q"].(string)
-		if pos := strings.Index(strings.ToLower(q), needle); pos >= 0 {
-			return true, clipSnippet(q, pos, len([]rune(needle)))
+		if pos, span := indexRunesFold(q, needle); pos >= 0 {
+			return true, clipSnippet(q, pos, span)
 		}
 		resp, _ := turn["resp"].(map[string]any)
 		text, _ := resp["answer"].(string)
-		if pos := strings.Index(strings.ToLower(text), needle); pos >= 0 {
-			return true, clipSnippet(text, pos, len([]rune(needle)))
+		if pos, span := indexRunesFold(text, needle); pos >= 0 {
+			return true, clipSnippet(text, pos, span)
 		}
 	}
 	return false, ""
@@ -458,7 +465,6 @@ func clipSnippet(text string, pos, span int) string {
 	return out
 }
 
-// append 追加记录并应用折叠。
 func (st *SessionStore) append(sid string, record map[string]any) bool {
 	if !ValidSID(sid) {
 		return false
@@ -487,7 +493,6 @@ func (st *SessionStore) appendLocked(path string, record map[string]any) bool {
 	return file.Close() == nil
 }
 
-// apply 单条记录折叠（与 session._apply 逐支对齐）。
 func applyRecord(state *SessionState, record map[string]any) {
 	switch t, _ := record["t"].(string); t {
 	case "turn":
@@ -603,7 +608,6 @@ func readLines(raw []byte) []map[string]any {
 	return out
 }
 
-// sweep 文件数超上限时删最旧（确定性清扫）。
 func (st *SessionStore) sweep() {
 	entries, err := os.ReadDir(st.base)
 	if err != nil {
@@ -632,7 +636,7 @@ func (st *SessionStore) sweep() {
 	if len(files) <= sessionMaxFiles {
 		return
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].mtime.Before(files[j].mtime) })
+	slices.SortFunc(files, func(a, b fileEntry) int { return a.mtime.Compare(b.mtime) })
 	expired := files[:len(files)-sessionMaxFiles]
 	sids := make([]string, 0, len(expired))
 	for _, file := range expired {

@@ -1,11 +1,7 @@
-//go:build windows
-
-// prefs_handlers.go 偏好工具：用户长期偏好的查询与显式保存（agent_memory 账本）。
 package agent
 
 import "holdexar/server-go/internal/store"
 
-// getUserPreferences 用户已保存的长期偏好清单。
 func getUserPreferences(c *CallContext) (*ToolResult, error) {
 	memories, err := ListMemories(c.Ctx, c.db)
 	if err != nil {
@@ -26,7 +22,6 @@ func getUserPreferences(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Status: StatusOK, Data: out}, nil
 }
 
-// pyStrDefault 非空取值否则默认（category 缺省 preference）。
 func pyStrDefault(v any, def string) string {
 	if s := pyStrOr(v); s != "" {
 		return s
@@ -34,7 +29,6 @@ func pyStrDefault(v any, def string) string {
 	return def
 }
 
-// setUserPreference 显式保存或更新一条长期偏好（来源标记 user_explicit）。
 func setUserPreference(c *CallContext) (*ToolResult, error) {
 	category := pyStrDefault(c.Args["category"], "preference")
 	key := pyStrOr(c.Args["key"])

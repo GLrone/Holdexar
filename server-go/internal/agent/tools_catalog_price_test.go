@@ -23,9 +23,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// catalogExtraSchema 批次一测试面的附加件：价格事件账本 / Steam 活动日历 /
-// 账号表（结算区派生）/ 历史表补列（is_bundle/product_unknown）/ 爬取作业
-// 表全列重建（默认最小建表缺端点查询列）。
 const catalogExtraSchema = `
 DROP TABLE crawl_jobs;
 CREATE TABLE crawl_jobs (
@@ -99,9 +96,6 @@ CREATE TABLE steam_accounts (
 );
 `
 
-// newCatalogSurface 批次一工具测试面：种子库 + 所需端点（榜单 stub / 捆绑包 /
-// 汇率 / HB / Epic / Steam 免费 / 活动日历 / 爬取读面）。
-// board 为热销榜 stub 返回值（nil = 榜单空 → 端点 502 FETCH_FAILED）。
 func newCatalogSurface(t *testing.T, board []int64) (*http.ServeMux, *sql.DB) {
 	t.Helper()
 	dataDir := t.TempDir()
@@ -132,7 +126,6 @@ func newCatalogSurface(t *testing.T, board []int64) (*http.ServeMux, *sql.DB) {
 	return mux, db
 }
 
-// catalogRegistryOrDie 批次一注册表（重名即错即注册失败）。
 func catalogRegistryOrDie(t *testing.T) *ToolRegistry {
 	t.Helper()
 	r := newRegistry()
@@ -142,7 +135,6 @@ func catalogRegistryOrDie(t *testing.T) *ToolRegistry {
 	return r
 }
 
-// executeCatalogTool 批次一快捷执行入口（与 executeTool 同构，走批次一注册表）。
 func executeCatalogTool(t *testing.T, mux *http.ServeMux, db *sql.DB, name string, argsJSON string) map[string]any {
 	t.Helper()
 	spec := catalogRegistryOrDie(t).get(name)
@@ -164,7 +156,6 @@ func executeCatalogTool(t *testing.T, mux *http.ServeMux, db *sql.DB, name strin
 	return payload
 }
 
-// seedGame900002 对比用第二款游戏（国区 198 分折扣 25%）。
 func seedGame900002(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO games (appid, name, name_en, positive_rate, review_count) VALUES
@@ -177,7 +168,6 @@ func seedGame900002(t *testing.T, db *sql.DB) {
 	}
 }
 
-// seedHistory900001 标准版历史三点（3000/1000/2000 分，跨三个月）。
 func seedHistory900001(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO game_price_history (appid, region_code, currency, price, discount_percent, price_status, cny_fen, snapshot_at) VALUES
@@ -188,7 +178,6 @@ func seedHistory900001(t *testing.T, db *sql.DB) {
 	}
 }
 
-// seedAccountUS 主账号结算区 US。
 func seedAccountUS(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO steam_accounts (steam_id, bound_at, wallet_json) VALUES
@@ -197,7 +186,6 @@ func seedAccountUS(t *testing.T, db *sql.DB) {
 	}
 }
 
-// seedGame900005 双区价游戏（CN 4800 / US 5200）供区价清单测试。
 func seedGame900005(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO games (appid, name, name_en) VALUES (900005, '双区样本', 'Dual Region')`); err != nil {
@@ -210,7 +198,6 @@ func seedGame900005(t *testing.T, db *sql.DB) {
 	}
 }
 
-// seedVersions900002 版本历史（普通版 sub 666 + Gold sub 777，CN/US 各一行）。
 func seedVersions900002(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO game_price_history (appid, region_code, currency, price, discount_percent, sub_id, is_gold, version_suffix, price_status, cny_fen, snapshot_at) VALUES
@@ -220,7 +207,6 @@ func seedVersions900002(t *testing.T, db *sql.DB) {
 	}
 }
 
-// seedBundleFollow 星标捆绑包 501。
 func seedBundleFollow(t *testing.T, db *sql.DB) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO monitor_sources (target_type, target_id, source, active) VALUES
@@ -229,8 +215,6 @@ func seedBundleFollow(t *testing.T, db *sql.DB) {
 	}
 }
 
-// TestCatalogPriceRegistry 批次一注册表契约：16 工具、全 read/low、
-// 预算按 D9 分档（60 重扫聚合 / 40 网络往返 / 默认 20）。
 func TestCatalogPriceRegistry(t *testing.T) {
 	r := catalogRegistryOrDie(t)
 	budget := map[string]float64{
@@ -266,7 +250,6 @@ func TestCatalogPriceRegistry(t *testing.T) {
 	}
 }
 
-// TestCatalogPriceShapes 批次一 16 工具的正例形状冒烟（真实端点 + 种子库）。
 func TestCatalogPriceShapes(t *testing.T) {
 	mux, db := newCatalogSurface(t, []int64{900001, 900002})
 	seedGame900002(t, db)
@@ -275,7 +258,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 	seedGame900005(t, db)
 	seedVersions900002(t, db)
 	seedBundleFollow(t, db)
-	// 包成员清单以区价行 app_ids 为基准（aggregate 基准行先到者胜）
 	if _, err := db.Exec(`UPDATE bundle_region_prices SET app_ids = '[900001]' WHERE bundle_id = 501`); err != nil {
 		t.Fatalf("种子写入失败: %v", err)
 	}
@@ -332,7 +314,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("种子写入失败: %v", err)
 	}
 
-	// top_games：榜序即序，briefs 补齐富卡。
 	payload := executeCatalogTool(t, mux, db, "top_games", ``)
 	if payload["kind"] != "games" || payload["titleKey"] != "top" {
 		t.Fatalf("top_games 形状不符: %v", payload)
@@ -348,7 +329,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("top_games 简报缺失: %v", items[0])
 	}
 
-	// get_price_briefing：现价/史低/近一年区间与中位（pyMedian）。
 	payload = executeCatalogTool(t, mux, db, "get_price_briefing", `{"appid": 900001}`)
 	if payload["kind"] != "price" || payload["appid"].(float64) != 900001 {
 		t.Fatalf("briefing 形状不符: %v", payload)
@@ -371,7 +351,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("briefing 走势不符: %v", trend)
 	}
 
-	// get_region_prices：主账号结算区（US）置顶。
 	payload = executeCatalogTool(t, mux, db, "get_region_prices", `{"appid": 900005}`)
 	if payload["kind"] != "region_prices" || payload["accountRegion"] != "us" {
 		t.Fatalf("region_prices 形状不符: %v", payload)
@@ -387,7 +366,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("region_prices 行内容不符: %v", ritems[0])
 	}
 
-	// compare_games：两款并排（事实复用 briefing 同源）。
 	payload = executeCatalogTool(t, mux, db, "compare_games", `{"appids": [900001, 900002]}`)
 	if payload["kind"] != "compare" {
 		t.Fatalf("compare 形状不符: %v", payload)
@@ -407,7 +385,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("compare 次款折扣不符: %v", citems[1])
 	}
 
-	// diagnose_price：覆盖行 + 问题区行（US 失败）。
 	if _, err := db.Exec(`INSERT INTO game_current_prices (appid, region_code, price_status, attempt_outcome, steam_answer, last_success_at, updated_at) VALUES
 		(900001, 'US', 'missing', 'failed', 'parse_failed', '2026-10-01 08:00:00', '2026-10-30 09:00:00')`); err != nil {
 		t.Fatalf("种子写入失败: %v", err)
@@ -434,7 +411,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("diagnose 问题区行不符: %v", problem)
 	}
 
-	// game_price_history：默认国区 365 天，走势抽样 + 极值 + 计数。
 	payload = executeCatalogTool(t, mux, db, "game_price_history", `{"appid": 900001}`)
 	if payload["kind"] != "price_history" || payload["region"] != "cn" || payload["days"].(float64) != 365 {
 		t.Fatalf("history 形状不符: %v", payload)
@@ -451,7 +427,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("history 极值不符: %v", payload["lowest"])
 	}
 
-	// game_versions：sub/suffix/分区价格投影（条目按 subId 定位，顺序随端点）。
 	payload = executeCatalogTool(t, mux, db, "game_versions", `{"appid": 900002}`)
 	if payload["kind"] != "game_versions" {
 		t.Fatalf("versions 形状不符: %v", payload)
@@ -481,7 +456,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("versions Gold 版不符: %v", goldVer)
 	}
 
-	// bundle_detail：区价剥离 appIds + 成员清单 + 差价。
 	payload = executeCatalogTool(t, mux, db, "bundle_detail", `{"bundle_id": 501}`)
 	if payload["kind"] != "bundle_detail" || payload["bundleId"].(float64) != 501 {
 		t.Fatalf("bundle_detail 形状不符: %v", payload)
@@ -508,7 +482,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("bundle_detail 成员不符: %v", members)
 	}
 
-	// list_bundles：diff 降序前列 + 最低区。
 	payload = executeCatalogTool(t, mux, db, "list_bundles", ``)
 	if payload["kind"] != "rows" || payload["titleKey"] != "bundlesAll" || payload["total"].(float64) != 1 {
 		t.Fatalf("list_bundles 形状不符: %v", payload)
@@ -522,7 +495,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("list_bundles data 不符: %v", ldata)
 	}
 
-	// list_bundle_follows：星标 → 名称投影。
 	payload = executeCatalogTool(t, mux, db, "list_bundle_follows", ``)
 	if payload["total"].(float64) != 1 {
 		t.Fatalf("list_bundle_follows total 不符: %v", payload)
@@ -531,7 +503,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("list_bundle_follows 行不符: %v", payload["rows"])
 	}
 
-	// rates_overview：快照行（rateToCny 字面量透传）。
 	payload = executeCatalogTool(t, mux, db, "rates_overview", ``)
 	if payload["kind"] != "rows" || payload["titleKey"] != "rates" || payload["total"].(float64) != 2 {
 		t.Fatalf("rates_overview 形状不符: %v", payload)
@@ -544,7 +515,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("rates_overview 汇率不符: %v", rrow["data"])
 	}
 
-	// hb_monthly：月包行（现价+史低+折扣词条）。
 	payload = executeCatalogTool(t, mux, db, "hb_monthly", ``)
 	if payload["kind"] != "rows" || payload["titleKey"] != "hb" || payload["total"].(float64) != 1 {
 		t.Fatalf("hb_monthly 形状不符: %v", payload)
@@ -558,7 +528,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("hb_monthly data 不符: %v", hdata)
 	}
 
-	// epic_free：快照回放（清单 + 行 + 移动端入口）。
 	payload = executeCatalogTool(t, mux, db, "epic_free", ``)
 	if payload["kind"] != "epic" || payload["titleKey"] != "epic" || payload["total"].(float64) != 1 {
 		t.Fatalf("epic_free 形状不符: %v", payload)
@@ -581,7 +550,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("epic_free 移动端不符: %v", emobile)
 	}
 
-	// steam_free：promo 快照行。
 	payload = executeCatalogTool(t, mux, db, "steam_free", ``)
 	if payload["kind"] != "rows" || payload["titleKey"] != "steamFree" || payload["total"].(float64) != 1 {
 		t.Fatalf("steam_free 形状不符: %v", payload)
@@ -591,7 +559,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("steam_free 行不符: %v", srow)
 	}
 
-	// price_drops：事件简报卡（事件类型词条小写对齐）。
 	payload = executeCatalogTool(t, mux, db, "price_drops", ``)
 	if payload["kind"] != "games" || payload["titleKey"] != "drops" || payload["total"].(float64) != 1 {
 		t.Fatalf("price_drops 形状不符: %v", payload)
@@ -605,7 +572,6 @@ func TestCatalogPriceShapes(t *testing.T) {
 		t.Fatalf("price_drops 注记不符: %v", note)
 	}
 
-	// calendar_events：进行中在前，季节大促置顶。
 	payload = executeCatalogTool(t, mux, db, "calendar_events", ``)
 	if payload["kind"] != "rows" || payload["titleKey"] != "calendar" || payload["total"].(float64) != 3 {
 		t.Fatalf("calendar_events 形状不符: %v", payload)
@@ -625,18 +591,14 @@ func TestCatalogPriceShapes(t *testing.T) {
 	}
 }
 
-// TestCatalogPriceEmpty 批次一 16 工具的空态边界（fail-closed 形状）。
 func TestCatalogPriceEmpty(t *testing.T) {
 	mux, db := newCatalogSurface(t, nil)
 
-	// top_games：榜单完全失败（端点 502 FETCH_FAILED）→ 空态。
 	payload := executeCatalogTool(t, mux, db, "top_games", ``)
 	if payload["kind"] != "empty" || payload["note"] != "no_data" {
 		t.Fatalf("top_games 空态不符: %v", payload)
 	}
 
-	// get_price_briefing / get_region_prices / game_price_history / game_versions /
-	// bundle_detail：对象缺席。
 	payload = executeCatalogTool(t, mux, db, "get_price_briefing", `{"appid": 42}`)
 	if payload["kind"] != "empty" || payload["note"] != "no_data" {
 		t.Fatalf("briefing 空态不符: %v", payload)
@@ -658,7 +620,6 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("bundle_detail 空态不符: %v", payload)
 	}
 
-	// compare_games：有效 id<2 → need_two；两 id 均无事实 → no_data。
 	payload = executeCatalogTool(t, mux, db, "compare_games", `{"appids": [900001]}`)
 	if payload["kind"] != "empty" || payload["note"] != "need_two" {
 		t.Fatalf("compare need_two 不符: %v", payload)
@@ -668,7 +629,6 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("compare no_data 不符: %v", payload)
 	}
 
-	// diagnose_price：无数据 / 无失败任务（appid≤0）。
 	payload = executeCatalogTool(t, mux, db, "diagnose_price", `{"appid": 42}`)
 	if payload["kind"] != "empty" || payload["note"] != "no_data" {
 		t.Fatalf("diagnose 空态不符: %v", payload)
@@ -678,7 +638,6 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("diagnose need_appid 不符: %v", payload)
 	}
 
-	// list_bundles：清空包档 → 空行卡。
 	if _, err := db.Exec(`DELETE FROM bundles`); err != nil {
 		t.Fatalf("清空包档失败: %v", err)
 	}
@@ -690,13 +649,11 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("list_bundles 空行卡不符: %v", payload["rows"])
 	}
 
-	// list_bundle_follows：无星标。
 	payload = executeCatalogTool(t, mux, db, "list_bundle_follows", ``)
 	if payload["kind"] != "rows" || payload["total"].(float64) != 0 {
 		t.Fatalf("list_bundle_follows 空态不符: %v", payload)
 	}
 
-	// rates_overview：清空汇率快照。
 	if _, err := db.Exec(`DELETE FROM fx_rates`); err != nil {
 		t.Fatalf("清空汇率失败: %v", err)
 	}
@@ -705,13 +662,11 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("rates_overview 空态不符: %v", payload)
 	}
 
-	// hb_monthly：月包未入库（端点 ok:false 无 games）→ 空行卡。
 	payload = executeCatalogTool(t, mux, db, "hb_monthly", ``)
 	if payload["kind"] != "rows" || payload["total"].(float64) != 0 {
 		t.Fatalf("hb_monthly 空态不符: %v", payload)
 	}
 
-	// epic_free：来源开关关闭 → 空载荷（不出网）。
 	if _, err := db.Exec(`INSERT INTO app_settings (key, value_json) VALUES
 		('fetch.epic_free', 'false')`); err != nil {
 		t.Fatalf("种子写入失败: %v", err)
@@ -727,26 +682,22 @@ func TestCatalogPriceEmpty(t *testing.T) {
 		t.Fatalf("epic_free 空态 mobile 应 null: %v", payload["mobile"])
 	}
 
-	// steam_free：无 promo 快照。
 	payload = executeCatalogTool(t, mux, db, "steam_free", ``)
 	if payload["kind"] != "rows" || payload["total"].(float64) != 0 {
 		t.Fatalf("steam_free 空态不符: %v", payload)
 	}
 
-	// price_drops：无事件。
 	payload = executeCatalogTool(t, mux, db, "price_drops", ``)
 	if payload["kind"] != "games" || payload["total"].(float64) != 0 {
 		t.Fatalf("price_drops 空态不符: %v", payload)
 	}
 
-	// calendar_events：无活动。
 	payload = executeCatalogTool(t, mux, db, "calendar_events", ``)
 	if payload["kind"] != "rows" || payload["total"].(float64) != 0 {
 		t.Fatalf("calendar_events 空态不符: %v", payload)
 	}
 }
 
-// TestCatalogPriceDiagnoseJobs diagnose_price appid≤0 的最近失败任务投影。
 func TestCatalogPriceDiagnoseJobs(t *testing.T) {
 	mux, db := newCatalogSurface(t, nil)
 	if _, err := db.Exec(`INSERT INTO crawl_jobs (kind, status, mode, cycle_id, regions_json, stats_json, started_at, finished_at, error) VALUES
@@ -765,7 +716,6 @@ func TestCatalogPriceDiagnoseJobs(t *testing.T) {
 	}
 }
 
-// jsonNumber JSON 数值字面量（快照 fetched_at 浮点秒）。
 func jsonNumber(f float64) string {
 	b, _ := json.Marshal(f)
 	return string(b)

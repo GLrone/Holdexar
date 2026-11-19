@@ -1,7 +1,3 @@
-//go:build windows
-
-// service.go 领航员服务运行态：依赖句柄、进程内会话态（在飞轮/在飞问）
-// 与门面方法。编排主体（ask/agent 循环）见 ask.go。
 package pilot
 
 import (
@@ -10,58 +6,58 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
+	"holdexar/server-go/internal/agent"
 	"holdexar/server-go/internal/modulectl"
 	"holdexar/server-go/internal/store"
 )
 
-// ToolBridge 工具执行桥：pilot 工具名 → 归一化结果（kind 键形状，与
-// Python REGISTRY 数据面同构）。由 serverd 装配注入。
 type ToolBridge func(ctx *CallCtx, name string, args map[string]any, guarded bool) map[string]any
 
-// CallCtx 工具执行环境。
 type CallCtx struct {
-	Ctx context.Context
-	Sid string
-	DB  *sql.DB
-	Mux *http.ServeMux
+	Ctx     context.Context
+	Sid     string
+	DB      *sql.DB
+	Mux     *http.ServeMux
+	DataDir string
+	Store   *SessionStore
 }
 
-// Deps 服务装配依赖。
 type Deps struct {
-	DB      *sql.DB
-	DataDir string
-	Version string
-	Mux     *http.ServeMux // 进程内 fetch 已迁移只读端点
-	Log     func(string, ...any)
-	// KV 桥：settings_service 语义（KV JSON 值 + secretbox 密文），serverd 注入。
+	DB          *sql.DB
+	DataDir     string
+	Version     string
+	Mux         *http.ServeMux // 进程内调用主 mux 端点（含删除提议与桥接写端点）
+	Log         func(string, ...any)
 	KVGet       func(key string) (json.RawMessage, bool)
 	KVGetSecret func(key string) (string, bool)
-	// ToolSpecs 工具表投影（serverd 从 agent 注册表注入）。
-	ToolSpecs func() []map[string]any
-	KVSet     func(ctx context.Context, values map[string]json.RawMessage, secrets map[string]string) error
+	ToolSpecs   func() []map[string]any
+	KVSet       func(ctx context.Context, values map[string]json.RawMessage, secrets map[string]string) error
 }
 
-// Service 领航员运行态。
 type Service struct {
-	deps      Deps
-	gate      *store.WriteGate
-	ctl       *modulectl.Control
-	mu        sync.Mutex
-	running   map[string]bool
-	inflight  map[string]int
-	inflightQ map[string]string
-	store     *SessionStore
-	bridge    ToolBridge
+	deps        Deps
+	gate        *store.WriteGate
+	ctl         *modulectl.Control
+	mu          sync.Mutex
+	running     map[string]bool
+	inflight    map[string]int
+	inflightQ   map[string]string
+	compactFail map[string]int
+	store       *SessionStore
+	bridge      ToolBridge
 }
 
-// New 构造服务（路由装配时创建一次）。
 func New(deps Deps, bridge ToolBridge) *Service {
 	return &Service{
 		deps: deps, bridge: bridge, ctl: modulectl.New(ModuleEnabledKey),
-		running:  map[string]bool{},
-		inflight: map[string]int{}, inflightQ: map[string]string{},
+		running:     map[string]bool{},
+		inflight:    map[string]int{},
+		inflightQ:   map[string]string{},
+		compactFail: map[string]int{},
 	}
 }
 
@@ -69,10 +65,8 @@ func (s *Service) SetToolSpecs(fn func() []map[string]any) {
 	s.deps.ToolSpecs = fn
 }
 
-// SetGate 注入写闸（模块开关落库用；路由装配前调用）。
 func (s *Service) SetGate(gate *store.WriteGate) { s.gate = gate }
 
-// inflightTotal 当前全局在飞轮数（锁内求和）。
 func (s *Service) inflightTotal() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,7 +83,6 @@ func (s *Service) log(format string, args ...any) {
 	}
 }
 
-// GetStore 会话存取（目录 = <data>/pilot/sessions）。
 func (s *Service) GetStore() *SessionStore {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,7 +93,7 @@ func (s *Service) GetStore() *SessionStore {
 	return s.store
 }
 
-// MarkSessionRunning ask 流受理登记（router 层挂载，断开必达）。
+// MarkSessionRunning 将会话标记为运行中（测试注入用；AskStream 内部维护运行态）。
 func (s *Service) MarkSessionRunning(sid string) {
 	if sid == "" {
 		return
@@ -110,7 +103,6 @@ func (s *Service) MarkSessionRunning(sid string) {
 	s.running[sid] = true
 }
 
-// ClearSessionRunning 流收口摘除登记。
 func (s *Service) ClearSessionRunning(sid string) {
 	if sid == "" {
 		return
@@ -120,7 +112,6 @@ func (s *Service) ClearSessionRunning(sid string) {
 	delete(s.running, sid)
 }
 
-// SessionRunning 本会话是否有流在途。
 func (s *Service) SessionRunning(sid string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -134,7 +125,6 @@ func (s *Service) SessionBusy(sid string) bool {
 	return s.inflight[sid] > 0 || s.running[sid]
 }
 
-// SetInflightQuestion 在飞轮的提问原文（刷新后据此补一屏进行中轮）。
 func (s *Service) SetInflightQuestion(sid, question string) {
 	if sid == "" {
 		return
@@ -144,14 +134,12 @@ func (s *Service) SetInflightQuestion(sid, question string) {
 	s.inflightQ[sid] = question
 }
 
-// ClearInflightQuestion 摘除在飞问。
 func (s *Service) ClearInflightQuestion(sid string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.inflightQ, sid)
 }
 
-// InflightQuestion 本会话在飞轮的提问；无则空串。
 func (s *Service) InflightQuestion(sid string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,7 +167,6 @@ func (s *Service) acquireTurn(sid string) (bool, int) {
 	return true, total
 }
 
-// releaseTurn 摘除在飞登记。
 func (s *Service) releaseTurn(sid string) {
 	if sid == "" {
 		return
@@ -193,13 +180,138 @@ func (s *Service) releaseTurn(sid string) {
 	}
 }
 
-// ToolExecute 工具执行入口（守卫/预算由桥接实现承载）。
 func (s *Service) ToolExecute(ctx context.Context, name string, args map[string]any, guarded bool, sid string) map[string]any {
 	if s.bridge == nil {
 		return map[string]any{"kind": "failed", "tool": name, "note": "tools_unwired"}
 	}
-	return s.bridge(&CallCtx{Ctx: ctx, Sid: sid, DB: s.deps.DB, Mux: s.deps.Mux}, name, args, guarded)
+	var st *SessionStore
+	if s.deps.DataDir != "" {
+		st = s.GetStore()
+	}
+	return s.bridge(&CallCtx{
+		Ctx:     ctx,
+		Sid:     sid,
+		DB:      s.deps.DB,
+		Mux:     s.deps.Mux,
+		DataDir: s.deps.DataDir,
+		Store:   st,
+	}, name, args, guarded)
 }
 
-// ToolNameLabel 工具显示名占位（tools.go 实装后由注册表 label 提供）。
-func (s *Service) ToolNameLabel(name string) string { return name }
+func (s *Service) ToolNameLabel(name string) string { return agent.StepLabel(name) }
+
+func (s *Service) ConfirmProposal(ctx context.Context, sid, pid string, approve bool) map[string]any {
+	st := s.GetStore()
+	state := st.Load(sid)
+	if state == nil {
+		return map[string]any{"ok": false, "reason": "no_session"}
+	}
+	prop := state.PendingProposal
+	if prop == nil || stringOf(prop["pid"]) != pid {
+		return map[string]any{"ok": false, "reason": "proposal_gone"}
+	}
+	action := stringOf(prop["action"])
+	args, _ := prop["args"].(map[string]any)
+	if args == nil {
+		args = map[string]any{}
+	}
+	items := anySlice(prop["items"])
+	if !approve {
+		_ = st.AppendProposal(sid, map[string]any{
+			"pid": pid, "action": action, "items": items, "args": args, "state": "rejected",
+		})
+		return map[string]any{
+			"ok": true, "state": "rejected", "action": action, "total": len(items), "done": 0,
+		}
+	}
+	done := []map[string]any{}
+	failed := []map[string]any{}
+	if action == "delete" {
+		for _, raw := range items {
+			item, _ := raw.(map[string]any)
+			key := stringOf(item["key"])
+			kind, idStr, found := strings.Cut(key, ":")
+			targetID, err := strconv.ParseInt(idStr, 10, 64)
+			if !found || err != nil || targetID <= 0 {
+				failed = append(failed, map[string]any{"key": key, "name": item["name"]})
+				continue
+			}
+			okDone := s.executeProposalDelete(ctx, kind, targetID)
+			if okDone {
+				done = append(done, map[string]any{"key": key, "name": item["name"]})
+			} else {
+				failed = append(failed, map[string]any{"key": key, "name": item["name"]})
+			}
+		}
+	} else {
+		for _, raw := range items {
+			item, _ := raw.(map[string]any)
+			appid := jsonInt(item["appid"])
+			if appid <= 0 {
+				continue
+			}
+			var res map[string]any
+			if action == "add_follow" {
+				res = s.ToolExecute(ctx, "add_follow", map[string]any{"appid": appid}, false, sid)
+			} else {
+				toolArgs := map[string]any{
+					"appid":       appid,
+					"target_type": stringOr(args["target_type"], "historic_low"),
+				}
+				if v, ok := args["target_value_yuan"]; ok && v != nil {
+					toolArgs["target_value_yuan"] = v
+				} else if v, ok := args["target_value_fen"]; ok && v != nil {
+					toolArgs["target_value_fen"] = v
+				}
+				res = s.ToolExecute(ctx, "create_price_alert", toolArgs, false, sid)
+			}
+			if res != nil && jsonInt(res["appid"]) > 0 && stringOf(res["kind"]) != "failed" {
+				done = append(done, map[string]any{"appid": appid, "name": stringOr(res["name"], stringOf(item["name"]))})
+			} else {
+				failed = append(failed, map[string]any{"appid": appid, "name": item["name"]})
+			}
+		}
+	}
+	_ = st.AppendProposal(sid, map[string]any{
+		"pid": pid, "action": action, "items": items, "args": args,
+		"state": "confirmed", "done": len(done), "failed": failed,
+	})
+	return map[string]any{
+		"ok": true, "state": "confirmed", "action": action,
+		"total": len(items), "done": len(done), "failed": failed,
+	}
+}
+
+func (s *Service) executeProposalDelete(ctx context.Context, kind string, targetID int64) bool {
+	if s.deps.Mux == nil {
+		return false
+	}
+	var path string
+	switch kind {
+	case "alert":
+		path = "/api/v1/alerts/" + strconv.FormatInt(targetID, 10)
+	case "bill_import":
+		path = "/api/v1/bills/imports/" + strconv.FormatInt(targetID, 10)
+	case "follow":
+		path = "/api/v1/follows/" + strconv.FormatInt(targetID, 10)
+	default:
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, "http://127.0.0.1"+path, nil)
+	if err != nil {
+		return false
+	}
+	req.RemoteAddr = "127.0.0.1:0"
+	rec := &statusRecorder{header: make(http.Header), code: http.StatusOK}
+	s.deps.Mux.ServeHTTP(rec, req)
+	return rec.code >= 200 && rec.code < 300
+}
+
+type statusRecorder struct {
+	header http.Header
+	code   int
+}
+
+func (r *statusRecorder) Header() http.Header         { return r.header }
+func (r *statusRecorder) Write(b []byte) (int, error) { return len(b), nil }
+func (r *statusRecorder) WriteHeader(statusCode int)  { r.code = statusCode }

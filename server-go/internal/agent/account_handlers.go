@@ -1,11 +1,9 @@
-// account 组只读工具：绑定账号 / 愿望单 / 已拥有（库内快照，无凭据无出网）。
 package agent
 
 import (
 	"holdexar/server-go/internal/account"
 )
 
-// rowsResult 对齐 Python _shared.rows_result：行截 8，total 取截前全量。
 func rowsResult(title string, rows []any, total int) *Obj {
 	out := newObj()
 	out.set("kind", "rows")
@@ -18,7 +16,6 @@ func rowsResult(title string, rows []any, total int) *Obj {
 	return out
 }
 
-// gamesCard 对齐 Python _shared.games_card：富卡清单截 8，total 同上。
 func gamesCard(title string, items []any, total int) *Obj {
 	out := newObj()
 	out.set("kind", "games")
@@ -31,7 +28,7 @@ func gamesCard(title string, items []any, total int) *Obj {
 	return out
 }
 
-// briefItem 对齐 Python _shared.brief_item：缺简报行降级为纯 appid 不丢对象。
+// briefItem 缺简报行时降级为纯 appid，不丢弃条目。
 func briefItem(appid int64, brief account.Brief, hasBrief bool) *Obj {
 	out := newObj()
 	out.set("appid", appid)
@@ -64,7 +61,6 @@ func briefItem(appid int64, brief account.Brief, hasBrief bool) *Obj {
 	return out
 }
 
-// listAccounts 绑定 Steam 账号清单（名称/好友码/主账号/拥有统计）。
 func listAccounts(c *CallContext) (*ToolResult, error) {
 	accounts, err := account.ListAccounts(c.Ctx, c.db)
 	if err != nil {
@@ -109,7 +105,6 @@ func listAccounts(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// wishlistIDs 愿望单/已拥有的 appid 序列（工具消费面按标记过滤）。
 func wishlistIDs(items []account.ItemFlags, owned bool) []int64 {
 	ids := make([]int64, 0, len(items))
 	for _, it := range items {
@@ -123,7 +118,6 @@ func wishlistIDs(items []account.ItemFlags, owned bool) []int64 {
 	return ids
 }
 
-// gamesListCard 愿望单/已拥有共用的清单卡组装。
 func gamesListCard(c *CallContext, title string, owned bool) (*ToolResult, error) {
 	items, err := account.ListItems(c.Ctx, c.db)
 	if err != nil {
@@ -150,12 +144,10 @@ func gamesListCard(c *CallContext, title string, owned bool) (*ToolResult, error
 	return &ToolResult{Data: out}, nil
 }
 
-// listWishlist 账户愿望单游戏（监控池内 wishlisted 来源，库内快照）。
 func listWishlist(c *CallContext) (*ToolResult, error) {
 	return gamesListCard(c, "wishlist", false)
 }
 
-// listOwned 账户已拥有游戏（监控池内 owned 来源，带国区现价）。
 func listOwned(c *CallContext) (*ToolResult, error) {
 	return gamesListCard(c, "owned", true)
 }

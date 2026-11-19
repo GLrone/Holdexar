@@ -1,7 +1,3 @@
-//go:build windows
-
-// rewind_compact_test.go 批 2 端点测试：compact 机器码链 + rewind 校验/夹取/
-// busy/成功（形状对齐 Python router.py:355-389 venv 实测锚点）。
 package pilot
 
 import (
@@ -12,7 +8,6 @@ import (
 	"testing"
 )
 
-// routeFixture 真 mux 全量路由 + JSON POST 通道。
 func routeFixture(t *testing.T) (*Service, func(method, path, body string) *httptest.ResponseRecorder) {
 	t.Helper()
 	service := New(Deps{DataDir: t.TempDir(), KVGet: func(string) (json.RawMessage, bool) { return nil, false }}, nil)
@@ -49,7 +44,6 @@ func seedTurns(t *testing.T, service *Service, sid string, count int) {
 	}
 }
 
-// TestRewindValidation keep_turns 校验（missing/ge/le/int_parsing 实测形状）。
 func TestRewindValidation(t *testing.T) {
 	_, do := routeFixture(t)
 	cases := []struct {
@@ -82,7 +76,6 @@ func TestRewindValidation(t *testing.T) {
 	}
 }
 
-// TestRewindNoSessionAndSuccess 无会话机器码 + 成功截断与夹取。
 func TestRewindNoSessionAndSuccess(t *testing.T) {
 	service, do := routeFixture(t)
 	sid := "probe0000000000000000sess01"
@@ -111,7 +104,6 @@ func TestRewindNoSessionAndSuccess(t *testing.T) {
 	}
 }
 
-// TestRewindBusy 生成中拒绝（busy 机器码，turn_total 0）。
 func TestRewindBusy(t *testing.T) {
 	service, do := routeFixture(t)
 	sid := "probe0000000000000000sess01"
@@ -124,7 +116,6 @@ func TestRewindBusy(t *testing.T) {
 	}
 }
 
-// TestCompactMachineCodes 无会话 404 + 未配置 LLM 机器码。
 func TestCompactMachineCodes(t *testing.T) {
 	_, do := routeFixture(t)
 	rec := do("POST", "/api/v1/pilot/sessions/absent00000000000000000001/compact", "")
@@ -140,5 +131,11 @@ func TestCompactMachineCodes(t *testing.T) {
 	body := decodePilotBody(t, rec)
 	if body["ok"] != false || body["reason"] != "llm_off" {
 		t.Fatalf("llm_off 形状不符：%s", rec.Body.String())
+	}
+
+	service.MarkSessionRunning("probe0000000000000000sess01")
+	busyRec := do("POST", "/api/v1/pilot/sessions/probe0000000000000000sess01/compact", "")
+	if busyRec.Code != http.StatusConflict {
+		t.Fatalf("运行中会话 compact 应返回 409：%d %s", busyRec.Code, busyRec.Body.String())
 	}
 }

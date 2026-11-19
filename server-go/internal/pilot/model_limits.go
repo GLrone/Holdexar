@@ -1,7 +1,4 @@
-//go:build windows
-
-// model_windows.go 模型上下文窗口自动识别（规则表对齐 model_windows.py，
-// 顺序敏感：具体在前宽泛在后；识别不出回落宽裕口径并标 fallback）。
+// 模型上下文窗口自动识别（顺序敏感：具体在前宽泛在后；识别不出回落宽裕口径并标 fallback）。
 package pilot
 
 import (
@@ -47,7 +44,6 @@ var windowRules = compileWindows([][]any{
 	{`yi-large`, 32768},
 })
 
-// FallbackContextWindow 表外模型兜底窗口（宽裕口径，source=fallback）。
 const FallbackContextWindow = 200000
 
 func compileWindows(pairs [][]any) []windowRule {
@@ -58,7 +54,6 @@ func compileWindows(pairs [][]any) []windowRule {
 	return out
 }
 
-// GuessContextWindow 模型名 → 窗口；表里没有返回 0（不猜）。
 func GuessContextWindow(model string) int {
 	name := trimSpace(model)
 	if name == "" {

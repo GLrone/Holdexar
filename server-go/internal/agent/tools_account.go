@@ -1,19 +1,19 @@
-// account 组批次二：账户/成就/账单/家庭读面 + 同步 POST 面 + 领航员会话读 + 元信息。
-// 形状与 Python builtin（account/userview/tracking/runtime_tools/info）逐字段对齐。
 package agent
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
+	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 
 	"holdexar/server-go/internal/account"
 )
 
-// coreTools 常驻工具切面（Python projection.CORE_TOOLS 同表，list_tools 解锁其余）。
 var coreTools = map[string]bool{
 	"search_games": true, "search_steam": true, "web_search": true, "ingest_appids": true,
 	"recommend_games": true, "top_games": true, "price_drops": true,
@@ -28,7 +28,6 @@ var coreTools = map[string]bool{
 	"list_tools": true,
 }
 
-// RegisterAccountTools 批次二登记（重名即错；TimeoutS 经 budgetFor 取档）。
 func RegisterAccountTools(r *ToolRegistry) error {
 	for _, spec := range []*ToolSpec{
 		{
@@ -190,8 +189,8 @@ func RegisterAccountTools(r *ToolRegistry) error {
 			Name: "list_sessions", Group: GroupRead, Risk: "low",
 			Description: "列出用户与领航员的历史对话清单（标题与轮数）。" +
 				"用户想找回或查看以前的对话时调用；对话内容用 read_session 读取",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     listSessions, TimeoutS: budgetFor("list_sessions"),
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    listSessions, TimeoutS: budgetFor("list_sessions"),
 		},
 		{
 			Name: "read_session", Group: GroupRead, Risk: "low",
@@ -236,8 +235,8 @@ func RegisterAccountTools(r *ToolRegistry) error {
 				"任务调度、汇率、捆绑包、区服开关、批量清理、历史会话列表等都在里面。" +
 				"不要在未查看前就回答「做不到」",
 			Parameters: `{"type": "object", "properties": {}}`,
-			Handler: func(c *CallContext) (*ToolResult, error) { return listTools(r) },
-			TimeoutS: budgetFor("list_tools"),
+			Handler:    func(c *CallContext) (*ToolResult, error) { return listTools(r) },
+			TimeoutS:   budgetFor("list_tools"),
 		},
 	} {
 		if err := r.register(spec); err != nil {
@@ -247,9 +246,6 @@ func RegisterAccountTools(r *ToolRegistry) error {
 	return nil
 }
 
-// ── 共用形状件 ──
-
-// fetchMapErr GET 端点 → JSON 对象；非 200 按错误上抛（执行器归一化为 failed）。
 func fetchMapErr(c *CallContext, path string) (map[string]any, error) {
 	var out map[string]any
 	if err := c.getJSON(path, &out); err != nil {
@@ -258,7 +254,6 @@ func fetchMapErr(c *CallContext, path string) (map[string]any, error) {
 	return out, nil
 }
 
-// rowsNoTotal rows_result 不带 total（Python total=None 缺省键）。
 func rowsNoTotal(title string, rows []any) *Obj {
 	out := newObj()
 	out.set("kind", "rows")
@@ -270,7 +265,6 @@ func rowsNoTotal(title string, rows []any) *Obj {
 	return out
 }
 
-// syncRowState 单行同步结果（done/fail 词条 + 失败详情）。
 func syncRowState(title, detail string, ok bool, doneKey, failKey string) *Obj {
 	vKey, tone := doneKey, "ok"
 	if !ok {
@@ -284,8 +278,7 @@ func syncRowState(title, detail string, ok bool, doneKey, failKey string) *Obj {
 	return rowsNoTotal(title, []any{row})
 }
 
-// syncCard Python _shared.sync_result：ok 键缺席视为成功（Python .get("ok", True)），
-// 键存在则按 Python bool() 取值（None → 失败）。
+// syncCard ok 键缺席视为成功，存在时按真值求值。
 func syncCard(title string, result map[string]any, doneKey, failKey string) *Obj {
 	ok := true
 	if result != nil {
@@ -300,12 +293,10 @@ func syncCard(title string, result map[string]any, doneKey, failKey string) *Obj
 	return syncRowState(title, detail, ok, doneKey, failKey)
 }
 
-// pyRound Python round()：银行家舍入。
 func pyRound(x float64) int {
 	return int(math.RoundToEven(x))
 }
 
-// pyEstimateTokens Python pilot.estimate_tokens 同式：CJK 4/5 向上取整 + 其余 1/4 + 1。
 func pyEstimateTokens(text string) int {
 	if text == "" {
 		return 0
@@ -320,7 +311,6 @@ func pyEstimateTokens(text string) int {
 	return (cjk*4+4)/5 + other/4 + 1
 }
 
-// pyText Python str(v)：None → "None"（f"AppID {v}" 同径）。
 func pyText(v any) string {
 	if v == nil {
 		return "None"
@@ -334,7 +324,6 @@ func pyText(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-// pyClipRunes 按字符数截断（Python s[:n] 语义）。
 func pyClipRunes(s string, n int) string {
 	runes := []rune(s)
 	if len(runes) <= n {
@@ -343,8 +332,7 @@ func pyClipRunes(s string, n int) string {
 	return string(runes[:n])
 }
 
-// argInt Python int(args.get(k) or default)：缺席/None/0 等假值回缺省，
-// 坏值上抛（Python int() ValueError 同径 → 执行器 failed）。
+// argInt 缺席或假值返回缺省值，非法数值类型返回错误。
 func argInt(args map[string]any, key string, def int64) (int64, error) {
 	v := args[key]
 	if !pyBool(v) {
@@ -353,12 +341,10 @@ func argInt(args map[string]any, key string, def int64) (int64, error) {
 	return pyIntOr(v)
 }
 
-// argID Python int(args[k])：required 数值入参。
 func argID(args map[string]any, key string) (int64, error) {
 	return pyIntOr(args[key])
 }
 
-// sourceIDs monitor_sources 单来源激活对象（Python ids_with_source 同表同口径）。
 func (c *CallContext) sourceIDs(source string) ([]int64, error) {
 	rows, err := c.db.QueryContext(c.Ctx,
 		"SELECT DISTINCT target_id FROM monitor_sources"+
@@ -379,7 +365,6 @@ func (c *CallContext) sourceIDs(source string) ([]int64, error) {
 	return out, rows.Err()
 }
 
-// followIDs GET /api/v1/follows（wishlist favorite 路）→ appid 序列。
 func (c *CallContext) followIDs() ([]int64, error) {
 	body, err := fetchMapErr(c, "/api/v1/follows")
 	if err != nil {
@@ -397,7 +382,6 @@ func (c *CallContext) followIDs() ([]int64, error) {
 	return out, nil
 }
 
-// sortedUnion 升序去重并集（Python sorted(set(a) | set(b))）。
 func sortedUnion(a, b []int64) []int64 {
 	seen := map[int64]bool{}
 	for _, id := range a {
@@ -410,11 +394,10 @@ func sortedUnion(a, b []int64) []int64 {
 	for id := range seen {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
-// followItem brief_item + note 来源注记（manual/favorite）。
 func followItem(appid int64, brief account.Brief, has bool, key string) *Obj {
 	item := briefItem(appid, brief, has)
 	note := newObj()
@@ -423,7 +406,6 @@ func followItem(appid int64, brief account.Brief, has bool, key string) *Obj {
 	return item
 }
 
-// followBriefs 关注并集的清单行（Python list_follows/audit 共用取数段）。
 func followBriefs(c *CallContext) ([]int64, map[int64]bool, map[int64]account.Brief, error) {
 	manual, err := c.sourceIDs("manual")
 	if err != nil {
@@ -445,9 +427,6 @@ func followBriefs(c *CallContext) ([]int64, map[int64]bool, map[int64]account.Br
 	return ids, fav, briefs, nil
 }
 
-// ── 读面 ──
-
-// account_status 账号状态 + 钱包余额 + 登录态新鲜度（Python userview.account_status）。
 func accountStatus(c *CallContext) (*ToolResult, error) {
 	st, err := fetchMapErr(c, "/api/v1/account")
 	if err != nil {
@@ -513,7 +492,6 @@ func accountStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// toneOrNil true→ok / false→null（Python "ok" if x else None）。
 func toneOrNil(ok bool) any {
 	if ok {
 		return "ok"
@@ -521,7 +499,6 @@ func toneOrNil(ok bool) any {
 	return nil
 }
 
-// toneOrWarn true→ok / false→warn（Python "ok" if x else "warn"）。
 func toneOrWarn(ok bool) any {
 	if ok {
 		return "ok"
@@ -529,10 +506,8 @@ func toneOrWarn(ok bool) any {
 	return "warn"
 }
 
-// toneOkWarn active→ok / 否则 warn（提醒行）。
 func toneOkWarn(active bool) any { return toneOrWarn(active) }
 
-// list_follows 手动关注 ∪ 收藏关注合并只读投影（Python tracking.list_follows）。
 func listFollows(c *CallContext) (*ToolResult, error) {
 	ids, fav, briefs, err := followBriefs(c)
 	if err != nil {
@@ -550,7 +525,6 @@ func listFollows(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: gamesCard("follows", items, len(ids))}, nil
 }
 
-// list_alerts 提醒规则清单（Python tracking.list_alerts）。
 func listAlerts(c *CallContext) (*ToolResult, error) {
 	alerts, err := fetchAlerts(c)
 	if err != nil {
@@ -582,7 +556,6 @@ func listAlerts(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("alerts", rows, len(rows))}, nil
 }
 
-// fetchAlerts GET /api/v1/alerts → 行序列。
 func fetchAlerts(c *CallContext) ([]map[string]any, error) {
 	var alerts []map[string]any
 	if err := c.getJSON("/api/v1/alerts", &alerts); err != nil {
@@ -591,7 +564,6 @@ func fetchAlerts(c *CallContext) ([]map[string]any, error) {
 	return alerts, nil
 }
 
-// alert_history 提醒触发历史（Python userview.alert_history）。
 func alertHistory(c *CallContext) (*ToolResult, error) {
 	limit := clampInt(c.Args["limit"], 20, 1, 200)
 	var events []map[string]any
@@ -626,8 +598,6 @@ func alertHistory(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("alertHistory", rows, len(events))}, nil
 }
 
-// auditFollowsWorkflow 巡检流水线 stepper（Python tracking.audit_follows_workflow；
-// MCP 面无会话绑定，提议段恒不落）。
 func auditFollowsWorkflow(c *CallContext) (*ToolResult, error) {
 	ids, _, briefs, err := followBriefs(c)
 	if err != nil {
@@ -702,7 +672,6 @@ func auditFollowsWorkflow(c *CallContext) (*ToolResult, error) {
 	})}, nil
 }
 
-// auditStepScan 步骤行（带 current/total；badge 空 = 不出键，对齐 Python 字面量）。
 func auditStepScan(id int, title, detail, status string, current, total int, badge string) *Obj {
 	step := newObj()
 	step.set("id", id)
@@ -717,7 +686,6 @@ func auditStepScan(id int, title, detail, status string, current, total int, bad
 	return step
 }
 
-// auditStepPlain 步骤行（无 current/total；badge 空 = 不出键）。
 func auditStepPlain(id int, title, detail, status, badge string) *Obj {
 	step := newObj()
 	step.set("id", id)
@@ -730,7 +698,6 @@ func auditStepPlain(id int, title, detail, status, badge string) *Obj {
 	return step
 }
 
-// auditStepperObj stepper 载荷组装（内层 kind 与外层 kind 同值，Python 同形）。
 func auditStepperObj(currentStepIndex int, steps []any) *Obj {
 	st := newObj()
 	st.set("kind", "stepper")
@@ -743,11 +710,13 @@ func auditStepperObj(currentStepIndex int, steps []any) *Obj {
 	return out
 }
 
-// achievements_summary 奖杯概览（Python account.achievements_summary）。
+const achievementsDisabledNote = "成就功能已停用，可在设置 → 插件中开启"
+
 func achievementsSummary(c *CallContext) (*ToolResult, error) {
-	s, err := fetchMapErr(c, "/api/v1/achievements/summary")
-	if err != nil {
-		return nil, err
+	var s map[string]any
+	if dis, err := c.getJSONOrDisabled("achievements_summary", "/api/v1/achievements/summary",
+		"module.achievements.enabled", achievementsDisabledNote, &s); dis != nil || err != nil {
+		return dis, err
 	}
 	out := newObj()
 	out.set("kind", "achievements")
@@ -814,12 +783,12 @@ func achievementsSummary(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// level_profile 猎手等级读数（Python account.level_profile）。
 func levelProfile(c *CallContext) (*ToolResult, error) {
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
-	p, err := fetchMapErr(c, queryPath("/api/v1/achievements/level", sidQuery(sid)))
-	if err != nil {
-		return nil, err
+	var p map[string]any
+	if dis, err := c.getJSONOrDisabled("level_profile", queryPath("/api/v1/achievements/level", sidQuery(sid)),
+		"module.achievements.enabled", achievementsDisabledNote, &p); dis != nil || err != nil {
+		return dis, err
 	}
 	var feed map[string]any
 	if err := c.getJSON(queryPath("/api/v1/achievements/feed", mergeQuery("limit=4", sidQuery(sid))), &feed); err != nil {
@@ -901,12 +870,12 @@ func levelProfile(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// challenges_overview 挑战进度读数（Python account.challenges_overview）。
 func challengesOverview(c *CallContext) (*ToolResult, error) {
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
-	data, err := fetchMapErr(c, queryPath("/api/v1/achievements/challenges", sidQuery(sid)))
-	if err != nil {
-		return nil, err
+	var data map[string]any
+	if dis, err := c.getJSONOrDisabled("challenges_overview", queryPath("/api/v1/achievements/challenges", sidQuery(sid)),
+		"module.achievements.enabled", achievementsDisabledNote, &data); dis != nil || err != nil {
+		return dis, err
 	}
 	summary, _ := data["summary"].(map[string]any)
 	type nearItem struct {
@@ -932,8 +901,8 @@ func challengesOverview(c *CallContext) (*ToolResult, error) {
 			})
 		}
 	}
-	sort.SliceStable(near, func(i, j int) bool {
-		return float64(near[i].progress)/float64(near[i].target) > float64(near[j].progress)/float64(near[j].target)
+	slices.SortStableFunc(near, func(a, b nearItem) int {
+		return cmp.Compare(float64(b.progress)/float64(b.target), float64(a.progress)/float64(a.target))
 	})
 	if len(near) > 3 {
 		near = near[:3]
@@ -978,13 +947,14 @@ func challengesOverview(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// achievements_near_completion 快白金清单（Python userview.achievements_near_completion）。
 func achievementsNearCompletion(c *CallContext) (*ToolResult, error) {
 	limit := clampInt(c.Args["limit"], 20, 1, 50)
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
-	body, err := fetchMapErr(c, queryPath("/api/v1/achievements/games", mergeQuery("filter=progress&sort=progress", sidQuery(sid))))
-	if err != nil {
-		return nil, err
+	var body map[string]any
+	if dis, err := c.getJSONOrDisabled("achievements_near_completion",
+		queryPath("/api/v1/achievements/games", mergeQuery("filter=progress&sort=progress", sidQuery(sid))),
+		"module.achievements.enabled", achievementsDisabledNote, &body); dis != nil || err != nil {
+		return dis, err
 	}
 	raw, _ := body["games"].([]any)
 	if int64(len(raw)) > limit {
@@ -1021,16 +991,21 @@ func achievementsNearCompletion(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("achNearDone", rows, len(raw))}, nil
 }
 
-// achievements_game_detail 单游戏成就明细（Python userview.achievements_game_detail）。
 func achievementsGameDetail(c *CallContext) (*ToolResult, error) {
 	appid, err := argID(c.Args, "appid")
 	if err != nil {
 		return nil, err
 	}
+	if isModuleDisabled(c.Ctx, c.db, "module.achievements.enabled") {
+		return disabledResult("achievements_game_detail", achievementsDisabledNote), nil
+	}
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
 	status, body, err := c.fetch(c.Ctx, queryPath(fmt.Sprintf("/api/v1/achievements/games/%d", appid), sidQuery(sid)))
 	if err != nil {
 		return nil, err
+	}
+	if status == http.StatusConflict {
+		return disabledResult("achievements_game_detail", conflictDetail(body, achievementsDisabledNote)), nil
 	}
 	if status == 404 {
 		out := newObj()
@@ -1105,7 +1080,6 @@ func achievementsGameDetail(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// list_family_library 家庭共享库（Python account.list_family_library）。
 func listFamilyLibrary(c *CallContext) (*ToolResult, error) {
 	lib, err := fetchMapErr(c, "/api/v1/family/library")
 	if err != nil {
@@ -1139,7 +1113,6 @@ func listFamilyLibrary(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: gamesCard("famLibrary", items, len(games))}, nil
 }
 
-// family_status 家庭组状态（Python account.family_status）。
 func familyStatus(c *CallContext) (*ToolResult, error) {
 	st, err := fetchMapErr(c, "/api/v1/family/status")
 	if err != nil {
@@ -1201,7 +1174,6 @@ func familyStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// memberSeen 成员 steamid 去重核对。
 func memberSeen(members []any, sid string) bool {
 	for _, v := range members {
 		if m, ok := v.(*Obj); ok {
@@ -1213,7 +1185,6 @@ func memberSeen(members []any, sid string) bool {
 	return false
 }
 
-// strOrNil 空串 → null（Python or None 投影）。
 func strOrNil(s string) any {
 	if s == "" {
 		return nil
@@ -1221,7 +1192,6 @@ func strOrNil(s string) any {
 	return s
 }
 
-// bills_spend_query 消费查询（Python userview.bills_spend_query）。
 func billsSpendQuery(c *CallContext) (*ToolResult, error) {
 	importID, err := argID(c.Args, "import_id")
 	if err != nil {
@@ -1233,18 +1203,18 @@ func billsSpendQuery(c *CallContext) (*ToolResult, error) {
 	}
 	if mode == "game_txs" {
 		limit := clampInt(c.Args["limit"], 50, 1, 200)
-		q := urlValues()
-		q.set("limit", fmt.Sprintf("%d", limit))
+		q := url.Values{}
+		q.Set("limit", fmt.Sprintf("%d", limit))
 		for _, key := range []string{"year", "month", "tx_type", "search"} {
 			if v := pyStrOr(c.Args[key]); v != "" {
 				name := key
 				if key == "tx_type" {
 					name = "txType"
 				}
-				q.set(name, v)
+				q.Set(name, v)
 			}
 		}
-		status, body, err := c.fetch(c.Ctx, fmt.Sprintf("/api/v1/bills/imports/%d/game-txs?%s", importID, q.encode()))
+		status, body, err := c.fetch(c.Ctx, fmt.Sprintf("/api/v1/bills/imports/%d/game-txs?%s", importID, q.Encode()))
 		if err != nil {
 			return nil, err
 		}
@@ -1370,7 +1340,6 @@ func billsSpendQuery(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// billsEmpty 缺 import / 无交易空态。
 func billsEmpty(importID int64, mode string) *ToolResult {
 	out := newObj()
 	out.set("kind", "empty")
@@ -1379,7 +1348,6 @@ func billsEmpty(importID int64, mode string) *ToolResult {
 	return &ToolResult{Status: StatusEmpty, Data: out}
 }
 
-// redeem_quota CDK 激活额度（Python account.redeem_quota）。
 func redeemQuota(c *CallContext) (*ToolResult, error) {
 	q, err := fetchMapErr(c, "/api/v1/redeem/quota")
 	if err != nil {
@@ -1404,10 +1372,7 @@ func redeemQuota(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsNoTotal("redeem", []any{row})}, nil
 }
 
-// ── 同步动作（POST 通道） ──
-
-// sync_wallet 立即抓取钱包余额（Python account.sync_wallet；端点回状态图，
-// 成功后 sync_error 必为空——saveWallet 成功清 wallet_error）。
+// 端点回状态图，成功后 sync_error 必为空——saveWallet 成功清 wallet_error。
 func syncWallet(c *CallContext) (*ToolResult, error) {
 	var status map[string]any
 	if err := c.postJSON("/api/v1/account/sync", map[string]any{}, &status); err != nil {
@@ -1417,12 +1382,9 @@ func syncWallet(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: syncRowState("wallet", detail, detail == "", "walletSynced", "walletFailed")}, nil
 }
 
-// syncLibrary 同步愿望单/拥有库（Python account.sync_library；wishlist 域
-// POST /accounts/{steamid}/sync 同一执行入口，inflight 去重与 auto_crawl 在域内）。
 func syncLibrary(c *CallContext) (*ToolResult, error) {
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
 	if sid == "" {
-		// Python 同径：sync_account(None) 抛 ValueError → 执行器 failed。
 		return nil, fmt.Errorf("账户不存在: None")
 	}
 	var result map[string]any
@@ -1432,9 +1394,10 @@ func syncLibrary(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: syncCard("library", result, "syncDone", "syncFailed")}, nil
 }
 
-// syncAchievements 发起成就后台同步（Python account.sync_achievements；
-// 409=已在跑 → syncRunning）。
 func syncAchievements(c *CallContext) (*ToolResult, error) {
+	if isModuleDisabled(c.Ctx, c.db, "module.achievements.enabled") {
+		return disabledResult("sync_achievements", achievementsDisabledNote), nil
+	}
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
 	status, body, err := c.post(c.Ctx, queryPath("/api/v1/achievements/sync", sidQuery(sid)), []byte("{}"))
 	if err != nil {
@@ -1448,6 +1411,9 @@ func syncAchievements(c *CallContext) (*ToolResult, error) {
 		}
 		return &ToolResult{Data: syncCard("achievementsSync", snap, "syncDone", "syncFailed")}, nil
 	case 409:
+		if detail := conflictDetail(body, ""); strings.Contains(detail, "停用") {
+			return disabledResult("sync_achievements", detail), nil
+		}
 		row := newObj()
 		row.set("k", "")
 		row.set("vKey", "syncRunning")
@@ -1458,7 +1424,6 @@ func syncAchievements(c *CallContext) (*ToolResult, error) {
 	}
 }
 
-// syncBills 同步 Steam 账单（Python account.sync_bills；409=no_cookie）。
 func syncBills(c *CallContext) (*ToolResult, error) {
 	status, body, err := c.post(c.Ctx, "/api/v1/bills/sync", []byte("{}"))
 	if err != nil {
@@ -1482,7 +1447,6 @@ func syncBills(c *CallContext) (*ToolResult, error) {
 	}
 }
 
-// syncFamily 家庭组同步（Python account.sync_family）。
 func syncFamily(c *CallContext) (*ToolResult, error) {
 	sid := strings.TrimSpace(pyStrOr(c.Args["steam_id"]))
 	var result map[string]any
@@ -1492,7 +1456,6 @@ func syncFamily(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: syncCard("familySync", result, "syncDone", "syncFailed")}, nil
 }
 
-// refreshRates 刷新汇率（Python account.refresh_rates；源不可用 → failed）。
 func refreshRates(c *CallContext) (*ToolResult, error) {
 	var result map[string]any
 	if err := c.postJSON("/api/v1/rates/refresh", map[string]any{}, &result); err != nil {
@@ -1501,18 +1464,12 @@ func refreshRates(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: syncCard("rates", result, "syncDone", "syncFailed")}, nil
 }
 
-// ── 领航员会话读面 ──
-
-// readMaxTurns 单次回读轮数上限（Python _READ_MAX_TURNS）。
 const readMaxTurns = 30
 
-// readDigestTokens 回读文本预算（Python _READ_DIGEST_TOKENS）。
 const readDigestTokens = 3000
 
-// digestToolChars 单个工具结果保留字符数（Python _READ_TOOL_CHARS）。
 const digestToolChars = 400
 
-// listSessions 会话清单（Python runtime_tools.list_sessions）。
 func listSessions(c *CallContext) (*ToolResult, error) {
 	body, err := fetchMapErr(c, "/api/v1/pilot/sessions?limit=20")
 	if err != nil {
@@ -1541,8 +1498,6 @@ func listSessions(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("sessions", rows, len(items))}, nil
 }
 
-// readSession 历史会话回读（Python runtime_tools.read_session；digest 为
-// digest_lines 同式移植——会话端点不含 messages，工具行走 answer 回退支路）。
 func readSession(c *CallContext) (*ToolResult, error) {
 	sid := pyStrOr(c.Args["sid"])
 	offset, err := argInt(c.Args, "offset", 0)
@@ -1634,8 +1589,7 @@ func readSession(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// digestLines Python pilot.context.digest_lines 同式移植（turns 从最新往回
-// 收集到预算为止；messages 缺席时回退 resp.answer，与 Python 兜底支路同径）。
+// digestLines 从最新轮倒序截断；messages 缺席时回退 resp.answer。
 func digestLines(turns []map[string]any, budget int) string {
 	picked := []string{}
 	total := 0
@@ -1675,7 +1629,6 @@ func digestLines(turns []map[string]any, budget int) string {
 	return strings.Join(picked, "\n---\n")
 }
 
-// digestMessageLine Python _message_line 同式（assistant/tool 两类，400 字截断）。
 func digestMessageLine(m map[string]any, toolChars int) string {
 	role := pyStrOr(m["role"])
 	text := strings.TrimSpace(pyStrOr(m["content"]))
@@ -1697,10 +1650,6 @@ func digestMessageLine(m map[string]any, toolChars int) string {
 	return ""
 }
 
-// ── 运行账本（agent_runs / agent_events SQL 直读，D6） ──
-
-// agentRunsList 运行账本清单（Python runtime_tools._agent_runs_list；
-// 排除条件与 Python list_runs 的 AgentRun 段同式）。
 func agentRunsList(c *CallContext) (*ToolResult, error) {
 	limit, err := argInt(c.Args, "limit", 10)
 	if err != nil {
@@ -1756,7 +1705,6 @@ func agentRunsList(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsResult("agentRuns", rows, len(rows))}, nil
 }
 
-// agentRunEvents 单个运行的事件回放（Python runtime_tools._agent_run_events）。
 func agentRunEvents(c *CallContext) (*ToolResult, error) {
 	runID := pyStrOr(c.Args["run_id"])
 	if runID == "" {
@@ -1819,13 +1767,9 @@ func agentRunEvents(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ── 元信息 ──
-
-// listToolsDescChars 清单描述截断长度（Python _DESC_CHARS）。
 const listToolsDescChars = 56
 
-// listTools 元工具：注册表全量对 CORE_TOOLS 取差集并「解锁」
-//（解锁是客户端语义提示，服务端无状态）。
+// listTools 返回 CORE_TOOLS 之外的工具集（服务端无状态，仅客户端解锁提示）。
 func listTools(r *ToolRegistry) (*ToolResult, error) {
 	extra := []*ToolSpec{}
 	for _, s := range r.all() {
@@ -1849,9 +1793,6 @@ func listTools(r *ToolRegistry) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ── 小件 ──
-
-// queryPath 带查询串的进程内路径（空查询原样返回）。
 func queryPath(path, query string) string {
 	if query == "" {
 		return path
@@ -1859,15 +1800,13 @@ func queryPath(path, query string) string {
 	return path + "?" + query
 }
 
-// sidQuery steamid 查询段（空账号省参，端点按主账号解析）。
 func sidQuery(sid string) string {
 	if sid == "" {
 		return ""
 	}
-	return "steamid=" + sid
+	return url.Values{"steamid": {sid}}.Encode()
 }
 
-// mergeQuery 保序查询段拼接（空段跳过）。
 func mergeQuery(parts ...string) string {
 	out := []string{}
 	for _, p := range parts {

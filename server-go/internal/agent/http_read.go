@@ -1,46 +1,43 @@
-// http_read.go agent 读面五端点（等价 Python domains/agent/router.py 的
-// GET /tasks、GET /runs、GET /runs/{id}、GET /runs/{id}/events、
-// POST /runs/{id}/cancel）：三源合并运行账的 HTTP 投影与精确取消。
-// 挂 /api/v1/agent/*，与 MCP MountPath（/api/v1/mcp）共存不冲突。
 package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/store"
 )
 
-// httpRunView 运行视图（Python schemas.AgentRunView 字段序逐项一致）。
 type httpRunView struct {
-	RunID      string                 `json:"run_id"`
-	SessionID  string                 `json:"session_id"`
-	Runner     string                 `json:"runner"`
-	Trigger    string                 `json:"trigger"`
-	Meta       map[string]any         `json:"meta"`
-	Status     string                 `json:"status"`
-	ErrorCode  *string                `json:"error_code"`
-	CreatedAt  *string                `json:"created_at"`
-	StartedAt  *string                `json:"started_at"`
-	FinishedAt *string                `json:"finished_at"`
+	RunID      string         `json:"run_id"`
+	SessionID  string         `json:"session_id"`
+	Runner     string         `json:"runner"`
+	Trigger    string         `json:"trigger"`
+	Meta       map[string]any `json:"meta"`
+	Status     string         `json:"status"`
+	ErrorCode  *string        `json:"error_code"`
+	CreatedAt  *string        `json:"created_at"`
+	StartedAt  *string        `json:"started_at"`
+	FinishedAt *string        `json:"finished_at"`
 }
 
-// httpTaskItem 任务名条目（Python AgentTaskItem 同形）。
 type httpTaskItem struct {
 	Kind  string `json:"kind"`
 	Label string `json:"label"`
 }
 
-// taskLabelOrder TASK_LABELS 固定顺序（Python dict 插入序）。
 var taskLabelOrder = []httpTaskItem{
 	{Kind: "price_refresh", Label: "priceRefresh"},
 	{Kind: "price_repair", Label: "priceRepair"},
@@ -48,29 +45,35 @@ var taskLabelOrder = []httpTaskItem{
 	{Kind: "dev_pytest", Label: "devPytest"},
 }
 
-// RegisterHTTPRead 装配 agent 读面五端点（与 MCP 面共用 db 与 mux）。
 func RegisterHTTPRead(mux *http.ServeMux, db *sql.DB, deps *Deps) {
-	h := &httpRead{db: db, deps: deps, fetch: newMuxFetcher(mux), post: newMuxPoster(mux)}
+	h := &httpRead{
+		db: db, deps: deps, fetch: newMuxFetcher(mux), post: newMuxPoster(mux),
+		fakeCancels: map[string]context.CancelFunc{},
+	}
 	mux.HandleFunc("GET /api/v1/agent/tasks", h.tasks)
+	mux.HandleFunc("POST /api/v1/agent/runs", h.createRun)
 	mux.HandleFunc("GET /api/v1/agent/runs", h.runs)
 	mux.HandleFunc("GET /api/v1/agent/runs/{run_id}", h.runDetail)
 	mux.HandleFunc("GET /api/v1/agent/runs/{run_id}/events", h.runEvents)
 	mux.HandleFunc("POST /api/v1/agent/runs/{run_id}/cancel", h.runCancel)
+	if db != nil {
+		h.registerMemoryRoutes(mux)
+	}
 }
 
 type httpRead struct {
-	db    *sql.DB
-	deps  *Deps
-	fetch muxFetcher
-	post  muxPoster
+	db          *sql.DB
+	deps        *Deps
+	fetch       muxFetcher
+	post        muxPoster
+	mu          sync.Mutex
+	fakeCancels map[string]context.CancelFunc
 }
 
 func (h *httpRead) tasks(w http.ResponseWriter, r *http.Request) {
 	writeRunJSON(w, http.StatusOK, taskLabelOrder)
 }
 
-// runs GET /runs?status=&limit=20：三源合并（账本行 ∪ price_cycles ∪ 无轮次
-// 挂靠抓取任务），created_at 降序 + run_id 降序，limit 夹取 1..100。
 func (h *httpRead) runs(w http.ResponseWriter, r *http.Request) {
 	limit, err := httpQueryInt(r, "limit", 20)
 	if err != nil {
@@ -104,24 +107,14 @@ func (h *httpRead) runDetail(w http.ResponseWriter, r *http.Request) {
 	writeRunJSON(w, http.StatusOK, view)
 }
 
-// runEvents GET /runs/{id}/events?after_seq=&limit=200：按 seq 升序回放；
-// 域行无事件账本恒空集（Python list_events 同径）。
 func (h *httpRead) runEvents(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 	afterSeq, err := httpQueryInt(r, "after_seq", 0)
-	if err == nil {
-		afterSeq, err = httpQueryInt(r, "limit", 200)
-	}
 	if err != nil {
 		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []runValErr{*err}})
 		return
 	}
 	limit, err := httpQueryInt(r, "limit", 200)
-	if err != nil {
-		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []runValErr{*err}})
-		return
-	}
-	afterSeq, err = httpQueryInt(r, "after_seq", 0)
 	if err != nil {
 		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []runValErr{*err}})
 		return
@@ -181,9 +174,6 @@ func (h *httpRead) runEvents(w http.ResponseWriter, r *http.Request) {
 	writeRunJSON(w, http.StatusOK, map[string]any{"run_id": runID, "items": items})
 }
 
-// runCancel POST /runs/{id}/cancel {reason}：域行走 crawl stop 两支路；
-// 账本 fake 行走取消跃迁写；runner≠fake 无执行句柄 → 409（Python
-// RunCancellationUnavailable 同径）。
 func (h *httpRead) runCancel(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("run_id")
 	reason, err := decodeCancelBody(r)
@@ -244,6 +234,7 @@ func (h *httpRead) runCancel(w http.ResponseWriter, r *http.Request) {
 		writeRunJSON(w, http.StatusConflict, map[string]any{"detail": "run has no live stop handle"})
 		return
 	}
+	h.signalFakeCancel(runID)
 	status, cancelErr := h.cancelLedgerRun(r.Context(), runID, view.Status, reason)
 	if cancelErr != nil {
 		writeRunJSON(w, http.StatusInternalServerError, map[string]any{"detail": nil})
@@ -252,8 +243,6 @@ func (h *httpRead) runCancel(w http.ResponseWriter, r *http.Request) {
 	writeRunJSON(w, http.StatusOK, map[string]any{"accepted": true, "status": status})
 }
 
-// cancelLedgerRun 账本行取消跃迁：cancel.requested / run.state / run.finished
-// 三事件 + 状态与 finished_at 落定（Python cancel_run write_session 分支同构）。
 func (h *httpRead) cancelLedgerRun(ctx context.Context, runID, current, reason string) (string, error) {
 	gate := (*store.WriteGate)(nil)
 	if h.deps != nil {
@@ -295,7 +284,6 @@ func (h *httpRead) cancelLedgerRun(ctx context.Context, runID, current, reason s
 	return "", errors.New("写闸未装配，取消请求无法落账")
 }
 
-// listRuns 三源合并读（Python list_runs 同构）。
 func (h *httpRead) listRuns(ctx context.Context, status string, limit int) ([]httpRunView, error) {
 	mergeLimit := 100
 	views := []httpRunView{}
@@ -322,8 +310,8 @@ func (h *httpRead) listRuns(ctx context.Context, status string, limit int) ([]ht
 		views = append(views, httpRunView{
 			RunID: id, SessionID: sessionID, Runner: runner, Trigger: trigger, Meta: meta,
 			Status: status, ErrorCode: nullIfEmpty(errorCode.String),
-			CreatedAt: nullIfEmpty(isoStamp(createdAt.String)),
-			StartedAt: nullIfEmpty(isoStamp(startedAt.String)),
+			CreatedAt:  nullIfEmpty(isoStamp(createdAt.String)),
+			StartedAt:  nullIfEmpty(isoStamp(startedAt.String)),
 			FinishedAt: nullIfEmpty(isoStamp(finishedAt.String)),
 		})
 	}
@@ -335,12 +323,12 @@ func (h *httpRead) listRuns(ctx context.Context, status string, limit int) ([]ht
 	if err := h.appendDomainRuns(ctx, status, mergeLimit, &views); err != nil {
 		return nil, err
 	}
-	sort.SliceStable(views, func(i, j int) bool {
-		ti, tj := taskTimeKey(stringOrStar(views[i].CreatedAt)), taskTimeKey(stringOrStar(views[j].CreatedAt))
-		if !ti.Equal(tj) {
-			return ti.After(tj)
+	slices.SortStableFunc(views, func(a, b httpRunView) int {
+		ta, tb := taskTimeKey(stringOrStar(a.CreatedAt)), taskTimeKey(stringOrStar(b.CreatedAt))
+		if c := tb.Compare(ta); c != 0 {
+			return c
 		}
-		return views[i].RunID > views[j].RunID
+		return strings.Compare(b.RunID, a.RunID)
 	})
 	if len(views) > limit {
 		views = views[:limit]
@@ -348,7 +336,6 @@ func (h *httpRead) listRuns(ctx context.Context, status string, limit int) ([]ht
 	return views, nil
 }
 
-// buildAgentRunQuery 账本行筛选（Python list_runs 主查询同构）。
 func buildAgentRunQuery(status string, limit int) (string, []any) {
 	query := `SELECT id, session_id, runner, "trigger", CAST(meta AS TEXT), status, error_code,
 		CAST(created_at AS TEXT), CAST(started_at AS TEXT), CAST(finished_at AS TEXT)
@@ -364,8 +351,6 @@ func buildAgentRunQuery(status string, limit int) (string, []any) {
 	return query, args
 }
 
-// appendDomainRuns 域行并入（cycle ∪ 无轮次挂靠 crawl job），状态过滤按
-// 域状态→run 状态映射展开；failed 附带未知域态兜底（Python 同径）。
 func (h *httpRead) appendDomainRuns(ctx context.Context, status string, limit int, views *[]httpRunView) error {
 	liveCycle := h.liveCycleID(ctx)
 	liveJob := h.liveJobID(ctx)
@@ -455,8 +440,8 @@ func (h *httpRead) appendDomainRuns(ctx context.Context, status string, limit in
 			*views = append(*views, httpRunView{
 				RunID: runID, SessionID: "runtime", Runner: "task", Trigger: trigger, Meta: meta,
 				Status: runStatus, ErrorCode: nullIfEmpty(errorCode.String),
-				CreatedAt: nullIfEmpty(isoStamp(startedAt.String)),
-				StartedAt: nullIfEmpty(isoStamp(startedAt.String)),
+				CreatedAt:  nullIfEmpty(isoStamp(startedAt.String)),
+				StartedAt:  nullIfEmpty(isoStamp(startedAt.String)),
 				FinishedAt: nullIfEmpty(isoStamp(finishedAt.String)),
 			})
 		}
@@ -469,7 +454,6 @@ func (h *httpRead) appendDomainRuns(ctx context.Context, status string, limit in
 	return nil
 }
 
-// domainStatusMatches run 状态过滤 → 域状态集合（failed 追加未知域态兜底）。
 func domainStatusMatches(status string) (matches, unknowns []string) {
 	if status == "" {
 		return nil, nil
@@ -479,18 +463,16 @@ func domainStatusMatches(status string) (matches, unknowns []string) {
 			matches = append(matches, domain)
 		}
 	}
-	sort.Strings(matches)
+	slices.Sort(matches)
 	if status == "failed" {
 		for domain := range domainStatusToRun {
 			unknowns = append(unknowns, domain)
 		}
-		sort.Strings(unknowns)
+		slices.Sort(unknowns)
 	}
 	return matches, unknowns
 }
 
-// getRun 按运行标识读单条（域键读域行，其余读账本；显式 cycle:/crawl: 前缀
-// 解析失败一律 not found，不回落账本查询，Python get_run 同径）。
 func (h *httpRead) getRun(ctx context.Context, runID string) (*httpRunView, error) {
 	if strings.HasPrefix(runID, "cycle:") || strings.HasPrefix(runID, "crawl:") {
 		source, id, ok := splitDomainRunID(runID)
@@ -523,13 +505,12 @@ func (h *httpRead) getRun(ctx context.Context, runID string) (*httpRunView, erro
 	return &httpRunView{
 		RunID: id, SessionID: sessionID, Runner: runner, Trigger: trigger, Meta: meta,
 		Status: status, ErrorCode: nullIfEmpty(errorCode.String),
-		CreatedAt: nullIfEmpty(isoStamp(createdAt.String)),
-		StartedAt: nullIfEmpty(isoStamp(startedAt.String)),
+		CreatedAt:  nullIfEmpty(isoStamp(createdAt.String)),
+		StartedAt:  nullIfEmpty(isoStamp(startedAt.String)),
 		FinishedAt: nullIfEmpty(isoStamp(finishedAt.String)),
 	}, nil
 }
 
-// getDomainRun 域行单条（crawl 行挂了轮次不可见，Python 同径）。
 func (h *httpRead) getDomainRun(ctx context.Context, source string, id int64) (*httpRunView, error) {
 	liveCycle := h.liveCycleID(ctx)
 	liveJob := h.liveJobID(ctx)
@@ -561,8 +542,8 @@ func (h *httpRead) getDomainRun(ctx context.Context, source string, id int64) (*
 				"task":         "price_refresh",
 			},
 			Status: runStatus, ErrorCode: nullIfEmpty(errorCode.String),
-			CreatedAt: nullIfEmpty(isoStamp(startedAt.String)),
-			StartedAt: nullIfEmpty(isoStamp(startedAt.String)),
+			CreatedAt:  nullIfEmpty(isoStamp(startedAt.String)),
+			StartedAt:  nullIfEmpty(isoStamp(startedAt.String)),
 			FinishedAt: nullIfEmpty(isoStamp(finishedAt.String)),
 		}, nil
 	}
@@ -607,13 +588,12 @@ func (h *httpRead) getDomainRun(ctx context.Context, source string, id int64) (*
 		RunID: source + ":" + strconv.FormatInt(id, 10), SessionID: "runtime",
 		Runner: "task", Trigger: trigger, Meta: meta,
 		Status: runStatus, ErrorCode: nullIfEmpty(errorCode.String),
-		CreatedAt: nullIfEmpty(isoStamp(startedAt.String)),
-		StartedAt: nullIfEmpty(isoStamp(startedAt.String)),
+		CreatedAt:  nullIfEmpty(isoStamp(startedAt.String)),
+		StartedAt:  nullIfEmpty(isoStamp(startedAt.String)),
 		FinishedAt: nullIfEmpty(isoStamp(finishedAt.String)),
 	}, nil
 }
 
-// liveCycleID 当前在跑的价格轮（执行态近似，tools_ops_runtime 同口径）。
 func (h *httpRead) liveCycleID(ctx context.Context) int64 {
 	var id int64
 	_ = h.db.QueryRowContext(ctx,
@@ -622,7 +602,6 @@ func (h *httpRead) liveCycleID(ctx context.Context) int64 {
 	return id
 }
 
-// liveJobID 当前在跑的抓取任务（/crawl/active 运行时事实）。
 func (h *httpRead) liveJobID(ctx context.Context) int64 {
 	status, body, err := h.fetch(ctx, "/api/v1/crawl/active")
 	if err != nil || status != http.StatusOK {
@@ -647,7 +626,6 @@ func (h *httpRead) liveJobID(ctx context.Context) int64 {
 	return 0
 }
 
-// decodeCancelBody cancel 请求体校验（reason 缺省 "user"、max_length=100）。
 func decodeCancelBody(r *http.Request) (string, *runValErr) {
 	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, 1<<20))
 	if err != nil {
@@ -685,16 +663,8 @@ func decodeCancelBody(r *http.Request) (string, *runValErr) {
 	return text, nil
 }
 
-// runValErr 校验错误项（Pydantic 实测形状）。
-type runValErr struct {
-	Type  string         `json:"type"`
-	Loc   []any          `json:"loc"`
-	Msg   string         `json:"msg"`
-	Input any            `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type runValErr = httpx.ValErr
 
-// httpQueryInt 查询参数整数校验（Pydantic query 校验同形状）。
 func httpQueryInt(r *http.Request, key string, fallback int) (int, *runValErr) {
 	raw := r.URL.Query().Get(key)
 	if raw == "" {
@@ -708,7 +678,6 @@ func httpQueryInt(r *http.Request, key string, fallback int) (int, *runValErr) {
 	return n, nil
 }
 
-// isoStamp 库内裸时刻 → FastAPI datetime ISO 形态（空格换 T）。
 func isoStamp(stamp string) string {
 	if stamp == "" {
 		return ""
@@ -734,4 +703,293 @@ func writeRunJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func randomHex16() string {
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	return hex.EncodeToString(buf)
+}
+
+func (h *httpRead) withWriteConn(ctx context.Context, fn func(*sql.Conn) error) error {
+	if gate := h.liveWriteGate(); gate != nil {
+		return gate.WithWrite(ctx, store.PriorityInteractive, fn)
+	}
+	conn, err := h.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return fn(conn)
+}
+
+func (h *httpRead) liveWriteGate() *store.WriteGate {
+	if h.deps != nil {
+		return h.deps.WriteGate
+	}
+	return nil
+}
+
+func (h *httpRead) signalFakeCancel(runID string) {
+	h.mu.Lock()
+	cancel := h.fakeCancels[runID]
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (h *httpRead) createRun(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID *string  `json:"session_id"`
+		Prompt    *string  `json:"prompt"`
+		Trigger   *string  `json:"trigger"`
+		Runner    *string  `json:"runner"`
+		Scenario  *string  `json:"scenario"`
+		Steps     *int     `json:"steps"`
+		StepDelay *float64 `json:"step_delay"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
+		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "invalid request body"})
+		return
+	}
+	runner := "fake"
+	if body.Runner != nil {
+		runner = *body.Runner
+	}
+	if runner == "task" {
+		writeRunJSON(w, http.StatusGone, map[string]any{"detail": "start price work through the crawl domain"})
+		return
+	}
+	if runner != "fake" {
+		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "invalid runner"})
+		return
+	}
+	scenario := "success"
+	if body.Scenario != nil {
+		scenario = *body.Scenario
+	}
+	if scenario != "success" && scenario != "failure" {
+		writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "unknown scenario"})
+		return
+	}
+	steps := 3
+	if body.Steps != nil {
+		if *body.Steps < 1 || *body.Steps > 20 {
+			writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "steps out of range"})
+			return
+		}
+		steps = *body.Steps
+	}
+	stepDelay := 0.0
+	if body.StepDelay != nil {
+		if *body.StepDelay < 0 || *body.StepDelay > 5.0 {
+			writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "step_delay out of range"})
+			return
+		}
+		stepDelay = *body.StepDelay
+	}
+	trigger := "manual"
+	if body.Trigger != nil && *body.Trigger != "" {
+		trigger = *body.Trigger
+	}
+	prompt := ""
+	if body.Prompt != nil {
+		if len([]rune(*body.Prompt)) > 2000 {
+			writeRunJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "prompt too long"})
+			return
+		}
+		prompt = *body.Prompt
+	}
+
+	meta := map[string]any{"scenario": scenario, "steps": steps, "step_delay": stepDelay}
+	metaRaw, _ := json.Marshal(meta)
+	runID := randomHex16()
+	ts := stampBeijing(time.Now())
+	var sid string
+	var notFound bool
+	err := h.withWriteConn(r.Context(), func(conn *sql.Conn) error {
+		if body.SessionID == nil || *body.SessionID == "" {
+			sid = randomHex16()
+			if _, err := conn.ExecContext(r.Context(),
+				`INSERT INTO agent_sessions(id, created_at, updated_at) VALUES(?,?,?)`, sid, ts, ts); err != nil {
+				return err
+			}
+		} else {
+			sid = *body.SessionID
+			var existing string
+			err := conn.QueryRowContext(r.Context(),
+				`SELECT id FROM agent_sessions WHERE id=?`, sid).Scan(&existing)
+			if errors.Is(err, sql.ErrNoRows) {
+				notFound = true
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(r.Context(),
+				`UPDATE agent_sessions SET updated_at=? WHERE id=?`, ts, sid); err != nil {
+				return err
+			}
+		}
+		if _, err := conn.ExecContext(r.Context(),
+			`INSERT INTO agent_runs(id, session_id, runner, "trigger", meta, status, created_at) VALUES(?,?,?,?,?,'queued',?)`,
+			runID, sid, runner, trigger, string(metaRaw), ts); err != nil {
+			return err
+		}
+		if prompt != "" {
+			payload, _ := json.Marshal(map[string]any{"text": prompt})
+			if _, err := conn.ExecContext(r.Context(),
+				`INSERT INTO agent_events(run_id, seq, event_type, payload, created_at) VALUES(?,1,'turn.received',?,?)`,
+				runID, string(payload), ts); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		writeRunJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+		return
+	}
+	if notFound {
+		writeRunJSON(w, http.StatusNotFound, map[string]any{"detail": "session not found: " + sid})
+		return
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	h.mu.Lock()
+	h.fakeCancels[runID] = cancel
+	h.mu.Unlock()
+	go h.executeFakeRun(runCtx, runID, scenario, steps, stepDelay)
+	writeRunJSON(w, http.StatusOK, map[string]any{
+		"run_id": runID, "session_id": sid, "status": "queued",
+	})
+}
+
+func (h *httpRead) executeFakeRun(ctx context.Context, runID, scenario string, steps int, stepDelay float64) {
+	defer func() {
+		h.mu.Lock()
+		delete(h.fakeCancels, runID)
+		h.mu.Unlock()
+	}()
+	if !h.transitionFakeRun(runID, "queued", "running", "", "") {
+		return
+	}
+	for n := 1; n <= steps; n++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if !h.appendFakeEvent(runID, "step.started", map[string]any{"step": n}) {
+			return
+		}
+		if scenario == "failure" && n == 1 {
+			_ = h.transitionFakeRun(runID, "running", "failed", "", "fake_error")
+			return
+		}
+		if stepDelay > 0 {
+			timer := time.NewTimer(time.Duration(stepDelay * float64(time.Second)))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		if !h.appendFakeEvent(runID, "step.completed", map[string]any{
+			"step": n, "summary": fmt.Sprintf("fake step %d", n),
+		}) {
+			return
+		}
+	}
+	if ctx.Err() == nil {
+		_ = h.transitionFakeRun(runID, "running", "done", "", "")
+	}
+}
+
+func (h *httpRead) appendFakeEvent(runID, eventType string, payload map[string]any) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ts := stampBeijing(time.Now())
+	raw, _ := json.Marshal(payload)
+	var written bool
+	err := h.withWriteConn(ctx, func(conn *sql.Conn) error {
+		var status string
+		if err := conn.QueryRowContext(ctx, `SELECT status FROM agent_runs WHERE id=?`, runID).Scan(&status); err != nil {
+			return err
+		}
+		if isTerminalRunStatus(status) {
+			return nil
+		}
+		var seq int64
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM agent_events WHERE run_id=?`, runID).Scan(&seq); err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO agent_events(run_id, seq, event_type, payload, created_at) VALUES(?,?,?,?,?)`,
+			runID, seq+1, eventType, string(raw), ts); err != nil {
+			return err
+		}
+		written = true
+		return nil
+	})
+	return err == nil && written
+}
+
+func (h *httpRead) transitionFakeRun(runID, from, to, reason, errorCode string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ts := stampBeijing(time.Now())
+	var changed bool
+	err := h.withWriteConn(ctx, func(conn *sql.Conn) error {
+		var res sql.Result
+		var err error
+		if to == "running" {
+			res, err = conn.ExecContext(ctx,
+				`UPDATE agent_runs SET status='running', started_at=COALESCE(started_at, ?) WHERE id=? AND status=?`,
+				ts, runID, from)
+		} else {
+			var ec any
+			if errorCode != "" {
+				ec = errorCode
+			}
+			res, err = conn.ExecContext(ctx,
+				`UPDATE agent_runs SET status=?, finished_at=?, error_code=COALESCE(?, error_code) WHERE id=? AND status=?`,
+				to, ts, ec, runID, from)
+		}
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return err
+		}
+		var seq int64
+		if err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM agent_events WHERE run_id=?`, runID).Scan(&seq); err != nil {
+			return err
+		}
+		statePayload, _ := json.Marshal(map[string]any{"from": from, "to": to, "reason": nullStringPtr(reason)})
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO agent_events(run_id, seq, event_type, payload, created_at) VALUES(?,?,'run.state',?,?)`,
+			runID, seq+1, string(statePayload), ts); err != nil {
+			return err
+		}
+		if isTerminalRunStatus(to) {
+			finPayload, _ := json.Marshal(map[string]any{"status": to, "error_code": nullStringPtr(errorCode)})
+			if _, err := conn.ExecContext(ctx,
+				`INSERT INTO agent_events(run_id, seq, event_type, payload, created_at) VALUES(?,?,'run.finished',?,?)`,
+				runID, seq+2, string(finPayload), ts); err != nil {
+				return err
+			}
+		}
+		changed = true
+		return nil
+	})
+	return err == nil && changed
+}
+
+func nullStringPtr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }

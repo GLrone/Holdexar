@@ -1,8 +1,3 @@
-//go:build windows
-
-// llm.go 多协议 LLM 客户端：openai / openai-responses / anthropic / ollama，
-// 归一化为统一事件流（thinking/answer/tool_calls/usage/context/cache）。
-// 语义对齐 pilot/llm.py。
 package pilot
 
 import (
@@ -12,16 +7,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
 
-// Protocols 支持的协议集。
 var Protocols = []string{"openai", "openai-responses", "anthropic", "ollama"}
 
 var defaultBaseURL = map[string]string{
@@ -39,7 +35,6 @@ const (
 	diagnosticIDLength = 6
 )
 
-// PilotLlmError LLM 调用失败（网络/非 2xx/响应形态不符）。
 type PilotLlmError struct {
 	Message      string
 	Code         string
@@ -49,7 +44,6 @@ type PilotLlmError struct {
 
 func (e *PilotLlmError) Error() string { return e.Message }
 
-// ToDiagnostic 诊断载荷（前端展示口径）。
 func (e *PilotLlmError) ToDiagnostic() map[string]any {
 	return map[string]any{
 		"id": e.DiagnosticID, "code": e.Code,
@@ -72,13 +66,19 @@ func statusCodeOrNil(code int) any {
 }
 
 func clip(text string, limit int) string {
-	if len(text) > limit {
-		return text[:limit]
+	if limit <= 0 {
+		return ""
+	}
+	if len(text) <= limit {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) > limit {
+		return string(runes[:limit])
 	}
 	return text
 }
 
-// EffectiveBaseURL 协议默认地址兜底。
 func EffectiveBaseURL(protocol, baseURL string) string {
 	base := trimSpace(baseURL)
 	if base != "" {
@@ -87,18 +87,17 @@ func EffectiveBaseURL(protocol, baseURL string) string {
 	return defaultBaseURL[protocol]
 }
 
-// LlmEvent 统一事件（kind ∈ thinking/answer/tool_calls/usage/context/cache）。
+// LlmEvent 统一流事件（kind ∈ thinking/answer/tool_calls/usage/context/cache/error）。
 type LlmEvent struct {
 	Kind     string
 	Text     string
-	Calls    []map[string]any // tool_calls
-	UsageIn  int              // usage
+	Calls    []map[string]any
+	UsageIn  int
 	UsageOut int
-	Cache    map[string]any // cache
-	Err      *PilotLlmError // error
+	Cache    map[string]any
+	Err      *PilotLlmError
 }
 
-// authHeaders 匿名端点不落鉴权头。
 func authHeaders(protocol, apiKey string) map[string]string {
 	if protocol == "anthropic" {
 		headers := map[string]string{"anthropic-version": "2023-06-01"}
@@ -122,13 +121,29 @@ func isLoopback(baseURL string) bool {
 	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
-// HttpClient 回环地址绕过系统代理（本地网关经代理会 502）。
+func sameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) > 0 && !sameOrigin(req.URL.String(), via[0].URL.String()) {
+		return errors.New("cross-origin redirect blocked")
+	}
+	return nil
+}
+
+// HttpClient 回环地址绕过系统代理，跨源或降级重定向一律拒绝。
 func HttpClient(baseURL string) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if isLoopback(baseURL) {
 		transport.Proxy = nil
+	} else {
+		transport.Proxy = http.ProxyFromEnvironment
 	}
-	return &http.Client{Timeout: llmTimeout, Transport: transport}
+	return &http.Client{
+		Timeout:       llmTimeout,
+		Transport:     transport,
+		CheckRedirect: sameOriginRedirect,
+	}
 }
 
 func assembleToolCalls(pending map[int]map[string]string) []map[string]any {
@@ -136,7 +151,7 @@ func assembleToolCalls(pending map[int]map[string]string) []map[string]any {
 	for idx := range pending {
 		keys = append(keys, idx)
 	}
-	sort.Ints(keys)
+	slices.Sort(keys)
 	out := make([]map[string]any, 0, len(pending))
 	for _, idx := range keys {
 		item := pending[idx]
@@ -150,17 +165,13 @@ func assembleToolCalls(pending map[int]map[string]string) []map[string]any {
 	return out
 }
 
-// ── openai 兼容 ──────────────────────────────────────────────────────
-
 func openaiRequest(baseURL, apiKey, model string, messages []map[string]any, tools []map[string]any) (string, map[string]string, map[string]any) {
 	endpoint := strings.TrimRight(baseURL, "/") + "/chat/completions"
 	normalized := make([]map[string]any, 0, len(messages))
 	for _, m := range messages {
 		if role, _ := m["role"].(string); role == "assistant" && m["content"] == nil {
-			copied := map[string]any{}
-			for k, v := range m {
-				copied[k] = v
-			}
+			// nil map 取不出 "assistant"，分支内 m 必非 nil，Clone 结果可直接写键。
+			copied := maps.Clone(m)
 			copied["content"] = ""
 			normalized = append(normalized, copied)
 			continue
@@ -178,7 +189,6 @@ func openaiRequest(baseURL, apiKey, model string, messages []map[string]any, too
 	return endpoint, authHeaders("openai", apiKey), body
 }
 
-// openaiAcc openai 流解析的跨帧状态（tool_calls 分片累积）。
 type openaiAcc struct {
 	pending map[int]map[string]string
 }
@@ -273,8 +283,6 @@ func (a *openaiAcc) feed(data string, out func(LlmEvent)) {
 	}
 }
 
-// ── anthropic（Messages API）────────────────────────────────────────
-
 func anthropicConvert(messages []map[string]any) (string, []map[string]any) {
 	systems := []string{}
 	for _, m := range messages {
@@ -367,7 +375,6 @@ func anthropicRequest(baseURL, apiKey, model string, messages []map[string]any, 
 	return endpoint, authHeaders("anthropic", apiKey), body
 }
 
-// OllamaParse 供测试复用的 ndjson 解析。
 func OllamaParse(out func(LlmEvent), line string) {
 	var ev map[string]any
 	if json.Unmarshal([]byte(line), &ev) != nil {
@@ -412,8 +419,6 @@ func OllamaParse(out func(LlmEvent), line string) {
 		}
 	}
 }
-
-// ── openai-responses（Responses API）────────────────────────────────
 
 func responsesInput(messages []map[string]any) (string, []map[string]any) {
 	systems := []string{}
@@ -480,8 +485,6 @@ func responsesRequest(baseURL, apiKey, model string, messages []map[string]any, 
 	return endpoint, authHeaders("openai-responses", apiKey), body
 }
 
-// ── ollama 请求 ─────────────────────────────────────────────────────
-
 func ollamaRequest(baseURL, apiKey, model string, messages []map[string]any, tools []map[string]any) (string, map[string]string, map[string]any) {
 	endpoint := strings.TrimRight(baseURL, "/") + "/api/chat"
 	converted := make([]map[string]any, 0, len(messages))
@@ -507,8 +510,6 @@ func ollamaRequest(baseURL, apiKey, model string, messages []map[string]any, too
 	return endpoint, authHeaders("ollama", apiKey), body
 }
 
-// ChatStream 按协议构造请求并流式解析，产出统一事件；error 事件携带
-// PilotLlmError（消费方转诊断帧）。
 func (s *Service) ChatStream(ctx context.Context, protocol, baseURL, apiKey, model string,
 	messages []map[string]any, tools []map[string]any, maxTokens int, client *http.Client) (<-chan LlmEvent, error) {
 	var endpoint string
@@ -533,19 +534,33 @@ func (s *Service) ChatStream(ctx context.Context, protocol, baseURL, apiKey, mod
 			body["max_tokens"] = maxTokens
 		}
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if !isLoopback(baseURL) {
-		transport.Proxy = http.ProxyFromEnvironment
+	hc := client
+	var closeIdle func()
+	if hc == nil {
+		hc = HttpClient(baseURL)
+		closeIdle = hc.CloseIdleConnections
 	} else {
-		transport.Proxy = nil
+		cloned := *hc
+		if _, hasDeadline := ctx.Deadline(); hasDeadline {
+			cloned.Timeout = 0
+		}
+		if cloned.CheckRedirect == nil {
+			cloned.CheckRedirect = sameOriginRedirect
+		}
+		hc = &cloned
 	}
-	nc := &http.Client{Timeout: llmTimeout, Transport: transport}
 	payload, err := json.Marshal(body)
 	if err != nil {
+		if closeIdle != nil {
+			closeIdle()
+		}
 		return nil, newLlmError(err.Error(), "provider_response_error", 0)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
+		if closeIdle != nil {
+			closeIdle()
+		}
 		return nil, newLlmError(err.Error(), "provider_network_error", 0)
 	}
 	for key, value := range headers {
@@ -555,7 +570,10 @@ func (s *Service) ChatStream(ctx context.Context, protocol, baseURL, apiKey, mod
 	events := make(chan LlmEvent, 64)
 	go func() {
 		defer close(events)
-		resp, err := nc.Do(request)
+		if closeIdle != nil {
+			defer closeIdle()
+		}
+		resp, err := hc.Do(request)
 		if err != nil {
 			code := "provider_network_error"
 			if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "Client.Timeout") {
@@ -698,7 +716,7 @@ func sseLines(resp *http.Response, handle func(string)) {
 		}
 		data := strings.TrimSpace(line[len("data:"):])
 		if data == "[DONE]" {
-			return // 流终止信号：立即停止读取
+			return
 		}
 		if data == "" {
 			continue

@@ -1,17 +1,18 @@
-//go:build windows
-
-// config.go 领航员 LLM 配置：多供应商账本（settings KV）+ 月度用量台账。
-// 语义对齐 pilot/config.py；写路径全部走写闸。
 package pilot
 
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/store"
 )
 
 const (
@@ -29,7 +30,6 @@ const (
 	legacyDefaultCap        = 500000
 )
 
-// Provider 供应商记录（账本口径）。
 type Provider struct {
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`
@@ -38,11 +38,10 @@ type Provider struct {
 	Models         []string `json:"models"`
 	ModelsDisabled []string `json:"models_disabled"`
 	ContextWindow  int      `json:"context_window"`
-	// HasKey 密钥在位布尔（不含原文）。
-	HasKey bool `json:"has_key"`
+	KeyOrigin      string   `json:"key_origin"`
+	HasKey         bool     `json:"has_key"`
 }
 
-// ConfigPayload 平面配置（消费方形态）。
 type ConfigPayload struct {
 	Protocol            string     `json:"protocol"`
 	Enabled             bool       `json:"enabled"`
@@ -64,8 +63,6 @@ type ConfigPayload struct {
 	Providers           []Provider `json:"providers"`
 }
 
-// kvGet / kvSet / kvGetSecret / kvSetSecret 由 serverd 装配注入
-// （settings_service 语义：KV JSON 值 + secretbox 密文）。
 type kvStore struct {
 	get       func(key string) (json.RawMessage, bool)
 	getSecret func(key string) (string, bool)
@@ -101,7 +98,55 @@ func cleanProvider(raw map[string]any) Provider {
 		Models:         modelsOf(raw["models"]),
 		ModelsDisabled: modelsOf(raw["models_disabled"]),
 		ContextWindow:  cleanWindow(raw["context_window"]),
+		KeyOrigin:      strings.TrimSpace(stringOf(raw["key_origin"])),
 	}
+}
+
+func originKey(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	} else {
+		p, err := strconv.Atoi(port)
+		if err != nil || p < 1 || p > 65535 {
+			return ""
+		}
+		port = strconv.Itoa(p)
+	}
+	authority := host
+	if strings.Contains(host, ":") {
+		authority = "[" + host + "]"
+	}
+	return scheme + "://" + authority + ":" + port
+}
+
+func sameOrigin(a, b string) bool {
+	oa := originKey(a)
+	return oa != "" && oa == originKey(b)
+}
+
+func providerOrigin(p Provider) string {
+	return originKey(EffectiveBaseURL(p.Protocol, p.BaseURL))
+}
+
+func keyOriginMatches(p Provider) bool {
+	return p.KeyOrigin != "" && p.KeyOrigin == providerOrigin(p)
 }
 
 func newProviderID() string {
@@ -149,7 +194,6 @@ func cleanToolLimit(raw any) int {
 	return value
 }
 
-// resolveWindow 手填优先 → 模型名识别 → 宽裕兜底（source 供前端提示）。
 func resolveWindow(manual, auto int) (int, string) {
 	if manual > 0 {
 		return manual, "manual"
@@ -160,7 +204,6 @@ func resolveWindow(manual, auto int) (int, string) {
 	return FallbackContextWindow, "fallback"
 }
 
-// LoadProviders 供应商清单投影（has_key 布尔，不含密钥原文）。
 func (s *Service) LoadProviders() []Provider {
 	raw, _ := s.kvGet(providersKey)
 	var list []map[string]any
@@ -170,20 +213,46 @@ func (s *Service) LoadProviders() []Provider {
 	out := make([]Provider, 0, len(list))
 	for _, item := range list {
 		provider := cleanProvider(item)
-		provider.HasKey = s.hasProviderKey(provider.ID)
+		provider.HasKey = s.hasProviderKey(provider)
 		out = append(out, provider)
 	}
 	return out
 }
 
-func (s *Service) hasProviderKey(pid string) bool {
-	// has_key 布尔只关心「密钥在不在」，不需要解密成功——
-	// 解密失败（机器换/钥文件丢）时 Python 侧 default="" 降级但 has_key 仍 true
-	_, ok := s.kvGet(providerKeyName(pid))
-	return ok
+func (s *Service) hasStoredKey(pid string) bool {
+	if raw, ok := s.kvGet(providerKeyName(pid)); ok {
+		trimmed := strings.TrimSpace(string(raw))
+		if trimmed != "" && trimmed != `""` && trimmed != "null" {
+			return true
+		}
+	}
+	if secret, ok := s.kvGetSecret(providerKeyName(pid)); ok && secret != "" {
+		return true
+	}
+	return false
 }
 
-// LoadConfig 平面配置（解析自活跃供应商 + 全局开关/上限/台账）。
+func (s *Service) hasProviderKey(p Provider) bool {
+	return s.hasStoredKey(p.ID) && keyOriginMatches(p)
+}
+
+// ProviderKey 仅当密钥对应的服务端源站与当前配置仍一致时才返回明文密钥（fail-closed）。
+func (s *Service) ProviderKey(pid string) string {
+	if pid == "" {
+		return ""
+	}
+	for _, p := range s.LoadProviders() {
+		if p.ID == pid {
+			if !keyOriginMatches(p) {
+				return ""
+			}
+			key, _ := s.kvGetSecret(providerKeyName(pid))
+			return key
+		}
+	}
+	return ""
+}
+
 func (s *Service) LoadConfig() ConfigPayload {
 	providers := s.LoadProviders()
 	activeID := s.kvGetString(activeKey)
@@ -200,7 +269,7 @@ func (s *Service) LoadConfig() ConfigPayload {
 	model := s.kvGetString(modelKey)
 	hasKey := false
 	if active != nil {
-		hasKey = s.hasProviderKey(active.ID)
+		hasKey = s.hasProviderKey(*active)
 	}
 	storedWindow := 0
 	autoWindow := 0
@@ -259,14 +328,13 @@ func (s *Service) monthlyCap() int {
 		return 0
 	}
 	if cap == legacyDefaultCap {
-		// 旧默认值不是用户的选择：一次性迁为不限
+		// legacyDefaultCap 视为未显式设限，读时重置为 0。
 		s.kvSetRaw(capKey, jsonNumber0())
 		return 0
 	}
 	return cap
 }
 
-// UsageMonth 当月用量台账（存量整数旧口径只记合计）。
 func (s *Service) UsageMonth() map[string]int {
 	out := map[string]int{"inp": 0, "out": 0, "calls": 0, "total": 0}
 	raw, ok := s.kvGet(usageKey())
@@ -287,17 +355,9 @@ func (s *Service) UsageMonth() map[string]int {
 	return out
 }
 
-// AddUsage 用量累加：单语句原子自增（不得经写闸——闸内 fn 再开池连接写入
-// 会被本事务的 RESERVED 锁挡住，busy_timeout 60s 自锁）。
-func (s *Service) AddUsage(ctx context.Context, inp, outN int) {
-	inp = maxInt(inp, 0)
-	outN = maxInt(outN, 0)
-	if inp == 0 && outN == 0 {
-		return
-	}
-	_, _ = s.deps.DB.ExecContext(ctx, `
+const usageUpsertSQL = `
 INSERT INTO app_settings(key,value_json,updated_at)
-VALUES(?1, json('{"inp":?2,"out":?3,"calls":1}'), ?4)
+VALUES(?1, json_object('inp', ?2, 'out', ?3, 'calls', 1), ?4)
 ON CONFLICT(key) DO UPDATE SET
   updated_at=excluded.updated_at,
   value_json = CASE WHEN json_type(app_settings.value_json)='object'
@@ -305,12 +365,26 @@ ON CONFLICT(key) DO UPDATE SET
       '$.inp',   COALESCE(json_extract(app_settings.value_json,'$.inp'),0)+?2,
       '$.out',   COALESCE(json_extract(app_settings.value_json,'$.out'),0)+?3,
       '$.calls', COALESCE(json_extract(app_settings.value_json,'$.calls'),0)+1)
-    ELSE json('{"inp":'||(COALESCE(CAST(app_settings.value_json AS INTEGER),0)+?2)||',"out":'||?3||',"calls":1}')
-  END`,
-		usageKey(), inp, outN, usageStamp())
+    ELSE json_object('inp', COALESCE(CAST(app_settings.value_json AS INTEGER),0)+?2, 'out', ?3, 'calls', 1)
+  END`
+
+func (s *Service) AddUsage(ctx context.Context, inp, outN int) {
+	inp = maxInt(inp, 0)
+	outN = maxInt(outN, 0)
+	if inp == 0 && outN == 0 || s.deps.DB == nil {
+		return
+	}
+	key, stamp := usageKey(), usageStamp()
+	if s.gate != nil {
+		_ = s.gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
+			_, err := conn.ExecContext(ctx, usageUpsertSQL, key, inp, outN, stamp)
+			return err
+		})
+		return
+	}
+	_, _ = s.deps.DB.ExecContext(ctx, usageUpsertSQL, key, inp, outN, stamp)
 }
 
-// usageStamp 与 serverd KVSet 同口径的 updated_at 文本（东八区）。
 func usageStamp() string {
 	return time.Now().UTC().Add(8 * time.Hour).Format("2006-01-02 15:04:05.000000")
 }
@@ -322,18 +396,15 @@ func maxInt(a, b int) int {
 	return b
 }
 
-// LlmReady 开关、地址、模型齐备即可用（密钥可选）。
 func (c *ConfigPayload) LlmReady() bool {
 	return c.Enabled && c.BaseURL != "" && c.Model != ""
 }
 
-// OverCap 月度用量超限（0=不限）。
 func (s *Service) OverCap() bool {
 	cfg := s.LoadConfig()
 	return cfg.MonthlyCap > 0 && cfg.UsageTotal >= cfg.MonthlyCap
 }
 
-// SaveConfig 平面 API 的一次提交（首次保存创建默认接入）。
 func (s *Service) SaveConfig(ctx context.Context, update map[string]any) error {
 	{
 		values := map[string]json.RawMessage{}
@@ -372,15 +443,25 @@ func (s *Service) SaveConfig(ctx context.Context, update map[string]any) error {
 			if targetIdx < 0 {
 				targetIdx = 0
 			}
-			merged := mergeProvider(providers[targetIdx], update)
+			prev := providers[targetIdx]
+			merged := mergeProvider(prev, update)
+			if hasAPIKey {
+				keyStr := stringOf(update["api_key"])
+				if keyStr != "" {
+					merged.KeyOrigin = providerOrigin(merged)
+				} else {
+					merged.KeyOrigin = ""
+				}
+				secrets[providerKeyName(merged.ID)] = keyStr
+			} else if providerOrigin(merged) != prev.KeyOrigin {
+				merged.KeyOrigin = ""
+				secrets[providerKeyName(merged.ID)] = ""
+			}
 			providers[targetIdx] = merged
 			model := s.kvGetString(modelKey)
 			values[providersKey] = mustJSON(providers)
 			values[activeKey] = mustJSON(merged.ID)
 			values[modelKey] = mustJSON(activeModel(merged, model))
-			if hasAPIKey {
-				secrets[providerKeyName(merged.ID)] = stringOf(update["api_key"])
-			}
 		}
 		if v, ok := update["enabled"]; ok {
 			values[enabledKey] = mustJSON(truthy(v))
@@ -398,7 +479,6 @@ func (s *Service) SaveConfig(ctx context.Context, update map[string]any) error {
 	}
 }
 
-// CreateProvider 新增供应商（清单/密钥/首次激活同一写边界）。
 func (s *Service) CreateProvider(ctx context.Context, update map[string]any) (Provider, error) {
 	var created Provider
 	err := func() error {
@@ -407,7 +487,12 @@ func (s *Service) CreateProvider(ctx context.Context, update map[string]any) (Pr
 			raw[key] = value
 		}
 		providers := s.LoadProviders()
+		delete(raw, "id")
+		delete(raw, "key_origin")
 		provider := cleanProvider(raw)
+		if key := stringOf(update["api_key"]); key != "" {
+			provider.KeyOrigin = providerOrigin(provider)
+		}
 		list := append(providers, provider)
 		values := map[string]json.RawMessage{providersKey: mustJSON(list)}
 		if len(providers) == 0 {
@@ -422,7 +507,7 @@ func (s *Service) CreateProvider(ctx context.Context, update map[string]any) (Pr
 		created = provider
 		return s.kvSet(ctx, values, secrets)
 	}()
-	created.HasKey = created.ID != "" && s.hasProviderKey(created.ID)
+	created.HasKey = created.ID != "" && s.hasProviderKey(created)
 	return created, err
 }
 
@@ -446,24 +531,32 @@ func (s *Service) UpdateProvider(ctx context.Context, pid string, update map[str
 		if strings.TrimSpace(stringOf(update["base_url"])) == "" && target.BaseURL != "" {
 			merged.BaseURL = target.BaseURL
 		}
+		secrets := map[string]string{}
+		if key, ok := update["api_key"]; ok {
+			keyStr := stringOf(key)
+			if keyStr != "" {
+				merged.KeyOrigin = providerOrigin(merged)
+			} else {
+				merged.KeyOrigin = ""
+			}
+			secrets[providerKeyName(pid)] = keyStr
+		} else if providerOrigin(merged) != target.KeyOrigin {
+			merged.KeyOrigin = ""
+			secrets[providerKeyName(pid)] = ""
+		}
 		providers[idx] = merged
 		values := map[string]json.RawMessage{providersKey: mustJSON(providers)}
 		activeID := s.kvGetString(activeKey)
 		if pid == activeID || activeID == "" {
 			values[modelKey] = mustJSON(activeModel(merged, s.kvGetString(modelKey)))
 		}
-		secrets := map[string]string{}
-		if key, ok := update["api_key"]; ok {
-			secrets[providerKeyName(pid)] = stringOf(key)
-		}
 		updated = merged
 		return s.kvSet(ctx, values, secrets)
 	}()
-	updated.HasKey = s.hasProviderKey(pid)
+	updated.HasKey = s.hasProviderKey(updated)
 	return updated, err
 }
 
-// DeleteProvider 删除供应商及密钥（删活跃家时交接首家）。
 func (s *Service) DeleteProvider(ctx context.Context, pid string) error {
 	{
 		providers := s.LoadProviders()
@@ -474,8 +567,7 @@ func (s *Service) DeleteProvider(ctx context.Context, pid string) error {
 			}
 		}
 		values := map[string]json.RawMessage{
-			providersKey:         mustJSON(remaining),
-			providerKeyName(pid): mustJSON(""),
+			providersKey: mustJSON(remaining),
 		}
 		if s.kvGetString(activeKey) == pid {
 			nextActive := ""
@@ -486,7 +578,7 @@ func (s *Service) DeleteProvider(ctx context.Context, pid string) error {
 			}
 			values[activeKey] = mustJSON(nextActive)
 		}
-		return s.kvSet(ctx, values, map[string]string{})
+		return s.kvSet(ctx, values, map[string]string{providerKeyName(pid): ""})
 	}
 }
 
@@ -494,7 +586,7 @@ func mergeProvider(target Provider, update map[string]any) Provider {
 	raw := map[string]any{
 		"id": target.ID, "name": target.Name, "protocol": target.Protocol,
 		"base_url": target.BaseURL, "models": target.Models,
-		"models_disabled": target.ModelsDisabled,
+		"models_disabled": target.ModelsDisabled, "key_origin": target.KeyOrigin,
 	}
 	if target.ContextWindow > 0 {
 		raw["context_window"] = target.ContextWindow
@@ -520,7 +612,6 @@ func mergeProvider(target Provider, update map[string]any) Provider {
 	return cleanProvider(raw)
 }
 
-// activeModel 供应商启用清单内回落首个模型。
 func activeModel(provider Provider, model string) string {
 	disabled := map[string]bool{}
 	for _, m := range provider.ModelsDisabled {
@@ -555,7 +646,6 @@ func mustJSON(v any) json.RawMessage {
 
 func jsonNumber0() json.RawMessage { return json.RawMessage("0") }
 
-// kv 桥（serverd 注入 settings_service 语义）。
 func (s *Service) kvGet(key string) (json.RawMessage, bool) {
 	if s.deps.KVGet == nil {
 		return nil, false

@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,9 +12,7 @@ import (
 	"strings"
 )
 
-// muxFetcher 经主 mux 进程内调用已迁移只读端点：与真实 HTTP 同一处理器、
-// 同一 SQL，不产生第二套口径。绕过访问闸（工具调用已在 MCP 闸之后，
-// 进程内转发属可信路径）。
+// muxFetcher 经主 mux 进程内转发请求（MCP 鉴权后绕过外部访问闸）。
 type muxFetcher func(ctx context.Context, path string) (int, []byte, error)
 
 func newMuxFetcher(mux *http.ServeMux) muxFetcher {
@@ -22,14 +21,16 @@ func newMuxFetcher(mux *http.ServeMux) muxFetcher {
 		if err != nil {
 			return 0, nil, err
 		}
+		req.RemoteAddr = "127.0.0.1:0"
 		rec := &recorder{header: http.Header{}}
 		mux.ServeHTTP(rec, req)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
 		return rec.status, rec.body.Bytes(), nil
 	}
 }
 
-// muxPoster 经主 mux 进程内转发 POST：与 muxFetcher 同一 mux 基址与超时口径
-// （超时由 ctx 与执行器预算承载），端点仍走各自处理器，不产生第二套口径。
 type muxPoster func(ctx context.Context, path string, body []byte) (int, []byte, error)
 
 func newMuxPoster(mux *http.ServeMux) muxPoster {
@@ -38,14 +39,17 @@ func newMuxPoster(mux *http.ServeMux) muxPoster {
 		if err != nil {
 			return 0, nil, err
 		}
+		req.RemoteAddr = "127.0.0.1:0"
 		req.Header.Set("Content-Type", "application/json")
 		rec := &recorder{header: http.Header{}}
 		mux.ServeHTTP(rec, req)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
 		return rec.status, rec.body.Bytes(), nil
 	}
 }
 
-// recorder 最小响应收集器（进程内转发专用，不引 httptest）。
 type recorder struct {
 	header http.Header
 	body   bytes.Buffer
@@ -67,7 +71,6 @@ func (c *recorder) WriteHeader(code int) {
 	}
 }
 
-// getJSON 进程内 GET 并解析；状态码非 200 按带状态码的错误返回。
 func (c *CallContext) getJSON(path string, out any) error {
 	status, body, err := c.fetch(c.Ctx, path)
 	if err != nil {
@@ -84,9 +87,6 @@ func (c *CallContext) getJSON(path string, out any) error {
 	return nil
 }
 
-// postJSON 进程内 POST 并解析（同步/刷新类端点通道）：body 序列化为 JSON
-// 请求体，状态码非 200 按带状态码的错误返回（需按 409/400 分支的工具改用
-// c.post 原语自取状态码）。out 为 nil 时跳过解码。
 func (c *CallContext) postJSON(path string, body any, out any) error {
 	if c.post == nil {
 		return errors.New("执行环境未注入 POST 通道")
@@ -110,8 +110,7 @@ func (c *CallContext) postJSON(path string, body any, out any) error {
 	return dec.Decode(out)
 }
 
-// pyBool Python bool() 语义：None/False/0/空串/空容器为假，其余为真
-// （字符串 "false" 是真值——KV 历史行为的同源副本）。
+// pyBool 按动态真值规则求值（字符串 "false" 亦为真）。
 func pyBool(v any) bool {
 	switch x := v.(type) {
 	case nil:
@@ -136,8 +135,6 @@ func pyBool(v any) bool {
 	return true
 }
 
-// pyIntOr int(value or 0)：数值/字符串按 Python int() 解析；解析失败返回错误
-// （执行器归一化为 failed，与 Python int() 抛 ValueError 同径）。
 func pyIntOr(v any) (int64, error) {
 	if v == nil {
 		return 0, nil
@@ -166,8 +163,6 @@ func pyIntOr(v any) (int64, error) {
 	return 0, fmt.Errorf("invalid literal for int(): %v", v)
 }
 
-// pyParseInt Python int(str) 语义：十进制整数，允许前后空白与符号；小数字符串
-// 拒绝（Python int("1.5") 抛 ValueError）。
 func pyParseInt(s string) (int64, error) {
 	if strings.ContainsAny(s, ".eE") {
 		return 0, fmt.Errorf("invalid literal for int() with base 10: %q", s)
@@ -179,7 +174,6 @@ func pyParseInt(s string) (int64, error) {
 	return n, nil
 }
 
-// pyFloatOr Python float(value)：数值/字符串解析；失败返回错误。
 func pyFloatOr(v any) (float64, error) {
 	switch x := v.(type) {
 	case nil:
@@ -203,8 +197,6 @@ func pyFloatOr(v any) (float64, error) {
 	return 0, fmt.Errorf("could not convert string to float: %v", v)
 }
 
-// clampInt 与 Python _shared._clamp 同语义：int(value) 失败（含缺席 None）
-// 回缺省，数值后夹界。
 func clampInt(v any, def int64, lo, hi int64) int64 {
 	if v == nil {
 		return def
@@ -222,7 +214,6 @@ func clampInt(v any, def int64, lo, hi int64) int64 {
 	return n
 }
 
-// maskAddr 收件邮箱脱敏：保留首字符与域名（与 Python _mask_addr 一致）。
 func maskAddr(addr string) string {
 	head, domain, ok := strings.Cut(addr, "@")
 	if !ok {
@@ -234,22 +225,57 @@ func maskAddr(addr string) string {
 	return head[:1] + "***@" + domain
 }
 
-// queryBuilder 保序查询串（推荐链路固定参数序，可读性优先）。
-type queryBuilder struct {
-	pairs []string
+func disabledResult(tool, note string) *ToolResult {
+	obj := newObj()
+	obj.set("kind", "disabled")
+	obj.set("tool", tool)
+	if note != "" {
+		obj.set("note", note)
+	}
+	return &ToolResult{Status: StatusEmpty, Data: obj}
 }
 
-func urlValues() *queryBuilder { return &queryBuilder{} }
-
-func (q *queryBuilder) set(key, val string) {
-	q.pairs = append(q.pairs, key+"="+val)
+func conflictDetail(body []byte, fallback string) string {
+	var obj map[string]any
+	if len(body) > 0 && json.Unmarshal(body, &obj) == nil {
+		if d := strings.TrimSpace(pyStrOr(obj["detail"])); d != "" {
+			return d
+		}
+	}
+	return fallback
 }
 
-func (q *queryBuilder) encode() string {
-	return strings.Join(q.pairs, "&")
+func isModuleDisabled(ctx context.Context, db *sql.DB, key string) bool {
+	if db == nil || key == "" {
+		return false
+	}
+	var raw sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT value_json FROM app_settings WHERE key=?`, key).Scan(&raw); err != nil {
+		return false
+	}
+	return strings.TrimSpace(raw.String) == "false"
 }
 
-// jsonDecoder UseNumber 解码器（数字字面量保留，键值查表不丢精度）。
+func (c *CallContext) getJSONOrDisabled(tool, path, moduleKey, fallbackNote string, out any) (*ToolResult, error) {
+	if isModuleDisabled(c.Ctx, c.db, moduleKey) {
+		return disabledResult(tool, fallbackNote), nil
+	}
+	status, body, err := c.fetch(c.Ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusConflict {
+		return disabledResult(tool, conflictDetail(body, fallbackNote)), nil
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("内部读取失败（%d）：%s", status, strings.TrimSpace(string(body)))
+	}
+	if err := jsonDecoder(body).Decode(out); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 func jsonDecoder(body []byte) *json.Decoder {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()

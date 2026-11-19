@@ -10,7 +10,6 @@ import (
 	"testing"
 )
 
-// accountTestSchema 本批工具直读面所需的最小表集（briefs / 关注来源 / 运行账本）。
 const accountTestSchema = `
 CREATE TABLE games (
   appid INTEGER PRIMARY KEY,
@@ -43,7 +42,6 @@ CREATE TABLE agent_events (
 );
 `
 
-// accountStubModes 桩端点分支开关（工具不透传 query，用可变模式切换正例/空态）。
 type accountStubModes struct {
 	accountNoCookie, walletFail           bool
 	followEmpty, alertsEmpty, eventsEmpty bool
@@ -56,7 +54,6 @@ type accountStubModes struct {
 	ratesUnavailable, sessionsEmpty       bool
 }
 
-// newAccountTestEnv 最小库 + 桩端点 mux（端点响应形状取自真实装配实现）。
 func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *accountStubModes) {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "holdexar.db"))
@@ -91,7 +88,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 			_, _ = w.Write([]byte(body))
 		})
 	}
-	// 账号状态 / 钱包同步（响应为 snake_case 原样状态图）。
 	stub("GET /api/v1/account", func(r *http.Request) (int, string) {
 		if modes.accountNoCookie {
 			return 200, `{"has_cookie": false, "cookie_steam_id": "", "bound_steam_id": "76500000000000001", "mismatch": true, "profile": null, "wallet": null, "accounts": []}`
@@ -108,7 +104,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 		}
 		return 200, `{"has_cookie": true, "sync_error": "", "wallet": {"balance_display": "¥ 48.00", "check_ok": true}, "accounts": []}`
 	})
-	// 关注 / 提醒。
 	stub("GET /api/v1/follows", func(r *http.Request) (int, string) {
 		if modes.followEmpty {
 			return 200, `{"appids": []}`
@@ -130,7 +125,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 		}
 		return 200, `[{"id": 9, "appid": 900001, "gameName": "星露谷物语", "region": "CN", "priceCny": 4800, "priceText": "¥48.00", "triggeredAt": "2026-11-14T10:00:00", "notified": 1}]`
 	})
-	// 成就面。
 	stub("GET /api/v1/achievements/summary", func(r *http.Request) (int, string) {
 		if modes.achSummaryEmpty {
 			return 200, `{"hasCredential": false, "steamid": "", "platinum": 0, "totalAchievements": 0, "unlockedAchievements": 0, "completionRate": 0, "lastSyncedAt": null, "platinums": [], "recentUnlocks": []}`
@@ -178,7 +172,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 		}
 		return 404, `{"detail": "该游戏不在成就快照中，请先同步"}`
 	})
-	// 家庭 / 账单 / 额度。
 	stub("GET /api/v1/family/library", func(r *http.Request) (int, string) {
 		if modes.famLibEmpty {
 			return 200, `{"familyGroupid": "g1", "games": [], "members": []}`
@@ -219,7 +212,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 		}
 		return 200, `{"hasCookie": true, "hasSessionId": true, "steamId": "76500000000000001", "used": 2, "limit": 5}`
 	})
-	// 同步 POST 面。
 	stub("POST /api/v1/accounts/{steamid}/sync", func(r *http.Request) (int, string) {
 		return 200, `{"steamid": "` + r.PathValue("steamid") + `", "wishlistCount": 3, "ownedCount": 9, "added": 1, "addedOwned": 0, "active": 10, "newAppids": [900002], "newOwnedAppids": []}`
 	})
@@ -247,7 +239,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 		}
 		return 200, `{"rows": [{"code": "USD", "rate": 7.25}], "source": "augmentedsteam"}`
 	})
-	// 领航员会话读面。
 	stub("GET /api/v1/pilot/sessions", func(r *http.Request) (int, string) {
 		if modes.sessionsEmpty {
 			return 200, `{"items": []}`
@@ -266,7 +257,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 			"turn_total": 2, "summary_through": 0, "title": "问价格"}`
 	})
 
-	// 独立空注册表 + 本批注册（buildRegistry 已含本批，重复调用即重名）。
 	registry := newRegistry()
 	if err := RegisterAccountTools(registry); err != nil {
 		t.Fatalf("批次二注册失败: %v", err)
@@ -274,7 +264,6 @@ func newAccountTestEnv(t *testing.T) (*http.ServeMux, *sql.DB, *ToolRegistry, *a
 	return mux, db, registry, modes
 }
 
-// runAccountTool 批次二测试入口：本地注册表取工具 → 执行 → 解码 payload。
 func runAccountTool(t *testing.T, mux *http.ServeMux, db *sql.DB, registry *ToolRegistry, name, argsJSON string) map[string]any {
 	t.Helper()
 	spec := registry.get(name)
@@ -295,7 +284,6 @@ func runAccountTool(t *testing.T, mux *http.ServeMux, db *sql.DB, registry *Tool
 	return payload
 }
 
-// rowsOf payload["rows"] → map 切片。
 func rowsOf(t *testing.T, payload map[string]any) []map[string]any {
 	t.Helper()
 	raw, ok := payload["rows"].([]any)
@@ -313,7 +301,6 @@ func rowsOf(t *testing.T, payload map[string]any) []map[string]any {
 	return out
 }
 
-// seedAgentRuns 运行账本种子（jobrun 同表形状）。
 func seedAgentRuns(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ins := func(q string, args ...any) {
@@ -330,7 +317,6 @@ func seedAgentRuns(t *testing.T, db *sql.DB) {
 		('runaaaa1111', 2, 'run.finished', '2026-11-14 09:01:00.000000')`)
 }
 
-// TestAccountToolsReadShapes 读面正例：形状与词条逐字段核对（对照 §五基线）。
 func TestAccountToolsReadShapes(t *testing.T) {
 	mux, db, registry, _ := newAccountTestEnv(t)
 	seedAgentRuns(t, db)
@@ -546,7 +532,6 @@ func TestAccountToolsReadShapes(t *testing.T) {
 	}
 }
 
-// TestAccountToolsEmptyAndCredentialEdges 空态 / 无凭据边界（对照 §五案名）。
 func TestAccountToolsEmptyAndCredentialEdges(t *testing.T) {
 	mux, db, registry, modes := newAccountTestEnv(t)
 	seed := func(q string, args ...any) {
@@ -709,7 +694,6 @@ func TestAccountToolsEmptyAndCredentialEdges(t *testing.T) {
 	}
 }
 
-// TestAccountToolsSyncDoneShapes 同步面 done 词条与库同步链（wishlist 执行入口）。
 func TestAccountToolsSyncDoneShapes(t *testing.T) {
 	mux, db, registry, _ := newAccountTestEnv(t)
 
@@ -750,7 +734,6 @@ func TestAccountToolsSyncDoneShapes(t *testing.T) {
 	}
 }
 
-// TestAccountToolsListTools 元工具：CORE_TOOLS 差集 + 自身排除 + 描述折叠截断。
 func TestAccountToolsListTools(t *testing.T) {
 	mux, db, registry, _ := newAccountTestEnv(t)
 
@@ -783,7 +766,6 @@ func TestAccountToolsListTools(t *testing.T) {
 	}
 }
 
-// TestAccountToolsTimeoutBudgets 预算分档钉住（批次二预算表）。
 func TestAccountToolsTimeoutBudgets(t *testing.T) {
 	r := newRegistry()
 	if err := RegisterAccountTools(r); err != nil {
@@ -817,8 +799,6 @@ func TestAccountToolsTimeoutBudgets(t *testing.T) {
 	}
 }
 
-// TestAccountRegistryNoDupes 批次二重名防线：重复注册报错（空注册表上
-// 注册两次——buildRegistry 已含本批，不再重复调用）。
 func TestAccountRegistryNoDupes(t *testing.T) {
 	r := newRegistry()
 	if err := RegisterAccountTools(r); err != nil {

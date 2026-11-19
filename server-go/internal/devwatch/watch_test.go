@@ -166,3 +166,61 @@ func main(){ listener,e:=net.Listen("tcp",os.Args[1]);if e!=nil{panic(e)};server
 	cancel()
 	wait("child closes on supervisor cancellation", func() bool { return read() == "" })
 }
+
+func TestStatStampAndHostkitTracking(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "server-go")
+	hostkitDir := filepath.Join(workspace, "shared", "hostkit")
+	if err := os.MkdirAll(filepath.Join(root, "internal", "demo"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(hostkitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hkFile := filepath.Join(hostkitDir, "version.go")
+	if err := os.WriteFile(hkFile, []byte("package hostkit\nconst V = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s1, err := statStamp(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1, err := fingerprint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(hostkitDir, "version_test.go"), []byte("package hostkit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sTest, err := statStamp(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fTest, err := fingerprint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sTest != s1 || fTest != f1 {
+		t.Fatal("hostkit _test.go should be ignored by statStamp and fingerprint")
+	}
+
+	if err := os.WriteFile(hkFile, []byte("package hostkit\nconst V = 22\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := statStamp(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2, err := fingerprint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2 == s1 || f2 == f1 {
+		t.Fatal("shared/hostkit .go modification missed by statStamp or fingerprint")
+	}
+}

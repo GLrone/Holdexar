@@ -19,45 +19,100 @@ const (
 	EnvChild = "HOLDEXAR_DEV_CHILD"
 )
 
-func fingerprint(root string) (string, error) {
-	hash := sha256.New()
-	add := func(path string) error {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(hash, "%s\x00%d\x00", filepath.ToSlash(rel), len(data))
-		_, err = hash.Write(data)
-		return err
+func watchedSourceFile(path string, allowSQL bool) bool {
+	if strings.HasSuffix(path, "_test.go") {
+		return false
 	}
-	for _, name := range []string{"go.mod", "go.sum"} {
-		if err := add(filepath.Join(root, name)); err != nil && !(name == "go.sum" && os.IsNotExist(err)) {
-			return "", err
-		}
+	ext := filepath.Ext(path)
+	return ext == ".go" || (allowSQL && ext == ".sql")
+}
+
+func walkSourceDirs(cleanRoot string, visit func(rel string, path string, entry fs.DirEntry) error) error {
+	type target struct {
+		dir      string
+		allowSQL bool
 	}
-	for _, dir := range []string{"cmd", "internal"} {
-		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, entry fs.DirEntry, err error) error {
+	targets := []target{
+		{dir: filepath.Join(cleanRoot, "cmd"), allowSQL: true},
+		{dir: filepath.Join(cleanRoot, "internal"), allowSQL: true},
+		{dir: filepath.Join(cleanRoot, "..", "shared", "hostkit"), allowSQL: false},
+	}
+	for _, t := range targets {
+		err := filepath.WalkDir(t.dir, func(path string, entry fs.DirEntry, err error) error {
 			if os.IsNotExist(err) {
 				return nil
 			}
 			if err != nil {
 				return err
 			}
-			if entry.IsDir() {
+			if entry.IsDir() || !watchedSourceFile(path, t.allowSQL) {
 				return nil
 			}
-			if strings.HasSuffix(path, "_test.go") || (filepath.Ext(path) != ".go" && filepath.Ext(path) != ".sql") {
-				return nil
+			rel, err := filepath.Rel(cleanRoot, path)
+			if err != nil {
+				return err
 			}
-			return add(path)
+			return visit(filepath.ToSlash(rel), path, entry)
 		})
 		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// statStamp 仅用目录项元数据计算轻量指纹（零文件打开），供轮询快路径判变。
+func statStamp(root string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	hash := sha256.New()
+	for _, name := range []string{"go.mod", "go.sum"} {
+		info, err := os.Stat(filepath.Join(cleanRoot, name))
+		if err != nil {
+			if name == "go.sum" && os.IsNotExist(err) {
+				continue
+			}
 			return "", err
 		}
+		fmt.Fprintf(hash, "%s\x00%d\x00%d\n", name, info.Size(), info.ModTime().UnixNano())
+	}
+	err := walkSourceDirs(cleanRoot, func(rel string, _ string, entry fs.DirEntry) error {
+		info, err := entry.Info()
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(hash, "%s\x00%d\x00%d\n", rel, info.Size(), info.ModTime().UnixNano())
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+func fingerprint(root string) (string, error) {
+	cleanRoot := filepath.Clean(root)
+	hash := sha256.New()
+	add := func(rel string, path string) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(hash, "%s\x00%d\x00", rel, len(data))
+		_, err = hash.Write(data)
+		return err
+	}
+	for _, name := range []string{"go.mod", "go.sum"} {
+		if err := add(name, filepath.Join(cleanRoot, name)); err != nil && !(name == "go.sum" && os.IsNotExist(err)) {
+			return "", err
+		}
+	}
+	if err := walkSourceDirs(cleanRoot, func(rel string, path string, _ fs.DirEntry) error {
+		return add(rel, path)
+	}); err != nil {
+		return "", err
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
@@ -114,6 +169,10 @@ func Run(ctx context.Context, root, executable string, args []string, output io.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	lastStamp, err := statStamp(root)
+	if err != nil {
+		return err
+	}
 	current, err := fingerprint(root)
 	if err != nil {
 		return err
@@ -167,11 +226,21 @@ func Run(ctx context.Context, root, executable string, args []string, output io.
 			childDone = nil
 		case <-ticker.C:
 		}
+		debouncePending := seen != attempted
+		stamp, err := statStamp(root)
+		if err != nil {
+			fmt.Fprintf(output, "[开发] 暂未读取到完整源码：%v\n", err)
+			continue
+		}
+		if stamp == lastStamp && !debouncePending {
+			continue
+		}
 		next, err := fingerprint(root)
 		if err != nil {
 			fmt.Fprintf(output, "[开发] 暂未读取到完整源码：%v\n", err)
 			continue
 		}
+		lastStamp = stamp
 		if next != seen {
 			seen = next
 			changedAt = time.Now()
@@ -221,8 +290,7 @@ func Run(ctx context.Context, root, executable string, args []string, output io.
 	}
 }
 
-// restartExitCode 数据库恢复换库的重启请求退出码（跨进程契约，
-// 与 internal/systemx.RestartExitCode、窗口宿主同值）。
+// restartExitCode 重启请求退出码（跨进程契约，与 systemx.RestartExitCode 同值）。
 const restartExitCode = 75
 
 func exitCodeOf(err error) int {

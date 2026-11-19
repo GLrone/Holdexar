@@ -1,9 +1,8 @@
-//go:build windows
-
 package main
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 
@@ -23,14 +22,28 @@ func TestPilotEpicUsesModuleLifecycle(t *testing.T) {
 	if e = store.InitializeFreshDatabase(ctx, db); e != nil {
 		t.Fatal(e)
 	}
-	service := epicfree.New(ctx, db, store.NewWriteGate(db, path), epicfree.Options{})
+	gate := store.NewWriteGate(db, path)
+	service := epicfree.New(ctx, db, gate, epicfree.Options{})
 	defer service.Close(ctx)
+	mux := http.NewServeMux()
+	service.Register(mux)
 	if e = service.SetEnabled(ctx, false); e != nil {
 		t.Fatal(e)
 	}
-	result := pilotEpicFree(&pilot.CallCtx{Ctx: ctx}, service)
-	if result["kind"] != "disabled" {
-		t.Fatalf("disabled module returned %+v", result)
+	for _, key := range []string{"module.humble_choice.enabled", "module.achievements.enabled"} {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, 'false', datetime('now'))
+			 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bridge := pilotToolBridge(db, gate, mux, nil)
+	callCtx := &pilot.CallCtx{Ctx: ctx, DB: db, Mux: mux}
+	for _, tool := range []string{"epic_free", "hb_monthly", "achievements_summary", "sync_achievements"} {
+		result := bridge(callCtx, tool, nil, false)
+		if result["kind"] != "disabled" {
+			t.Fatalf("%s disabled module returned %+v", tool, result)
+		}
 	}
 }
 
@@ -53,7 +66,6 @@ func TestPilotModuleLifecycle(t *testing.T) {
 	if err != nil || !enabled || running {
 		t.Fatalf("initial state=%t/%t err=%v", enabled, running, err)
 	}
-	// 停用：无在飞轮立即收尾；状态翻转并持久。
 	if e = service.SetEnabled(ctx, false); e != nil {
 		t.Fatal(e)
 	}
@@ -61,18 +73,15 @@ func TestPilotModuleLifecycle(t *testing.T) {
 	if err != nil || enabled || running {
 		t.Fatalf("disabled state=%t/%t err=%v", enabled, running, err)
 	}
-	// 发问入口拒新（用户语言拒因）。
 	_, err = service.AskStream(ctx, pilot.AskRequest{Question: "你好"})
 	if err == nil || err.Error() != pilot.ErrModuleDisabled.Error() {
 		t.Fatalf("ask while disabled err=%v", err)
 	}
-	// 新服务实例从库读回停用态（跨重启语义）。
 	reborn := pilot.New(pilot.Deps{DB: db, DataDir: t.TempDir()}, nil)
 	reborn.SetGate(gate)
 	if enabled, _, e = reborn.State(ctx); e != nil || enabled {
 		t.Fatalf("reborn state=%t err=%v", enabled, e)
 	}
-	// 重开恢复。
 	if e = service.SetEnabled(ctx, true); e != nil {
 		t.Fatal(e)
 	}

@@ -1,5 +1,3 @@
-// bills_summary MCP 工具：账单导入记录与消费合计（本地账本只读投影）。
-// 对齐 Python _bills_summary → rows_result("bills", rows)。
 package agent
 
 import (
@@ -8,7 +6,6 @@ import (
 	"holdexar/server-go/internal/bills"
 )
 
-// billsSummary 账单汇总行：k=昵称/源文件/#id，data.spendFen，v=订单数，at=导入时刻。
 func billsSummary(c *CallContext) (*ToolResult, error) {
 	records, err := bills.ListImports(c.Ctx, c.db)
 	if err != nil {

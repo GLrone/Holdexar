@@ -38,15 +38,14 @@ type proxySchedule struct {
 	wake      chan struct{}
 	tick      chan struct{}
 	done      chan struct{}
-	// started 标记 run 已开跑：验收期提前退场时 run 可能从未启动，
-	// 等待方据此直接闭合 done，不死等（见 waitDone）。
+	// started 区分 run 未启动即退场，避免 waitDone 永久阻塞。
 	started  atomic.Bool
 	stopOnce sync.Once
 }
 
 func newProxySchedule(db *sql.DB, gate *store.WriteGate, dataDir, bundleDir string, recorder *jobrun.Recorder, log func(string, ...any)) *proxySchedule {
 	return &proxySchedule{
-		cycle:     proxypool.Cycle{DB: db, Gate: gate, DataDir: dataDir},
+		cycle:     proxypool.Cycle{DB: db, Gate: gate, DataDir: dataDir, Log: log},
 		bundleDir: bundleDir, recorder: recorder, log: log, blocked: netenv.NetworkTakenOver,
 		wake: make(chan struct{}, 1), tick: make(chan struct{}, 1), done: make(chan struct{}),
 	}
@@ -133,10 +132,7 @@ func (p *proxySchedule) afterCrawl() {
 
 func (p *proxySchedule) closeDone() { p.stopOnce.Do(func() { close(p.done) }) }
 
-// maybeRevertToDirect 无可用代理出口时回退默认直连（自动切换的反面对称
-// 动作）。三重护栏：用户显式选过策略不动；只回退依赖代理池的策略
-// （proxy_first/proxy_only）；出口只看稳定事实——未废弃订阅与手动池启用
-// 节点计数，不看节点瞬时存活（体检抖动不该把策略永久打回直连）。
+// maybeRevertToDirect 无未废弃订阅与启用节点时回退 direct_only（显式选择、非代理策略不动，不看瞬时体检）。
 func maybeRevertToDirect(ctx context.Context, db *sql.DB, gate *store.WriteGate, bus *events.Bus, log func(string, ...any)) bool {
 	switched := false
 	err := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
@@ -182,7 +178,6 @@ func maybeRevertToDirect(ctx context.Context, db *sql.DB, gate *store.WriteGate,
 	return switched
 }
 
-// waitDone 等待代理周期退出；run 从未开跑（验收期提前退场）时直接闭合 done。
 func (p *proxySchedule) waitDone() {
 	if p.started.CompareAndSwap(false, true) {
 		p.closeDone()
@@ -269,8 +264,6 @@ func (p *proxySchedule) kickRepair(ctx context.Context, clock *sched.Scheduler) 
 	}
 }
 
-// updateChannels 更新下载通道表（对齐 clash_manager._download_attempts 的
-// 出口链：内核运行中走其混合端口，本地备用混合口探活后加入，直连垫底）。
 func updateChannels(schedule *proxySchedule) func() []updater.Channel {
 	return func() []updater.Channel {
 		channels := make([]updater.Channel, 0, 3)
@@ -301,8 +294,6 @@ func updateChannels(schedule *proxySchedule) func() []updater.Channel {
 	}
 }
 
-// subscriptionKernelProxy 订阅内核混合口借道通道（对齐 Python
-// default_kernel_proxy：入口没在听不交假通道；仅作订阅获取第二通道）。
 func subscriptionKernelProxy(kernel *clashkernel.Runtime) func(ctx context.Context) string {
 	return func(ctx context.Context) string {
 		status := kernel.Status()

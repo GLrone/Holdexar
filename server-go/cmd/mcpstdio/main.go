@@ -1,10 +1,4 @@
-// mcpstdio：MCP stdio 桥——把本机正式实例的 MCP 端点转发到 stdio，
-// 供本机开发 Agent 消费。子进程只做协议转发：不初始化数据库 / 调度器 /
-// 代理池，业务执行全部在正式实例进程内，不产生第二写者。
-//
-// 准入令牌从数据目录 mcp-token 读取（数据目录解析与主程序同一规则，
-// 尊重 HOLDEXAR_DATA_DIR）。可选环境变量 HOLDEXAR_MCP_URL 覆盖上游端点
-// （默认 http://127.0.0.1:28765/api/v1/mcp）。
+// mcpstdio：把本机正式实例的 MCP HTTP 端点转发到 stdio（无状态协议桥，不持第二写者）。
 package main
 
 import (
@@ -43,7 +37,6 @@ func run() error {
 		return err
 	}
 
-	// 出口忽略环境代理（Python trust_env=False 同语义）；重定向默认跟随。
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	base.Proxy = nil
 	httpClient := &http.Client{Transport: &tokenTransport{token: token, base: base}}
@@ -64,8 +57,6 @@ func run() error {
 		return fmt.Errorf("MCP 工具清单获取失败：%v", err)
 	}
 
-	// 启动时快照上游工具表：清单内工具逐一注册转发；清单外名称经 middleware
-	// 同样转发（纯协议桥不自带语义，与现网桥的动态转发同径）。
 	forward := mcp.NewServer(&mcp.Implementation{Name: "holdexar-stdio", Version: config.Version()}, nil)
 	callUpstream := func(ctx context.Context, name string, args json.RawMessage) (*mcp.CallToolResult, error) {
 		return session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
@@ -93,7 +84,6 @@ func run() error {
 	return forward.Run(ctx, &mcp.StdioTransport{})
 }
 
-// loadToken 从数据目录读准入令牌；空令牌按未启用 MCP 报错退出。
 func loadToken() (string, error) {
 	dataDir, err := config.ResolveDataDir()
 	if err != nil {
@@ -110,7 +100,6 @@ func loadToken() (string, error) {
 	return token, nil
 }
 
-// tokenTransport 每跳注入准入令牌头。
 type tokenTransport struct {
 	token string
 	base  http.RoundTripper

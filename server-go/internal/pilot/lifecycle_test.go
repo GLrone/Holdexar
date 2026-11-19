@@ -1,5 +1,3 @@
-//go:build windows
-
 package pilot
 
 import (
@@ -25,7 +23,6 @@ func TestSetEnabledWaitsForInflightTurns(t *testing.T) {
 	service := New(Deps{DB: db, DataDir: t.TempDir()}, nil)
 	service.SetGate(store.NewWriteGate(db, path))
 
-	// 模拟一轮在飞问答（同包登记真实在飞轮）。
 	accepted, _ := service.acquireTurn("s1")
 	if !accepted {
 		t.Fatal("turn not accepted")
@@ -33,13 +30,11 @@ func TestSetEnabledWaitsForInflightTurns(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- service.SetEnabled(ctx, false) }()
 
-	// 在飞未收尾：停用调用必须阻塞（300ms 窗口内不返回）。
 	select {
 	case err := <-done:
 		t.Fatalf("SetEnabled returned before inflight finished: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
-	// 在飞期间状态如实反映 running。
 	if _, running, _ := service.State(ctx); !running {
 		t.Fatal("state.running must be true while turn in flight")
 	}
@@ -52,7 +47,6 @@ func TestSetEnabledWaitsForInflightTurns(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("SetEnabled did not finish after inflight release")
 	}
-	// 收尾后停用生效，发问入口拒绝。
 	if enabled, running, _ := service.State(ctx); enabled || running {
 		t.Fatalf("state after disable=%t/%t", enabled, running)
 	}

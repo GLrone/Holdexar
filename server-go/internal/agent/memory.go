@@ -1,7 +1,3 @@
-//go:build windows
-
-// memory.go 用户长期画像偏好账本（agent_memories）：查询/写入/画像装配/
-// 从文本启发式提取。语义对齐 agent/memory.py。
 package agent
 
 import (
@@ -37,15 +33,12 @@ ON CONFLICT(category,"key") DO UPDATE SET
 	source=CASE WHEN excluded.source!='' THEN excluded.source ELSE agent_memories.source END,
 	updated_at=excluded.updated_at`
 
-// UpsertMemory 写入或更新记忆项（category+key 唯一确定一行）。gate 非空时
-// 写路径经写闸交互优先级排队（对齐 Python write_session(INTERACTIVE,
-// "agent_memory")）；nil 兜底直写（无闸装配的调用面）。
+// UpsertMemory 写入长期记忆（category+key 唯一）；gate 非空走写闸交互优先级，否则直写。
 func UpsertMemory(ctx context.Context, db *sql.DB, gate *store.WriteGate, category, key string,
 	value any, confidence float64, source string) (map[string]any, error) {
 	if key == "" {
 		return nil, fmt.Errorf("memory key required")
 	}
-	// Python val_dict = value if isinstance(value, dict) else {"val": value}
 	wrapped := value
 	if _, ok := value.(map[string]any); !ok {
 		wrapped = map[string]any{"val": value}
@@ -92,7 +85,6 @@ func memoryRow(ctx context.Context, db *sql.DB, category, key string) (map[strin
 	}, nil
 }
 
-// ListMemories 记忆清单（按 category 与 key 排序）。
 func ListMemories(ctx context.Context, db *sql.DB) ([]map[string]any, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT id, category, "key", value, confidence, COALESCE(source,''), created_at, updated_at
@@ -120,6 +112,85 @@ FROM agent_memories ORDER BY category, "key"`)
 	return out, rows.Err()
 }
 
+func ListMemoriesByCategory(ctx context.Context, db *sql.DB, category string) ([]map[string]any, error) {
+	if strings.TrimSpace(category) == "" {
+		return ListMemories(ctx, db)
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT id, category, "key", value, confidence, COALESCE(source,''), created_at, updated_at
+FROM agent_memories WHERE category=? ORDER BY category, "key"`, category)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, cat, key, value string
+		var confidence float64
+		var source, createdAt, updatedAt sql.NullString
+		if err := rows.Scan(&id, &cat, &key, &value, &confidence, &source, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		var parsed any
+		_ = json.Unmarshal([]byte(value), &parsed)
+		out = append(out, map[string]any{
+			"id": id, "category": cat, "key": key, "value": parsed,
+			"confidence": confidence, "source": source.String,
+			"created_at": createdAt.String, "updated_at": updatedAt.String,
+		})
+	}
+	return out, rows.Err()
+}
+
+func DeleteMemory(ctx context.Context, db *sql.DB, gate *store.WriteGate, category, key string) (bool, error) {
+	var deleted int64
+	run := func(exec func(string, ...any) (sql.Result, error)) error {
+		res, err := exec(`DELETE FROM agent_memories WHERE category=? AND "key"=?`, category, key)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		deleted = n
+		return err
+	}
+	var err error
+	if gate != nil {
+		err = gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			return run(func(q string, args ...any) (sql.Result, error) { return conn.ExecContext(ctx, q, args...) })
+		})
+	} else {
+		err = run(func(q string, args ...any) (sql.Result, error) { return db.ExecContext(ctx, q, args...) })
+	}
+	return deleted > 0, err
+}
+
+func ClearMemories(ctx context.Context, db *sql.DB, gate *store.WriteGate, category string) (int64, error) {
+	var count int64
+	run := func(exec func(string, ...any) (sql.Result, error)) error {
+		var res sql.Result
+		var err error
+		if strings.TrimSpace(category) != "" {
+			res, err = exec(`DELETE FROM agent_memories WHERE category=?`, category)
+		} else {
+			res, err = exec(`DELETE FROM agent_memories`)
+		}
+		if err != nil {
+			return err
+		}
+		count, err = res.RowsAffected()
+		return err
+	}
+	var err error
+	if gate != nil {
+		err = gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
+			return run(func(q string, args ...any) (sql.Result, error) { return conn.ExecContext(ctx, q, args...) })
+		})
+	} else {
+		err = run(func(q string, args ...any) (sql.Result, error) { return db.ExecContext(ctx, q, args...) })
+	}
+	return count, err
+}
+
 var profileLabels = map[string]string{
 	"region_preference": "常用关注区服",
 	"genre_preference":  "游戏类型与标签偏好",
@@ -127,7 +198,6 @@ var profileLabels = map[string]string{
 	"user_profile":      "用户习惯",
 }
 
-// BuildProfileContext 高置信度偏好 → 系统提示背景文本（无偏好返回空）。
 func BuildProfileContext(ctx context.Context, db *sql.DB) string {
 	memories, err := ListMemories(ctx, db)
 	if err != nil || len(memories) == 0 {
@@ -161,7 +231,6 @@ func BuildProfileContext(ctx context.Context, db *sql.DB) string {
 	return strings.Join(lines, "\n")
 }
 
-// preferenceValueText 偏好值 → 平文本（与 Python 的 value 展开同语义）。
 func preferenceValueText(value any) string {
 	switch v := value.(type) {
 	case map[string]any:
@@ -203,14 +272,11 @@ var genreKeywords = []string{
 
 var budgetRe = regexp.MustCompile(`(?:预算|价格)(?:不超过|低于|在)\s*(\d+)\s*(?:块|元)?`)
 
-// ExtractPreferencesFromText 从文本启发式提取显式偏好并写入记忆账本。
-// gate 语义同 UpsertMemory（nil 兜底直写）。
 func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, gate *store.WriteGate, text, source string) []map[string]any {
 	if text == "" {
 		return nil
 	}
 	var extracted []map[string]any
-	// 区服偏好：中文区名或区码词面
 	seen := map[string]bool{}
 	var regions []string
 	for zh, code := range regionNameMap {
@@ -227,7 +293,6 @@ func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, gate *store.Wri
 			extracted = append(extracted, rec)
 		}
 	}
-	// 类型偏好
 	var genres []string
 	for _, g := range genreKeywords {
 		if strings.Contains(text, g) {
@@ -240,7 +305,6 @@ func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, gate *store.Wri
 			extracted = append(extracted, rec)
 		}
 	}
-	// 史低 / 预算偏好
 	if strings.Contains(text, "史低") {
 		if rec, err := UpsertMemory(ctx, db, gate, "budget_habit", "deal_timing",
 			"史低优先", 0.8, source); err == nil {
@@ -257,7 +321,6 @@ func ExtractPreferencesFromText(ctx context.Context, db *sql.DB, gate *store.Wri
 	return extracted
 }
 
-// regionCodeMatch 区码作为独立词出现（Python \b{code}\b 的 ASCII 词界等价）。
 func regionCodeMatch(text, code string) bool {
 	for _, field := range strings.FieldsFunc(text, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_')

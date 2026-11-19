@@ -1,68 +1,58 @@
 package main
 
-// 局域网访问模式启动接线（Python _init_lan_access / ensure_lan_password 等价）：
-// 开关与密码事实源在设置 KV 与环境变量，这里只做装配。
-
 import (
 	"context"
 	"database/sql"
 	"time"
 
 	"holdexar/server-go/internal/access"
-	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/settings"
 	"holdexar/server-go/internal/store"
 )
 
-const (
-	lanEnabledKey  = "access.lan_enabled"
-	lanPasswordKey = "access.lan_password"
-)
-
-// ensureLANPassword 访问密码解析：环境变量优先，其次设置密文 KV；都没有则
-// 生成并落库（下次解锁即用此密码）。
-func ensureLANPassword(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string) (string, error) {
+// resolveLANPasswordVerifier 按用户哈希 KV → 环境口令 → 旧密文一次性迁移解析；用户口令优先，无凭据返回空串。
+func resolveLANPasswordVerifier(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string) (string, error) {
+	phc, err := settings.ReadValue(ctx, db, settings.KeyLANPasswordHash)
+	if err != nil {
+		return "", err
+	}
+	if phc != "" {
+		return phc, nil
+	}
 	if env := access.EnvPassword(); env != "" {
-		return env, nil
+		return access.HashPassword(env), nil
 	}
-	stored, err := settings.ReadSecret(ctx, db, dataDir, lanPasswordKey)
+	legacy, err := settings.ReadSecret(ctx, db, dataDir, settings.KeyLANPassword)
 	if err != nil {
 		return "", err
 	}
-	if stored != "" {
-		return stored, nil
+	if legacy == "" {
+		return "", nil
 	}
-	generated := access.GeneratePassword()
-	sealed, err := secretbox.EncryptSecretIn(dataDir, generated, secretbox.SecretPurpose(lanPasswordKey))
-	if err != nil {
-		return "", err
-	}
+	migrated := access.HashPassword(legacy)
 	err = gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
-		return settings.WriteValue(ctx, conn, lanPasswordKey, sealed)
+		if err := settings.WriteValue(ctx, conn, settings.KeyLANPasswordHash, migrated); err != nil {
+			return err
+		}
+		return settings.DeleteValue(ctx, conn, settings.KeyLANPassword)
 	})
 	if err != nil {
 		return "", err
 	}
-	return generated, nil
+	return migrated, nil
 }
 
-// initLANAccess 局域网访问模式初始化：读设置开关并同步 Host 闸白名单。
-// 环境变量 HOLDEXAR_ACCESS=lan 强制开启（先于设置页存在的 NAS 无窗口场景）；
-// 任何失败按关闭处理（fail-closed），不影响正常启动。
+// initLANAccess 初始化局域网访问开关并刷新 Host 白名单（HOLDEXAR_ACCESS=lan 强制开启；环境口令仅内存哈希不落库）；失败按关闭处理。
 func initLANAccess(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataDir string, log, logFail func(string, ...any)) {
 	var initErr error
-	kvEnabled, err := settings.ReadBool(ctx, db, lanEnabledKey, false)
+	kvEnabled, err := settings.ReadBool(ctx, db, settings.KeyLANEnabled, false)
 	if err != nil {
 		initErr = err
 	} else {
 		access.SetLANEnabled(kvEnabled)
 		access.RefreshExtraHosts()
 		if access.LANEnabled() {
-			if _, err := ensureLANPassword(ctx, db, gate, dataDir); err != nil {
-				initErr = err
-			} else {
-				log("局域网访问模式已开启，本机地址已加入访问白名单")
-			}
+			log("局域网访问模式已开启，本机地址已加入访问白名单")
 		}
 	}
 	if initErr != nil {
@@ -72,11 +62,10 @@ func initLANAccess(ctx context.Context, db *sql.DB, gate *store.WriteGate, dataD
 	}
 }
 
-// unlockPasswordResolver 解锁端点的密码解析（带短超时，隔离请求生命周期）。
-func unlockPasswordResolver(db *sql.DB, gate *store.WriteGate, dataDir string) func() (string, error) {
+func unlockVerifierResolver(db *sql.DB, gate *store.WriteGate, dataDir string) func() (string, error) {
 	return func() (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return ensureLANPassword(ctx, db, gate, dataDir)
+		return resolveLANPasswordVerifier(ctx, db, gate, dataDir)
 	}
 }

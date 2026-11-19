@@ -1,8 +1,3 @@
-//go:build windows
-
-// routes.go 领航员域 27 端点装配（对齐 app/domains/pilot/router.py）：
-// providers CRUD / config GET+PUT / detect / test / sessions 全生命周期 /
-// attachments / flywheel / proposal confirm / tool run / ask / ask-stream(SSE)。
 package pilot
 
 import (
@@ -14,9 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/httpx"
 )
 
-// Register 领航员域路由装配。
 func Register(mux *http.ServeMux, service *Service) {
 	writeJSON := func(w http.ResponseWriter, status int, payload any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -93,10 +89,30 @@ func Register(mux *http.ServeMux, service *Service) {
 			return
 		}
 		apiKey := req.APIKey
-		if apiKey == "" && req.ProviderID != "" {
-			apiKey, _ = service.kvGetSecret(providerKeyName(req.ProviderID))
-		} else if apiKey == "" {
-			apiKey, _ = service.kvGetSecret(providerKeyName(service.LoadConfig().Active))
+		if apiKey == "" {
+			ownerBase := ""
+			storedKey := ""
+			if req.ProviderID != "" {
+				for _, p := range service.LoadProviders() {
+					if p.ID == req.ProviderID {
+						ownerBase = p.BaseURL
+						break
+					}
+				}
+				storedKey = service.ProviderKey(req.ProviderID)
+			} else {
+				cfg := service.LoadConfig()
+				ownerBase = cfg.BaseURL
+				storedKey = service.ProviderKey(cfg.Active)
+			}
+			// 已存密钥同源闸：实际检测地址与配置地址同源才携带（防跨源泄露 API Key）
+			if storedKey != "" {
+				if strings.TrimSpace(req.BaseURL) == "" || !sameOrigin(req.BaseURL, ownerBase) {
+					writeErr(w, http.StatusUnprocessableEntity, keyScopeHint)
+					return
+				}
+				apiKey = storedKey
+			}
 		}
 		writeJSON(w, http.StatusOK, DetectProvider(req.BaseURL, apiKey, req.Protocol))
 	})
@@ -127,7 +143,15 @@ func Register(mux *http.ServeMux, service *Service) {
 		if req.APIKey != nil {
 			apiKey = *req.APIKey
 		} else {
-			apiKey, _ = service.kvGetSecret(providerKeyName(cfg.Active))
+			storedKey := service.ProviderKey(cfg.Active)
+			// 已存密钥同源闸：实际请求地址与配置地址同源才携带（密钥只去配置过的源）
+			if storedKey != "" {
+				if !sameOrigin(EffectiveBaseURL(protocol, baseURL), EffectiveBaseURL(protocol, cfg.BaseURL)) {
+					writeErr(w, http.StatusUnprocessableEntity, keyScopeHint)
+					return
+				}
+				apiKey = storedKey
+			}
 		}
 		if baseURL == "" || model == "" {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "latency_ms": 0,
@@ -147,11 +171,15 @@ func Register(mux *http.ServeMux, service *Service) {
 			return
 		}
 		var reply strings.Builder
+		var usageIn, usageOut int
 		for event := range events {
-			if event.Kind == "answer" {
+			switch event.Kind {
+			case "answer":
 				reply.WriteString(event.Text)
-			}
-			if event.Kind == "error" {
+			case "usage":
+				usageIn += event.UsageIn
+				usageOut += event.UsageOut
+			case "error":
 				detail := event.Text
 				lowered := strings.ToLower(detail)
 				reason := "server_error"
@@ -166,6 +194,9 @@ func Register(mux *http.ServeMux, service *Service) {
 					"model":      model, "reason": reason, "detail": clip(detail, 200)})
 				return
 			}
+		}
+		if usageIn != 0 || usageOut != 0 {
+			service.AddUsage(r.Context(), usageIn, usageOut)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true,
 			"latency_ms": int(time.Since(started).Milliseconds()),
@@ -389,25 +420,7 @@ func Register(mux *http.ServeMux, service *Service) {
 		if !decode(w, r, &payload) {
 			return
 		}
-		state := service.GetStore().Load(payload.SessionID)
-		if state == nil {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reason": "no_session"})
-			return
-		}
-		prop := state.PendingProposal
-		if prop == nil || stringOf(prop["pid"]) != payload.PID {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "reason": "proposal_gone"})
-			return
-		}
-		confirmState := "rejected"
-		if payload.Approve {
-			confirmState = "confirmed"
-		}
-		_ = service.GetStore().AppendProposal(payload.SessionID, map[string]any{
-			"pid": payload.PID, "action": prop["action"], "items": prop["items"],
-			"args": prop["args"], "state": confirmState})
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": confirmState,
-			"action": prop["action"]})
+		writeJSON(w, http.StatusOK, service.ConfirmProposal(r.Context(), payload.SessionID, payload.PID, payload.Approve))
 	})
 	mux.HandleFunc("POST /api/v1/pilot/tool", func(w http.ResponseWriter, r *http.Request) {
 		var payload struct {
@@ -502,6 +515,10 @@ func Register(mux *http.ServeMux, service *Service) {
 	})
 	mux.HandleFunc("POST /api/v1/pilot/sessions/{session_id}/compact", func(w http.ResponseWriter, r *http.Request) {
 		sid := r.PathValue("session_id")
+		if service.SessionBusy(sid) {
+			writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "reason": "busy", "detail": "session is busy"})
+			return
+		}
 		state := service.GetStore().Load(sid)
 		if state == nil {
 			writeErr(w, http.StatusNotFound, "session not found")
@@ -551,18 +568,8 @@ func Register(mux *http.ServeMux, service *Service) {
 	})
 }
 
-// valErr 校验错误项（形状对齐 FastAPI/Pydantic 实测锚点）。
-type valErr struct {
-	Type  string `json:"type"`
-	Loc   []any  `json:"loc"`
-	Msg   string `json:"msg"`
-	Input any    `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type valErr = httpx.ValErr
 
-// parseKeepTurns keep_turns 校验（Pydantic int 宽松强转 + ge=0 le=999；
-// venv 实测锚点：缺值 missing、串/浮点按 int_parsing/int_from_float、
-// 越界 greater_than_equal/less_than_equal）。
 func parseKeepTurns(w http.ResponseWriter, r *http.Request) (int, *valErr) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
@@ -663,7 +670,7 @@ func eventMap(event StreamEvent) map[string]any {
 			out[key] = value
 		}
 	}
-	if event.Card != nil {
+	if event.Type == "card" || event.Card != nil {
 		out["card"] = event.Card
 	}
 	if event.Payload != nil {
@@ -677,7 +684,6 @@ func eventMap(event StreamEvent) map[string]any {
 	return out
 }
 
-// sessionStats 会话级统计投影（对全部轮次现算的只读折叠）。
 func sessionStats(state *SessionState) map[string]any {
 	steps, elapsedMS, ttftMS, ttftN, decodeMS, decodeOut, usageIn, usageOut := 0, 0, 0, 0, 0, 0, 0, 0
 	var cacheRead, cacheWrite, cacheBase *int
@@ -709,7 +715,6 @@ func anySlice(value any) []any {
 	case []any:
 		return list
 	case []map[string]any:
-		// 工具桥内联结果与 HTTP 投影并存：统一视图，避免决策层把行集当空集
 		out := make([]any, len(list))
 		for i, item := range list {
 			out[i] = item
@@ -738,7 +743,6 @@ func minInt(a, b int) int {
 	return b
 }
 
-// DetectProvider 网址+密钥 → 协议/服务商/模型清单/密钥有效性（host 指纹+端点探测）。
 func DetectProvider(baseURL, apiKey, protocolHint string) map[string]any {
 	knownHosts := []struct {
 		hostKey  string
@@ -783,6 +787,7 @@ func DetectProvider(baseURL, apiKey, protocolHint string) map[string]any {
 		listURL = strings.TrimRight(base, "/") + "/api/tags"
 	}
 	client := HttpClient(base)
+	defer client.CloseIdleConnections()
 	request, err := http.NewRequest(http.MethodGet, listURL, nil)
 	if err != nil {
 		return map[string]any{"protocol": protocol, "vendor": vendor, "models": suggested,
@@ -838,3 +843,5 @@ func sortStrings(list []string) {
 		}
 	}
 }
+
+const keyScopeHint = "该地址与已配置服务不一致，请填写该服务的 API 密钥后再试"

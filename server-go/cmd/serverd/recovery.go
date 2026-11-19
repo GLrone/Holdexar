@@ -1,27 +1,25 @@
 package main
 
-// 忘记密码找回：锁定态下用 Steam 官方登录证明身份。
-//
-// 信任锚 = Steam 官方认证产生的登录身份 ∈ 数据库绑定账号集合（登录流程在
-// BindCookies 之前经一次性守卫校验，未绑定账号不落库不建登录态）。通过后
-// 签发本机会话，用户随后在设置页修改局域网访问密码。
-//
-// 攻击面控制：四个端点全部公开可达（找回发生在锁定态、无会话），共用
-// 局域网解锁限速器——同一条口令防线，任一通道穷举都触发全局锁定；Steam
-// 凭据中转面被 busy 互斥 + 完成态校验压缩（每次只有一条登录流）。
+// 忘记密码找回（5 个端点均在 access.PublicPaths）：登录启动与完成时均核验 Steam 账号已绑定后再签发会话。
+// 攻击面控制：/login/start、/login/code 与 /complete 校对端维度解锁限速，/cancel 限 1s 冷却。
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/account"
 )
 
-var lastRecoveryCancel = time.Now().Add(-time.Second)
+var (
+	recoveryCancelMu   sync.Mutex
+	lastRecoveryCancel = time.Now().Add(-time.Second)
+)
 
 func registerRecovery(mux *http.ServeMux, accountService *account.Service, db *sql.DB, gate *access.Gate, logLine func(string, ...any)) {
 	boundSetCheck := func(steamID string) error {
@@ -35,14 +33,22 @@ func registerRecovery(mux *http.ServeMux, accountService *account.Service, db *s
 		return nil
 	}
 	write := func(w http.ResponseWriter, payload any) {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(payload); err != nil {
+			http.Error(w, "响应序列化失败", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(payload)
+		_, _ = w.Write(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}))
 	}
 
 	mux.HandleFunc("POST /api/v1/session/recovery/login/start", func(w http.ResponseWriter, r *http.Request) {
-		if remaining := access.UnlockLockedSeconds(); remaining > 0 {
-			write(w, map[string]any{"ok": false, "error": fmt.Sprintf("尝试次数过多，%.0f 秒后可重试", remaining)})
+		peer := access.PeerKey(r.RemoteAddr)
+		if remaining := access.UnlockLockedSeconds(peer); remaining > 0 {
+			write(w, map[string]any{"ok": false, "error": fmt.Sprintf("尝试次数过多，%d 秒后可重试", int(remaining)+1)})
 			return
 		}
 		var body struct {
@@ -50,31 +56,46 @@ func registerRecovery(mux *http.ServeMux, accountService *account.Service, db *s
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&body); err != nil {
+			access.RecordUnlockFailureFor(peer)
 			write(w, map[string]any{"ok": false, "error": "请求体无法读取"})
 			return
 		}
-		// 守卫在登录成功、绑定落库之前校验账号归属（一次性）
-		accountService.SetRecoveryGuard(boundSetCheck)
-		res, err := accountService.StartLogin(r.Context(), body.Account, body.Password)
+		res, err := accountService.StartRecoveryLogin(r.Context(), body.Account, body.Password, boundSetCheck, func() {
+			access.RecordUnlockFailureFor(peer)
+		})
 		if err != nil {
+			access.RecordUnlockFailureFor(peer)
 			write(w, map[string]any{"ok": false, "error": "找回登录启动失败"})
 			return
+		}
+		if res["ok"] == false && res["busy"] != true {
+			access.RecordUnlockFailureFor(peer)
 		}
 		write(w, res)
 	})
 
 	mux.HandleFunc("POST /api/v1/session/recovery/login/code", func(w http.ResponseWriter, r *http.Request) {
+		peer := access.PeerKey(r.RemoteAddr)
+		if remaining := access.UnlockLockedSeconds(peer); remaining > 0 {
+			write(w, map[string]any{"ok": false, "error": fmt.Sprintf("尝试次数过多，%d 秒后可重试", int(remaining)+1)})
+			return
+		}
 		var body struct {
 			Code string `json:"code"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&body); err != nil {
+			access.RecordUnlockFailureFor(peer)
 			write(w, map[string]any{"ok": false, "error": "请求体无法读取"})
 			return
 		}
-		res, err := accountService.SubmitLoginCode(r.Context(), body.Code)
+		res, err := accountService.SubmitRecoveryLoginCode(r.Context(), body.Code)
 		if err != nil {
+			access.RecordUnlockFailureFor(peer)
 			write(w, map[string]any{"ok": false, "error": "找回验证码提交失败"})
 			return
+		}
+		if res["ok"] == false {
+			access.RecordUnlockFailureFor(peer)
 		}
 		write(w, res)
 	})
@@ -84,31 +105,37 @@ func registerRecovery(mux *http.ServeMux, accountService *account.Service, db *s
 	})
 
 	mux.HandleFunc("POST /api/v1/session/recovery/cancel", func(w http.ResponseWriter, r *http.Request) {
-		// 冷却 1 秒：免认证端点不可被无成本高频重置（打断进行中的找回）
+		recoveryCancelMu.Lock()
 		if time.Since(lastRecoveryCancel) < time.Second {
+			recoveryCancelMu.Unlock()
 			write(w, map[string]any{"ok": true})
 			return
 		}
 		lastRecoveryCancel = time.Now()
-		accountService.CancelLogin()
-		// 回复最小化：状态机详情（验证码提示等）不进免认证响应——
-		// 前端取消后经 status 轮询取状态即可
+		recoveryCancelMu.Unlock()
+		accountService.CancelRecoveryLogin()
 		write(w, map[string]any{"ok": true})
 	})
 
 	mux.HandleFunc("POST /api/v1/session/recovery/complete", func(w http.ResponseWriter, r *http.Request) {
-		if remaining := access.UnlockLockedSeconds(); remaining > 0 {
-			write(w, map[string]any{"ok": false, "error": fmt.Sprintf("尝试次数过多，%.0f 秒后可重试", remaining)})
+		peer := access.PeerKey(r.RemoteAddr)
+		if remaining := access.UnlockLockedSeconds(peer); remaining > 0 {
+			write(w, map[string]any{"ok": false, "error": fmt.Sprintf("尝试次数过多，%d 秒后可重试", int(remaining)+1)})
 			return
 		}
-		steamID, done := accountService.RecoverySteamID()
+		steamID, done := accountService.ConsumeRecoverySteamID()
 		if !done {
+			access.RecordUnlockFailureFor(peer)
 			write(w, map[string]any{"ok": false, "error": "Steam 登录流程未完成"})
 			return
 		}
-		_ = steamID // 身份经守卫核验（绑定集合成员）；会话签发不再回显身份
+		if err := boundSetCheck(steamID); err != nil {
+			access.RecordUnlockFailureFor(peer)
+			write(w, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 		gate.Issue(w)
-		access.RecordUnlockSuccess()
+		access.RecordUnlockSuccessFor(peer)
 		logLine("找回完成：Steam 登录身份通过绑定核验，已签发会话")
 		write(w, map[string]any{"ok": true})
 	})

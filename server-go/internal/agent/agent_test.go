@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/notifications"
@@ -162,7 +164,6 @@ CREATE TABLE monitor_exclusions (
 );
 `
 
-// newTestSurface 建真实测试库 + 已迁读路径挂载 + MCP 面（启用态）。
 func newTestSurface(t *testing.T, flag bool) (*http.ServeMux, *sql.DB, *access.Gate, string) {
 	t.Helper()
 	dataDir := t.TempDir()
@@ -223,7 +224,6 @@ func seedTools(t *testing.T, db *sql.DB) {
 	ins(`INSERT INTO monitor_sources (target_type, target_id, source, active) VALUES ('game', 900001, 'manual', 1)`)
 }
 
-// executeTool 测试快捷入口：注册表取工具 → 执行 → 返回解码后 payload。
 func executeTool(t *testing.T, mux *http.ServeMux, db *sql.DB, name string, argsJSON string) map[string]any {
 	t.Helper()
 	spec := buildRegistryOrDie().get(name)
@@ -262,8 +262,6 @@ func buildRegistryOrDie() *ToolRegistry {
 	return r
 }
 
-// TestRegistryFailClosed fail-closed 投影：只含已实现只读工具，无写组、
-// 无会话 / UI 绑定面。
 func TestRegistryFailClosed(t *testing.T) {
 	r := buildRegistryOrDie()
 	excluded := map[string]bool{
@@ -276,18 +274,14 @@ func TestRegistryFailClosed(t *testing.T) {
 		"linked_bundles": true, "rates_history": true, "regions_config": true,
 		"notifications_status": true, "notification_history": true,
 		"list_accounts": true, "list_wishlist": true, "list_owned": true,
-		"bills_summary": true,
+		"bills_summary":        true,
 		"get_user_preferences": true, "set_user_preference": true,
 	}
-	// 准入面 66 工具（阶段 6 三批补齐，清单=Python 准入 80 的差额；分批清单
-	// 见 docs/migration/MCP_TOOLS_SPEC.md §四）
 	for _, name := range []string{
-		// 批一：目录/价格/捆绑/优惠/汇率/日历（16）
 		"top_games", "get_price_briefing", "get_region_prices", "compare_games",
 		"diagnose_price", "game_price_history", "game_versions", "bundle_detail",
 		"list_bundles", "list_bundle_follows", "rates_overview", "hb_monthly",
 		"epic_free", "steam_free", "price_drops", "calendar_events",
-		// 批二：账户/成就/账单/兑换/同步/会话/元信息（25）
 		"account_status", "list_follows", "list_alerts", "alert_history",
 		"audit_follows_workflow", "achievements_summary", "level_profile",
 		"challenges_overview", "achievements_near_completion", "achievements_game_detail",
@@ -295,7 +289,6 @@ func TestRegistryFailClosed(t *testing.T) {
 		"sync_wallet", "sync_library", "sync_achievements", "sync_bills",
 		"sync_family", "refresh_rates", "list_sessions", "read_session",
 		"agent_runs_list", "agent_run_events", "list_tools",
-		// 批三：爬取运维/代理面/诊断/网络/运行时（25）
 		"crawl_active", "price_freshness", "recent_cycles", "price_events",
 		"crawl_stop", "recent_job_failures", "write_gate_status", "read_logs",
 		"system_diagnostics", "subscriptions_list", "subscription_sync",
@@ -335,7 +328,6 @@ func TestRegistryFailClosed(t *testing.T) {
 	}
 }
 
-// TestRegistryDuplicateError 重名即错。
 func TestRegistryDuplicateError(t *testing.T) {
 	r := newRegistry()
 	if err := r.register(&ToolSpec{Name: "x", Group: GroupRead}); err != nil {
@@ -348,11 +340,8 @@ func TestRegistryDuplicateError(t *testing.T) {
 	}
 }
 
-// TestGateThreeStates 前缀闸三态：未启用 404；启用后无令牌 / 错令牌 401，
-// 对令牌 0 放行；令牌文件持久化（二次装配复用同一令牌）。
 func TestGateThreeStates(t *testing.T) {
 	_, db, gate, dataDir := newTestSurface(t, true)
-	// 未启用面：独立数据目录装配（空设置 + 无旗标 + 无 env）。
 	t.Setenv("HOLDEXAR_MCP", "")
 	mux2 := http.NewServeMux()
 	gate2 := access.New()
@@ -362,6 +351,7 @@ func TestGateThreeStates(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, MountPath, nil)
 	req.Host = "127.0.0.1:28765"
+	req.RemoteAddr = "127.0.0.1:40000"
 	if got := gateCode(gate2, req); got != http.StatusNotFound {
 		t.Fatalf("未启用应 404: got %d", got)
 	}
@@ -385,7 +375,6 @@ func TestGateThreeStates(t *testing.T) {
 		t.Fatalf("对令牌应放行: got %d", got)
 	}
 
-	// 二次装配（模拟重启）：令牌跨进程稳定。
 	mux3 := http.NewServeMux()
 	gate3 := access.New()
 	if err := Register(mux3, db, gate3, Options{DataDir: dataDir, EnabledByFlag: true}); err != nil {
@@ -396,7 +385,6 @@ func TestGateThreeStates(t *testing.T) {
 		t.Fatalf("重启后令牌应仍有效: got %d", got)
 	}
 
-	// 未启用时令牌文件被清除（同一 mux 重复注册是装配错误，换新 mux）。
 	mux4 := http.NewServeMux()
 	gate4 := access.New()
 	if err := Register(mux4, db, gate4, Options{DataDir: dataDir}); err != nil {
@@ -407,7 +395,6 @@ func TestGateThreeStates(t *testing.T) {
 	}
 }
 
-// gateCode 经完整中间件链取闸判定：放行回 0，拦截回响应状态码。
 func gateCode(g *access.Gate, r *http.Request) int {
 	reached := false
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) { reached = true })
@@ -419,12 +406,10 @@ func gateCode(g *access.Gate, r *http.Request) int {
 	return rec.Code
 }
 
-// stubToolSpec 执行器测试用最小工具。
 func stubToolSpec(name string, timeout float64, fn HandlerFunc) *ToolSpec {
 	return &ToolSpec{Name: name, Group: GroupRead, Risk: "low", Handler: fn, TimeoutS: timeout}
 }
 
-// TestExecutorTimeout 超时归一化：budget_s 取整档，绝不外抛。
 func TestExecutorTimeout(t *testing.T) {
 	spec := stubToolSpec("slow", 0.05, func(c *CallContext) (*ToolResult, error) {
 		time.Sleep(200 * time.Millisecond)
@@ -439,7 +424,6 @@ func TestExecutorTimeout(t *testing.T) {
 	}
 }
 
-// TestExecutorFailureNormalization 异常 = 结果：error 与 panic 都归一化回灌。
 func TestExecutorFailureNormalization(t *testing.T) {
 	spec := stubToolSpec("boom", 20, func(c *CallContext) (*ToolResult, error) {
 		return nil, errors.New("数据库不可用")
@@ -464,7 +448,6 @@ func TestExecutorFailureNormalization(t *testing.T) {
 	}
 }
 
-// TestExecutorDeny 写工具 + 守卫 → deny（策略面守恒）。
 func TestExecutorDeny(t *testing.T) {
 	spec := &ToolSpec{Name: "w", Group: GroupWrite, Risk: "low", Handler: func(c *CallContext) (*ToolResult, error) {
 		return &ToolResult{Data: newObj()}, nil
@@ -475,7 +458,6 @@ func TestExecutorDeny(t *testing.T) {
 	}
 }
 
-// TestToolHandlersShapes 真实种子库上八工具的形状冒烟（对照验收前的单测防线）。
 func TestToolHandlersShapes(t *testing.T) {
 	mux, db, _, _ := newTestSurface(t, true)
 
@@ -560,7 +542,6 @@ func TestToolHandlersShapes(t *testing.T) {
 	}
 }
 
-// TestToolHandlersMissing detail / bundles 对不存在游戏回 empty（fail-closed 边界）。
 func TestToolHandlersMissing(t *testing.T) {
 	mux, db, _, _ := newTestSurface(t, true)
 	for _, tc := range []struct {
@@ -578,8 +559,6 @@ func TestToolHandlersMissing(t *testing.T) {
 	}
 }
 
-// TestReapplyToggle 设置写 mcp.enabled 后的运行时重应用：开→令牌文件与闸放行，
-// 关→令牌文件清除、前缀闸回 404；env 强制通道优先于设置关闭。
 func TestReapplyToggle(t *testing.T) {
 	t.Setenv("HOLDEXAR_MCP", "")
 	_, db, gate, dataDir := newTestSurface(t, false)
@@ -596,6 +575,7 @@ func TestReapplyToggle(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, MountPath, nil)
 	req.Host = "127.0.0.1:28765"
+	req.RemoteAddr = "127.0.0.1:40000"
 
 	if got := gateCode(gate, req); got != http.StatusNotFound {
 		t.Fatalf("初始关闭应 404: got %d", got)
@@ -630,7 +610,6 @@ func TestReapplyToggle(t *testing.T) {
 		t.Fatalf("关闭后运行态应为未在役")
 	}
 
-	// env 强制通道：设置关闭不生效（Python enabled = env or settings 同径）
 	t.Setenv("HOLDEXAR_MCP", "1")
 	Reapply()
 	if got := gateCode(gate, req); got != http.StatusUnauthorized {
@@ -641,28 +620,157 @@ func TestReapplyToggle(t *testing.T) {
 	}
 }
 
-// validateArgs：required 缺失必须拒执行（G7-C：缺参静默按空执行会把
-// 「没找到」伪装成「查了确实没有」）；未声明键沿用 Python 忽略语义。
-func TestValidateArgsRequiredParams(t *testing.T) {
-	spec := &ToolSpec{
-		Name:       "search_games",
-		Parameters: `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`,
+func registerOne(t *testing.T, spec *ToolSpec) *ToolRegistry {
+	t.Helper()
+	r := newRegistry()
+	if err := r.register(spec); err != nil {
+		t.Fatalf("登记失败: %v", err)
 	}
-	if err := validateArgs(spec, map[string]any{}); err == nil {
-		t.Fatal("缺 required 参数应报错")
+	return r
+}
+
+func TestValidateArgsFullSchema(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec      *ToolSpec
+		args      map[string]any
+		wantPass  bool
+		wantParts []string
+	}{
+		{
+			name:      "缺必填",
+			spec:      &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`},
+			args:      map[string]any{},
+			wantParts: []string{"t 参数校验失败", `missing properties: ["q"]`},
+		},
+		{
+			name:      "类型错误",
+			spec:      &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"appid":{"type":"integer"}},"required":["appid"]}`},
+			args:      map[string]any{"appid": "abc"},
+			wantParts: []string{"/properties/appid", `want "integer"`},
+		},
+		{
+			name:     "json.Number 归一后过 integer 校验",
+			spec:     &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"appid":{"type":"integer"}},"required":["appid"]}`},
+			args:     map[string]any{"appid": json.Number("730")},
+			wantPass: true,
+		},
+		{
+			name:      "enum 违例",
+			spec:      &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"level":{"type":"string","enum":["info","warning","error"]}}}`},
+			args:      map[string]any{"level": "debug"},
+			wantParts: []string{"/properties/level", "enum:"},
+		},
+		{
+			name:      "minimum 违例",
+			spec:      &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"days":{"type":"integer","minimum":1}}}`},
+			args:      map[string]any{"days": 0},
+			wantParts: []string{"/properties/days", "minimum:"},
+		},
+		{
+			name:     "未声明额外键放行",
+			spec:     &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`},
+			args:     map[string]any{"q": "portal", "extra": 1},
+			wantPass: true,
+		},
+		{
+			name:     "合法参数通过",
+			spec:     &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"q":{"type":"string"},"days":{"type":"integer"}},"required":["q"]}`},
+			args:     map[string]any{"q": "portal", "days": 90},
+			wantPass: true,
+		},
+		{
+			name:      "数组元素类型错误",
+			spec:      &ToolSpec{Name: "t", Parameters: `{"type":"object","properties":{"appids":{"type":"array","items":{"type":"integer"}}}}`},
+			args:      map[string]any{"appids": []any{730, "x"}},
+			wantParts: []string{"/properties/appids/items", `want "integer"`},
+		},
+	}
+	for _, tc := range cases {
+		reg := registerOne(t, tc.spec)
+		err := validateArgs(reg, tc.spec, tc.args)
+		if tc.wantPass {
+			if err != nil {
+				t.Errorf("%s: 应放行: %v", tc.name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: 应报错", tc.name)
+			continue
+		}
+		for _, part := range tc.wantParts {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("%s: 报错缺 %q: %v", tc.name, part, err)
+			}
+		}
+	}
+}
+
+func TestValidateArgsUnresolvableFallback(t *testing.T) {
+	// schema 可解析但引用悬空：回退必需键校验，且失败原因留在 registry 供上报。
+	spec := &ToolSpec{Name: "t", Parameters: `{"type":"object","$ref":"#/missing","required":["q"]}`}
+	reg := registerOne(t, spec)
+	if len(reg.schemaFailures()) == 0 {
+		t.Fatal("Resolve 失败应登记")
+	}
+	if err := validateArgs(reg, spec, map[string]any{}); err == nil {
+		t.Fatal("兜底仍应校验 required")
 	} else if !strings.Contains(err.Error(), `缺少必需参数 "q"`) {
-		t.Fatalf("报错文案 = %q", err.Error())
+		t.Fatalf("兜底文案不符: %v", err)
 	}
-	if err := validateArgs(spec, map[string]any{"q": "portal"}); err != nil {
-		t.Fatalf("全参应放行: %v", err)
+	if err := validateArgs(reg, spec, map[string]any{"q": "portal"}); err != nil {
+		t.Fatalf("兜底全参应放行: %v", err)
 	}
-	// 未声明键放行（对齐 Python BaseHandler 忽略语义）
-	if err := validateArgs(spec, map[string]any{"q": "portal", "extra": 1}); err != nil {
-		t.Fatalf("未声明键应放行: %v", err)
-	}
-	// schema 不可解析时放行（handler 取参路径兜底）
 	broken := &ToolSpec{Name: "x", Parameters: `{not-json`}
-	if err := validateArgs(broken, map[string]any{}); err != nil {
-		t.Fatalf("schema 不可解析应放行: %v", err)
+	breg := registerOne(t, broken)
+	if len(breg.schemaFailures()) == 0 {
+		t.Fatal("不可解析 schema 应登记")
+	}
+	if err := validateArgs(breg, broken, map[string]any{}); err != nil {
+		t.Fatalf("required 不可解析应放行: %v", err)
+	}
+}
+
+func TestCallHandlerInvalidArgsIsError(t *testing.T) {
+	reg := registerOne(t, &ToolSpec{
+		Name: "echo", Group: GroupRead, TimeoutS: 5,
+		Parameters: `{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`,
+		Handler: func(c *CallContext) (*ToolResult, error) {
+			out := newObj()
+			out.set("kind", "echo")
+			return &ToolResult{Status: StatusOK, Data: out}, nil
+		},
+	})
+	s := &Surface{registry: reg}
+	spec := reg.get("echo")
+
+	bad := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+		Name: "echo", Arguments: json.RawMessage(`{"q":42}`),
+	}}
+	res, err := s.callHandler(spec)(context.Background(), bad)
+	if err != nil {
+		t.Fatalf("校验失败应回 isError 而非协议错误: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("类型错误应回 isError: %+v", res)
+	}
+	if len(res.Content) == 0 {
+		t.Fatal("isError 应带文案")
+	}
+	if text, ok := res.Content[0].(*mcp.TextContent); !ok ||
+		!strings.Contains(text.Text, `参数校验失败`) || !strings.Contains(text.Text, `want "string"`) {
+		t.Fatalf("文案不符: %+v", res.Content[0])
+	}
+
+	good := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{
+		Name: "echo", Arguments: json.RawMessage(`{"q":"portal","spare":true}`),
+	}}
+	res, err = s.callHandler(spec)(context.Background(), good)
+	if err != nil {
+		t.Fatalf("合法调用不应出错: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("合法参数不应 isError: %+v", res)
 	}
 }

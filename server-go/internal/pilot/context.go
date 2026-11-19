@@ -1,7 +1,3 @@
-//go:build windows
-
-// context.go 模型上下文装配：预算派生、历史裁剪、工具结果裁剪、自动压缩、
-// 溢出回收。语义对齐 pilot/context.py 的核心行为面。
 package pilot
 
 import (
@@ -13,46 +9,35 @@ import (
 
 const (
 	// charsPerToken 中文场景粗估：~2 字符/token（各提供方自陈偏低，取宽裕口径）。
-	charsPerToken = 2.0
-	// fallbackHistoryBudget 窗口未知时的固定历史预算（token）。
+	charsPerToken         = 2.0
 	fallbackHistoryBudget = 30000
-	// minHistoryTurns 装配结果最少保留的近期轮数（不让位到零）。
-	minHistoryTurns = 2
-	// pruneTriggerRatio 全量视图超出预算的触发比（超过即先尝试剪枝）。
-	pruneTriggerRatio = 0.85
-	// idlePruneTriggerRatio 闲置会话的更早触发比（闲置 30 分钟后阈值降到 0.6）。
+	minHistoryTurns       = 2
+	pruneTriggerRatio     = 0.85
 	idlePruneTriggerRatio = 0.60
-	// idlePruneMinutes 闲置判定阈值（分钟）。
-	idlePruneMinutes = 30.0
-	// compactTriggerRatio 剪枝后仍超预算的压缩触发比。
-	compactTriggerRatio = 0.95
-	// toolClipHead/Tail 超长工具结果的头尾保留（字符）。
-	toolClipHead = 800
-	toolClipTail = 400
+	idlePruneMinutes      = 30.0
+	compactTriggerRatio   = 0.95
+	toolClipHead          = 800
+	toolClipTail          = 400
 )
 
-// EstimateTokens 字符 → token 粗估（中文 ~2 字符/token）。
 func EstimateTokens(text string) int {
 	return int(float64(len([]rune(text))) / charsPerToken)
 }
 
-// EstimateMessages 消息序列 token 估算。
 func EstimateMessages(messages []map[string]any) int {
 	total := 0
 	for _, m := range messages {
 		if content, ok := m["content"].(string); ok {
 			total += EstimateTokens(content)
 		}
-		// tool_calls 的 arguments 也计入
-		if rawCalls, ok := m["tool_calls"].([]any); ok {
+		if rawCalls := m["tool_calls"]; rawCalls != nil {
 			payload, _ := json.Marshal(rawCalls)
 			total += EstimateTokens(string(payload))
 		}
 	}
-	return total + 20 // 每条消息的格式开销
+	return total + 20
 }
 
-// UserText 构造用户消息文本（附加 appid / 页面上下文 / 元素引用 / 编号引用）。
 func UserText(question string, appid *int, viewContext map[string]any,
 	elementRefs []map[string]any, quotes []map[string]any) string {
 	parts := []string{}
@@ -77,7 +62,6 @@ func UserText(question string, appid *int, viewContext map[string]any,
 	return strings.Join(parts, "\n")
 }
 
-// ToolClip 超长工具结果裁剪（头尾保留、中段省略）。
 func ToolClip(text string, limit int) string {
 	runes := []rune(text)
 	if len(runes) <= limit {
@@ -91,13 +75,11 @@ func ToolClip(text string, limit int) string {
 	return head + "\n…（中段省略，超出保留预算）\n" + tail
 }
 
-// SummaryMessage 要点存档消息。
 func SummaryMessage(summary, sid string) map[string]any {
 	return map[string]any{"role": "system",
 		"content": "（要点存档·以下是早期轮次的蒸馏摘要，后续为近期轮次原文）\n" + summary}
 }
 
-// EnvironmentMessage 环境事实（每轮现取：今天日期/星期几）。
 func EnvironmentMessage() map[string]any {
 	now := time.Now()
 	weekdays := []string{"日", "一", "二", "三", "四", "五", "六"}
@@ -106,39 +88,55 @@ func EnvironmentMessage() map[string]any {
 			now.Year(), int(now.Month()), now.Day(), weekdays[now.Weekday()])}
 }
 
-// deriveHistoryBudget 从模型窗口派生历史预算（token）。
 func deriveHistoryBudget(contextWindow, overheadTokens int) int {
+	return deriveHistoryBudgetWithCorrection(contextWindow, overheadTokens, 1.0)
+}
+
+func deriveHistoryBudgetWithCorrection(contextWindow, overheadTokens int, correction float64) int {
 	window := contextWindow
 	if window <= 0 {
 		window = FallbackContextWindow
 	}
-	// 预算 = 窗口 - 系统提示与工具表开销 - 输出预留（maxOutputTokens）
 	budget := window - overheadTokens - maxOutputTokens
+	if correction > 1.0 {
+		budget = int(float64(budget) / correction)
+	}
 	if budget < 2000 {
 		budget = 2000
 	}
 	return budget
 }
 
-// needsCompaction 全量视图是否需要压缩。
+func turnMessages(turn map[string]any) []map[string]any {
+	switch raw := turn["messages"].(type) {
+	case []map[string]any:
+		return raw
+	case []any:
+		out := make([]map[string]any, 0, len(raw))
+		for _, item := range raw {
+			if msg, ok := item.(map[string]any); ok {
+				out = append(out, msg)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
 func needsCompaction(full []map[string]any, budget int) bool {
 	return EstimateMessages(full) > budget
 }
 
-// clipTurnToolResults 裁剪单轮中的超长工具结果。
 func clipTurnToolResults(turn map[string]any, limit int) {
-	if messages, ok := turn["messages"].([]map[string]any); ok {
-		for _, msg := range messages {
-			if role, _ := msg["role"].(string); role == "tool" {
-				if content, ok := msg["content"].(string); ok {
-					msg["content"] = ToolClip(content, limit)
-				}
+	for _, msg := range turnMessages(turn) {
+		if role, _ := msg["role"].(string); role == "tool" {
+			if content, ok := msg["content"].(string); ok {
+				msg["content"] = ToolClip(content, limit)
 			}
 		}
 	}
 }
 
-// pruneOldToolResults 剪枝：对早期轮次的工具结果做裁剪（免费清理，不调模型）。
 func pruneOldToolResults(state *SessionState, keepRecent int, toolLimit int) {
 	if state == nil {
 		return
@@ -152,7 +150,35 @@ func pruneOldToolResults(state *SessionState, keepRecent int, toolLimit int) {
 	}
 }
 
-// fullView 全量视图（不裁剪的全部未存档轮次 + 当前问题）。
+func appendTurnToMessages(msgs []map[string]any, turn map[string]any, toolLimit int) []map[string]any {
+	if rawMsgs := turnMessages(turn); len(rawMsgs) > 0 {
+		for _, msg := range rawMsgs {
+			if role, _ := msg["role"].(string); role == "tool" {
+				if content, ok := msg["content"].(string); ok {
+					cloned := make(map[string]any, len(msg))
+					for k, v := range msg {
+						cloned[k] = v
+					}
+					cloned["content"] = ToolClip(content, toolLimit)
+					msgs = append(msgs, cloned)
+					continue
+				}
+			}
+			msgs = append(msgs, msg)
+		}
+		return msgs
+	}
+	if q, ok := turn["q"].(string); ok && q != "" {
+		msgs = append(msgs, map[string]any{"role": "user", "content": q})
+	}
+	if resp, ok := turn["resp"].(map[string]any); ok {
+		if answer, ok := resp["answer"].(string); ok && answer != "" {
+			msgs = append(msgs, map[string]any{"role": "assistant", "content": answer})
+		}
+	}
+	return msgs
+}
+
 func fullView(state *SessionState, question string, appid *int, toolLimit int,
 	viewContext map[string]any, elementRefs []map[string]any, quotes []map[string]any) []map[string]any {
 	msgs := []map[string]any{}
@@ -161,38 +187,13 @@ func fullView(state *SessionState, question string, appid *int, toolLimit int,
 	}
 	if state != nil {
 		for _, turn := range state.Turns[state.SummaryThrough:] {
-			if msgsRaw, ok := turn["messages"].([]map[string]any); ok && len(msgsRaw) > 0 {
-				for _, msg := range msgsRaw {
-					if role, _ := msg["role"].(string); role == "tool" {
-						if content, ok := msg["content"].(string); ok {
-							cloned := map[string]any{"role": role, "content": ToolClip(content, toolLimit)}
-							if tc, ok := msg["tool_call_id"]; ok {
-								cloned["tool_call_id"] = tc
-							}
-							msgs = append(msgs, cloned)
-							continue
-						}
-					}
-					msgs = append(msgs, msg)
-				}
-				continue
-			}
-			if q, ok := turn["q"].(string); ok && q != "" {
-				msgs = append(msgs, map[string]any{"role": "user", "content": q})
-			}
-			if resp, ok := turn["resp"].(map[string]any); ok {
-				if answer, ok := resp["answer"].(string); ok && answer != "" {
-					msgs = append(msgs, map[string]any{"role": "assistant", "content": answer})
-				}
-			}
+			msgs = appendTurnToMessages(msgs, turn, toolLimit)
 		}
 	}
 	msgs = append(msgs, map[string]any{"role": "user", "content": UserText(question, appid, viewContext, elementRefs, quotes)})
 	return msgs
 }
 
-// assemble 在预算内装配消息序列（要点存档 + 近期轮次 + 当前问题）。
-// 超预算时从旧到新让位（保留最少 minHistoryTurns 轮）。
 func assemble(state *SessionState, question string, appid *int, budget int, toolLimit int,
 	viewContext map[string]any, elementRefs []map[string]any, quotes []map[string]any) []map[string]any {
 	msgs := []map[string]any{}
@@ -207,7 +208,6 @@ func assemble(state *SessionState, question string, appid *int, budget int, tool
 	if state != nil {
 		turns = state.Turns[start:]
 	}
-	// 从旧到新试装配，超预算即截断（从最新往回保留）
 	var included []map[string]any
 	currentTokens := 0
 	if state != nil && state.Summary != "" {
@@ -223,39 +223,31 @@ func assemble(state *SessionState, question string, appid *int, budget int, tool
 		included = append([]map[string]any{turn}, included...)
 	}
 	for _, turn := range included {
-		if msgsRaw, ok := turn["messages"].([]map[string]any); ok && len(msgsRaw) > 0 {
-			for _, msg := range msgsRaw {
-				if role, _ := msg["role"].(string); role == "tool" {
-					if content, ok := msg["content"].(string); ok {
-						cloned := map[string]any{"role": role, "content": ToolClip(content, toolLimit)}
-						if tc, ok := msg["tool_call_id"]; ok {
-							cloned["tool_call_id"] = tc
-						}
-						msgs = append(msgs, cloned)
-						continue
-					}
-				}
-				msgs = append(msgs, msg)
-			}
-			continue
-		}
-		if q, ok := turn["q"].(string); ok && q != "" {
-			msgs = append(msgs, map[string]any{"role": "user", "content": q})
-		}
-		if resp, ok := turn["resp"].(map[string]any); ok {
-			if answer, ok := resp["answer"].(string); ok && answer != "" {
-				msgs = append(msgs, map[string]any{"role": "assistant", "content": answer})
-			}
-		}
+		msgs = appendTurnToMessages(msgs, turn, toolLimit)
 	}
 	msgs = append(msgs, map[string]any{"role": "user",
 		"content": UserText(question, appid, viewContext, elementRefs, quotes)})
 	return msgs
 }
 
-// estimateTurnTokens 单轮的 token 估算。
 func estimateTurnTokens(turn map[string]any, toolLimit int) int {
 	total := 0
+	if msgs := turnMessages(turn); len(msgs) > 0 {
+		for _, msg := range msgs {
+			if content, ok := msg["content"].(string); ok {
+				if role, _ := msg["role"].(string); role == "tool" {
+					total += EstimateTokens(ToolClip(content, toolLimit))
+				} else {
+					total += EstimateTokens(content)
+				}
+			}
+			if rawCalls := msg["tool_calls"]; rawCalls != nil {
+				payload, _ := json.Marshal(rawCalls)
+				total += EstimateTokens(string(payload))
+			}
+		}
+		return total + 20
+	}
 	if q, ok := turn["q"].(string); ok {
 		total += EstimateTokens(q)
 	}
@@ -264,17 +256,9 @@ func estimateTurnTokens(turn map[string]any, toolLimit int) int {
 			total += EstimateTokens(answer)
 		}
 	}
-	if msgs, ok := turn["messages"].([]map[string]any); ok {
-		for _, msg := range msgs {
-			if content, ok := msg["content"].(string); ok {
-				total += EstimateTokens(ToolClip(content, toolLimit))
-			}
-		}
-	}
 	return total + 20
 }
 
-// ReferenceDigest 跨会话引用摘要（最近几轮的问答对精简）。
 func ReferenceDigest(state *SessionState) string {
 	if state == nil || len(state.Turns) == 0 {
 		return ""
@@ -299,7 +283,6 @@ func ReferenceDigest(state *SessionState) string {
 	return strings.Join(lines, "\n")
 }
 
-// ReferenceMessage 跨会话引用 → system 消息。
 func ReferenceMessage(title, digest string) map[string]any {
 	return map[string]any{"role": "system",
 		"content": fmt.Sprintf("（系统侧同步·仅供参照）以下是另一段会话「%s」的近期问答摘要：\n%s", title, digest)}

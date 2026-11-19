@@ -1,5 +1,3 @@
-// http_read_test.go agent 读面五端点测试：tasks 静态四项、runs 三源合并投影、
-// events 分页、cancel 幂等矩阵（形状对齐 Python agent/router.py venv 实测锚点）。
 package agent
 
 import (
@@ -9,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"holdexar/server-go/internal/store"
 )
@@ -61,7 +60,6 @@ func decodeRead(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	return out
 }
 
-// TestAgentTasksStatic 四项固定名称与顺序。
 func TestAgentTasksStatic(t *testing.T) {
 	do := readMux(t, nil, &Deps{})
 	rec := do("GET", "/api/v1/agent/tasks", "")
@@ -86,8 +84,6 @@ func TestAgentTasksStatic(t *testing.T) {
 	}
 }
 
-// TestAgentRunsMerge 三源合并：账本行过滤（task 例外与 job 价格任务排除）、
-// 域行投影、排序与截断。
 func TestAgentRunsMerge(t *testing.T) {
 	db, _ := readFixtureDB(t)
 	seed := func(q string, args ...any) {
@@ -112,7 +108,6 @@ func TestAgentRunsMerge(t *testing.T) {
 	}
 	body := decodeRead(t, rec)
 	items := body["items"].([]any)
-	// f1(fake) / cycle:9 / crawl:7 / j2(job 非价格任务) / t1(dev_pytest)；j1 被 runner=job 价格任务排除
 	if len(items) != 5 {
 		t.Fatalf("应五条（j1 排除）：%d %s", len(items), rec.Body.String())
 	}
@@ -141,18 +136,15 @@ func TestAgentRunsMerge(t *testing.T) {
 	if first["created_at"] != "2026-11-14T12:00:00" {
 		t.Fatalf("created_at 应 ISO 形态：%v", first["created_at"])
 	}
-	// 账本行投影：cancellable 按 runner=fake
 	fake := items[2].(map[string]any)
 	if fake["meta"].(map[string]any)["cancellable"] != true {
 		t.Fatalf("fake 运行应可取消：%v", fake)
 	}
-	// status 过滤（域状态映射）
 	rec = do("GET", "/api/v1/agent/runs?status=done", "")
 	items = decodeRead(t, rec)["items"].([]any)
 	if len(items) != 4 {
 		t.Fatalf("done 过滤应四条：%s", rec.Body.String())
 	}
-	// limit 夹取
 	rec = do("GET", "/api/v1/agent/runs?limit=2", "")
 	items = decodeRead(t, rec)["items"].([]any)
 	if len(items) != 2 {
@@ -160,7 +152,6 @@ func TestAgentRunsMerge(t *testing.T) {
 	}
 }
 
-// TestAgentRunDetail404 缺席 404 逐字 + 显式坏域键不回落账本。
 func TestAgentRunDetail404(t *testing.T) {
 	db, _ := readFixtureDB(t)
 	do := readMux(t, db, &Deps{})
@@ -174,7 +165,6 @@ func TestAgentRunDetail404(t *testing.T) {
 	}
 }
 
-// TestAgentRunEvents 分页（after_seq/limit）+ 域行空集 + 404。
 func TestAgentRunEvents(t *testing.T) {
 	db, _ := readFixtureDB(t)
 	if _, err := db.Exec(`INSERT INTO agent_runs(id,session_id,runner,"trigger",meta,status,created_at)
@@ -214,8 +204,6 @@ func TestAgentRunEvents(t *testing.T) {
 	}
 }
 
-// TestAgentRunCancel 取消矩阵：缺席 404 带编号、终态 accepted=false、
-// 域行非活 409、域行活体经 crawl stop、runner=job 409、fake 行取消跃迁写。
 func TestAgentRunCancel(t *testing.T) {
 	db, gate := readFixtureDB(t)
 	seed := func(q string, args ...any) {
@@ -247,7 +235,6 @@ func TestAgentRunCancel(t *testing.T) {
 	if status != 404 || body["detail"] != "run not found: cycle:999" {
 		t.Fatalf("缺席域行应 404（Python get_run None 同径）：%d %s", status, recBody(body))
 	}
-	// 非终态且非活：planning 轮 5（活轮是 6，liveCycleID 取最大执行中 id）
 	if _, err := db.Exec(`INSERT INTO price_cycles(id,kind,status,started_at) VALUES(5,'scheduled','planning','2026-11-14 10:00:00'),
 		(6,'scheduled','running','2026-11-14 10:00:00')`); err != nil {
 		t.Fatal(err)
@@ -263,17 +250,14 @@ func TestAgentRunCancel(t *testing.T) {
 	if status != 409 {
 		t.Fatalf("在账非活抓取任务应 409：%d %s", status, recBody(body))
 	}
-	// 活体域行：crawl:7 是 liveJobID（/crawl/active 桩返回 7）
 	status, body = cancel("crawl:7", `{"reason": "user-stop"}`)
 	if status != 200 || body["accepted"] != true {
 		t.Fatalf("活体取消应受理：%d %s", status, recBody(body))
 	}
-	// runner=job：无执行句柄 409
 	status, body = cancel("job1", `{}`)
 	if status != 409 || body["detail"] != "run has no live stop handle" {
 		t.Fatalf("runner=job 应 409：%d %s", status, recBody(body))
 	}
-	// fake 行：取消跃迁写三事件
 	status, body = cancel("fake1", `{"reason": "user"}`)
 	if status != 200 || body["accepted"] != true || body["status"] != "cancelled" {
 		t.Fatalf("fake 取消应受理：%d %s", status, recBody(body))
@@ -292,12 +276,10 @@ func TestAgentRunCancel(t *testing.T) {
 	if eventCount != 3 {
 		t.Fatalf("应三事件：%d", eventCount)
 	}
-	// 终态重复取消：幂等拒绝
 	status, body = cancel("fake1", `{}`)
 	if status != 200 || body["accepted"] != false || body["status"] != "cancelled" {
 		t.Fatalf("重复取消应幂等：%d %s", status, recBody(body))
 	}
-	// reason 非串 422
 	rec := do("POST", "/api/v1/agent/runs/absent/cancel", `{"reason": 5}`)
 	if rec.Code != 422 {
 		t.Fatalf("reason 非串应 422：%d", rec.Code)
@@ -307,4 +289,100 @@ func TestAgentRunCancel(t *testing.T) {
 func recBody(body map[string]any) string {
 	raw, _ := json.Marshal(body)
 	return string(raw)
+}
+
+func TestAgentCreateRunAndFakeLifecycle(t *testing.T) {
+	db, gate := readFixtureDB(t)
+	do := readMux(t, db, &Deps{WriteGate: gate})
+
+	rec := do("POST", "/api/v1/agent/runs", `{"runner":"task"}`)
+	if rec.Code != 410 {
+		t.Fatalf("runner=task 应返回 410：%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do("POST", "/api/v1/agent/runs", `{"runner":"fake","scenario":"bogus"}`)
+	if rec.Code != 422 {
+		t.Fatalf("未知 scenario 应返回 422：%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do("POST", "/api/v1/agent/runs", `{"runner":"fake","session_id":"missing-sess"}`)
+	if rec.Code != 404 {
+		t.Fatalf("不存在的 session_id 应返回 404：%d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do("POST", "/api/v1/agent/runs", `{"runner":"fake","scenario":"success","steps":2,"prompt":"hello"}`)
+	if rec.Code != 200 {
+		t.Fatalf("创建 fake success 失败：%d %s", rec.Code, rec.Body.String())
+	}
+	created := decodeRead(t, rec)
+	runID, _ := created["run_id"].(string)
+	if runID == "" || created["session_id"] == "" {
+		t.Fatalf("缺少 run_id/session_id: %v", created)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		view := decodeRead(t, do("GET", "/api/v1/agent/runs/"+runID, ""))
+		if view["status"] == "done" {
+			evBody := decodeRead(t, do("GET", "/api/v1/agent/runs/"+runID+"/events", ""))
+			items, _ := evBody["items"].([]any)
+			if len(items) < 6 {
+				t.Fatalf("事件数量过少：%d %s", len(items), evBody)
+			}
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	view := decodeRead(t, do("GET", "/api/v1/agent/runs/"+runID, ""))
+	if view["status"] != "done" {
+		t.Fatalf("fake run 未完成：%v", view)
+	}
+
+	recFail := do("POST", "/api/v1/agent/runs", `{"runner":"fake","scenario":"failure","steps":2}`)
+	if recFail.Code != 200 {
+		t.Fatalf("创建 fake failure 失败：%d %s", recFail.Code, recFail.Body.String())
+	}
+	failID, _ := decodeRead(t, recFail)["run_id"].(string)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		v := decodeRead(t, do("GET", "/api/v1/agent/runs/"+failID, ""))
+		if v["status"] == "failed" {
+			if v["error_code"] != "fake_error" {
+				t.Fatalf("失败错误码不符：%v", v)
+			}
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("fake failure run 未收敛到 failed")
+}
+
+func TestAgentMemoriesCRUD(t *testing.T) {
+	_, db := memoryTestDB(t)
+	do := readMux(t, db, &Deps{})
+
+	rec := do("POST", "/api/v1/agent/memories", `{"category":"region_preference","key":"preferred","value":["CN","JP"],"confidence":0.9}`)
+	if rec.Code != 200 {
+		t.Fatalf("POST memories 失败：%d %s", rec.Code, rec.Body.String())
+	}
+	rec = do("POST", "/api/v1/agent/memories", `{"category":"budget_habit","key":"max","value":120}`)
+	if rec.Code != 200 {
+		t.Fatalf("POST 第二条 memories 失败：%d %s", rec.Code, rec.Body.String())
+	}
+	listRec := do("GET", "/api/v1/agent/memories?category=region_preference", "")
+	if listRec.Code != 200 {
+		t.Fatalf("GET memories 失败：%d", listRec.Code)
+	}
+	items, _ := decodeRead(t, listRec)["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("按分类过滤条数不符：%d %s", len(items), listRec.Body.String())
+	}
+	delRec := do("DELETE", "/api/v1/agent/memories/region_preference/preferred", "")
+	if delRec.Code != 200 {
+		t.Fatalf("DELETE 单条失败：%d %s", delRec.Code, delRec.Body.String())
+	}
+	if miss := do("DELETE", "/api/v1/agent/memories/region_preference/preferred", ""); miss.Code != 404 {
+		t.Fatalf("删除不存在条目应 404：%d", miss.Code)
+	}
+	clearRec := do("DELETE", "/api/v1/agent/memories", "")
+	if clearRec.Code != 200 || decodeRead(t, clearRec)["count"].(float64) != 1 {
+		t.Fatalf("清空记忆返回值不符：%d %s", clearRec.Code, clearRec.Body.String())
+	}
 }

@@ -1,9 +1,4 @@
-// Package agent：MCP 面——工具注册表投影到 MCP 协议（Streamable HTTP + stdio 桥）。
-//
-// 单一事实源是本包工具注册表：工具的名称/描述/参数 Schema 只在这里声明，
-// 外部 MCP 客户端经同一执行边界消费已迁移的业务读路径。fail-closed 铁律：
-// 只注册 Go 侧有真实实现的只读工具；绑定领航员会话 / UI / 写组的工具不进
-// MCP 面；未启用时该前缀一律 404。
+// MCP 工具注册表与执行边界（写组与领航员会话/UI 工具不进 MCP；未启用回 404）。
 package agent
 
 import (
@@ -15,14 +10,12 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// MCP 挂载路径与令牌头；与现网 Python 侧逐字对齐。
 const (
 	MountPath     = "/api/v1/mcp"
 	TokenHeader   = "X-Holdexar-Mcp"
 	TokenFilename = "mcp-token"
 )
 
-// Group 工具风险分组；Risk 风险级；Status 归一化结果状态。
 type (
 	Group  string
 	Risk   string
@@ -42,75 +35,51 @@ const (
 	StatusTimeout Status = "timeout"
 )
 
-// ToolSpec 工具契约：一处声明携带协议视图（description/parameters）与风险面
-// （group/risk）。handler 经 CallContext 访问已迁移读路径。
 type ToolSpec struct {
-	Name        string
-	Group       Group
-	Risk        Risk
-	Description string
-	// Parameters 是 MCP inputSchema 的原样 JSON 文本（与 Python 声明逐字段一致）。
-	Parameters string
-	Handler    HandlerFunc
-	// TimeoutS 执行预算（秒），超时归一化为 timeout 结果。
-	TimeoutS float64
-	// Idempotent 幂等提示；只影响协议投影注解。
-	Idempotent bool
+	Name           string
+	Group          Group
+	Risk           Risk
+	Description    string
+	Parameters     string
+	Handler        HandlerFunc
+	TimeoutS       float64
+	Idempotent     bool
+	required       []string
+	requiredParsed bool
 }
 
-// HandlerFunc 工具执行体：返回 error 即「工具失败」，由执行器归一化为结果
-// 回灌，绝不终结调用。
+// HandlerFunc 返回 error 时由执行器归一化为 failed 结果，不中断整次调用。
 type HandlerFunc func(c *CallContext) (*ToolResult, error)
 
-// Deps MCP 工具共享依赖面（serverd 经 Options 注入，CallContext 透传给全部
-// handler）。零值字段 = 该件未装配，handler 走不可用语义（不得 panic）：
-// LogRing nil = 运行日志不可读；WriteGate nil = 写闸诊断不可用；
-// ResolveProxy nil = 出站一律直连；ImportAppids / AppIDFreshness nil = 对应
-// 工具回 not available 形状。
+// Deps 共享依赖面；零值字段由 handler 走未装配降级或直连语义，不得 panic。
 type Deps struct {
-	// LogRing 运行日志环形缓冲（read_logs 快照事实源，Ring.Snapshot(limit)）。
-	LogRing *eventstream.Ring
-	// WriteGate 单写者闸句柄（write_gate_status 诊断快照）。
-	WriteGate *store.WriteGate
-	// ResolveProxy 出站代理解析（search_steam/web_search 等出网工具）：
-	// ok=true 用 proxyURL，ok=false 直连；实现方自行回落，不返回错误。
-	ResolveProxy func(ctx context.Context) (proxyURL string, ok bool)
-	// ImportAppids 目录导入分类（games.ImportAppids 装配形态）。
-	ImportAppids func(ctx context.Context, appids []any) (map[string]any, error)
-	// AppIDFreshness 对象级价格新鲜度（crawl Runtime.AppIDFreshness 装配形态）。
+	LogRing        *eventstream.Ring
+	WriteGate      *store.WriteGate
+	ResolveProxy   func(ctx context.Context) (proxyURL string, ok bool)
+	ImportAppids   func(ctx context.Context, appids []any) (map[string]any, error)
 	AppIDFreshness func(ctx context.Context, appids []int64) ([]map[string]any, error)
 }
 
-// CallContext 单次工具调用的执行环境。
 type CallContext struct {
-	Ctx context.Context
-	// Args MCP 客户端原始入参（UseNumber 解码，键值查表用）。
-	Args map[string]any
-	// fetch 经主 mux 进程内调用已迁移只读端点（GET，返回状态码与响应体）。
+	Ctx   context.Context
+	Args  map[string]any
 	fetch func(ctx context.Context, path string) (int, []byte, error)
-	// post 经主 mux 进程内转发 POST（同步/刷新类端点通道）。
-	post func(ctx context.Context, path string, body []byte) (int, []byte, error)
-	// db 业务库句柄（注册表自述类小查询直接走 SQL）。
-	db *sql.DB
-	// deps 共享依赖面（D2/D3/D4/D7/D8 注入件）；直建 CallContext 的测试为 nil。
-	deps *Deps
+	post  func(ctx context.Context, path string, body []byte) (int, []byte, error)
+	db    *sql.DB
+	deps  *Deps
 }
 
-// ToolResult 归一化工具结果：Data 的 kind 键决定终态
-// （denied/empty/failed→error/timeout，其余 ok）。
 type ToolResult struct {
-	Status Status
-	Data   *Obj
-	// ErrCode 失败归类（timeout/tool_error），成功态为空。
+	Status  Status
+	Data    *Obj
 	ErrCode string
 }
 
-// deriveStatus handler 结果 → 状态（denied / empty / failed→error / timeout / ok）。
 func deriveStatus(data *Obj) Status {
 	switch data.get("kind") {
 	case "denied":
 		return StatusDenied
-	case "empty":
+	case "empty", "disabled":
 		return StatusEmpty
 	case "failed":
 		return StatusError
@@ -120,10 +89,8 @@ func deriveStatus(data *Obj) Status {
 	return StatusOK
 }
 
-// guardWords 守卫词表（自 intent 收编）：写工具 + 守卫问句 → deny。
 var guardWords = []string{"清空", "删除", "移除", "移出", "停用", "停止", "批量", "全部", "所有"}
 
-// isGuarded 文本是否命中守卫词。
 func isGuarded(text string) bool {
 	for _, w := range guardWords {
 		if strings.Contains(text, w) {
@@ -133,7 +100,6 @@ func isGuarded(text string) bool {
 	return false
 }
 
-// decide 风险判定：allow / deny。P3 语义：写工具 + 守卫 → deny（审批面 P5 扩展）。
 func decide(spec *ToolSpec, guarded bool) string {
 	if spec.Group == GroupWrite && guarded {
 		return "deny"
@@ -141,7 +107,6 @@ func decide(spec *ToolSpec, guarded bool) string {
 	return "allow"
 }
 
-// denyResult 与 Python policy.DENY_RESULT 同形。
 func denyResult() *Obj {
 	obj := newObj()
 	obj.set("kind", "denied")
@@ -150,5 +115,4 @@ func denyResult() *Obj {
 	return obj
 }
 
-// readRowsLimit 卡片行截断线（与 Python _shared._READ_ROWS_LIMIT 一致）。
 const readRowsLimit = 8

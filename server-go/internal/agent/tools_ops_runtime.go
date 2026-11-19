@@ -1,10 +1,7 @@
-// 批次三工具面：运维 / 代理 / 诊断 / 运行时任务 / 网络出站（25 个，全部
-// group=read）。形状逐条对齐 Python builtin/system.py、proxy_ops.py、
-// crawlops.py、runtime_tools.py、catalog.py；fail-closed：只注册 Go 侧有
-// 真实实现的只读投影，POST 只走同步受理类端点（与 Python MCP 准入面同闸）。
 package agent
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,36 +10,31 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"golang.org/x/net/html"
 	"holdexar/server-go/internal/netenv"
 )
 
-// networkTakenOver 本机接管判定（var 仅为测试注入缝；生产 = netenv.NetworkTakenOver）。
 var networkTakenOver = netenv.NetworkTakenOver
 
-// ─── 常量与词表 ─────────────────────────────────────────────────────────────
-
-// priceEventTypes 价格事实事件闭集（Python crawl events.EVENT_TYPES）。
 var priceEventTypes = map[string]bool{
 	"PRICE_DROP": true, "PRICE_INCREASE": true,
 	"NEW_HISTORICAL_LOW": true, "HISTORICAL_LOW_MATCH": true,
 	"PERMANENT_PRICE_CHANGE": true,
-	"REGION_LOCKED": true, "REGION_UNLOCKED": true,
+	"REGION_LOCKED":          true, "REGION_UNLOCKED": true,
 	"PRICE_UNAVAILABLE": true, "PRICE_RESTORED": true,
 	"FREE_PROMO": true, "REMOVED": true,
 }
 
-// taskLabels 任务类型 → 行词条（Python agent_service.TASK_LABELS）。
 var taskLabels = map[string]string{
 	"price_refresh": "priceRefresh", "price_repair": "priceRepair",
 	"price_missing": "priceMissing", "dev_pytest": "devPytest",
 }
 
-// domainStatusToRun 域终态/执行态 → run 状态（Python _DOMAIN_STATUSES）。
 var domainStatusToRun = map[string]string{
 	"completed": "done", "partial": "done", "failed": "failed", "cancelled": "cancelled",
 	"done": "done", "stopped": "cancelled",
@@ -50,7 +42,6 @@ var domainStatusToRun = map[string]string{
 	"repairing": "running", "finalizing": "running", "interrupted": "failed",
 }
 
-// taskStatusRow run 状态 →（行值词条, 色调）（Python _TASK_STATUS_ROW）。
 var taskStatusRow = map[string][2]string{
 	"queued":            {"taskQueued", "warn"},
 	"running":           {"taskRunning", "ok"},
@@ -69,8 +60,6 @@ func isTerminalRunStatus(status string) bool {
 	return false
 }
 
-// logSeverityWords 日志行首 [结果词] → severity（Python core/logging.py
-// TAG_SEVERITY 同表；Go 日志行同格式：HH:MM:SS [结果词] 模块 · 主句）。
 var logSeverityWords = map[string]string{
 	"调试": "info", "信息": "info", "成功": "info", "开始": "info", "结束": "info",
 	"清理": "info", "跳过": "info", "已修复": "info", "忽略": "info",
@@ -79,27 +68,23 @@ var logSeverityWords = map[string]string{
 	"失败": "error", "严重": "error",
 }
 
-// logSeverityFilters 级别过滤集（Python _LOG_SEVERITY_FILTERS）。
 var logSeverityFilters = map[string]string{
 	"info": "info", "warning": "warning", "error": "error",
 }
 
-// 出站常量：DuckDuckGo HTML 端点与 Steam storesearch（Python system.py /
-// crawler/epic_free.py 同值）。
 const (
-	ddgSearchURL     = "https://html.duckduckgo.com/html/"
-	ddgUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-	steamSearchURL   = "https://store.steampowered.com/api/storesearch/"
-	steamSearchLimit = 5
-	ingestMaxAppids  = 20
-	logSnapshotLimit = 2000
-	logTailMax       = 400
+	ddgSearchURL        = "https://html.duckduckgo.com/html/"
+	ddgUserAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+	steamSearchURL      = "https://store.steampowered.com/api/storesearch/"
+	steamSearchLimit    = 5
+	ingestMaxAppids     = 20
+	logSnapshotLimit    = 2000
+	logTailMax          = 400
 	writeLockWaitWarnMs = 30000
 	writeLedgerSamples  = 8
 )
 
-// 出口延迟检测轮询窗（var 仅为测试可缩窗；生产语义 = 170s 略低于执行预算
-// 180s、2s 步长，Python 同值）。
+// 出口延迟检测轮询窗（默认 170s 略低于 180s 执行预算，2s 步长；var 供测试缩窗）。
 var (
 	proxyTestWaitS = 170.0
 	proxyTestPollS = 2.0
@@ -113,9 +98,6 @@ var steamHTTPHeaders = map[string]string{
 	"Referer":         "https://store.epicgames.com/en-US/",
 }
 
-// ─── 小件：形状与 Python 标量语义 ───────────────────────────────────────────
-
-// rowsCard rows_result 移植：行截 8；total 传 nil 时按 Python 语义不落键。
 func rowsCard(title string, rows []any, total any) *Obj {
 	out := newObj()
 	out.set("kind", "rows")
@@ -130,7 +112,6 @@ func rowsCard(title string, rows []any, total any) *Obj {
 	return out
 }
 
-// truncateRunes Python s[:n] 字符语义（按 rune 截，不碎 UTF-8）。
 func truncateRunes(s string, n int) string {
 	runes := []rune(s)
 	if len(runes) <= n {
@@ -139,7 +120,6 @@ func truncateRunes(s string, n int) string {
 	return string(runes[:n])
 }
 
-// pyFStr Python f-string 标量形态：None → "None"；其余按 str()。
 func pyFStr(v any) string {
 	switch x := v.(type) {
 	case nil:
@@ -158,8 +138,7 @@ func pyFStr(v any) string {
 	}
 }
 
-// notAvailable 依赖件未装配（Deps 零值）的不可用形状：failed 归一，
-// 不冒充空数据（agent.go Deps 契约）。
+// notAvailable 依赖未装配时返回 failed 占位，不冒充空数据。
 func notAvailable() *ToolResult {
 	obj := newObj()
 	obj.set("kind", "failed")
@@ -167,8 +146,6 @@ func notAvailable() *ToolResult {
 	return &ToolResult{Status: StatusError, Data: obj, ErrCode: "tool_error"}
 }
 
-// postRaw 进程内 POST 并返回原始状态码与解码体（409/400 分支工具用）；
-// 空响应体解码为 nil。
 func (c *CallContext) postRaw(path string, body any) (int, map[string]any, error) {
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -187,8 +164,6 @@ func (c *CallContext) postRaw(path string, body any) (int, map[string]any, error
 	return status, out, nil
 }
 
-// outboundClient 出网 HTTP client：D4 代理解析（未装配/解析失败按直连），
-// 12s 总超时（Python 出网工具同口径）。
 func (c *CallContext) outboundClient() *http.Client {
 	transport := &http.Transport{}
 	if c.deps != nil && c.deps.ResolveProxy != nil {
@@ -201,7 +176,6 @@ func (c *CallContext) outboundClient() *http.Client {
 	return &http.Client{Transport: transport, Timeout: 12 * time.Second}
 }
 
-// intArgs 整数入参列表（Python [int(a) for a in raw]；解析失败按工具失败）。
 func intArgs(v any) ([]int64, error) {
 	raw, _ := v.([]any)
 	out := make([]int64, 0, len(raw))
@@ -215,8 +189,6 @@ func intArgs(v any) ([]int64, error) {
 	return out, nil
 }
 
-// gameName 库内游戏名（Python games_service.names_for 单点；无行回空，
-// 其余库错误按工具失败上抛）。
 func (c *CallContext) gameName(appid int64) (string, error) {
 	var name string
 	err := c.db.QueryRowContext(c.Ctx, `SELECT name FROM games WHERE appid=?`, appid).Scan(&name)
@@ -229,7 +201,6 @@ func (c *CallContext) gameName(appid int64) (string, error) {
 	return name, nil
 }
 
-// limitArg Python「or 缺省」语义的 limit 入参：0/空/缺席都用缺省值。
 func limitArg(v any, def int64) any {
 	if !pyBool(v) {
 		return nil
@@ -237,9 +208,6 @@ func limitArg(v any, def int64) any {
 	return v
 }
 
-// ─── 爬取运维读面（crawlops.py）────────────────────────────────────────────
-
-// crawlActive 当前活动任务、占用与限流排队（GET /crawl/active 同源投影）。
 func crawlActive(c *CallContext) (*ToolResult, error) {
 	snap := fetchMap(c, "/api/v1/crawl/active")
 	if snap == nil {
@@ -283,8 +251,6 @@ func crawlActive(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("crawlActive", rows, nil)}, nil
 }
 
-// priceFreshness 对象级价格新鲜度 + 全库时钟（deps.AppIDFreshness + GET
-// /crawl/freshness/latest；对象一次最多 200 个，去重保序）。
 func priceFreshness(c *CallContext) (*ToolResult, error) {
 	if c.deps == nil || c.deps.AppIDFreshness == nil {
 		return notAvailable(), nil
@@ -333,7 +299,6 @@ func priceFreshness(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// recentCycles 最近价格刷新轮次（新→旧，默认 5 条）。
 func recentCycles(c *CallContext) (*ToolResult, error) {
 	limit := clampInt(limitArg(c.Args["limit"], 5), 5, 1, 20)
 	var cycles []map[string]any
@@ -356,7 +321,6 @@ func recentCycles(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("cycles", rows, len(rows))}, nil
 }
 
-// priceEvents 最近价格事实事件（可按事件类型/游戏/轮次过滤）。
 func priceEvents(c *CallContext) (*ToolResult, error) {
 	eventType := pyStrOr(c.Args["event_type"])
 	if eventType != "" && !priceEventTypes[eventType] {
@@ -371,19 +335,19 @@ func priceEvents(c *CallContext) (*ToolResult, error) {
 		return nil, err
 	}
 	limit := clampInt(limitArg(c.Args["limit"], 20), 20, 1, 100)
-	query := urlValues()
-	query.set("limit", strconv.FormatInt(limit, 10))
+	query := url.Values{}
+	query.Set("limit", strconv.FormatInt(limit, 10))
 	if cycleID != 0 {
-		query.set("cycle_id", strconv.FormatInt(cycleID, 10))
+		query.Set("cycle_id", strconv.FormatInt(cycleID, 10))
 	}
 	if appid != 0 {
-		query.set("appid", strconv.FormatInt(appid, 10))
+		query.Set("appid", strconv.FormatInt(appid, 10))
 	}
 	if eventType != "" {
-		query.set("event_type", eventType)
+		query.Set("event_type", eventType)
 	}
 	var events []map[string]any
-	if err := c.getJSON("/api/v1/crawl/price-events?"+query.encode(), &events); err != nil {
+	if err := c.getJSON("/api/v1/crawl/price-events?"+query.Encode(), &events); err != nil {
 		return nil, err
 	}
 	rows := make([]any, 0, len(events))
@@ -401,7 +365,6 @@ func priceEvents(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("priceEvents", rows, len(rows))}, nil
 }
 
-// crawlStop 停止当前爬取任务（整链停止，与任务页停止按钮同义）。
 func crawlStop(c *CallContext) (*ToolResult, error) {
 	var out map[string]any
 	if err := c.postJSON("/api/v1/crawl/stop?chain=true", nil, &out); err != nil {
@@ -420,7 +383,6 @@ func crawlStop(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("crawlStop", []any{row}, nil)}, nil
 }
 
-// recentJobFailures 最近失败的抓取任务与原因（crawl_jobs 账本只读投影）。
 func recentJobFailures(c *CallContext) (*ToolResult, error) {
 	var jobs []map[string]any
 	if err := c.getJSON("/api/v1/crawl/jobs?limit=20", &jobs); err != nil {
@@ -444,9 +406,6 @@ func recentJobFailures(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("jobs", rows, total)}, nil
 }
 
-// ─── 写闸 / 日志 / 诊断 ─────────────────────────────────────────────────────
-
-// writeGateStatus 写入调度状态（deps.WriteGate.Diagnostics 快照）。
 func writeGateStatus(c *CallContext) (*ToolResult, error) {
 	if c.deps == nil || c.deps.WriteGate == nil {
 		return notAvailable(), nil
@@ -480,7 +439,6 @@ func writeGateStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("gate", []any{busyRow, waitRow}, nil)}, nil
 }
 
-// logLineSeverity 日志行首 [结果词] → severity（缺词回空）。
 func logLineSeverity(line string) string {
 	m := logLineTagRe.FindStringSubmatch(line)
 	if m == nil {
@@ -491,8 +449,6 @@ func logLineSeverity(line string) string {
 
 var logLineTagRe = regexp.MustCompile(`\[([^\]]{1,6})\]`)
 
-// readLogs 运行日志最近片段（deps.LogRing 快照；级别/关键词过滤 + 尾部窗口
-// + 级别计数）。
 func readLogs(c *CallContext) (*ToolResult, error) {
 	if c.deps == nil || c.deps.LogRing == nil {
 		return notAvailable(), nil
@@ -559,13 +515,10 @@ func readLogs(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// writeLedgerSample 写账样本（信号派生只用等写锁）。
 type writeLedgerSample struct {
 	lockwaitMs int64
 }
 
-// parseWriteLedger 环形日志 → 写账样本（Python _parse_write_ledger 同构；
-// 只取 等写锁 一个数）。
 func parseWriteLedger(lines []string, limit int) []writeLedgerSample {
 	out := []writeLedgerSample{}
 	for i := len(lines) - 1; i >= 0 && len(out) < limit; i-- {
@@ -599,16 +552,12 @@ func parseWriteLedger(lines []string, limit int) []writeLedgerSample {
 	return out
 }
 
-// diagSignal 诊断信号行原料。
 type diagSignal struct {
 	code     string
 	severity string
 	text     string
 }
 
-// systemDiagnostics 机器排障证据面快照：身份 + 最近价格轮 + 异常信号
-// （Python system/router.diagnostics 五段聚合中工具投影消费的子集；
-// 一面失败不拖垮整体；六信号按 Python 派生序产出）。
 func systemDiagnostics(c *CallContext) (*ToolResult, error) {
 	rows := []any{}
 	version := ""
@@ -736,7 +685,6 @@ func systemDiagnostics(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("diag", rows, len(rows))}, nil
 }
 
-// orStr 空串兑底。
 func orStr(s, fallback string) string {
 	if s == "" {
 		return fallback
@@ -744,8 +692,6 @@ func orStr(s, fallback string) string {
 	return s
 }
 
-// fetchMap 单面 GET（失败回 nil：诊断面自身必须可用，Python
-// _diagnostics_section 同语义）。
 func fetchMap(c *CallContext, path string) map[string]any {
 	var out map[string]any
 	if err := c.getJSON(path, &out); err != nil {
@@ -754,9 +700,7 @@ func fetchMap(c *CallContext, path string) map[string]any {
 	return out
 }
 
-// proxyAvailabilityCounts 可用性统计（Python pool_stats 口径）：手动池
-// enabled&ok 计数 + Clash 按出口 IP 去重（ACTIVE/STALE 且有最近 L2 证据、
-// 当前订阅未废弃才算可用）。pool/exit 负值 = 读取失败。
+// 统计手动池可用数及非废弃订阅下具备近期 L2 证据且 ACTIVE/STALE 的去重出口数（负值=读失败）。
 func proxyAvailabilityCounts(c *CallContext) (poolOK, poolTotal, exitAll, exitOK int64) {
 	if err := c.db.QueryRowContext(c.Ctx,
 		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN enabled=1 AND status='ok' THEN 1 ELSE 0 END),0)
@@ -805,8 +749,7 @@ func proxyAvailabilityCounts(c *CallContext) (poolOK, poolTotal, exitAll, exitOK
 	return poolOK, poolTotal, int64(len(allIdents)), int64(len(okIdents))
 }
 
-// pendingMissing 是否存在可重试的待补欠账（missing 行 + 冷却外；Go 侧无
-// 恢复排除面，直接对账本判据做直读近似，冷却 4 分钟）。
+// pendingMissing 直读冷却（4 分钟）外待补的 missing 价格行。
 func pendingMissing(c *CallContext) bool {
 	cutoff := time.Now().Add(-4 * time.Minute).Format("2006-01-02 15:04:05")
 	var exists bool
@@ -819,7 +762,6 @@ func pendingMissing(c *CallContext) bool {
 	return exists
 }
 
-// failedJobRunCount 最近 10 次生产作业中的失败/中断数（total<0 = 读失败）。
 func failedJobRunCount(c *CallContext) (int64, int64) {
 	payload := fetchMap(c, "/api/v1/proxypool/job-runs?limit=10")
 	if payload == nil {
@@ -841,8 +783,6 @@ func failedJobRunCount(c *CallContext) (int64, int64) {
 	return bad, total
 }
 
-// ─── 代理面（proxy_ops.py / system.py 代理段）──────────────────────────────
-
 // hostOf 订阅 URL → 域名级摘要（scheme://host；路径/查询里的 token 不出工具面）。
 func hostOf(raw string) string {
 	if raw == "" {
@@ -859,7 +799,6 @@ func hostOf(raw string) string {
 	return parsed.Scheme + "://" + host
 }
 
-// subRow 订阅视图 → 工具行（绝不含订阅链接本身）。
 func subRow(s map[string]any) *Obj {
 	stats, _ := s["lastStats"].(map[string]any)
 	bits := []string{}
@@ -888,7 +827,6 @@ func subRow(s map[string]any) *Obj {
 	return row
 }
 
-// listSubscriptionItems GET /api/v1/proxies/subscriptions → items。
 func listSubscriptionItems(c *CallContext, kind string) ([]map[string]any, error) {
 	path := "/api/v1/proxies/subscriptions"
 	if kind != "" {
@@ -903,7 +841,6 @@ func listSubscriptionItems(c *CallContext, kind string) ([]map[string]any, error
 	return resp.Items, nil
 }
 
-// subscriptionsList 代理订阅清单（名称、来源域名、存活与上次拉取时间）。
 func subscriptionsList(c *CallContext) (*ToolResult, error) {
 	subs, err := listSubscriptionItems(c, "")
 	if err != nil {
@@ -919,7 +856,6 @@ func subscriptionsList(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("subs", rows, len(rows))}, nil
 }
 
-// subscriptionSync 重拉指定的一条代理订阅。
 func subscriptionSync(c *CallContext) (*ToolResult, error) {
 	subID := clampInt(c.Args["sub_id"], 0, 0, math.MaxInt64)
 	subs, err := listSubscriptionItems(c, "")
@@ -960,7 +896,6 @@ func subscriptionSync(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("subs", []any{row}, nil)}, nil
 }
 
-// failedSyncResult kind=failed + error 文案（Python {"kind":"failed","error":...}）。
 func failedSyncResult(text string) *Obj {
 	obj := newObj()
 	obj.set("kind", "failed")
@@ -968,7 +903,6 @@ func failedSyncResult(text string) *Obj {
 	return obj
 }
 
-// detailText 端点错误体里的 detail 字段（原样文本，空回空）。
 func detailText(body map[string]any) string {
 	if body == nil {
 		return ""
@@ -976,7 +910,6 @@ func detailText(body map[string]any) string {
 	return pyStrOr(body["detail"])
 }
 
-// poolHealthHistory 代理池最近体检台账（最近 20 轮）。
 func poolHealthHistory(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Runs []map[string]any `json:"runs"`
@@ -1019,7 +952,6 @@ func poolHealthHistory(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("healthRuns", rows, len(rows))}, nil
 }
 
-// healthRunWhen startedAt ISO → "MM-DD HH:MM"（解析失败回空，行键落 #id）。
 func healthRunWhen(startedAt string) string {
 	at, err := time.Parse("2006-01-02T15:04:05", truncateRunes(startedAt, 19))
 	if err != nil {
@@ -1028,7 +960,6 @@ func healthRunWhen(startedAt string) string {
 	return at.Format("01-02 15:04")
 }
 
-// poolJobRuns 代理生产作业台账（附今日概览行）。
 func poolJobRuns(c *CallContext) (*ToolResult, error) {
 	limit := clampInt(c.Args["limit"], 10, 1, 100)
 	var payload struct {
@@ -1082,7 +1013,6 @@ func poolJobRuns(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("jobRuns", rows, len(payload.Items))}, nil
 }
 
-// proxyPoolStatus 代理通道可用状态（手动池 + Clash 出口计数）。
 func proxyPoolStatus(c *CallContext) (*ToolResult, error) {
 	poolOK, poolTotal, exitAll, exitOK := proxyAvailabilityCounts(c)
 	if poolOK < 0 {
@@ -1129,8 +1059,6 @@ func proxyPoolStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("proxy", []any{poolRow, exitRow, runRow}, nil)}, nil
 }
 
-// proxyExitDetail 出口节点明细（节点账本只读投影，不发起探测；存活按延迟
-// 升序在前）。
 func proxyExitDetail(c *CallContext) (*ToolResult, error) {
 	clash := fetchMap(c, "/api/v1/proxies/clash")
 	if clash == nil {
@@ -1185,12 +1113,15 @@ func proxyExitDetail(c *CallContext) (*ToolResult, error) {
 		}
 		return 1 << 30
 	}
-	sort.SliceStable(nodes, func(i, j int) bool {
-		okI, okJ := exitStateOK(nodes[i].state), exitStateOK(nodes[j].state)
+	slices.SortStableFunc(nodes, func(a, b exitNode) int {
+		okI, okJ := exitStateOK(a.state), exitStateOK(b.state)
 		if okI != okJ {
-			return okI
+			if okI {
+				return -1
+			}
+			return 1
 		}
-		return latencyOrMax(nodes[i]) < latencyOrMax(nodes[j])
+		return cmp.Compare(latencyOrMax(a), latencyOrMax(b))
 	})
 	rows := make([]any, 0, len(nodes))
 	for _, n := range nodes {
@@ -1214,12 +1145,10 @@ func proxyExitDetail(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("proxyExits", rows, len(rows))}, nil
 }
 
-// exitStateOK 账本态 → 展示可用（ACTIVE/STALE=ok；DEAD/RETIRED 及未知=bad）。
 func exitStateOK(state string) bool {
 	return state == "ACTIVE" || state == "STALE"
 }
 
-// latestL2Latencies 每节点最近一次 L2 观测延迟（账本只读）。
 func latestL2Latencies(c *CallContext) (map[string]int64, error) {
 	out := map[string]int64{}
 	rows, err := c.db.QueryContext(c.Ctx, `SELECT node_id, latency_ms FROM health_observations
@@ -1243,8 +1172,6 @@ func latestL2Latencies(c *CallContext) (map[string]int64, error) {
 	return out, rows.Err()
 }
 
-// proxyLatencyTest 发起全量出口延迟检测并等到收口（轮询窗 170s/2s；在飞
-// 复用同会话；超窗回 pending 行）。
 func proxyLatencyTest(c *CallContext) (*ToolResult, error) {
 	snap, err := postSnap(c, "/api/v1/proxies/clash/test")
 	if err != nil {
@@ -1301,11 +1228,14 @@ func proxyLatencyTest(c *CallContext) (*ToolResult, error) {
 			exit:  pyStrOr(it["exitIp"]),
 		})
 	}
-	sort.SliceStable(probed, func(i, j int) bool {
-		if probed[i].alive != probed[j].alive {
-			return probed[i].alive
+	slices.SortStableFunc(probed, func(a, b probedNode) int {
+		if a.alive != b.alive {
+			if a.alive {
+				return -1
+			}
+			return 1
 		}
-		return nodeMS(probed[i].ms) < nodeMS(probed[j].ms)
+		return cmp.Compare(nodeMS(a.ms), nodeMS(b.ms))
 	})
 	alive := 0
 	for _, n := range probed {
@@ -1342,7 +1272,6 @@ func proxyLatencyTest(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("proxyTest", rows, len(probed))}, nil
 }
 
-// nodeMS 检测延迟排序键（None 排最后，Python 1<<30 同语义）。
 func nodeMS(ms any) int64 {
 	if ms == nil {
 		return 1 << 30
@@ -1353,7 +1282,6 @@ func nodeMS(ms any) int64 {
 	return 1 << 30
 }
 
-// postSnap POST 测速端点 → 会话快照（响应即 JSON 对象）。
 func postSnap(c *CallContext, path string) (map[string]any, error) {
 	status, body, err := c.postRaw(path, nil)
 	if err != nil {
@@ -1365,7 +1293,6 @@ func postSnap(c *CallContext, path string) (map[string]any, error) {
 	return body, nil
 }
 
-// ctxSleep 睡眠并尊重执行预算取消。
 func ctxSleep(c *CallContext, d time.Duration) error {
 	select {
 	case <-time.After(d):
@@ -1375,8 +1302,7 @@ func ctxSleep(c *CallContext, d time.Duration) error {
 	}
 }
 
-// syncSubscriptions 重新拉取全部启用的代理订阅（单条失败不影响其余；
-// 回执只含订阅标签与结果，绝不含订阅链接本身）。
+// 回执仅含订阅标签与结果，不含订阅链接。
 func syncSubscriptions(c *CallContext) (*ToolResult, error) {
 	subs, err := listSubscriptionItems(c, "clash")
 	if err != nil {
@@ -1430,49 +1356,126 @@ func syncSubscriptions(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("subs", rows, total)}, nil
 }
 
-// ─── 网络出站（web_search / search_steam）──────────────────────────────────
-
-var ddgResultRe = regexp.MustCompile(`(?s)class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>`)
-
-var htmlTagRe = regexp.MustCompile(`<[^>]+>`)
-
-// ddgHit 一条搜索结果（纯函数输出，便于单测）。
 type ddgHit struct {
 	title   string
 	url     string
 	snippet string
 }
 
-// parseDDG DuckDuckGo HTML 结果解析（Python _parse_ddg 纯函数移植：
-// uddg 反解 + 去标签 + 纯文本化，上限 limit 条）。
-func parseDDG(html string, limit int) []ddgHit {
-	out := []ddgHit{}
-	for _, m := range ddgResultRe.FindAllStringSubmatch(html, -1) {
-		href := m[1]
-		if strings.Contains(href, "uddg=") {
-			if parsed, err := url.Parse(strings.ReplaceAll(href, "&amp;", "&")); err == nil {
-				if v := parsed.Query().Get("uddg"); v != "" {
-					if unq, err := url.QueryUnescape(v); err == nil {
-						href = unq
-					} else {
-						href = v
-					}
+func htmlAttr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func htmlHasClass(n *html.Node, class string) bool {
+	for _, c := range strings.Fields(htmlAttr(n, "class")) {
+		if c == class {
+			return true
+		}
+	}
+	return false
+}
+
+func htmlNodeText(n *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(cur *html.Node) {
+		if cur.Type == html.TextNode {
+			b.WriteString(cur.Data)
+			return
+		}
+		if cur.Type == html.ElementNode && (cur.Data == "script" || cur.Data == "style") {
+			return
+		}
+		for ch := cur.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(n)
+	return b.String()
+}
+
+func decodeDDGHref(href string) string {
+	if strings.Contains(href, "uddg=") {
+		if parsed, err := url.Parse(href); err == nil {
+			if v := parsed.Query().Get("uddg"); v != "" {
+				if unq, err := url.QueryUnescape(v); err == nil {
+					return unq
 				}
+				return v
 			}
 		}
-		title := strings.TrimSpace(htmlTagRe.ReplaceAllString(m[2], ""))
-		snippet := strings.TrimSpace(htmlTagRe.ReplaceAllString(m[3], ""))
-		if href == "" || title == "" {
-			continue
+	}
+	return href
+}
+
+func parseDDG(rawHTML string, limit int) []ddgHit {
+	out := []ddgHit{}
+	if limit <= 0 || rawHTML == "" {
+		return out
+	}
+	doc, err := html.Parse(strings.NewReader(rawHTML))
+	if err != nil {
+		return out
+	}
+	type pendingHit struct {
+		href    string
+		title   string
+		snippet string
+	}
+	var pending *pendingHit
+	flush := func() bool {
+		if pending == nil {
+			return len(out) >= limit
+		}
+		p := pending
+		pending = nil
+		if p.href == "" || p.title == "" {
+			return false
 		}
 		out = append(out, ddgHit{
-			title:   truncateRunes(title, 120),
-			url:     truncateRunes(href, 300),
-			snippet: truncateRunes(snippet, 160),
+			title:   truncateRunes(p.title, 120),
+			url:     truncateRunes(p.href, 300),
+			snippet: truncateRunes(p.snippet, 160),
 		})
-		if len(out) >= limit {
-			break
+		return len(out) >= limit
+	}
+	var walk func(*html.Node) bool
+	walk = func(n *html.Node) bool {
+		if n.Type == html.ElementNode {
+			if n.Data == "a" && htmlHasClass(n, "result__a") {
+				if flush() {
+					return true
+				}
+				pending = &pendingHit{
+					href:  decodeDDGHref(htmlAttr(n, "href")),
+					title: strings.TrimSpace(htmlNodeText(n)),
+				}
+				return false
+			}
+			if htmlHasClass(n, "result__snippet") {
+				if pending != nil {
+					pending.snippet = strings.TrimSpace(htmlNodeText(n))
+					if flush() {
+						return true
+					}
+				}
+				return false
+			}
 		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			if walk(ch) {
+				return true
+			}
+		}
+		return false
+	}
+	if !walk(doc) {
+		flush()
 	}
 	return out
 }
@@ -1494,7 +1497,6 @@ func webSearch(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("web", rows, len(rows))}, nil
 }
 
-// fetchDDGHTML 单次检索（失败回空串：结果为空行卡，不抛网络错误）。
 func fetchDDGHTML(c *CallContext, term string) string {
 	req, err := http.NewRequestWithContext(c.Ctx, http.MethodGet,
 		ddgSearchURL+"?"+url.Values{"q": {term}}.Encode(), nil)
@@ -1513,8 +1515,6 @@ func fetchDDGHTML(c *CallContext, term string) string {
 	return string(readAll(resp.Body))
 }
 
-// searchSteam Steam 商店全网检索（storesearch 匿名端点；cc=US&l=english；
-// 中文词零结果，US 视图可见国区锁区游戏）。
 func searchSteam(c *CallContext) (*ToolResult, error) {
 	term := truncateRunes(strings.Join(strings.Fields(pyStrOr(c.Args["term"])), " "), 80)
 	if term == "" {
@@ -1530,8 +1530,6 @@ func searchSteam(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// steamSearchItems storesearch 响应 → 候选条目（cnyFen 仅币种恰为 CNY 才进、
-// discount 由 final/initial 推算，取前 limit 条；纯函数便于单测）。
 func steamSearchItems(data map[string]any, limit int) []any {
 	rawItems, _ := data["items"].([]any)
 	items := []any{}
@@ -1572,7 +1570,6 @@ func steamSearchItems(data map[string]any, limit int) []any {
 	return items
 }
 
-// priceInt 价格字段 → int64 指针（缺失/非整数回 nil）。
 func priceInt(price map[string]any, key string) *int64 {
 	if price == nil {
 		return nil
@@ -1584,12 +1581,10 @@ func priceInt(price map[string]any, key string) *int64 {
 	return &n
 }
 
-// roundPy Python round() 银行家舍入。
 func roundPy(f float64) int64 {
 	return int64(math.RoundToEven(f))
 }
 
-// fetchStoreSearch storesearch 单次检索（走代理出口；失败回 nil 不抛）。
 func fetchStoreSearch(c *CallContext, term string) map[string]any {
 	q := url.Values{"term": {term}, "cc": {"US"}, "l": {"english"}}
 	req, err := http.NewRequestWithContext(c.Ctx, http.MethodGet, steamSearchURL+"?"+q.Encode(), nil)
@@ -1614,7 +1609,6 @@ func fetchStoreSearch(c *CallContext, term string) map[string]any {
 	return out
 }
 
-// readAll 有限读取响应体（8MB 上限防异常大响应）。
 func readAll(body interface{ Read([]byte) (int, error) }) []byte {
 	buf := make([]byte, 32*1024)
 	out := make([]byte, 0, 1<<20)
@@ -1628,10 +1622,6 @@ func readAll(body interface{ Read([]byte) (int, error) }) []byte {
 	return out
 }
 
-// ─── 目录导入 / 价格补抓 / 测试邮件 / 更新状态 ─────────────────────────────
-
-// ingestAppids AppID 入库：目录导入分类 + 新导入首爬排队（kind=import 同一
-// 执行入口）。只进目录与价格，不建立关注。
 func ingestAppids(c *CallContext) (*ToolResult, error) {
 	if c.deps == nil || c.deps.ImportAppids == nil {
 		return notAvailable(), nil
@@ -1699,7 +1689,7 @@ func ingestAppids(c *CallContext) (*ToolResult, error) {
 		case status == http.StatusOK:
 			started = true
 		case status == http.StatusConflict:
-			started = false // 已有任务在跑：目录已导入，首爬让位现役任务
+			started = false
 		default:
 			return nil, fmt.Errorf("首爬排队被拒（%d）", status)
 		}
@@ -1739,7 +1729,6 @@ func ingestAppids(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("ingest", rows, len(rows))}, nil
 }
 
-// refreshGamePrice 单游戏价格补抓（手动 job 挂后台执行，完成自动入库）。
 func refreshGamePrice(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -1776,7 +1765,6 @@ func refreshGamePrice(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("refresh", []any{row}, nil)}, nil
 }
 
-// notifyTest 发一封连通性测试邮件（只走一次 SMTP，不碰业务数据）。
 func notifyTest(c *CallContext) (*ToolResult, error) {
 	cfg := fetchMap(c, "/api/v1/alerts/smtp")
 	if cfg == nil {
@@ -1815,8 +1803,7 @@ func notifyTest(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("notify", []any{row}, nil)}, nil
 }
 
-// updateStatus 应用更新状态（只读：当前版本 / 下载进度 / 暂存包，绝不触发
-// 检查或下载）。
+// 只读：当前版本 / 下载进度 / 暂存包，绝不触发检查或下载。
 func updateStatus(c *CallContext) (*ToolResult, error) {
 	info := fetchMap(c, "/api/v1/info")
 	current := ""
@@ -1917,10 +1904,6 @@ func updateStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 运行时任务（list_tasks / cancel_task：三源合并运行账）────────────────
-
-// taskRunView 三源合并后的运行视图（Python _agent_view/_domain_view 子集，
-// 只装任务行投影与取消定位所需字段）。
 type taskRunView struct {
 	runID         string
 	status        string
@@ -1931,9 +1914,6 @@ type taskRunView struct {
 	createdAt     string
 }
 
-// listTaskRuns 三源合并读（price_tasks_only 口径）：dev_pytest 账本行 ∪
-// price_cycles ∪ 无轮次挂靠的 repair/missing 抓取任务；created_at 降序 +
-// run_id 降序，截 100。
 func listTaskRuns(c *CallContext) ([]taskRunView, error) {
 	const mergeLimit = 100
 	runs, err := scanAgentRuns(c, mergeLimit)
@@ -1955,11 +1935,11 @@ func listTaskRuns(c *CallContext) ([]taskRunView, error) {
 			return nil, err
 		}
 		runs = append(runs, taskRunView{
-			runID:         "cycle:" + strconv.FormatInt(id, 10),
-			status:        mapDomainStatus(status),
-			task:          "price_refresh", domainStatus: status,
-			progressDone:  done, progressTotal: expected,
-			createdAt:     startedAt,
+			runID:  "cycle:" + strconv.FormatInt(id, 10),
+			status: mapDomainStatus(status),
+			task:   "price_refresh", domainStatus: status,
+			progressDone: done, progressTotal: expected,
+			createdAt: startedAt,
 		})
 	}
 	if err := cycleRows.Err(); err != nil {
@@ -1986,11 +1966,11 @@ func listTaskRuns(c *CallContext) ([]taskRunView, error) {
 			_ = jsonDecoder([]byte(statsRaw)).Decode(&stats)
 		}
 		runs = append(runs, taskRunView{
-			runID:         "crawl:" + strconv.FormatInt(id, 10),
-			status:        mapDomainStatus(status),
-			task:          mapCrawlTask(kind), domainStatus: status,
-			progressDone:  stats["processed"], progressTotal: stats["total"],
-			createdAt:     startedAt,
+			runID:  "crawl:" + strconv.FormatInt(id, 10),
+			status: mapDomainStatus(status),
+			task:   mapCrawlTask(kind), domainStatus: status,
+			progressDone: stats["processed"], progressTotal: stats["total"],
+			createdAt: startedAt,
 		})
 	}
 	if err := crawlRows.Err(); err != nil {
@@ -1998,12 +1978,12 @@ func listTaskRuns(c *CallContext) ([]taskRunView, error) {
 		return nil, err
 	}
 	crawlRows.Close()
-	sort.SliceStable(runs, func(i, j int) bool {
-		ti, tj := taskTimeKey(runs[i].createdAt), taskTimeKey(runs[j].createdAt)
-		if !ti.Equal(tj) {
-			return ti.After(tj)
+	slices.SortStableFunc(runs, func(a, b taskRunView) int {
+		ta, tb := taskTimeKey(a.createdAt), taskTimeKey(b.createdAt)
+		if c := tb.Compare(ta); c != 0 {
+			return c
 		}
-		return runs[i].runID > runs[j].runID
+		return strings.Compare(b.runID, a.runID)
 	})
 	if len(runs) > mergeLimit {
 		runs = runs[:mergeLimit]
@@ -2011,9 +1991,6 @@ func listTaskRuns(c *CallContext) ([]taskRunView, error) {
 	return runs, nil
 }
 
-// taskTimeKey 运行时刻排序键（兼容 ISO「T」与空格两种时刻文本——账本行与域行
-// 存储格式不同，字符串直比会错序；解析失败按零时刻排最后，等价 Python
-// created_at or datetime.min）。
 func taskTimeKey(s string) time.Time {
 	if t, err := time.Parse("2006-01-02T15:04:05", s); err == nil {
 		return t
@@ -2024,7 +2001,6 @@ func taskTimeKey(s string) time.Time {
 	return time.Time{}
 }
 
-// scanAgentRuns dev_pytest 账本行（runner='task'）。
 func scanAgentRuns(c *CallContext, limit int) ([]taskRunView, error) {
 	rows, err := c.db.QueryContext(c.Ctx,
 		`SELECT id,status,CAST(meta AS TEXT),COALESCE(created_at,'') FROM agent_runs
@@ -2057,7 +2033,6 @@ func scanAgentRuns(c *CallContext, limit int) ([]taskRunView, error) {
 	return out, rows.Err()
 }
 
-// mapDomainStatus 域状态 → run 状态（未知态按 failed 兜底）。
 func mapDomainStatus(status string) string {
 	if mapped, ok := domainStatusToRun[status]; ok {
 		return mapped
@@ -2065,7 +2040,6 @@ func mapDomainStatus(status string) string {
 	return "failed"
 }
 
-// mapCrawlTask 抓取任务类型 → 任务名（repair/missing 之外无任务名）。
 func mapCrawlTask(kind string) string {
 	switch kind {
 	case "repair":
@@ -2076,7 +2050,6 @@ func mapCrawlTask(kind string) string {
 	return ""
 }
 
-// taskRowView 任务行（Python _task_row 同形）。
 func taskRowView(r taskRunView) *Obj {
 	vKey, tone := "taskQueued", "warn"
 	if m, ok := taskStatusRow[r.status]; ok {
@@ -2100,7 +2073,6 @@ func taskRowView(r taskRunView) *Obj {
 	return row
 }
 
-// listTasks 运行中的价格任务与最近终态（live 在前、终态取 3）。
 func listTasks(c *CallContext) (*ToolResult, error) {
 	runs, err := listTaskRuns(c)
 	if err != nil {
@@ -2139,7 +2111,6 @@ func listTasks(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: rowsCard("tasks", rows, len(live))}, nil
 }
 
-// getTaskRun 按运行标识直读（Python get_run：域键读域行，其余读账本）。
 func getTaskRun(c *CallContext, runID string) (*taskRunView, error) {
 	if source, id, ok := splitDomainRunID(runID); ok {
 		if source == "cycle" {
@@ -2153,11 +2124,11 @@ func getTaskRun(c *CallContext, runID string) (*taskRunView, error) {
 				return nil, nil
 			}
 			return &taskRunView{
-				runID:         runID,
-				status:        mapDomainStatus(status),
-				task:          "price_refresh", domainStatus: status,
-				progressDone:  done, progressTotal: expected,
-				createdAt:     startedAt,
+				runID:  runID,
+				status: mapDomainStatus(status),
+				task:   "price_refresh", domainStatus: status,
+				progressDone: done, progressTotal: expected,
+				createdAt: startedAt,
 			}, nil
 		}
 		var kind, status, statsRaw, startedAt string
@@ -2173,11 +2144,11 @@ func getTaskRun(c *CallContext, runID string) (*taskRunView, error) {
 			_ = jsonDecoder([]byte(statsRaw)).Decode(&stats)
 		}
 		return &taskRunView{
-			runID:         runID,
-			status:        mapDomainStatus(status),
-			task:          mapCrawlTask(kind), domainStatus: status,
-			progressDone:  stats["processed"], progressTotal: stats["total"],
-			createdAt:     startedAt,
+			runID:  runID,
+			status: mapDomainStatus(status),
+			task:   mapCrawlTask(kind), domainStatus: status,
+			progressDone: stats["processed"], progressTotal: stats["total"],
+			createdAt: startedAt,
 		}, nil
 	}
 	var id, status, metaRaw string
@@ -2202,7 +2173,6 @@ func getTaskRun(c *CallContext, runID string) (*taskRunView, error) {
 	}, nil
 }
 
-// agentProgress 账本任务进度（meta.progress.done/total，Python meta.progress 同形）。
 func agentProgress(meta map[string]any) (any, any) {
 	progress, _ := meta["progress"].(map[string]any)
 	if progress == nil {
@@ -2211,7 +2181,6 @@ func agentProgress(meta map[string]any) (any, any) {
 	return progress["done"], progress["total"]
 }
 
-// splitDomainRunID cycle:N / crawl:N 域键解析（N 必为正整数）。
 func splitDomainRunID(runID string) (string, int64, bool) {
 	source, num, found := strings.Cut(runID, ":")
 	if !found || (source != "cycle" && source != "crawl") {
@@ -2224,7 +2193,6 @@ func splitDomainRunID(runID string) (string, int64, bool) {
 	return source, id, true
 }
 
-// liveCycleID 当前在跑的价格轮（执行态近似：最新一个执行中的轮）。
 func liveCycleID(c *CallContext) int64 {
 	var id int64
 	if err := c.db.QueryRowContext(c.Ctx,
@@ -2235,7 +2203,6 @@ func liveCycleID(c *CallContext) int64 {
 	return id
 }
 
-// liveJobID 当前在跑的抓取任务（/crawl/active 的运行时事实）。
 func liveJobID(c *CallContext) int64 {
 	snap := fetchMap(c, "/api/v1/crawl/active")
 	if snap == nil || !pyBool(snap["activeJobId"]) {
@@ -2248,8 +2215,6 @@ func liveJobID(c *CallContext) int64 {
 	return id
 }
 
-// cancelTask 请求停止运行中的长任务（首版支持 cycle/crawl 两支路；
-// Go 侧无 task-runner 协作取消，账本任务回不可停形状）。
 func cancelTask(c *CallContext) (*ToolResult, error) {
 	runs, err := listTaskRuns(c)
 	if err != nil {
@@ -2324,12 +2289,10 @@ func cancelTask(c *CallContext) (*ToolResult, error) {
 		}
 		return &ToolResult{Data: rowsCard("tasks", []any{taskRowView(*target)}, nil)}, nil
 	}
-	// 账本任务（runner=task）：Go 无协作取消通道 → 不可停形状。
 	return &ToolResult{Data: rowsCard("tasks",
 		[]any{taskRowViewFlag(*target, "taskStopUnavailable", "warn")}, nil)}, nil
 }
 
-// taskRowViewFlag 任务行（覆盖 vKey/tone；tone 空串按状态默认色）。
 func taskRowViewFlag(r taskRunView, vKey, tone string) *Obj {
 	row := taskRowView(r)
 	row.set("vKey", vKey)
@@ -2339,11 +2302,6 @@ func taskRowViewFlag(r taskRunView, vKey, tone string) *Obj {
 	return row
 }
 
-// ─── 注册 ───────────────────────────────────────────────────────────────────
-
-// RegisterOpsRuntimeTools 批次三 25 工具登记（重名即错；预算取
-// budgetFor 分档：任务面 60 / 出网 40 / 全量出口检测 180 / 同步类 240 /
-// 其余 20）。
 func RegisterOpsRuntimeTools(r *ToolRegistry) error {
 	for _, spec := range []*ToolSpec{
 		{
@@ -2431,8 +2389,8 @@ func RegisterOpsRuntimeTools(r *ToolRegistry) error {
 			Name: "subscriptions_list", Group: GroupRead, Risk: "low",
 			Description: "查看代理订阅清单：名称、来源域名、节点存活与上次拉取时间（不含订阅链接）。" +
 				"用户问『我有哪些订阅/订阅还剩多少节点』，或重拉单条订阅前确认 sub_id 时调用",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     subscriptionsList,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    subscriptionsList,
 		},
 		{
 			Name: "subscription_sync", Group: GroupRead, Risk: "high",
@@ -2447,8 +2405,8 @@ func RegisterOpsRuntimeTools(r *ToolRegistry) error {
 			Name: "pool_health_history", Group: GroupRead, Risk: "low",
 			Description: "查看代理池最近的体检台账：每轮时间、覆盖节点数、可用/失败数与收尾原因。" +
 				"用户问『最近体检结果怎么样/节点为什么被换掉』时调用",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     poolHealthHistory,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    poolHealthHistory,
 		},
 		{
 			Name: "pool_job_runs", Group: GroupRead, Risk: "low",
@@ -2469,23 +2427,23 @@ func RegisterOpsRuntimeTools(r *ToolRegistry) error {
 			Name: "proxy_exit_detail", Group: GroupRead, Risk: "low",
 			Description: "查看代理出口节点明细：逐节点的状态、延迟与出口 IP（最近一次检测的账本事实，不发起新探测）。" +
 				"用户问『出口 IP 是什么/有哪些节点/哪个节点延迟最低』时调用",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     proxyExitDetail,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    proxyExitDetail,
 		},
 		{
 			Name: "proxy_latency_test", Group: GroupRead, Risk: "medium",
 			Description: "对全部代理出口节点发起一次真实延迟与连通性检测（耗时约 1~3 分钟，等它跑完再回答）。" +
 				"用户说『测一下节点延迟/测试连通性/体检代理』时调用；只想看最近一次结果用 proxy_exit_detail",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     proxyLatencyTest,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    proxyLatencyTest,
 		},
 		{
 			Name: "sync_subscriptions", Group: GroupRead, Risk: "medium",
 			Description: "重新拉取全部启用的代理订阅（下载新配置，内核按需自动重启；约需十几秒）。" +
 				"用户说『同步订阅/更新订阅/重新拉一下订阅』时调用。" +
 				"只想看订阅状态用 proxy_pool_status；回执不含订阅链接",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     syncSubscriptions,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    syncSubscriptions,
 		},
 		{
 			Name: "web_search", Group: GroupRead, Risk: "medium",
@@ -2515,15 +2473,15 @@ func RegisterOpsRuntimeTools(r *ToolRegistry) error {
 			Name: "update_status", Group: GroupRead, Risk: "low",
 			Description: "查看应用更新状态（当前版本 / 是否在下载 / 是否有待重启安装的更新包）。" +
 				"用户问『现在是什么版本/有没有更新』时调用",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     updateStatus,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    updateStatus,
 		},
 		{
 			Name: "list_tasks", Group: GroupRead, Risk: "low",
 			Description: "查看正在运行的耗时任务（价格刷新 / 价格补抓）与最近结束的几次。" +
 				"用户问『刷新到哪了』『还在跑吗』『跑完了吗』时调用",
-			Parameters:  `{"type": "object", "properties": {}}`,
-			Handler:     listTasks,
+			Parameters: `{"type": "object", "properties": {}}`,
+			Handler:    listTasks,
 		},
 		{
 			Name: "cancel_task", Group: GroupRead, Risk: "high",

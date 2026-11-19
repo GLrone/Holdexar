@@ -60,7 +60,6 @@ func newReconcileDB(t *testing.T) (*sql.DB, *store.WriteGate) {
 	return db, store.NewWriteGate(db, filepath.Join(t.TempDir(), "gate.lock"))
 }
 
-// seedRun 造一条 run；createdBefore=false 表示创建时刻晚于进程锚点（活 run）。
 func seedRun(t *testing.T, db *sql.DB, id, status string, createdBefore bool) {
 	t.Helper()
 	stamp := "2026-01-01 08:00:00.000000"
@@ -83,8 +82,6 @@ func runStatus(t *testing.T, db *sql.DB, id string) string {
 	return status.String
 }
 
-// 收尸：queued/running/awaiting_approval 三态收敛 cancelled，终态不动，
-// run.state 事件载荷 {from,to,reason=runtime_restarted}。
 func TestReconcileOrphans(t *testing.T) {
 	db, gate := newReconcileDB(t)
 	seedRun(t, db, "ridq", "queued", true)
@@ -134,7 +131,6 @@ func TestReconcileOrphans(t *testing.T) {
 	}
 }
 
-// 空账本收尸零收敛。
 func TestReconcileEmpty(t *testing.T) {
 	db, gate := newReconcileDB(t)
 	count, err := ReconcileOrphanRuns(context.Background(), db, gate, time.Now())
@@ -146,7 +142,6 @@ func TestReconcileEmpty(t *testing.T) {
 	}
 }
 
-// 开门到收尸窗口内新建的 run 是活 run：不被启动收尸误收敛。
 func TestReconcileSparesRunsCreatedAfterStart(t *testing.T) {
 	db, gate := newReconcileDB(t)
 	seedRun(t, db, "live", "queued", false)

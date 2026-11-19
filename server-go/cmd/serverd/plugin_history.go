@@ -10,6 +10,7 @@ import (
 	"holdexar/server-go/internal/games"
 	"holdexar/server-go/internal/notifications"
 	"holdexar/server-go/internal/plugins"
+	"holdexar/server-go/internal/timeutil"
 )
 
 type pluginHistorySource struct{ manager *plugins.Manager }
@@ -36,7 +37,7 @@ func (s *pluginHistorySource) Fetch(ctx context.Context, appid int64, region str
 	}
 	rows := make([]dbwriter.CommunityObservation, 0, len(data.Observations))
 	for _, point := range data.Observations {
-		at, err := time.ParseInLocation("2006-01-02", point.Date, time.FixedZone("UTC+8", 8*3600))
+		at, err := time.ParseInLocation("2006-01-02", point.Date, timeutil.ZoneUTC8)
 		if err != nil {
 			return nil, fmt.Errorf("历史观测日期无效")
 		}

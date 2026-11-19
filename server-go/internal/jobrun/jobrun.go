@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 type Recorder struct {
@@ -33,7 +34,7 @@ func encode(v any) string {
 func (r *Recorder) stamp() string { return stampAt(r.Now()) }
 
 func stampAt(at time.Time) string {
-	return at.In(time.FixedZone("Beijing", 8*3600)).Format("2006-01-02 15:04:05.000000")
+	return at.In(timeutil.ZoneBeijing).Format("2006-01-02 15:04:05.000000")
 }
 
 type event struct {
@@ -58,8 +59,6 @@ func (r *Recorder) Run(ctx context.Context, job string, body func() (map[string]
 	return r.runWith(ctx, job, "scheduled", "scheduled", body)
 }
 
-// RunManual 手动触发记账（对齐 scheduler_bridge.run_accounted trigger="manual"）：
-// entry 为入口标识（如 manual_refresh_button）。
 func (r *Recorder) RunManual(ctx context.Context, job, entry string, body func() (map[string]any, error)) (map[string]any, error) {
 	return r.runWith(ctx, job, "manual", entry, body)
 }

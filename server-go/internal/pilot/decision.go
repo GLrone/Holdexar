@@ -1,7 +1,3 @@
-//go:build windows
-
-// decision.go 领航员内部快速决策代理：卡片准入裁决 + 模型视图增强 + 追问建议。
-// 语义对齐 pilot/decision.py。
 package pilot
 
 import (
@@ -9,13 +5,12 @@ import (
 	"strings"
 )
 
-// CardDecision 卡片发放裁决。
 type CardDecision struct {
 	ShouldEmit bool
 	Card       map[string]any
 	Kind       string
-	Status     string // "rendered" | "suppressed"
-	Reason     string // "ok" | "suppressed_by_model" | "no_price_intent" | "empty" | ...
+	Status     string
+	Reason     string
 	Summary    string
 }
 
@@ -106,7 +101,6 @@ var dataSynthesisTools = map[string]bool{
 	"steam_free": true, "hb_monthly": true, "calendar_events": true, "rates_overview": true,
 }
 
-// EvaluateIntent 评估问句的意图与价格/导购倾向。
 func EvaluateIntent(question string) map[string]any {
 	q := strings.TrimSpace(question)
 	intent := Route(q)
@@ -126,7 +120,6 @@ func EvaluateIntent(question string) map[string]any {
 	}
 }
 
-// hasSingleGameTarget 问句是否明确针对单款游戏。
 func hasSingleGameTarget(q string) bool {
 	if strings.Contains(q, "《") && strings.Contains(q, "》") {
 		return true
@@ -145,7 +138,6 @@ func hasSingleGameTarget(q string) bool {
 	return false
 }
 
-// isFullListRequest 问句是否旨在查看完整清单。
 func isFullListRequest(q string) bool {
 	for _, ind := range []string{"在不在", "有没有", "买了吗", "买了没", "在吗",
 		"关注了吗", "在关注里吗", "在库里吗", "在愿望单吗"} {
@@ -156,7 +148,6 @@ func isFullListRequest(q string) bool {
 	return containsAny(q, []string{"列表", "清单", "有哪些", "全部", "所有"})
 }
 
-// CardIdentity 卡片身份：同 kind 下区分内容的最小锚。
 func CardIdentity(kind string, card map[string]any) string {
 	if kind == "epic" {
 		offers := anySlice(card["offers"])
@@ -190,7 +181,6 @@ func CardIdentity(kind string, card map[string]any) string {
 	return ""
 }
 
-// DecideCard 裁决工具结果是否在前端生成可视化卡片。
 func (s *Service) DecideCard(toolName string, result map[string]any, args map[string]any,
 	question string, currentCards []map[string]any, baseCard map[string]any,
 	recentCards [][2]string) CardDecision {
@@ -201,7 +191,6 @@ func (s *Service) DecideCard(toolName string, result map[string]any, args map[st
 		return CardDecision{ShouldEmit: false, Status: "suppressed",
 			Reason: "empty_or_failed", Summary: "工具未返回有效可视化数据"}
 	}
-	// 模型显式控制
 	if v, ok := args["emit_card"]; ok {
 		if b, ok := v.(bool); ok && !b {
 			kind := stringOf(baseCard["kind"])
@@ -219,14 +208,12 @@ func (s *Service) DecideCard(toolName string, result map[string]any, args map[st
 		explicitAllow = true
 	}
 
-	// 价格/地区/对比卡：非比价导向时抑制
 	if kind == "price" || kind == "regions" || kind == "compare" {
 		if isNonPrice && !explicitAllow {
 			return CardDecision{ShouldEmit: false, Kind: kind, Status: "suppressed",
 				Reason: "no_price_intent", Summary: "问句非比价导向"}
 		}
 	}
-	// games 卡：空候选/搜索但非找游戏意图/单款核查
 	if kind == "games" {
 		items := anySlice(baseCard["items"])
 		if len(items) == 0 {
@@ -242,14 +229,12 @@ func (s *Service) DecideCard(toolName string, result map[string]any, args map[st
 				Reason: "single_game_query", Summary: "针对单款游戏核查"}
 		}
 	}
-	// 单对象核验工具
 	if singleItemCheckTools[toolName] {
 		if hasSingleGameTarget(question) && !isFullListRequest(question) && !explicitAllow {
 			return CardDecision{ShouldEmit: false, Kind: kind, Status: "suppressed",
 				Reason: "single_game_query", Summary: "问句仅核验单款游戏"}
 		}
 	}
-	// Epic 卡：空 offer 抑制
 	if kind == "epic" {
 		offers := anySlice(baseCard["offers"])
 		if len(offers) == 0 && baseCard["mobile"] == nil {
@@ -257,22 +242,18 @@ func (s *Service) DecideCard(toolName string, result map[string]any, args map[st
 				Reason: "empty_candidates", Summary: "Epic 免费游戏数据为空"}
 		}
 	}
-	// 数据综合类工具默认不外泄为卡片
 	if dataSynthesisTools[toolName] && !explicitAllow {
 		return CardDecision{ShouldEmit: false, Kind: kind, Status: "suppressed",
 			Reason: "internal_data_for_synthesis", Summary: "数据供大模型总结"}
 	}
-	// 诊断工具非诊断问句抑制
 	if diagnosticTools[toolName] && !containsAny(question, []string{"代理", "节点", "网络", "延迟", "排查", "诊断"}) && !explicitAllow {
 		return CardDecision{ShouldEmit: false, Kind: kind, Status: "suppressed",
 			Reason: "internal_diagnostic", Summary: "技术诊断数据供内部推演"}
 	}
-	// 卡片上限
 	if len(currentCards) >= maxCardsPerTurn {
 		return CardDecision{ShouldEmit: false, Kind: kind, Status: "suppressed",
 			Reason: "quota_exceeded", Summary: "本轮卡片数已达上限"}
 	}
-	// 跨轮去重：静态清单类近轮已呈现过即抑制
 	if repeatableSuppressKinds[kind] {
 		identity := CardIdentity(kind, baseCard)
 		if identity != "" {
@@ -288,7 +269,38 @@ func (s *Service) DecideCard(toolName string, result map[string]any, args map[st
 		Status: "rendered", Reason: "ok"}
 }
 
-// EnhanceModelView 在回灌大模型的视图中注入卡片呈现状态。
+func (s *Service) StreamCardHint(toolName string, args map[string]any, question string,
+	currentCards []map[string]any, baseHint string, recentCards [][2]string) string {
+	if baseHint == "" {
+		return ""
+	}
+	if v, ok := args["emit_card"]; ok {
+		if b, ok := v.(bool); ok && !b {
+			return ""
+		}
+	}
+	if len(currentCards) >= maxCardsPerTurn {
+		return ""
+	}
+	intentInfo := EvaluateIntent(question)
+	isNonPrice, _ := intentInfo["is_non_price"].(bool)
+	explicitAllow := false
+	if v, ok := args["emit_card"].(bool); ok && v {
+		explicitAllow = true
+	}
+	if (baseHint == "price" || baseHint == "regions" || baseHint == "compare") && isNonPrice && !explicitAllow {
+		return ""
+	}
+	if dataSynthesisTools[toolName] && !explicitAllow {
+		return ""
+	}
+	if diagnosticTools[toolName] && !containsAny(question, []string{"代理", "节点", "网络", "延迟", "排查", "诊断"}) && !explicitAllow {
+		return ""
+	}
+	_ = recentCards
+	return baseHint
+}
+
 func EnhanceModelView(result map[string]any, decision CardDecision) map[string]any {
 	out := map[string]any{}
 	for k, v := range result {
@@ -304,7 +316,6 @@ func EnhanceModelView(result map[string]any, decision CardDecision) map[string]a
 	return out
 }
 
-// SuggestFollowups 本轮追问候选（确定性产出）。
 func SuggestFollowups(question, intent string, cards []map[string]any,
 	lastGame map[string]any, toolsRan int) []map[string]any {
 	q := strings.TrimSpace(question)

@@ -20,19 +20,13 @@ import (
 	"holdexar/server-go/internal/config"
 )
 
-// Options 装配入参：数据目录（令牌文件落点）与启动日志出口。
 type Options struct {
-	DataDir string
-	// EnabledByFlag 启动旗标（-mcp）：与 env HOLDEXAR_MCP 等价的启用通道。
+	DataDir       string
 	EnabledByFlag bool
-	// Log 非致命事件出口（MCP 启用失败不拖垮主程序，与现网同语义）；可空。
-	Log func(format string, args ...any)
-	// Deps 工具共享依赖面（D2 日志环/D3 写闸/D4 出站代理/D7 目录导入/D8
-	// 新鲜度）；nil = 全部按不可用语义处理。
-	Deps *Deps
+	Log           func(format string, args ...any)
+	Deps          *Deps
 }
 
-// Surface MCP 面运行态：协议服务器、令牌与启用态的唯一持有者。
 type Surface struct {
 	registry *ToolRegistry
 	fetcher  muxFetcher
@@ -46,17 +40,12 @@ type Surface struct {
 	forcedByFlag bool // -mcp 启动旗标：与 env 同级的强制通道，设置关闭不生效
 
 	enabled atomic.Bool
-	token   atomic.Value // string
-	lastErr atomic.Value // string
+	token   atomic.Value
+	lastErr atomic.Value
 }
 
-// Default 最近一次 Register 装配的运行态；settings 写 mcp.enabled 后经包级
-// Reapply/Status 转发到这里（函数字段注入见 settings 包）。
 var Default *Surface
 
-// Register 装配 MCP 面：注册表构建（重名即错，启动即失败）→ 协议服务器 →
-// 挂载路径与前缀闸 → 启用判定（env HOLDEXAR_MCP 或设置 mcp.enabled）→
-// 令牌落盘。未启用时令牌文件清除、前缀一律 404。
 func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) error {
 	registry, err := buildRegistry()
 	if err != nil {
@@ -69,6 +58,9 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) e
 	s := &Surface{
 		registry: registry, fetcher: newMuxFetcher(mux), poster: newMuxPoster(mux), db: db, deps: deps,
 		dataDir: opts.DataDir, logf: opts.Log, forcedByFlag: opts.EnabledByFlag,
+	}
+	for name, schemaErr := range registry.schemaFailures() {
+		s.log(opts, "MCP 工具 %s 入参 schema 解析失败，回退必需键校验：%v", name, schemaErr)
 	}
 	Default = s
 
@@ -83,7 +75,7 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) e
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
 
-	// 前缀闸恒注册：未启用时 Host/Origin 之后、会话之前回 404（与现网一致）。
+	// 前缀闸恒注册，未启用时在会话前返回 404。
 	gate.RegisterMCPGate(MountPath, s.gateVerdict)
 	mux.Handle(MountPath, s)
 	mux.Handle(MountPath+"/", s)
@@ -95,7 +87,6 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *access.Gate, opts Options) e
 	}
 	token, err := ensureTokenFile(opts.DataDir)
 	if err != nil {
-		// 启用失败不抛：保持关闭态，原因经 lastError 留痕。
 		s.lastErr.Store("MCP 启用失败：" + err.Error())
 		s.log(opts, "MCP 启用失败，保持关闭态：%v", err)
 		return nil
@@ -111,10 +102,6 @@ func (s *Surface) log(opts Options, format string, args ...any) {
 	}
 }
 
-// Reapply mcp.enabled 写入后的运行时重应用（Python reapply 同语义：重算启用态，
-// 开→令牌文件与在役态，关→清令牌文件、前缀闸与挂载壳回 404）。env/启动旗标
-// 强制开启时设置关闭不生效（Python enabled = env or settings 同径）。无在役
-// 装配时为空操作。
 func Reapply() {
 	if Default != nil {
 		Default.reapply()
@@ -130,7 +117,6 @@ func (s *Surface) reapply() {
 	}
 	token, err := ensureTokenFile(s.dataDir)
 	if err != nil {
-		// 启用失败不拖垮主程序：保持关闭态，原因经 lastError 留痕
 		s.enabled.Store(false)
 		s.lastErr.Store("MCP 启用失败：" + err.Error())
 		if s.logf != nil {
@@ -143,8 +129,6 @@ func (s *Surface) reapply() {
 	s.lastErr.Store("")
 }
 
-// MCPStatus 运行态快照（settings GET 投影消费；Python mcp.status 同形）。
-// running=启用态在役；forcedByEnv 含 env 与 -mcp 启动旗标两条强制通道。
 func MCPStatus() (running bool, errText string, forcedByEnv bool) {
 	if Default == nil {
 		return false, "", envEnabled()
@@ -153,7 +137,6 @@ func MCPStatus() (running bool, errText string, forcedByEnv bool) {
 	return Default.enabled.Load(), errText, envEnabled() || Default.forcedByFlag
 }
 
-// envEnabled 环境开关：HOLDEXAR_MCP ∈ {1,true,yes,on}（大小写不敏感）。
 func envEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("HOLDEXAR_MCP"))) {
 	case "1", "true", "yes", "on":
@@ -162,7 +145,6 @@ func envEnabled() bool {
 	return false
 }
 
-// settingsEnabled 设置开关：app_settings 的 mcp.enabled（JSON 布尔，缺行/空为关）。
 func settingsEnabled(db *sql.DB) bool {
 	var raw sql.NullString
 	err := db.QueryRow("SELECT value_json FROM app_settings WHERE key = 'mcp.enabled'").Scan(&raw)
@@ -176,7 +158,6 @@ func settingsEnabled(db *sql.DB) bool {
 	return pyBool(v)
 }
 
-// ensureTokenFile 令牌持久化（一次生成跨重启稳定），0600 权限。
 func ensureTokenFile(dataDir string) (string, error) {
 	path := filepath.Join(dataDir, TokenFilename)
 	if raw, err := os.ReadFile(path); err == nil {
@@ -198,8 +179,7 @@ func ensureTokenFile(dataDir string) (string, error) {
 	return token, nil
 }
 
-// gateVerdict MCP 前缀闸三态：0 放行 / 401 令牌不符 / 404 未启用。
-// 令牌头恒时比较；未启用（或令牌未就绪）一律 404。
+// gateVerdict 返回 0 放行 / 401 令牌不符 / 404 未启用（令牌恒时比较，未就绪回 404）。
 func (s *Surface) gateVerdict(r *http.Request) int {
 	if !s.enabled.Load() {
 		return http.StatusNotFound
@@ -218,7 +198,6 @@ func (s *Surface) gateVerdict(r *http.Request) int {
 	return 0
 }
 
-// ServeHTTP 挂载壳：未启用时 404（与前缀闸双保险），启用后交协议处理器。
 func (s *Surface) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.enabled.Load() {
 		w.Header().Set("Content-Type", "application/json")
@@ -229,8 +208,6 @@ func (s *Surface) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
 }
 
-// projectTool 注册表条目 → MCP 工具投影。写组与领航员会话 / UI 绑定工具
-// 不进本注册表，协议面天然不可达（fail-closed）。
 func projectTool(spec *ToolSpec) *mcp.Tool {
 	no := false
 	return &mcp.Tool{
@@ -245,8 +222,6 @@ func projectTool(spec *ToolSpec) *mcp.Tool {
 	}
 }
 
-// availabilityGuard 不可用工具拦截：注册表外的名称一律回 isError 结果
-// （文案与现网执行边界同文；协议错误按工具结果回灌，与 Python 一致）。
 func (s *Surface) availabilityGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if method == "tools/call" {
@@ -263,18 +238,20 @@ func (s *Surface) availabilityGuard(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
-// validateArgs 按 spec 声明的 JSON Schema 校验必需参数：required 键缺失
-// 回 isError（对齐 Python validation error 拒执行语义——缺参静默按空执行
-// 会把「没找到」伪装成「查了确实没有」）；未声明键沿用 Python BaseHandler
-// 忽略语义不拦；schema 声明本身不可解析时放行，由 handler 取参路径兜底。
-func validateArgs(spec *ToolSpec, args map[string]any) error {
-	var schema struct {
-		Required []string `json:"required"`
-	}
-	if err := jsonDecoder([]byte(spec.Parameters)).Decode(&schema); err != nil {
+// validateArgs 全量校验工具入参（type/enum/minimum/required 等），未声明额外键不拦截；
+// schema 解析失败时回退必需键检查。
+func validateArgs(reg *ToolRegistry, spec *ToolSpec, args map[string]any) error {
+	if res := reg.resolvedSchema(spec.Name); res != nil {
+		if err := res.Validate(schemaView(args)); err != nil {
+			return fmt.Errorf("%s 参数校验失败：%v", spec.Name, err)
+		}
 		return nil
 	}
-	for _, k := range schema.Required {
+	required := spec.required
+	if !spec.requiredParsed {
+		required = parseRequiredParams(spec.Parameters)
+	}
+	for _, k := range required {
 		if _, ok := args[k]; !ok {
 			return fmt.Errorf("%s 缺少必需参数 %q", spec.Name, k)
 		}
@@ -282,8 +259,31 @@ func validateArgs(spec *ToolSpec, args map[string]any) error {
 	return nil
 }
 
-// callHandler 工具调用 → 公共执行边界，结果 JSON 文本回传
-// （payload = {"status": 归一态, **data}）。
+// schemaView 复制入参并把 json.Number 归一为 float64，使 schema 数值类型可识别。
+func schemaView(v any) any {
+	switch x := v.(type) {
+	case json.Number:
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, item := range x {
+			out[k] = schemaView(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = schemaView(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func (s *Surface) callHandler(spec *ToolSpec) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := map[string]any{}
@@ -292,7 +292,7 @@ func (s *Surface) callHandler(spec *ToolSpec) mcp.ToolHandler {
 				return nil, err
 			}
 		}
-		if err := validateArgs(spec, args); err != nil {
+		if err := validateArgs(s.registry, spec, args); err != nil {
 			return &mcp.CallToolResult{
 				IsError: true,
 				Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},

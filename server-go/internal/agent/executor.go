@@ -9,10 +9,7 @@ import (
 
 var errNoFetch = errors.New("执行环境未注入读路径")
 
-// Execute 工具执行边界：策略判定 → 超时包裹 → 失败归一化。
-//
-// 铁律：工具失败 / 超时 = 归一化 ToolResult 回灌客户端，绝不终结调用。
-// 结果形状（kind=failed/timeout）与现网执行器逐字对齐。
+// 失败或超时统一归一化为 ToolResult（kind=failed/timeout），绝不中断整次调用。
 func Execute(cctx *CallContext, spec *ToolSpec, guarded bool) *ToolResult {
 	if decide(spec, guarded) == "deny" {
 		return &ToolResult{Status: StatusDenied, Data: denyResult()}
@@ -50,7 +47,6 @@ func Execute(cctx *CallContext, spec *ToolSpec, guarded bool) *ToolResult {
 	select {
 	case <-runCtx.Done():
 		if errors.Is(runCtx.Err(), context.Canceled) {
-			// 调用方整体取消（连接断开）：按失败归一，等价「异常 = 结果」。
 			return &ToolResult{Status: StatusError,
 				Data:    failedData(spec.Name, "context canceled"),
 				ErrCode: "tool_error"}
@@ -75,8 +71,6 @@ func Execute(cctx *CallContext, spec *ToolSpec, guarded bool) *ToolResult {
 	}
 }
 
-// failedResult 异常归一化：kind=failed + 类型名注记（Python type(e).__name__
-// 的等位；Go 侧承载的是 Go 错误类型名，属既定差异）。
 func failedResult(name string, cause any) *ToolResult {
 	return &ToolResult{Status: StatusError, Data: failedData(name, typeName(cause)), ErrCode: "tool_error"}
 }
@@ -89,9 +83,7 @@ func failedData(name, note string) *Obj {
 	return data
 }
 
-// typeName 异常类型名（Python type(e).__name__ 的等位投影）。errors.New 产
-// 的 errorString 是实现细节（全部未包装错误共用一名，对读者零信息），泛化
-// 为 "error"；有语义的具体类型（如 *fs.PathError、超时类）原样保留。
+// typeName 提取错误类型名；普通 errorString 泛化为 "error"。
 func typeName(cause any) string {
 	t := reflect.TypeOf(cause)
 	if t == nil {

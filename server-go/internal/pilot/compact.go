@@ -1,7 +1,3 @@
-//go:build windows
-
-// compact.go LLM 驱动的上下文自动压缩：蒸早期轮次为要点存档。
-// 语义对齐 pilot/context.py 的 compact_plan / compact。
 package pilot
 
 import (
@@ -16,39 +12,54 @@ import (
 
 const compactFailLimit = 2
 
-var compactFailures = map[string]int{}
+func (s *Service) compactFailCount(sid string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compactFail[sid]
+}
 
-// CompactPlan 压缩计划：蒸 [0, through) 的轮次为摘要。
+func (s *Service) incCompactFail(sid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.compactFail == nil {
+		s.compactFail = map[string]int{}
+	}
+	if len(s.compactFail) > 256 {
+		s.compactFail = map[string]int{}
+	}
+	s.compactFail[sid]++
+}
+
+func (s *Service) resetCompactFail(sid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.compactFail, sid)
+}
+
 type CompactPlan struct {
-	Through int // 蒸馏边界（前 N 轮）
+	Through int
 	Prompt  string
 }
 
-// compactPlan 决定压缩区间：无可蒸馏轮次或区间太小返回 nil。
 func compactPlan(state *SessionState) *CompactPlan {
 	if state == nil || len(state.Turns) == 0 {
 		return nil
 	}
-	// 已有摘要时从 summaryThrough 开始，否则从头开始
 	start := state.SummaryThrough
-	// 保留最近 minHistoryTurns 轮不压缩
 	end := len(state.Turns) - minHistoryTurns
 	if end <= start {
-		return nil // 区间太小或无可蒸馏
+		return nil
 	}
 	through := end
 	return &CompactPlan{Through: through}
 }
 
-// compact 调 LLM 蒸馏早期轮次为要点存档。
-// 返回 (摘要文本, 蒸馏边界, 输入/输出用量) 或 nil（失败）。
 func (s *Service) compact(ctx context.Context, state *SessionState, cfg ConfigPayload,
 	protocol, baseURL, apiKey, model string, sysPrompt string) (string, int, [2]int, error) {
 	plan := compactPlan(state)
 	if plan == nil {
 		return "", 0, [2]int{}, fmt.Errorf("无可蒸馏轮次")
 	}
-	// 装配蒸馏请求的消息序列
 	turns := state.Turns[:plan.Through]
 	var transcript strings.Builder
 	for _, turn := range turns {
@@ -61,13 +72,10 @@ func (s *Service) compact(ctx context.Context, state *SessionState, cfg ConfigPa
 		if answer != "" {
 			transcript.WriteString(fmt.Sprintf("助手：%s\n", clip(answer, 300)))
 		}
-		// 工具结果摘要
-		if msgs, ok := turn["messages"].([]map[string]any); ok {
-			for _, msg := range msgs {
-				if role, _ := msg["role"].(string); role == "tool" {
-					content := ToolClip(stringOf(msg["content"]), 200)
-					transcript.WriteString(fmt.Sprintf("工具：%s\n", content))
-				}
+		for _, msg := range turnMessages(turn) {
+			if role, _ := msg["role"].(string); role == "tool" {
+				content := ToolClip(stringOf(msg["content"]), 200)
+				transcript.WriteString(fmt.Sprintf("工具：%s\n", content))
 			}
 		}
 	}
@@ -82,7 +90,6 @@ func (s *Service) compact(ctx context.Context, state *SessionState, cfg ConfigPa
 		compactPrompt,
 	}
 
-	// 调 LLM（非流式：等完整响应）
 	events, err := s.ChatStream(ctx, protocol, baseURL, apiKey, model, messages, nil, 512, nil)
 	if err != nil {
 		return "", 0, [2]int{}, err
@@ -108,74 +115,65 @@ func (s *Service) compact(ctx context.Context, state *SessionState, cfg ConfigPa
 	return text, plan.Through, [2]int{usageIn, usageOut}, nil
 }
 
-// compactIfNeeded 检查全量视图是否需要压缩，需要则执行。
-// 返回 (是否发生了压缩, 错误)。
-func (s *Service) compactIfNeeded(ctx context.Context, state *SessionState, cfg ConfigPayload,
-	question string) (bool, error) {
-	if state == nil || len(state.Turns) == 0 {
-		return false, nil
+func (s *Service) assembleForModel(ctx context.Context, state *SessionState, question string,
+	req AskRequest, cfg ConfigPayload, sysPrompt string, expanded map[string]bool) ([]map[string]any, bool) {
+	if state == nil {
+		return []map[string]any{{"role": "user", "content": UserText(question, req.AppID, req.ViewContext, req.ElementRefs, req.Quotes)}}, false
 	}
-	// 连败熔断
-	if compactFailures[state.Sid] >= compactFailLimit {
-		return false, nil
-	}
-	budget := s.historyBudget(cfg, state)
-	full := fullView(state, question, reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil)
+	budget := s.historyBudgetWith(cfg, state, sysPrompt, expanded)
+	msgs := assemble(state, question, req.AppID, budget, cfg.ToolContentLimit,
+		req.ViewContext, req.ElementRefs, req.Quotes)
+	full := fullView(state, question, req.AppID, cfg.ToolContentLimit,
+		req.ViewContext, req.ElementRefs, req.Quotes)
 	if !needsCompaction(full, budget) {
-		return false, nil
+		return msgs, false
 	}
-	// 免费剪枝已够则不花模型调用
 	pruneOldToolResults(state, 6, cfg.ToolContentLimit)
-	full2 := fullView(state, question, reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil)
+	full2 := fullView(state, question, req.AppID, cfg.ToolContentLimit,
+		req.ViewContext, req.ElementRefs, req.Quotes)
 	if !needsCompaction(full2, budget) {
-		return false, nil
+		return assemble(state, question, req.AppID, budget, cfg.ToolContentLimit,
+			req.ViewContext, req.ElementRefs, req.Quotes), false
 	}
-	// 调 LLM 蒸馏
-	sysPrompt := SystemPrompt
+	if s.compactFailCount(state.Sid) >= compactFailLimit {
+		return msgs, false
+	}
 	baseURL := EffectiveBaseURL(cfg.Protocol, cfg.BaseURL)
 	apiKey := s.activeAPIKey(cfg)
 	text, through, usage, err := s.compact(ctx, state, cfg, cfg.Protocol, baseURL, apiKey, cfg.Model, sysPrompt)
 	if err != nil {
-		if len(compactFailures) > 256 {
-			compactFailures = map[string]int{}
-		}
-		compactFailures[state.Sid]++
-		return false, err
+		s.incCompactFail(state.Sid)
+		return msgs, false
 	}
-	// 先估后账：压缩后体量必须比压缩前小
 	preTokens := EstimateMessages(full2)
-	state.Summary = text
-	state.SummaryThrough = through
-	postMsgs := fullView(state, question, reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil)
-	postTokens := EstimateMessages(postMsgs)
-	state.Summary = ""
-	state.SummaryThrough = 0
+	prevSummary, prevThrough := state.Summary, state.SummaryThrough
+	state.Summary, state.SummaryThrough = text, through
+	postTokens := EstimateMessages(fullView(state, question, req.AppID, cfg.ToolContentLimit,
+		req.ViewContext, req.ElementRefs, req.Quotes))
+	postMsgs := assemble(state, question, req.AppID, budget, cfg.ToolContentLimit,
+		req.ViewContext, req.ElementRefs, req.Quotes)
+	state.Summary, state.SummaryThrough = prevSummary, prevThrough
 	if postTokens >= preTokens {
-		// 摘要没缩小源内容：拒绝，不计熔断
 		s.log("压缩存档未缩小源内容（%d→%d），已丢弃", preTokens, postTokens)
-		return false, nil
+		return msgs, false
 	}
 	if usage[0] != 0 || usage[1] != 0 {
 		s.AddUsage(ctx, usage[0], usage[1])
 	}
 	if s.GetStore().AppendSummary(state.Sid, text, through, "auto", preTokens, postTokens) {
-		state.Summary = text
-		state.SummaryThrough = through
-		delete(compactFailures, state.Sid)
-		// 存档蒸馏出用户显式偏好 → 记忆账本（失败静默，不拖垮压缩）
+		state.Summary, state.SummaryThrough = text, through
+		s.resetCompactFail(state.Sid)
 		if s.deps.DB != nil {
 			exCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			agent.ExtractPreferencesFromText(exCtx, s.deps.DB, s.gate, text, fmt.Sprintf("compact:%s", state.Sid))
 		}
-		return true, nil
+		return postMsgs, true
 	}
-	return false, nil
+	return msgs, false
 }
 
-// CompactNow 手动压缩（Python compact_session_now 同构）：不看预算闸，只要
-// 蒸得动就蒸；成功重置该会话压缩连败熔断。机器码响应与 Python 逐字对齐，
-// 异常路径由路由层兜 502。
+// CompactNow 手动触发会话压缩（跳过预算闸，成功重置连败熔断）。
 func (s *Service) CompactNow(ctx context.Context, state *SessionState, cfg ConfigPayload) map[string]any {
 	plan := compactPlan(state)
 	if plan == nil {
@@ -188,7 +186,6 @@ func (s *Service) CompactNow(ctx context.Context, state *SessionState, cfg Confi
 	if err != nil {
 		return map[string]any{"ok": false, "reason": "compact_failed"}
 	}
-	// 先估后账：压缩后体量必须比压缩前小，否则拒绝存档
 	state.Summary = text
 	state.SummaryThrough = through
 	postTokens := EstimateMessages(fullView(state, "", reqAppID(&cfg), cfg.ToolContentLimit, nil, nil, nil))
@@ -203,19 +200,17 @@ func (s *Service) CompactNow(ctx context.Context, state *SessionState, cfg Confi
 	if s.GetStore().AppendSummary(state.Sid, text, through, "manual", preTokens, postTokens) {
 		state.Summary = text
 		state.SummaryThrough = through
-		delete(compactFailures, state.Sid)
+		s.resetCompactFail(state.Sid)
 		return map[string]any{"ok": true, "summary_through": through, "turn_total": len(state.Turns),
 			"pre_tokens": preTokens, "post_tokens": postTokens}
 	}
 	return map[string]any{"ok": false, "reason": "compact_failed"}
 }
 
-// reqAppID 从配置取当前 appid（压缩时通常无上下文 appid）。
 func reqAppID(cfg *ConfigPayload) *int {
 	return nil // 压缩装配不带 appid 上下文
 }
 
-// LooksLikeOverflow 检测上下文溢出错误（导出到 ask.go 使用）。
 func LooksLikeOverflow(errText string) bool {
 	lower := strings.ToLower(errText)
 	for _, pattern := range []string{

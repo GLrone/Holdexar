@@ -2,16 +2,14 @@ package agent
 
 import ()
 
-// 预算分档（等价 Python projection.py budget_for）：同步刷新类 240（等待多为
-// 共享写闸排队，短预算会把正常排队误判成失败）、运行面调度工具 60、单工具
-// 覆盖表、默认 20。写组与 propose_* 在 Go MCP 面不存在（fail-closed），不设档。
+// 预算分档：同步类 240s（含写闸排队）、任务类 60s、单工具覆盖或默认 20s。
 const (
 	budgetDefaultS = 20.0
 	budgetSlowS    = 240.0
 	budgetTaskS    = 60.0
 )
 
-// syncBudgetTools 同步刷新工具（Python _SYNC_TOOLS 同表，幂等拉取不设守卫）。
+// syncBudgetTools 适用 240s 慢速超时分档的工具集合。
 var syncBudgetTools = map[string]bool{
 	"sync_wallet": true, "sync_library": true, "sync_achievements": true,
 	"sync_bills": true, "sync_family": true, "sync_subscriptions": true,
@@ -19,13 +17,10 @@ var syncBudgetTools = map[string]bool{
 	"refresh_game_price": true, "notify_test": true,
 }
 
-// taskBudgetTools 运行面调度工具（Python _TASK_TOOLS 同表）。
 var taskBudgetTools = map[string]bool{
 	"list_tasks": true, "start_task": true, "cancel_task": true, "crawl_stop": true,
 }
 
-// toolBudgetS 单工具预算覆盖（Python _TOOL_BUDGET_S 同表：40 网络往返 /
-// 60 重扫聚合 / 90 流水线巡检 / 180 全量出口检测）。
 var toolBudgetS = map[string]float64{
 	"search_steam": 40.0, "web_search": 40.0, "hb_monthly": 40.0, "epic_free": 40.0,
 	"steam_free": 40.0, "calendar_events": 40.0, "rates_overview": 40.0,
@@ -38,7 +33,6 @@ var toolBudgetS = map[string]float64{
 	"proxy_latency_test": 180.0,
 }
 
-// budgetFor 工具执行预算（秒）。
 func budgetFor(name string) float64 {
 	if syncBudgetTools[name] {
 		return budgetSlowS
@@ -52,16 +46,12 @@ func budgetFor(name string) float64 {
 	return budgetDefaultS
 }
 
-// applyDefaultBudget 未显式指定 TimeoutS 的工具落默认预算；预置值原样保留
-//（工具批经 budgetFor 取档后写入 spec.TimeoutS）。
 func applyDefaultBudget(spec *ToolSpec) {
 	if spec.TimeoutS == 0 {
 		spec.TimeoutS = budgetDefaultS
 	}
 }
 
-// buildRegistry 登记全部 MCP 可用工具（声明序 = Python 注册表子集序）。
-// 重名即错（程序错误，启动即失败）。
 func buildRegistry() (*ToolRegistry, error) {
 	r := newRegistry()
 	for _, spec := range []*ToolSpec{
@@ -181,9 +171,6 @@ func buildRegistry() (*ToolRegistry, error) {
 			return nil, err
 		}
 	}
-	// 阶段 6 三批补齐（66 个准入工具，重名即错）：
-	// 批一目录/价格/捆绑/优惠/汇率/日历 16、批二账户/同步/会话/元信息 25、
-	// 批三运维/代理/诊断/网络/运行时 25——分批清单见 docs/migration/MCP_TOOLS_SPEC.md §四。
 	for _, register := range []func(*ToolRegistry) error{
 		RegisterCatalogPriceTools,
 		RegisterAccountTools,
@@ -193,7 +180,6 @@ func buildRegistry() (*ToolRegistry, error) {
 			return nil, err
 		}
 	}
-	// 预算统一按分档表归一（覆盖既有 14 工具的缺省档，如 list_owned/bills_summary=60）。
 	for _, spec := range r.all() {
 		spec.TimeoutS = budgetFor(spec.Name)
 	}

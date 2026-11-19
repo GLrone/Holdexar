@@ -10,8 +10,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// RunManual 手动触发记账：trigger=manual + 入口 ref 进 meta（对齐
-// scheduler_bridge.run_accounted trigger="manual" 的 run 行形状）。
 func TestRunManualTriggerAndEntry(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "holdexar.db")
 	db, e := store.Open(path)

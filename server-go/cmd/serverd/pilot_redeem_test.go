@@ -1,8 +1,3 @@
-//go:build windows
-
-// pilot_redeem_test.go 领航员 redeem_quota 工具形状（对齐 Python
-// tests/test_pilot_tools.py::test_bills_and_redeem_rows 的 redeem 断言与
-// agent/tools/builtin/account.py::redeem_quota 行形状）。
 package main
 
 import (
@@ -10,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -22,12 +16,13 @@ import (
 
 const pilotRedeemSteamID = "76561198000000001"
 
-// refusedTransport 钱包/资料请求全部快速失败（测试环境不出网）。
 type refusedTransport struct{}
 
-func (refusedTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, errors.New("refused") }
+func (refusedTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("refused")
+}
 
-func pilotRedeemFixture(t *testing.T) (*redeem.Service, *account.Service) {
+func pilotRedeemFixture(t *testing.T) (pilot.ToolBridge, *account.Service) {
 	t.Helper()
 	data := t.TempDir()
 	path := filepath.Join(data, "holdexar.db")
@@ -50,34 +45,56 @@ func pilotRedeemFixture(t *testing.T) (*redeem.Service, *account.Service) {
 		}
 	})
 	svc := redeem.NewService(db, gate, redeem.ServiceOptions{Accounts: accounts})
-	return svc, accounts
+	mux := http.NewServeMux()
+	svc.Register(mux)
+	return pilotToolBridge(db, gate, mux, nil), accounts
 }
 
 func TestPilotRedeemQuotaShapes(t *testing.T) {
-	svc, accounts := pilotRedeemFixture(t)
+	bridge, accounts := pilotRedeemFixture(t)
 	ctx := &pilot.CallCtx{Ctx: context.Background()}
-	out := pilotRedeemQuota(ctx, svc)
-	rows := out["rows"].([]map[string]any)
-	if out["titleKey"] != "redeem" || rows[0]["vKey"] != "redeemNoCookie" || rows[0]["tone"] != "warn" {
+	out := bridge(ctx, "redeem_quota", nil, false)
+	rows, ok := out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("未绑定行缺失: %v", out)
+	}
+	row0, _ := rows[0].(map[string]any)
+	if out["titleKey"] != "redeem" || row0["vKey"] != "redeemNoCookie" || row0["tone"] != "warn" {
 		t.Fatalf("未绑定形状不符: %v", out)
 	}
 	if _, err := accounts.BindCookies(context.Background(), "sessionid=abc; steamLoginSecure="+pilotRedeemSteamID+"||jwt-token"); err != nil {
 		t.Fatal(err)
 	}
-	out = pilotRedeemQuota(ctx, svc)
-	rows = out["rows"].([]map[string]any)
-	if rows[0]["vKey"] != "redeemQuota" || rows[0]["tone"] != "ok" {
+	out = bridge(ctx, "redeem_quota", nil, false)
+	rows, ok = out["rows"].([]any)
+	if !ok || len(rows) == 0 {
+		t.Fatalf("额度行缺失: %v", out)
+	}
+	row0, _ = rows[0].(map[string]any)
+	if row0["vKey"] != "redeemQuota" || row0["tone"] != "ok" {
 		t.Fatalf("额度行形状不符: %v", out)
 	}
-	data, ok := rows[0]["data"].(map[string]any)
-	if !ok || data["used"] != 0 || data["limit"] != 10 {
-		t.Fatalf("data 字段不符: %v", rows[0]["data"])
+	data, ok := row0["data"].(map[string]any)
+	if !ok || jsonInt(data["used"]) != 0 || jsonInt(data["limit"]) != 10 {
+		t.Fatalf("data 字段不符: %v", row0["data"])
 	}
 }
 
-func TestPilotRedeemQuotaNilService(t *testing.T) {
-	out := pilotRedeemQuota(&pilot.CallCtx{Ctx: context.Background()}, nil)
-	if !strings.Contains(out["kind"].(string), "empty") {
-		t.Fatalf("nil 服务应回空: %v", out)
+func TestPilotRedeemQuotaUnwiredMux(t *testing.T) {
+	bridge := pilotToolBridge(nil, nil, http.NewServeMux(), nil)
+	out := bridge(&pilot.CallCtx{Ctx: context.Background()}, "redeem_quota", nil, false)
+	if out["kind"] != "failed" {
+		t.Fatalf("未挂载路由应回 failed: %v", out)
+	}
+
+	var gotPeer string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /probe", func(w http.ResponseWriter, r *http.Request) {
+		gotPeer = r.RemoteAddr
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	status, _, err := muxJSON(context.Background(), mux, http.MethodPost, "/probe", map[string]any{"x": 1})
+	if err != nil || status != http.StatusOK || gotPeer != "127.0.0.1:0" {
+		t.Fatalf("muxJSON status=%d peer=%q err=%v", status, gotPeer, err)
 	}
 }

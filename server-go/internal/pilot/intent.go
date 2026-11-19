@@ -1,12 +1,7 @@
-//go:build windows
-
-// Package pilot 领航员：确定性意图路由、多协议 LLM 编排与会话账本。
-// 语义对齐 app/domains/pilot/*（intent/session/llm/config/attachments/service）。
 package pilot
 
 import "strings"
 
-// 意图常量（内部运行信息，不进用户文案）。
 const (
 	IntentHowTo         = "how_to"
 	IntentCreateAlert   = "create_alert"
@@ -59,7 +54,7 @@ var (
 		"能不能", "可不可以", "是不是",
 		"改", "修改", "换", "添加", "同步", "清理", "重试", "刷新", "找", "查",
 	}
-	// GuardWords 守卫词表（唯一来源 agent.tools.policy；写工具 + 命中即拒）。
+	// GuardWords 触发写工具拦截的守卫词表（与 agent.guardWords 同步）。
 	GuardWords = []string{"清空", "删除", "移除", "移出", "停用", "停止", "批量", "全部", "所有"}
 )
 
@@ -72,14 +67,12 @@ func containsAny(text string, words []string) bool {
 	return false
 }
 
-// IsGuarded 问句是否命中写工具守卫词。
 func IsGuarded(question string) bool { return containsAny(question, GuardWords) }
 
 func looksLikeAlert(q string) bool {
 	return containsAny(q, alertChannelWords) && containsAny(q, alertCondWords)
 }
 
-// NavTarget 导航直通目标：导航动词与页面别名同时命中且无疑问/守卫形态。
 func NavTarget(question string) string {
 	q := strings.TrimSpace(question)
 	if q == "" || len([]rune(q)) > 12 {
@@ -99,7 +92,6 @@ func NavTarget(question string) string {
 	return ""
 }
 
-// Route 确定性关键词分派；未命中交 LLM 自由问答。
 func Route(question string) string {
 	q := strings.TrimSpace(question)
 	if q == "" {

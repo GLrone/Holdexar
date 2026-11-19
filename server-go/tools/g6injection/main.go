@@ -1,26 +1,12 @@
-// g6injection：G6-3 隔离副本故障注入实验程序（tools/ 临时实验物，结论沉淀后按纪律评估去留）。
-//
-// 子命令：
-//
-//	snapshot <db>                       integrity_check + foreign_key_check + 关键表行数
-//	replay <db>                         实验 A：真实库上同观测重放保 ID（含跨秒新行对照）
-//	concurrent <db>                     E3：8 goroutine 经写闸并发 UPSERT 同一 settings 键
-//	rollback <db>                       E4：闸内事务中途 error → 断言零残留
-//	holdgate <db> <sec>                 E2 配套：持写闸 N 秒（跨运行时互斥编排用）
-//	killtx <db>                         E1 配套：闸内写一批 settings 后挂起（等待外部强杀）
-//	walfix <db>                         E5：WAL checkpoint(TRUNCATE) + 复检
-//	migrationgate <db> <ver>            E6：对（伪造版本的）库执行版本门，输出行为与文案
-//
-// 全部命令只作用于调用方显式传入的隔离副本路径。
 package main
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"sort"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -78,8 +64,6 @@ func snapshot(dbPath string) {
 	}
 }
 
-// replay 实验 A：挑最新一条 game_price_history 观测，构造同观测批两次写入，
-// 断言行 id 不变（唯一观测键重放保 ID）；再跨秒写入一次，断言产生新行。
 func replay(dbPath string) {
 	db, gate := openDB(dbPath)
 	defer db.Close()
@@ -127,7 +111,6 @@ func replay(dbPath string) {
 			IsBundle: &isBundle,
 		}},
 	}
-	// 写两次（同观测重放，进程内 now 同秒 → 同唯一键）
 	var firstID int64
 	for i := 0; i < 2; i++ {
 		if _, err := w.UpsertTaskBatch(ctx, []dbwriter.BatchEntry{entry}); err != nil {
@@ -148,7 +131,6 @@ func replay(dbPath string) {
 		die(err)
 	}
 	fmt.Printf("重放后: 同观测行数=%d（期望 1，重放保 ID）最新id=%d\n", cnt, firstID)
-	// 跨秒写第三次：snapshot_at 变化 → 新行
 	time.Sleep(1100 * time.Millisecond)
 	price2 := price + 100
 	entry.Prices[0].Price = &price2
@@ -168,7 +150,6 @@ func replay(dbPath string) {
 	fmt.Println("REPLAY_RESULT = PASS")
 }
 
-// concurrent E3：8 goroutine × 25 次 UPSERT 同一 settings 键（全部经写闸）。
 func concurrent(dbPath string) {
 	db, gate := openDB(dbPath)
 	defer db.Close()
@@ -176,16 +157,14 @@ func concurrent(dbPath string) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 8)
 	for g := 0; g < 8; g++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := 0; i < 25; i++ {
 				e := gate.WithWrite(ctx, store.PriorityBackground, func(conn *sql.Conn) error {
 					_, ex := conn.ExecContext(ctx,
 						`INSERT INTO app_settings(key, value_json, updated_at)
 						 VALUES('g6.injection.probe', ?, datetime('now','localtime'))
 						 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at`,
-						fmt.Sprintf(`"w%d-%d"`, id, i))
+						fmt.Sprintf(`"w%d-%d"`, g, i))
 					return ex
 				})
 				if e != nil {
@@ -193,7 +172,7 @@ func concurrent(dbPath string) {
 					return
 				}
 			}
-		}(g)
+		})
 	}
 	wg.Wait()
 	close(errs)
@@ -208,7 +187,6 @@ func concurrent(dbPath string) {
 	fmt.Println("CONCURRENT_RESULT = PASS")
 }
 
-// rollback E4：闸内 INSERT 后主动返回 error，断言零残留。
 func rollback(dbPath string) {
 	db, gate := openDB(dbPath)
 	defer db.Close()
@@ -235,7 +213,6 @@ func rollback(dbPath string) {
 	fmt.Println("ROLLBACK_RESULT = PASS")
 }
 
-// holdgate E2 配套：持写闸 N 秒。
 func holdgate(dbPath string, sec int) {
 	db, gate := openDB(dbPath)
 	defer db.Close()
@@ -254,7 +231,6 @@ func holdgate(dbPath string, sec int) {
 	fmt.Println("HOLD_RELEASED")
 }
 
-// killtx E1 配套：闸内写一批 settings 后挂起，等待外部强杀。
 func killtx(dbPath string) {
 	_, gate := openDB(dbPath)
 	ctx := context.Background()
@@ -277,7 +253,6 @@ func killtx(dbPath string) {
 	}
 }
 
-// walfix E5：checkpoint(TRUNCATE) + 复检。
 func walfix(dbPath string) {
 	db, err := store.Open(dbPath)
 	if err != nil {
@@ -297,7 +272,6 @@ func walfix(dbPath string) {
 	fmt.Println("WALFIX_RESULT = PASS")
 }
 
-// migrationgate E6：版本门行为。
 func migrationgate(dbPath string, ver int) {
 	got, err := store.ReadSchemaVersion(dbPath)
 	if err != nil {
@@ -354,8 +328,6 @@ func main() {
 	}
 }
 
-
-// seriesFull 实测集 2：全量 RefreshSeries（changed=nil, overrides=nil），计时。
 func seriesFull(dbPath string) {
 	db, _ := openDB(dbPath)
 	defer db.Close()
@@ -372,7 +344,6 @@ func seriesFull(dbPath string) {
 	fmt.Printf("SERIES_RESULT = PASS rows=%d elapsed=%s\n", n, time.Since(t0).Round(time.Millisecond))
 }
 
-// derivedBatch 实测集 3：对 JSON appids 清单跑 UpdatePriceDerived(history=true)。
 func derivedBatch(dbPath, jsonPath string) {
 	raw, err := os.ReadFile(jsonPath)
 	if err != nil {
@@ -398,8 +369,6 @@ func derivedBatch(dbPath, jsonPath string) {
 	fmt.Printf("DERIVED_RESULT = PASS rows=%d elapsed=%s\n", n, time.Since(t0).Round(time.Millisecond))
 }
 
-
-// listBench G6-5 瓶颈定案：go 引擎内同 SQL 串行 100 发分位（排除 HTTP 层）。
 func listBench(dbPath string) {
 	db, _ := openDB(dbPath)
 	defer db.Close()
@@ -423,12 +392,10 @@ func listBench(dbPath string) {
 		rows.Close()
 		ts = append(ts, float64(time.Since(t0).Microseconds())/1000)
 	}
-	sort.Float64s(ts)
+	slices.Sort(ts)
 	fmt.Printf("LISTBENCH: n=100 p50=%.1fms p95=%.1fms\n", ts[50], ts[95])
 }
 
-
-// writeBench G6-5 写入吞吐：单发事务 KV UPSERT n 发（rows/s）。
 func writeBench(dbPath string, nArg string) {
 	n, err := strconv.Atoi(nArg)
 	if err != nil || n <= 0 {
@@ -445,7 +412,7 @@ func writeBench(dbPath string, nArg string) {
 				 VALUES(?, ?, datetime('now','localtime'))
 				 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json`,
 				fmt.Sprintf("g6.wb.%d", i%50), fmt.Sprintf("\"%d\"", i))
-		return e
+			return e
 		})
 		if e != nil {
 			die(e)

@@ -1,5 +1,3 @@
-//go:build windows
-
 package agent
 
 import (
@@ -30,7 +28,6 @@ func memoryTestDB(t *testing.T) (context.Context, *sql.DB) {
 	return ctx, db
 }
 
-// 记忆账本：写入/更新同键覆盖、清单排序、画像装配阈值。
 func TestMemoryUpsertListProfile(t *testing.T) {
 	ctx, db := memoryTestDB(t)
 
@@ -42,7 +39,6 @@ func TestMemoryUpsertListProfile(t *testing.T) {
 	if rec["category"] != "region_preference" || rec["source"] != "compact:s1" {
 		t.Fatalf("写入投影不符: %v", rec)
 	}
-	// 同键更新：值与来源覆盖，行数不变
 	if _, err = UpsertMemory(ctx, db, nil, "region_preference", "preferred_regions",
 		[]string{"CN"}, 0.9, "user_explicit"); err != nil {
 		t.Fatal(err)
@@ -61,7 +57,6 @@ func TestMemoryUpsertListProfile(t *testing.T) {
 	if list[0]["source"] != "user_explicit" {
 		t.Fatalf("来源应更新: %v", list[0]["source"])
 	}
-	// 低置信度不进画像；高置信度按标签分组
 	if _, err = UpsertMemory(ctx, db, nil, "genre_preference", "preferred_genres",
 		[]string{"肉鸽"}, 0.3, "auto"); err != nil {
 		t.Fatal(err)
@@ -75,7 +70,6 @@ func TestMemoryUpsertListProfile(t *testing.T) {
 	}
 }
 
-// 启发式提取：区服/类型/史低/预算四类词面。
 func TestExtractPreferencesFromText(t *testing.T) {
 	ctx, db := memoryTestDB(t)
 	text := "我只买阿根廷和土耳其区，喜欢肉鸽和魂类游戏，只在史低入手，预算不超过200元"
@@ -102,14 +96,11 @@ func TestExtractPreferencesFromText(t *testing.T) {
 	if fmtValue(budget["value"]) != `{"val":200}` {
 		t.Fatalf("预算提取值不符: %v", budget["value"])
 	}
-	// 空文本不提取
 	if got := ExtractPreferencesFromText(ctx, db, nil, "", "x"); got != nil {
 		t.Fatalf("空文本应返回空: %v", got)
 	}
 }
 
-// B9：gate 装配时写路径经写闸交互优先级排队——闸被占期间写入挂起，
-// 释放后落库（busy 探针），行为与直写逐字段一致。
 func TestMemoryUpsertQueuesBehindGateHolder(t *testing.T) {
 	ctx, db := memoryTestDB(t)
 	path := filepath.Join(t.TempDir(), "holdexar.db")

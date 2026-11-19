@@ -99,7 +99,6 @@ func TestRevertRevertsWhenNoExits(t *testing.T) {
 	db, gate, bus, cancel := newRevertDB(t)
 	defer cancel()
 	seedSetting(t, db, "proxy.strategy", `"proxy_first"`)
-	// 已废弃订阅不算可用出口
 	if _, err := db.Exec(`INSERT INTO proxy_subscriptions(id,kind,url,deprecated) VALUES(1,'clash','https://example.invalid/sub',1)`); err != nil {
 		t.Fatalf("订阅种子失败: %v", err)
 	}

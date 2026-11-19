@@ -4,17 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
 	"holdexar/server-go/internal/games"
 )
 
-// ─── 目录检索 ───────────────────────────────────────────────────────────────
-
-// searchGames 本地目录名检索（含未爬价/锁区游戏；不触发抓取）。
-// Python: search_catalog → {"kind": "games", "items": [...]}。
 func searchGames(c *CallContext) (*ToolResult, error) {
 	q := strings.TrimSpace(pyStrOr(c.Args["q"]))
 	items, err := c.searchCatalog(q)
@@ -27,8 +24,6 @@ func searchGames(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// searchCatalog 目录检索：优先 FTS 影子列，退回 LIKE（games 包单一实现）。
-// 行形状 = 检索原始行（basePriceFen 键，无中文支持列——与 Python 工具链一致）。
 func (c *CallContext) searchCatalog(q string) ([]any, error) {
 	rows, err := games.SearchCatalog(c.Ctx, c.db, q, 5)
 	if err != nil {
@@ -49,8 +44,6 @@ func (c *CallContext) searchCatalog(q string) ([]any, error) {
 	return items, nil
 }
 
-// gameItem 清单行 → 推荐卡条目（appid/name/cnyFen/discount/positiveRate/
-// reviewCount/chineseSupport；清单行无中文支持列 → null，与 Python _game_item 一致）。
 func (c *CallContext) gameItem(it map[string]any) *Obj {
 	obj := newObj()
 	obj.set("appid", it["appid"])
@@ -63,8 +56,6 @@ func (c *CallContext) gameItem(it map[string]any) *Obj {
 	return obj
 }
 
-// pyRateValue 好评率恒为 positive_rate/100 的 Python 浮点（98.0 形态）；
-// 端点 JSON 的整数字面量（encoding/json 渲染 95.0 → 95）忠实重建为浮点。
 func pyRateValue(v any) any {
 	if n, ok := v.(json.Number); ok && !strings.Contains(n.String(), ".") {
 		if f, err := n.Float64(); err == nil {
@@ -74,7 +65,6 @@ func pyRateValue(v any) any {
 	return v
 }
 
-// recommendGames 结构化条件挑库内游戏（smart 排序；自然语言整句不作名称）。
 func recommendGames(c *CallContext) (*ToolResult, error) {
 	onlyDiscounted := pyBool(c.Args["only_discounted"])
 	minRating, err := pyIntOr(c.Args["min_rating"])
@@ -82,22 +72,22 @@ func recommendGames(c *CallContext) (*ToolResult, error) {
 		return nil, err
 	}
 	maxPriceYuan := c.Args["max_price_yuan"]
-	query := urlValues()
-	query.set("sort", "smart")
-	query.set("limit", "5")
-	query.set("onlyDiscounted", strconv.FormatBool(onlyDiscounted))
-	query.set("minRating", strconv.FormatInt(minRating, 10))
+	query := url.Values{}
+	query.Set("sort", "smart")
+	query.Set("limit", "5")
+	query.Set("onlyDiscounted", strconv.FormatBool(onlyDiscounted))
+	query.Set("minRating", strconv.FormatInt(minRating, 10))
 	if pyBool(maxPriceYuan) {
 		f, err := pyFloatOr(maxPriceYuan)
 		if err != nil {
 			return nil, err
 		}
-		query.set("maxPrice", strconv.FormatInt(int64(f*100), 10))
+		query.Set("maxPrice", strconv.FormatInt(int64(f*100), 10))
 	}
 	var page struct {
 		Items []map[string]any `json:"items"`
 	}
-	if err := c.getJSON("/api/v1/games?"+query.encode(), &page); err != nil {
+	if err := c.getJSON("/api/v1/games?"+query.Encode(), &page); err != nil {
 		return nil, err
 	}
 	items := make([]any, 0, len(page.Items))
@@ -110,9 +100,6 @@ func recommendGames(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 数据查看 ───────────────────────────────────────────────────────────────
-
-// detailView 游戏详情端点响应中工具投影所需的字段切片。
 type detailView struct {
 	Name             string                     `json:"name"`
 	NameEn           *string                    `json:"nameEn"`
@@ -140,7 +127,6 @@ type tagRef struct {
 	NameEn *string `json:"nameEn"`
 }
 
-// bundleView 关联捆绑包条目（详情端点 linkedBundles 数组元素）。
 type bundleView struct {
 	BundleID       int64  `json:"bundleId"`
 	Name           string `json:"name"`
@@ -152,7 +138,7 @@ type bundleView struct {
 	DiffFen        int64  `json:"diffFen"`
 }
 
-// fetchDetail 进程内取游戏详情；404 回 nil（游戏不存在，非错误）。
+// fetchDetail 404 时返回 (nil, nil) 表示游戏不存在。
 func (c *CallContext) fetchDetail(appid int64) (*detailView, error) {
 	var d detailView
 	status, body, err := c.fetch(c.Ctx, "/api/v1/games/"+strconv.FormatInt(appid, 10))
@@ -173,7 +159,6 @@ func (c *CallContext) fetchDetail(appid int64) (*detailView, error) {
 	return &d, nil
 }
 
-// gameDetail 游戏完整档案瘦身投影（大数组压成计数与摘要）。
 func gameDetail(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -237,7 +222,6 @@ func gameDetail(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// linkedBundles 游戏关联捆绑包（详情端点同一数据源，剥离封面图）。
 func linkedBundles(c *CallContext) (*ToolResult, error) {
 	appid, err := toolAppid(c.Args)
 	if err != nil {
@@ -280,7 +264,6 @@ func linkedBundles(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ratesHistory 汇率走势：日线尾部窗口 + 等距抽样（保末点）。
 func ratesHistory(c *CallContext) (*ToolResult, error) {
 	cur := strings.ToUpper(strings.TrimSpace(pyStrOr(c.Args["currency"])))
 	if cur == "" {
@@ -337,10 +320,8 @@ func ratesHistory(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ratesMaxPoints 汇率走势抽样上限（与价格走势同量级）。
 const ratesMaxPoints = 72
 
-// sampleKeep 等距抽样：int(i*stride) 全保留 + 末点（Python 同构）。
 func sampleKeep(seq []any, limit int) []any {
 	stride := float64(len(seq)) / float64(limit)
 	keep := map[int]bool{}
@@ -352,7 +333,7 @@ func sampleKeep(seq []any, limit int) []any {
 	for i := range keep {
 		idx = append(idx, i)
 	}
-	sort.Ints(idx)
+	slices.Sort(idx)
 	out := make([]any, 0, len(idx))
 	for _, i := range idx {
 		out = append(out, seq[i])
@@ -380,7 +361,6 @@ func pyMax(v []float64) float64 {
 	return m
 }
 
-// regionsConfig 区服配置：全量区服（含启用标记）+ 已购抓取区。
 func regionsConfig(c *CallContext) (*ToolResult, error) {
 	var resp struct {
 		Regions []struct {
@@ -419,9 +399,6 @@ func regionsConfig(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 用户面 ─────────────────────────────────────────────────────────────────
-
-// notificationsStatus 通知偏好 + 投递指标合并视图（设置页与统计同源）。
 func notificationsStatus(c *CallContext) (*ToolResult, error) {
 	var prefs map[string]any
 	if err := c.getJSON("/api/v1/notifications/prefs", &prefs); err != nil {
@@ -520,7 +497,6 @@ func notificationsStatus(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// notificationHistory 通知投递账本最近记录（收件邮箱脱敏）。
 func notificationHistory(c *CallContext) (*ToolResult, error) {
 	limit := clampInt(c.Args["limit"], 20, 1, 500)
 	var resp struct {
@@ -566,9 +542,6 @@ func notificationHistory(c *CallContext) (*ToolResult, error) {
 	return &ToolResult{Data: out}, nil
 }
 
-// ─── 公共小件 ───────────────────────────────────────────────────────────────
-
-// toolAppid 工具入参 appid：int(args.get("appid") or 0)。
 func toolAppid(args map[string]any) (int64, error) {
 	if !pyBool(args["appid"]) {
 		return 0, nil
@@ -576,7 +549,6 @@ func toolAppid(args map[string]any) (int64, error) {
 	return pyIntOr(args["appid"])
 }
 
-// emptyResult kind=empty 快捷构造。
 func emptyResult(note string) *ToolResult {
 	obj := newObj()
 	obj.set("kind", "empty")
@@ -584,8 +556,6 @@ func emptyResult(note string) *ToolResult {
 	return &ToolResult{Status: StatusEmpty, Data: obj}
 }
 
-// trackedGame 关注态：monitor_sources 有效来源且未被排除（monitoring
-// active_ids 的成员判定等价式；Python 工具链同源语义）。
 func (c *CallContext) trackedGame(appid int64) (bool, error) {
 	row := c.db.QueryRowContext(c.Ctx,
 		"SELECT EXISTS(SELECT 1 FROM monitor_sources ms"+
@@ -607,7 +577,6 @@ func mapGet(m map[string]any, key string) any {
 	return m[key]
 }
 
-// statInt 统计字段 → int64（JSON 数值缺省 0）。
 func statInt(stat map[string]any, key string) int64 {
 	n, err := pyIntOr(mapGet(stat, key))
 	if err != nil {
@@ -616,7 +585,6 @@ func statInt(stat map[string]any, key string) int64 {
 	return n
 }
 
-// pyStrOr str(value or "")：None/False/0 → 空串；其余按字符串化。
 func pyStrOr(v any) string {
 	if !pyBool(v) {
 		return ""

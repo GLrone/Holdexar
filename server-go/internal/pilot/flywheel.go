@@ -1,7 +1,3 @@
-//go:build windows
-
-// flywheel.go 决策飞轮：decisions.jsonl 追加（shadow，无读取依赖）+
-// 意图×反馈只读投影 + 可训数据集导出。语义对齐 pilot/flywheel.py。
 package pilot
 
 import (
@@ -9,7 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +25,6 @@ func preferencePath(sessionsBase string) string {
 	return filepath.Join(sessionsBase, "preference_pairs.jsonl")
 }
 
-// AppendDecision 决策日志追加（失败静默：飞轮不依赖日志，日志不阻塞问答）。
 func AppendDecision(sessionsBase string, entry map[string]any) bool {
 	flywheelMu.Lock()
 	defer flywheelMu.Unlock()
@@ -110,7 +105,6 @@ func writeJSONLAtomic(path string, rows []map[string]any) bool {
 	return os.Rename(tmp, path) == nil
 }
 
-// turnOutcomes 记录 → tid 结果标签（rejected/failed/empty/accepted/unlabeled）。
 func turnOutcomes(records []map[string]any) map[string]string {
 	feedback := map[string]string{}
 	for _, record := range records {
@@ -151,7 +145,6 @@ func turnOutcomes(records []map[string]any) map[string]string {
 	return outcomes
 }
 
-// FlywheelStats 决策飞轮画像（意图×反馈折叠）。
 func FlywheelStats(sessionsBase string, rawRecords func(string) []map[string]any) map[string]any {
 	records := readJSONL(decisionsPath(sessionsBase))
 	outcomes := map[string]string{}
@@ -191,7 +184,6 @@ func FlywheelStats(sessionsBase string, rawRecords func(string) []map[string]any
 		tid, _ := record["tid"].(string)
 		outcome, known := outcomes[tid]
 		if !known {
-			// 无会话态问答计入 unlabeled
 			stat.unlabeled++
 			unlabeled++
 			continue
@@ -224,7 +216,7 @@ func FlywheelStats(sessionsBase string, rawRecords func(string) []map[string]any
 	for key := range byIntent {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for _, key := range keys {
 		stat := byIntent[key]
 		intentRows = append(intentRows, map[string]any{
@@ -241,7 +233,6 @@ func FlywheelStats(sessionsBase string, rawRecords func(string) []map[string]any
 	}
 }
 
-// readJSONL 决策日志读取（无 t 分型过滤——决策条目不是会话记录）。
 func readJSONL(path string) []map[string]any {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -264,7 +255,6 @@ func readJSONL(path string) []map[string]any {
 
 var _ = time.Now
 
-// PreferencePair 真实回答偏好对（同会话同问先否定后肯定且内容不同）。
 type PreferencePair struct {
 	Sid      string `json:"sid"`
 	Question string `json:"question"`
@@ -272,7 +262,6 @@ type PreferencePair struct {
 	Accepted string `json:"accepted"`
 }
 
-// PreferencePairs 导出真实回答偏好对（同会话同问先否定后肯定且内容不同）。
 func PreferencePairs(sessionsBase string, rawRecords func(string) []map[string]any) []PreferencePair {
 	if rawRecords == nil {
 		return nil
@@ -289,7 +278,6 @@ func PreferencePairs(sessionsBase string, rawRecords func(string) []map[string]a
 		sid := strings.TrimSuffix(entry.Name(), ".jsonl")
 		records := rawRecords(sid)
 		outcomes := turnOutcomes(records)
-		// 按问句分组，找先 rejected 后 accepted 的对
 		type turnEntry struct {
 			question string
 			answer   string
@@ -307,7 +295,6 @@ func PreferencePairs(sessionsBase string, rawRecords func(string) []map[string]a
 			turnOrder = append(turnOrder, tid)
 			turnMap[tid] = turnEntry{question: q, answer: answer}
 		}
-		// 找 rejected → accepted 的对
 		for i, tidA := range turnOrder {
 			if outcomes[tidA] != "rejected" {
 				continue
@@ -332,7 +319,6 @@ func PreferencePairs(sessionsBase string, rawRecords func(string) []map[string]a
 	return pairs
 }
 
-// ExportPreferencePairs 导出偏好对到文件。
 func ExportPreferencePairs(sessionsBase string, rawRecords func(string) []map[string]any) (int, string, bool) {
 	pairs := PreferencePairs(sessionsBase, rawRecords)
 	path := preferencePath(sessionsBase)
