@@ -31,18 +31,12 @@ from app.core.paths import resolve_data_dir
 from app.crawler.utils import get_beijing_time_obj
 from app.domains.pilot import session as pilot_session
 
-# 内联阈值：提问字段里的文本超过它即转附件（粘贴落文件口径）
 INLINE_LIMIT_CHARS = 15360
-# 引用消息里的预览：先到者为准（行数上限或字符上限）
 PREVIEW_LINES = 30
 PREVIEW_CHARS = 1200
-# 单次读取块预算（字符）：一次取不出全文是**设计**，超出即收窄并告知截断
 READ_BLOCK_CHARS = 24000
-# 单份附件上限（字符）：防御性封顶，避免一次落盘几百 MB
 MAX_ATTACH_CHARS = 2_000_000
-# 单轮随问携带的附件数上限
 MAX_ATTACH_PER_TURN = 8
-# 单会话附件文件数上限：超出删最旧（与会话文件同样的确定性清扫口径）
 MAX_FILES_PER_SID = 60
 DEFAULT_NAME = "粘贴文本"
 
@@ -188,7 +182,7 @@ def read_range(sid: str, aid: str, *, start_line: int = 1, end_line: int | None 
             if not picked:
                 picked.append(line[: max(0, block_chars)])
                 cursor += 1
-                clipped_line = True  # 该行自身超预算：行内截断，续读的粒度到不了
+                clipped_line = True
             break
         picked.append(line)
         used += cost

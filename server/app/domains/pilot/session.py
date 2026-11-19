@@ -46,7 +46,6 @@ SESSION_MAX_FILES = 200
 _STATE_CACHE_MAX = 50
 _TITLE_AUTO_CHARS = 24
 _TITLE_MAX_LEN = 60
-# 搜索命中片段：以命中词为中心截一段，两端各留定量上下文
 _SNIPPET_CHARS = 80
 
 
@@ -70,7 +69,6 @@ def valid_sid(sid: str) -> bool:
     return bool(_SID_RE.fullmatch(sid or ""))
 
 
-# 引用标号：中文【引用N】与英文【Ref N】同形（括号内非数字前缀 + 编号）
 _QUOTE_MARKER_RE = re.compile(r"【[^】\d]*\d+】")
 
 
@@ -88,19 +86,14 @@ class SessionState:
     turns: list[dict] = field(default_factory=list)
     summary: str | None = None
     summary_through: int = 0
-    # 压缩边界（对话流分隔线的账本依据）：每次压缩一条，after_turn = 压缩时已存在的轮数
     markers: list[dict] = field(default_factory=list)
     title: str | None = None
     last_game: dict | None = None
     updated_at: str | None = None
-    # 会话内待确认的批量提议（唯一，新提议覆盖旧的）；终态后清空
     pending_proposal: dict | None = None
-    # pid → 提议终态投影（state/done）：历史轮回放时按它校正卡片，避免显示失效按钮
     proposals: dict[str, dict] = field(default_factory=dict)
-    # 列表管理标记（会话级布尔事实，账本后者胜）
     pinned: bool = False
     archived: bool = False
-    # 分叉溯源：派生自哪个会话的前若干轮（fork 记录，仅明细接口暴露）
     forked_from: str | None = None
 
     def proposal_state_of(self, pid: str) -> str:
@@ -120,12 +113,9 @@ class SessionStore:
         # 账本被本进程之外改写/新增/删除时弃缓存重折叠（与列表投影同一口径）
         self._cache_stat: dict[str, tuple[int, int] | None] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        # 列表投影缓存：sid → (mtime_ns+size 键, 摘要)。命中零折叠——
-        # 列表接口高频刷新，逐文件全量折叠是 O(全部历史) 的重复劳动
         self._list_cache: dict[str, tuple[tuple[int, int], dict]] = {}
         self._sweep()
 
-    # ── 读 ────────────────────────────────────────────────────────────
 
     async def load(self, sid: str) -> SessionState | None:
         """载入会话（缓存优先，账本 stat 键失配即重折叠）；无文件返回 None，不创建。
@@ -180,7 +170,6 @@ class SessionStore:
         self._cache_put(state)
         return state
 
-    # ── 写 ────────────────────────────────────────────────────────────
 
     async def append_turn(self, sid: str, record: dict) -> bool:
         if valid_sid(sid):
@@ -278,8 +267,6 @@ class SessionStore:
         except OSError:
             return []
         needle = (q or "").strip().lower()
-        # 检索时扫全部账本（命中可能在很早的会话里，截断窗口会漏），
-        # 无检索才按 limit 截断；命中数最后统一按 limit 收口
         window = files if needle else files[: max(0, limit)]
         out: list[dict] = []
         for path in window:
@@ -402,7 +389,7 @@ class SessionStore:
         records.extend({**turn} for turn in src.turns[:keep])
         async with self._lock(new_sid):
             if self._path(new_sid).is_file():
-                return False  # 目标已存在，绝不覆盖既有会话
+                return False
             try:
                 self.base.mkdir(parents=True, exist_ok=True)
                 with self._path(new_sid).open("w", encoding="utf-8") as f:
@@ -441,7 +428,6 @@ class SessionStore:
             self._cache_put(state)
             return True
 
-    # ── 折叠与清理 ────────────────────────────────────────────────────
 
     @staticmethod
     def _apply(state: SessionState, record: dict) -> None:
@@ -453,7 +439,6 @@ class SessionStore:
         elif kind == "summary":
             state.summary = str(record.get("text") or "")
             state.summary_through = max(0, min(int(record.get("through") or 0), len(state.turns)))
-            # 每次压缩都是一条边界事实（对话流分隔线）；存档内容后者胜，边界行全保留
             state.markers.append({
                 "after_turn": state.summary_through,
                 "trigger": str(record.get("trigger") or "auto"),
@@ -478,7 +463,6 @@ class SessionStore:
             keep = max(0, int(record.get("keep") or 0))
             if keep < len(state.turns):
                 state.turns = state.turns[:keep]
-            # 派生视图随轮数收紧：压缩边界不能指向已作废的轮
             state.summary_through = min(state.summary_through, len(state.turns))
             state.markers = [m for m in state.markers if m.get("after_turn", 0) <= len(state.turns)]
             state.pending_proposal = None
@@ -513,7 +497,7 @@ class SessionStore:
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
-                continue  # 末尾撕裂行 / 坏行跳过
+                continue
             if isinstance(item, dict) and item.get("t"):
                 out.append(item)
         return out
@@ -536,7 +520,6 @@ class SessionStore:
         for sid in targets:
             self._delete_files(sid)
 
-    # ── 路径与缓存 ────────────────────────────────────────────────────
 
     def _path(self, sid: str) -> Path:
         return self.base / f"{sid}.jsonl"

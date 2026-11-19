@@ -148,24 +148,14 @@ class PilotResumePayload(BaseModel):
 
 
 class AskRequest(BaseModel):
-    # 内联上限宽松（6 万字符）；再长的正文由服务端自动转附件（见 pilot/attachments.py），
-    # 消息体里只留引用——内容长度对问答本身不再构成上限。
-    # 允许空串：只挂附件不写问题也是合法一轮，服务端回落到「请查看我附带的附件。」
     question: str = Field(default="", max_length=60000)
     appid: int | None = None
-    # 领航台会话 id：前端每次开抽屉生成一次，同一会话内追问/指代靠它串起
     session_id: str | None = Field(default=None, max_length=64)
-    # 跨会话引用：本轮把另一段会话的要点摘要注入上下文（一次性，不入被引会话）
     reference_sid: str | None = Field(default=None, max_length=64)
-    # 本轮随问携带的附件 id（前端粘贴转附件后回填）；服务端按会话校验归属
     attachments: list[str] = Field(default_factory=list, max_length=8)
-    # 中断续跑：上一轮被中断时已完成的事实（一次性注入，不入账本）
     resume: PilotResumePayload | None = None
-    # 用户当前所在页面的上下文（前端路由 + 活跃板块），让模型知道用户在看什么
     view_context: dict | None = None
-    # 用户在页面上选中的元素引用（标签/文本/selector/role），让模型知道用户指代的具体元素
     element_refs: list[dict] | None = None
-    # 本轮随问携带的编号引用（n + 正文）：正文里的 【引用N】 标号给出它们在句中的位置
     quotes: list[dict] | None = None
 
 

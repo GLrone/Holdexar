@@ -14,7 +14,6 @@ class ServerComponentRegistry:
         self._init_builtin_components()
 
     def _init_builtin_components(self) -> None:
-        # 五大核心通用组件 (P0)
         self.register(
             ComponentMeta(
                 component_id="metric-grid",

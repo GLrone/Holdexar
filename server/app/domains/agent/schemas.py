@@ -15,7 +15,6 @@ class AgentRunCreate(BaseModel):
     # 历史 task 请求参数。
     task: str | None = Field(default=None, max_length=32)
     ref: dict | None = None
-    # fake 执行器参数（scenario：success / failure）
     scenario: str = "success"
     steps: int = Field(default=3, ge=1, le=20)
     step_delay: float = Field(default=0.0, ge=0, le=5.0)

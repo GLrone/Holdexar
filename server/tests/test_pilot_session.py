@@ -70,7 +70,6 @@ class TestSessionStore:
         assert await store.load("nope") is None
         state = await store.load_or_new("nope")
         assert isinstance(state, SessionState)
-        # 未写入前零足迹（懒创建）
         assert not (store.base / "nope.jsonl").exists()
 
     @pytest.mark.asyncio
@@ -82,17 +81,16 @@ class TestSessionStore:
         reopened = SessionStore(tmp_path / "sessions")
         state = await reopened.load("sid-2")
         assert state.summary == "新存档"
-        assert state.summary_through == 2  # 超出轮数的 through 收敛到 len(turns)
+        assert state.summary_through == 2
 
     @pytest.mark.asyncio
     async def test_torn_tail_tolerated(self, store):
         await store.append_turn("sid-3", _turn("完整轮", "回答"))
         path = store.base / "sid-3.jsonl"
         with path.open("a", encoding="utf-8") as f:
-            f.write('{"t":"turn","q":"撕')  # 模拟崩溃留下的半行
+            f.write('{"t":"turn","q":"撕')
         state = await store.load("sid-3")
         assert len(state.turns) == 1 and state.turns[0]["q"] == "完整轮"
-        # 后续追加照常
         assert await store.append_turn("sid-3", _turn("再问", "再答")) is True
         assert len((await store.load("sid-3")).turns) == 2
 
@@ -107,14 +105,14 @@ class TestSessionStore:
         base.mkdir(parents=True)
         old_path = base / "old.jsonl"
         old_path.write_text('{"t":"turn"}\n', encoding="utf-8")
-        stale = 9999999999  # 远早于现在的 mtime，模拟闲置已久的会话
+        stale = 9999999999
         os.utime(old_path, (stale, stale))
         for i in range(SESSION_MAX_FILES + 5):
             (base / f"s{i}.jsonl").write_text('{"t":"turn"}\n', encoding="utf-8")
         SessionStore(base)
-        assert old_path.exists()  # 闲置会话保留（不再按 TTL 静默删除）
+        assert old_path.exists()
         leftovers = sorted(base.glob("*.jsonl"))
-        assert len(leftovers) == SESSION_MAX_FILES  # 仅超上限时删最旧
+        assert len(leftovers) == SESSION_MAX_FILES
 
     @pytest.mark.asyncio
     async def test_concurrent_appends_serialize(self, store):
@@ -131,7 +129,7 @@ class TestContextEstimate:
         assert pilot_context.estimate_tokens("") == 0
         ascii_tokens = pilot_context.estimate_tokens("abcd" * 25)
         cjk_tokens = pilot_context.estimate_tokens("测" * 100)
-        assert ascii_tokens < cjk_tokens  # 同 token 计量下中文密度更高
+        assert ascii_tokens < cjk_tokens
         assert pilot_context.estimate_messages([{"role": "user", "content": "x"}]) > 0
 
     def test_prune_keeps_head_and_tail(self):
@@ -160,7 +158,6 @@ class TestAssemble:
         msgs = pilot_context.assemble(state, "现在呢", None)
         assert msgs[0]["role"] == "user" and "存档要点" in msgs[0]["content"]
         roles = [m["role"] for m in msgs]
-        # 存档覆盖轮 0；轮 1、2 原文保留（2 个历史 user）+ 摘要 user + 当前问题
         assert roles.count("user") == 4
         assert msgs[-1]["content"] == "现在呢"
 
@@ -169,7 +166,6 @@ class TestAssemble:
         state = _state_with_turns(6)
         msgs = pilot_context.assemble(state, "最新问题", None)
         assert pilot_context.estimate_messages(msgs) <= 1700
-        # 最近 RECENT_KEEP_TURNS 轮逐字保留
         bodies = [m.get("content") for m in msgs]
         assert any("问题4" in (b or "") for b in bodies)
         assert not any("问题0" in (b or "") for b in bodies)
@@ -183,14 +179,14 @@ _CFG_MIN = {"protocol": "openai", "base_url": "http://127.0.0.1:9/v1",
             "api_key": "k", "model": "m"}
 
 
-_PLAN = (0, 2, 900)  # 显式计划：单测这两条路径时不需要真去推边界（边界另有专测）
+_PLAN = (0, 2, 900)
 
 
 class TestCompact:
     @pytest.mark.asyncio
     async def test_nothing_to_distill(self):
         state = _state_with_turns(2)
-        assert await pilot_context.compact(state, _CFG_MIN) is None  # 轮数 ≤ KEEP，无可蒸馏
+        assert await pilot_context.compact(state, _CFG_MIN) is None
 
     @pytest.mark.asyncio
     async def test_distills_older_turns_with_merge(self, monkeypatch):
@@ -208,7 +204,6 @@ class TestCompact:
         assert text == "存档：用户在问价格。"
         assert through == 2
         assert usage == (50, 12)
-        # 首条是合并用的既有存档，末条是压缩指令，中间是被蒸馏区间的真实消息
         assert "旧存档" in seen["messages"][0]["content"]
         assert "合并" in seen["messages"][0]["content"]
         assert seen["messages"][-1]["content"] == pilot_context._COMPACT_INSTRUCTION
@@ -241,7 +236,7 @@ class TestCompact:
             })
         await pilot_context.compact(state, _CFG_MIN, sys_prompt="系统提示", plan=(0, 2, 900))
         blob = "\n".join(str(m.get("content") or "") for m in seen["messages"])
-        assert '"price":1001' in blob          # 工具返回原样在输入里
+        assert '"price":1001' in blob
         assert seen["messages"][0]["content"] == "系统提示"
 
     @pytest.mark.asyncio
@@ -269,7 +264,6 @@ class TestCompact:
         assert text == "存档"
         assert len(calls) == 2
         assert len(calls[1]) < len(calls[0])
-        # 截断标记在场，且首条不会是落单的 tool 消息
         assert any(pilot_context._COMPACT_RETRY_MARKER in str(m.get("content") or "")
                    for m in calls[1])
 
@@ -312,7 +306,6 @@ class TestOverflow:
         done = events[-1]
         assert done["type"] == "done" and done["source"] == "llm" and done["answer"] == "好"
         assert len(calls) == 2
-        # 第二次调用不再含历史轮次
         assert not any("历史问题" in (m.get("content") or "") for m in calls[1])
 
 
@@ -330,7 +323,6 @@ class TestCompactionInService:
             pass
 
         monkeypatch.setattr(pilot_config, "add_usage", _add)
-        # 预算压到极小，迫使首轮后就触发压缩
         monkeypatch.setattr(pilot_context, "HISTORY_BUDGET_TOKENS", 150)
         compact_calls = {"n": 0}
 
@@ -379,7 +371,6 @@ class TestManualCompact:
             return "存档文本", 3, (20, 5)
 
         monkeypatch.setattr(pilot_context, "compact", _compact)
-        # 本用例只验落盘与状态流转，蒸馏计划另行专测——给一个确定的计划
         monkeypatch.setattr(pilot_context, "compact_plan", lambda *a, **k: (0, 3, 900))
 
         async def _add(inp, out):
@@ -389,7 +380,6 @@ class TestManualCompact:
         out = await service.compact_session_now(state, {})
         assert out["ok"] is True and out["summary_through"] == 3 and out["turn_total"] == 5
         assert isinstance(out["pre_tokens"], int) and isinstance(out["post_tokens"], int)
-        # 摘要确实把源内容缩小了才允许落盘（不缩小的结果被拒）
         assert out["post_tokens"] < out["pre_tokens"]
         assert state.summary == "存档文本" and state.summary_through == 3
         reopened = SessionStore(tmp_path / "pilot" / "sessions")
@@ -432,7 +422,7 @@ class TestRestartResume:
 
         monkeypatch.setattr(service.pilot_llm, "chat_stream", _stream)
         await service.ask("巫师 3 值得入手吗", session_id="s-r")
-        service._store = None  # 模拟进程重启：内存态清零，账本在盘上
+        service._store = None
         await service.ask("把它加进关注", session_id="s-r")
         second = seen[1]
         assert any(m.get("role") == "user" and "巫师 3" in (m.get("content") or "") for m in second)
@@ -449,7 +439,6 @@ class TestSessionTitle:
         await store.append_turn(sid, _turn("第二问不改变标题", "好"))
         assert (await store.load(sid)).title == "打开设置看看"
         await store.set_title(sid, "我的设置会话")
-        # 重启（新实例）后折叠还原标题
         state2 = await SessionStore(store.base).load(sid)
         assert state2.title == "我的设置会话"
 
@@ -470,7 +459,6 @@ class TestSessionTitle:
         assert items["t-list-a"]["title"] == "甲乙丙丁"
         assert items["t-list-b"]["turn_total"] == 1
         assert items["t-list-b"]["updated_at"]
-        # 旧文件无 title 行：投影按首问兜底
         import json as _json
 
         store.base.mkdir(parents=True, exist_ok=True)
@@ -530,7 +518,6 @@ class TestRewrite:
         state = await second.load("s1")
         assert [t["q"] for t in state.turns] == ["q0", "q1"]
         lines = (tmp_path / "s" / "s1.jsonl").read_text(encoding="utf-8").strip().splitlines()
-        # 首轮自动标题 1 行 + 3 轮原文 + 1 条截断记录：历史一行未少，截断只追加
         assert len(lines) == 5
         assert any('"t": "truncate"' in line for line in lines)
 
@@ -628,7 +615,6 @@ class TestResumeInjection:
         msgs = seen[0]
         system_text = "\n".join(m.get("content") or "" for m in msgs if m.get("role") == "system")
         assert "查价格" in system_text and "31 元" in system_text
-        # 装配契约不被续跑打破：末位仍是当前问题
         user_msgs = [m for m in msgs if m.get("role") == "user"]
         assert user_msgs and "继续" in user_msgs[-1]["content"]
 
@@ -641,7 +627,6 @@ class TestSessionFlags:
         first = SessionStore(tmp_path / "s")
         await first.append_turn("s1", _turn("q0", "a0"))
         assert await first.set_pinned("s1", True) is True
-        # 换实例重折叠：置顶是账本语义，不是内存态
         second = SessionStore(tmp_path / "s")
         assert (await second.load("s1")).pinned is True
         assert await second.set_pinned("s1", False) is True
@@ -658,7 +643,6 @@ class TestSessionFlags:
         st = SessionStore(tmp_path / "s")
         await st.append_turn("old", _turn("旧会话", "a"))
         await st.append_turn("new", _turn("新会话", "a"))
-        # 置顶较旧的那个：列表里必须排在新会话之前
         await st.set_pinned("old", True)
         items = st.list_recent(10)
         assert [i["sid"] for i in items] == ["old", "new"]
@@ -696,7 +680,7 @@ class TestFork:
         dst = await store.load("dst")
         assert [t["q"] for t in dst.turns] == ["q0", "q1"]
         assert dst.forked_from == "src"
-        assert dst.title == "q0"  # 生效标题随分叉带过来
+        assert dst.title == "q0"
 
     @pytest.mark.asyncio
     async def test_fork_leaves_source_untouched(self, tmp_path):
@@ -706,7 +690,7 @@ class TestFork:
         await st.fork("src", "dst", 1)
         assert [t["q"] for t in (await st.load("src")).turns] == ["q0", "q1", "q2"]
         src_lines = (tmp_path / "s" / "src.jsonl").read_text(encoding="utf-8").strip().splitlines()
-        assert len(src_lines) == 4  # 自动标题 1 + 3 轮，分叉不写源账本
+        assert len(src_lines) == 4
 
     @pytest.mark.asyncio
     async def test_fork_refuses_existing_target(self, store):
@@ -773,7 +757,6 @@ class TestFork:
             assert service.session_busy("s-live") is True
             service.clear_session_running("s-live")
             assert service.session_busy("s-live") is False
-            # 流已摘：无此会话 → 闸放行，走到 no_session（证明拒绝来自闸而非别处）
             out2 = await service.rewind_session("s-live", 1)
             assert out2["ok"] is False and out2["reason"] == "no_session"
         finally:
@@ -804,6 +787,5 @@ async def test_load_refolds_when_ledger_file_changed_externally(store, tmp_path)
 
     reloaded = await store.load(sid)
     assert reloaded is not None and reloaded.title == "外部改名"
-    # 外部删除同样按失配处理：缓存不再复活已删账本
     path.unlink()
     assert await store.load(sid) is None

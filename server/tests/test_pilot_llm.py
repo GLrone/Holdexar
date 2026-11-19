@@ -53,7 +53,7 @@ async def test_usage_on_every_frame_still_yields_answer():
     body = (
         _frame("你", {"prompt_tokens": 10, "completion_tokens": 1})
         + _frame("好", {"prompt_tokens": 10, "completion_tokens": 2})
-        + _frame(None, {"prompt_tokens": 10, "completion_tokens": 2})  # 纯用量帧
+        + _frame(None, {"prompt_tokens": 10, "completion_tokens": 2})
     )
 
     async def handler(request):
@@ -221,24 +221,20 @@ async def test_detect_refuses_cross_origin_stored_key(monkeypatch):
     monkeypatch.setattr(pilot_router.pilot_config, "load_config", fake_load_config)
     monkeypatch.setattr(pilot_router.pilot_llm, "detect_provider", fake_detect)
 
-    # 供应商已存密钥：base_url 换 host / 换端口 / 换 scheme → 一律 422 且不触网
     for url in ("https://evil.example/v1", "https://x:8443/v1", "http://x/v1"):
         with pytest.raises(pilot_router.HTTPException) as ei:
             await pilot_router.detect(DetectRequest(base_url=url, provider_id="p-1"))
         assert ei.value.status_code == 422
-        assert captured.get("key", "") == ""  # detect 从未带密钥发出
+        assert captured.get("key", "") == ""
 
-    # 活跃配置密钥：跨源同理 422
     with pytest.raises(pilot_router.HTTPException) as ei:
         await pilot_router.detect(DetectRequest(base_url="https://evil.example/v1"))
     assert ei.value.status_code == 422
     assert captured.get("key", "") == ""
 
-    # 同源（scheme+host+port 一致，路径不同也算同源）才携带
     await pilot_router.detect(DetectRequest(base_url="https://x/other", provider_id="p-1"))
     assert captured["key"] == "sk-p1"
 
-    # 显式提供的密钥：调用方自有选择，跨源也原样携带
     await pilot_router.detect(
         DetectRequest(base_url="https://evil.example/v1", api_key="sk-explicit"))
     assert captured["key"] == "sk-explicit"
@@ -267,20 +263,17 @@ async def test_test_connection_refuses_cross_origin_stored_key(monkeypatch):
         await pilot_router.test_connection(
             pilot_router.TestRequest(base_url="https://evil.example/v1", model="m"))
     assert ei.value.status_code == 422
-    assert captured == {}  # 未发出任何请求
+    assert captured == {}
 
-    # 缺省 base_url = 配置地址本身：携带已存密钥
     r = await pilot_router.test_connection(pilot_router.TestRequest(model="m"))
     assert r.ok is True
     assert captured["key"] == "sk-cfg"
     assert captured["base_url"] == "https://x/v1"
 
-    # 同源自定义路径：携带
     await pilot_router.test_connection(
         pilot_router.TestRequest(base_url="https://x/alt", model="m"))
     assert captured["key"] == "sk-cfg"
 
-    # 显式密钥：跨源也原样携带
     await pilot_router.test_connection(
         pilot_router.TestRequest(base_url="https://evil.example/v1", model="m",
                                  api_key="sk-explicit"))
@@ -395,7 +388,6 @@ def test_protocol_requests_preserve_tool_calls_and_results(protocol):
         assert body["messages"][-2]["tool_calls"][0]["function"] == expected
 
 
-# ── _anthropic_convert：连续同角色合并（协议要求 user/assistant 交替）──
 
 
 def test_anthropic_convert_merges_consecutive_same_role():
@@ -427,9 +419,6 @@ def test_anthropic_convert_system_extracted_and_alternating():
     assert [m["role"] for m in out] == ["user", "assistant"]
 
 
-# ── anthropic 协议真实请求循环：连续同角色在发出的报文里不得再现 ──
-# （回归：合并逻辑丢失时真实端点 400 交替角色违约——此处捕获实际发出的
-#  请求体，在服务端位置断言交替角色契约，并回放标准 SSE 验证解析闭环。）
 
 
 def _anthropic_sse() -> bytes:
@@ -467,11 +456,10 @@ async def test_anthropic_chat_stream_request_roles_alternate():
                 api_key="sk-test", model="test-model", messages=msgs, client=client,
             )
         ]
-    assert [k for k, _ in chunks][:2] == ["cache", "answer"], chunks  # 流尾部还有 usage/context 汇总
+    assert [k for k, _ in chunks][:2] == ["cache", "answer"], chunks
     body = captured[0]
     roles = [m["role"] for m in body["messages"]]
-    assert roles == ["user", "assistant", "user"], roles  # 严格交替，无连续同角色
-    # 工具结果收进 user 轮 tool_result 块，末接追问文本
+    assert roles == ["user", "assistant", "user"], roles
     last = body["messages"][-1]["content"]
     assert [b["type"] for b in last] == ["tool_result", "text"]
     assert any(m["role"] == "system" for m in body["messages"]) is False

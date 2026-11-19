@@ -209,7 +209,7 @@ async def _wallet_region_line() -> str | None:
         if currency:
             return f"账号结算区：{str(code).upper()}（币种 {currency.upper()}）"
         return f"账号结算区：{str(code).upper()}"
-    except Exception as e:  # noqa: BLE001 —— 事实注入是旁支，取不到就不写
+    except Exception as e:  # noqa: BLE001
         log_event(logger, "环境事实：钱包结算区取数失败，本条不注入",
                   level=logging.DEBUG, detail={"原因": str(e)})
         return None
@@ -309,13 +309,11 @@ def user_text(question: str, appid: int | None,
         if vc_parts:
             parts.append(vc_parts)
     ctx_suffix = f"（{'; '.join(parts)}）" if parts else ""
-    # 元素引用作为独立后缀块（可能有多条，每条一行）
     el_block = _format_element_refs(element_refs)
     quote_block = _format_quote_refs(quotes)
     return f"{question}{ctx_suffix}{el_block}{quote_block}"
 
 
-# 路由路径 → 中文页面名映射（与前端路由表 + NAV_TARGETS 对齐）
 _ROUTE_NAMES: dict[str, str] = {
     "/dashboard": "仪表盘",
     "/library": "游戏商店",
@@ -359,14 +357,11 @@ def _format_view_context(vc: dict) -> str | None:
     if not route:
         return None
 
-    # 路由名查表，查不到用路径兜底
     page_name = _ROUTE_NAMES.get(route, route.lstrip("/"))
 
-    # 游戏详情页特殊处理：从路由或 view_context 提取 appid
     if route.startswith("/game/"):
         page_name = "游戏详情"
         if not vc_appid:
-            # 路由路径形如 /game/1817190，提取 appid
             parts = route.split("/")
             if len(parts) >= 3:
                 try:
@@ -378,7 +373,6 @@ def _format_view_context(vc: dict) -> str | None:
     if vc_appid:
         fragments.append(f"正在看 AppID {vc_appid} 的游戏")
     if section:
-        # section 用前端给的原始键，不强行翻译——前端最清楚自己的 tab 语义
         fragments.append(f"看「{section}」板块")
     if tab:
         fragments.append(f"「{tab}」标签页")
@@ -403,7 +397,6 @@ def _format_element_refs(refs: list[dict] | None) -> str:
         text = str(ref.get("text") or "").strip()
         selector = str(ref.get("selector") or "").strip()
         role = str(ref.get("role") or "").strip()
-        # 优先用 label，没有才用 text（label 是 aria-label/alt/title，语义更强）
         desc = label or text
         parts_list = [f"<{tag}>"]
         if role:
@@ -494,7 +487,6 @@ def estimate_tokens(text: str) -> int:
         return 0
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f" or "\uff00" <= ch <= "\uffef")
     other = len(text) - cjk
-    # 汉字部分向上取整：宁可略高估（少放一点）也不要低估（请求真的溢出）
     cjk_tokens = (cjk * _CJK_PER_TOKEN_NUM + _CJK_PER_TOKEN_DEN - 1) // _CJK_PER_TOKEN_DEN
     return cjk_tokens + other // 4 + 1
 
@@ -834,7 +826,6 @@ async def compact(state, cfg: dict, *, sys_prompt: str | None = None,
                 elif kind == "answer":
                     parts.append(delta)
         except pilot_llm.PilotLlmError as e:
-            # 压缩输入自己撑爆窗口：丢掉最早一段再试，不是本会话不可压
             if (attempt >= COMPACT_INPUT_RETRY_LIMIT or tail <= 2
                     or not looks_like_overflow(str(e))):
                 return None

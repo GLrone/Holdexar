@@ -63,18 +63,14 @@ class IllegalRunTransition(ValueError):
         super().__init__(f"illegal run transition: {current} -> {target}")
 
 
-# ── 域终态 → run 终态映射（统一状态投影，唯一来源）──────────────────
-#
 # run 记调度事实；业务成败由域账本裁判（price_cycles / crawl_jobs）。
 # 映射只回答「这次调度收在哪个 run 终态」：partial（部分成功）的业务
 # 细节留在 price_cycles，run 不冒充业务结论，照样记 done。
 DOMAIN_TERMINAL_TO_RUN: dict[str, str] = {
-    # price_cycles 终态：completed / partial / failed / cancelled
     "completed": RUN_DONE,
     "partial": RUN_DONE,
     "failed": RUN_FAILED,
     "cancelled": RUN_CANCELLED,
-    # crawl_jobs 终态：done / failed / stopped
     "done": RUN_DONE,
     "stopped": RUN_CANCELLED,
 }

@@ -4,7 +4,6 @@ from __future__ import annotations
 from app.domains.agent.tools.base import ToolSpec
 from app.domains.agent.tools.builtin import _shared
 
-# 运行状态 → （行值词条, 色调）；一级状态语义见 runtime/state.py
 _TASK_STATUS_ROW: dict[str, tuple[str, str]] = {
     "queued": ("taskQueued", "warn"),
     "running": ("taskRunning", "ok"),
@@ -190,7 +189,7 @@ async def read_session(sid: str, offset: int = 0, count: int = _shared._READ_ROW
         from app.domains.pilot import context as pilot_context
 
         digest = pilot_context.digest_lines(window, budget=_READ_DIGEST_TOKENS)
-    except Exception:  # noqa: BLE001 — 摘要失败不影响清单行
+    except Exception:  # noqa: BLE001
         digest = None
     result = _shared.rows_result("sessionRead", rows, total=total)
     result["sid"] = str(sid or "")

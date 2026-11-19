@@ -34,8 +34,6 @@ async def price_facts(appid: int) -> dict | None:
         cn_fen = at["cnyFen"]
         cn_discount = at.get("discount") or 0
 
-    # 国区不可买（锁区/未爬）时取最低可购区：直接消费 get_game_detail 的
-    # lowest 事实（全区最低已由同一处判定），折扣从价格矩阵补齐
     alt = None
     if cn_fen is None:
         low_fen = detail.get("lowestCnyFen")

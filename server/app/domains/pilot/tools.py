@@ -52,7 +52,6 @@ from app.domains.agent.tools.projection import (
 )
 from app.domains.agent.tools.registry import REGISTRY
 
-# 触发 builtin 登记（工具全集由注册表自持，此处不保存数量）
 from app.domains.agent.tools.builtin import catalog as _catalog  # noqa: F401 — 触发内置工具注册
 
 _BULK_MAX_ITEMS = _shared._BULK_MAX_ITEMS
@@ -64,7 +63,6 @@ _THRESH_RE = _shared._THRESH_RE
 
 TOOL_META: dict[str, dict] = REGISTRY.meta()
 
-# 工具表切面（唯一事实源在 agent/tools/projection.py）
 CARD_TOOLS = _CARD_TOOLS
 """产卡工具：只有它们需要 emit_card 开关。"""
 

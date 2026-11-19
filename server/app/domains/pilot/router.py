@@ -39,14 +39,7 @@ _KEY_SCOPE_HINT = "该地址与已配置服务不一致，请填写该服务的 
 
 
 def _same_origin(a: str, b: str) -> bool:
-    """scheme+host+port 同源判定；任一侧解析失败即不同源。"""
-    try:
-        ua, ub = urlsplit(a), urlsplit(b)
-        pa, pb = ua.port, ub.port
-    except ValueError:
-        return False
-    return (ua.scheme.lower(), (ua.hostname or "").lower(), pa) == (
-        ub.scheme.lower(), (ub.hostname or "").lower(), pb)
+    return pilot_config.same_origin(a, b)
 
 
 async def _config_payload() -> PilotConfigPayload:
@@ -126,7 +119,6 @@ async def get_config() -> PilotConfigPayload:
 @router.put("/config")
 async def update_config(payload: PilotConfigUpdate) -> PilotConfigPayload:
     try:
-        # 只提交显式给出的字段；缺省字段保持原值（api_key 的清空 = 显式空串）
         update = {k: getattr(payload, k) for k in payload.model_fields_set}
         await pilot_config.save_config(update)
         return await _config_payload()
@@ -227,7 +219,6 @@ async def list_sessions(limit: int = 50, q: str = "") -> PilotSessionListOut:
     """最近会话投影（mtime 倒序，置顶在前）：标题/轮数/更新时间 + 是否生成中
     （运行登记），供历史面板与会话列。q 给定时按关键词过滤（标题或问答正文）。"""
     try:
-        # 折叠/检索入线程：账本文件扫描不占事件循环，流式回合不被卡顿
         items = await asyncio.to_thread(
             service.get_store().list_recent, max(1, min(limit, 200)), q or None)
     except Exception as e:  # noqa: BLE001
@@ -262,7 +253,7 @@ async def get_session(session_id: str) -> PilotSessionOut:
             turns.append(PilotSessionTurn(
                 q=t.get("q") or "", resp=t.get("resp") or {}, ts=t.get("ts"),
                 tid=t.get("tid"), feedback=feedback_by_tid.get(str(t.get("tid") or ""))))
-        except Exception:  # noqa: BLE001 — 单条坏记录跳过，不拖垮整段历史
+        except Exception:  # noqa: BLE001
             log_event(
                 logger,
                 f"会话 {session_id} 有一条历史记录无法还原，已跳过",
@@ -518,7 +509,6 @@ async def ask_stream(payload: AskRequest):
         sid = payload.session_id
         if sid:
             service.mark_session_running(sid)
-            # 与本层运行登记同生命周期：刷新后据此补一屏进行中轮（含只挂附件的提交）
             service.set_inflight_question(
                 sid, (payload.question or "").strip() or ("附件" if payload.attachments else ""))
         try:
@@ -533,7 +523,7 @@ async def ask_stream(payload: AskRequest):
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except pilot_llm.PilotLlmError as e:
                 yield f'data: {json.dumps({"type": "error", "reason": "llm_failed", "diagnostic": e.to_diagnostic()}, ensure_ascii=False)}\n\n'
-            except Exception as e:  # noqa: BLE001 — 流已开始，HTTP 状态无法再改，帧内报错
+            except Exception as e:  # noqa: BLE001
                 diagnostic_id = uuid4().hex[:12]
                 log_event(
                     logger,

@@ -53,12 +53,13 @@ async def test_upgrade_moves_provider_and_preserves_cipher_identity(tmp_data_dir
     assert current["models"] == ["model-a", "model-b"]
     assert current["models_disabled"] == ["model-b"]
     assert current["context_window"] == 123456
-    assert current["api_key"] == "fixture-secret"
+    assert current["api_key"] == ""
     assert current["model"] == "model-a" and current["enabled"] is True
     assert not LEGACY_KEYS & await _keys()
     sealed = await settings.get_value(f"pilot.llm.provider_key.{current['active']}")
     assert sealed == original_cipher
     assert secretbox.decrypt_secret(sealed, "kv:pilot.llm.api_key") == "fixture-secret"
+    assert current["providers"][0]["has_key"] is False
     with pytest.raises(secretbox.SecretBoxError):
         secretbox.decrypt_secret(sealed, "kv:pilot.llm.provider_key.other")
     await config.delete_provider(current["active"])
@@ -118,7 +119,9 @@ async def test_non_list_provider_state_preserves_legacy_config(tmp_data_dir, sto
     await _old_config()
     await settings.set_value("pilot.llm.providers", stored)
     await init_db()
-    assert (await config.load_config())["api_key"] == "fixture-secret"
+    current = await config.load_config()
+    assert current["api_key"] == ""
+    assert current["providers"][0]["has_key"] is False
 
 
 @pytest.mark.asyncio
@@ -134,9 +137,9 @@ async def test_locked_passphrase_upgrade_can_start_and_unlock(tmp_data_dir):
         assert keyring.is_locked(tmp_data_dir)
         assert keyring.unlock(tmp_data_dir, "fixture-passphrase")
         secretbox.clear_key_cache()
-        assert (await config.load_config())["api_key"] == "fixture-secret"
+        assert (await config.load_config())["api_key"] == ""
         await rekey.switch_mode(keyring.MODE_LEGACY, current_passphrase="fixture-passphrase")
-        assert (await config.load_config())["api_key"] == "fixture-secret"
+        assert (await config.load_config())["api_key"] == ""
     finally:
         keyring.reset_state()
         secretbox.clear_key_cache()
@@ -153,7 +156,8 @@ async def test_existing_main_provider_keeps_its_published_cipher_purpose(tmp_dat
     await init_db()
     current = await config.load_config()
     assert current["active"] == "main"
-    assert current["api_key"] == "main-secret"
+    assert current["api_key"] == ""
+    assert current["providers"][0]["has_key"] is False
 
 
 @pytest.mark.asyncio
@@ -191,3 +195,49 @@ async def test_add_usage_concurrent_increments_not_lost(tmp_data_dir):
     await asyncio.gather(*(config.add_usage(2, 3) for _ in range(60)))
     usage = await config.usage_month()
     assert usage == {"inp": 120, "out": 180, "calls": 60, "total": 300}
+
+
+@pytest.mark.asyncio
+async def test_provider_key_is_not_reused_after_origin_change(tmp_data_dir):
+    """已保存密钥只能用于配置它时授权的服务源。"""
+    await init_db()
+    await config.save_config({
+        "base_url": "https://provider.example.test/v1",
+        "api_key": "provider-secret",
+    })
+    assert (await config.load_config())["api_key"] == "provider-secret"
+
+    await config.save_config({"base_url": "http://127.0.0.1:29100/collect"})
+    current = await config.load_config()
+    assert current["api_key"] == ""
+    assert current["providers"][0]["has_key"] is False
+
+
+@pytest.mark.asyncio
+async def test_provider_key_origin_cannot_be_overridden_by_config_update(tmp_data_dir):
+    await init_db()
+    await config.save_config({
+        "base_url": "https://provider.example.test/v1",
+        "api_key": "provider-secret",
+    })
+    provider = (await config.load_config())["providers"][0]
+
+    await config.update_provider(provider["id"], {
+        "base_url": "http://127.0.0.1:29100/collect",
+        "key_origin": config._origin_key("http://127.0.0.1:29100/collect"),
+    })
+
+    assert await config.provider_key(provider["id"]) == ""
+
+
+@pytest.mark.asyncio
+async def test_provider_key_remains_available_for_same_origin_path_change(tmp_data_dir):
+    await init_db()
+    await config.save_config({
+        "base_url": "https://provider.example.test/v1",
+        "api_key": "provider-secret",
+    })
+
+    await config.save_config({"base_url": "https://provider.example.test/custom/v2"})
+
+    assert (await config.load_config())["api_key"] == "provider-secret"

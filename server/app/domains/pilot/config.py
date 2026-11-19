@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from app.core.database import WritePriority, write_gate
 from app.crawler.utils import get_beijing_time_obj
@@ -33,11 +34,8 @@ _MODEL_KEY = "pilot.llm.model"
 _CAP_KEY = "pilot.llm.monthly_cap"
 _PROVIDERS_KEY = "pilot.llm.providers"
 _ACTIVE_KEY = "pilot.llm.active"
-# 窗口上限：防手滑填爆（1M 级窗口已覆盖现役模型；未知填 0/清空即回落固定预算）
 _CONTEXT_WINDOW_MAX = 2_000_000
 
-# 工具输出留在上下文里的保留预算（字符，头尾保留、中段省略）：
-# 历史轮里超长工具结果按它裁剪——调大更保真但更快撞上下文预算。
 _TOOL_LIMIT_KEY = "pilot.ctx.tool_content_limit"
 TOOL_CONTENT_LIMIT_DEFAULT = 3000
 TOOL_CONTENT_LIMIT_MIN = 500
@@ -49,8 +47,40 @@ def _provider_key_name(pid: str) -> str:
 
 
 async def provider_key(pid: str) -> str:
-    """读指定供应商已存密钥；无密钥返回空串。"""
+    """Read a stored key only while its configured service origin still matches."""
+    provider = next((p for p in await load_providers() if p["id"] == pid), None)
+    if provider is None or not _key_origin_matches(provider):
+        return ""
     return str(await settings_service.get_secret_value(_provider_key_name(pid), "") or "")
+
+
+def _origin_key(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        if port is None:
+            port = {"http": 80, "https": 443}.get(scheme)
+    except ValueError:
+        return ""
+    if scheme not in {"http", "https"} or not host or port is None:
+        return ""
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}:{port}"
+
+
+def same_origin(a: str, b: str) -> bool:
+    return bool(_origin_key(a) and _origin_key(a) == _origin_key(b))
+
+
+def _provider_origin(provider: dict) -> str:
+    url = pilot_llm.effective_base_url(provider["protocol"], provider["base_url"])
+    return _origin_key(url)
+
+
+def _key_origin_matches(provider: dict) -> bool:
+    return bool(provider.get("key_origin") and provider["key_origin"] == _provider_origin(provider))
 
 
 def _clean_window(raw) -> int | None:
@@ -100,6 +130,7 @@ def _clean_provider(raw: dict) -> dict:
         "models": _models_of(raw.get("models")),
         "models_disabled": _models_of(raw.get("models_disabled")),
         "context_window": _clean_window(raw.get("context_window")),
+        "key_origin": str(raw.get("key_origin") or ""),
     }
 
 
@@ -116,7 +147,7 @@ async def load_providers() -> list[dict]:
 
 async def _with_key_flag(provider: dict) -> dict:
     stored = await settings_service.get_value(_provider_key_name(provider["id"]), None)
-    return {**provider, "has_key": bool(stored)}
+    return {**provider, "has_key": bool(stored) and _key_origin_matches(provider)}
 
 
 def _active_model(provider: dict, model: str) -> str:
@@ -129,6 +160,7 @@ async def create_provider(record: dict) -> dict:
     """新增供应商，清单、密钥与首次激活在同一写边界提交。"""
     async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
         provider = _clean_provider({**record, "id": uuid4().hex[:12]})
+        provider["key_origin"] = _provider_origin(provider) if record.get("api_key") else ""
         providers = await load_providers()
         values = {_PROVIDERS_KEY: [*providers, provider]}
         if not providers:
@@ -146,10 +178,12 @@ async def update_provider(pid: str, update: dict) -> dict:
         target = next((p for p in providers if p["id"] == pid), None)
         if target is None:
             raise LookupError(f"provider not found: {pid}")
-        patch = {k: v for k, v in update.items() if k not in {"api_key", "id"}}
+        patch = {k: v for k, v in update.items() if k not in {"api_key", "id", "key_origin"}}
         if not str(patch.get("base_url") or "").strip() and target["base_url"]:
             patch["base_url"] = target["base_url"]
         merged = _clean_provider({**target, **patch})
+        if "api_key" in update:
+            merged["key_origin"] = _provider_origin(merged) if update["api_key"] else ""
         providers[providers.index(target)] = merged
         values = {_PROVIDERS_KEY: providers}
         active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
@@ -196,7 +230,6 @@ async def load_config() -> dict:
     except (TypeError, ValueError):
         cap = DEFAULT_MONTHLY_CAP
     if cap == _LEGACY_DEFAULT_CAP:
-        # 旧默认值不是用户的选择：一次性迁为不限，让「默认移除 token 上限」对存量库生效
         cap = 0
         async with write_gate(WritePriority.INTERACTIVE, label="pilot_config"):
             await settings_service.set_value(_CAP_KEY, 0)
@@ -204,11 +237,10 @@ async def load_config() -> dict:
     active_id = str(await settings_service.get_value(_ACTIVE_KEY, "") or "")
     active = next((p for p in providers if p["id"] == active_id), providers[0] if providers else None)
     api_key = ""
-    if active:
+    if active and _key_origin_matches(active):
         api_key = str(await settings_service.get_secret_value(_provider_key_name(active["id"]), "") or "")
     model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
     stored_window = active["context_window"] if active else None
-    # 手填优先，没手填就按模型名问内置表——填了 a 家地址却忘了窗口也能工作
     auto_window = MODEL_WINDOWS.guess_context_window(model)
     window, window_source = _resolve_window(stored_window, auto_window)
     return {
@@ -248,6 +280,8 @@ async def save_config(update: dict) -> None:
                 providers = [_clean_provider({"id": uuid4().hex[:12], "name": "默认接入"})]
             target = next((p for p in providers if p["id"] == active_id), providers[0])
             merged = _clean_provider({**target, **patch})
+            if "api_key" in update:
+                merged["key_origin"] = _provider_origin(merged) if update["api_key"] else ""
             providers[providers.index(target)] = merged
             model = str(await settings_service.get_value(_MODEL_KEY, "") or "").strip()
             values.update({_PROVIDERS_KEY: providers, _ACTIVE_KEY: merged["id"],

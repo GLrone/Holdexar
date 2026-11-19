@@ -205,7 +205,6 @@ async def extract_preferences_from_text(text: str, source: str = "auto_extract")
         return []
     extracted: list[dict] = []
 
-    # 1. 区服偏好
     found_regions: list[str] = []
     for zh, code in _REGION_NAME_MAP.items():
         if zh in text or re.search(rf"\b{code}\b", text, re.IGNORECASE):
@@ -221,7 +220,6 @@ async def extract_preferences_from_text(text: str, source: str = "auto_extract")
         )
         extracted.append(rec)
 
-    # 2. 类型偏好
     found_genres: list[str] = []
     for g in _GENRE_KEYWORDS:
         if g in text and g not in found_genres:
@@ -236,7 +234,6 @@ async def extract_preferences_from_text(text: str, source: str = "auto_extract")
         )
         extracted.append(rec)
 
-    # 3. 史低 / 预算偏好
     if "史低" in text:
         rec = await upsert_memory(
             category="budget_habit",

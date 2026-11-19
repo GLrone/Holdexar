@@ -109,7 +109,7 @@ async def search_steam(term: str) -> dict:
         return {"kind": "empty", "note": "bad_term"}
     try:
         proxy = await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001 — 出口解析失败按无代理直试
+    except Exception:  # noqa: BLE001
         proxy = None
     data = await _steam_storesearch(term, proxy)
     if not isinstance(data, dict):
@@ -165,7 +165,7 @@ async def ingest_appids(appids: list) -> dict:
             await crawl_service.start_job(scope="appids", appids=fresh, kind="import", trigger="manual")
             started = True
         except RuntimeError:
-            started = False  # 已有任务在跑：目录已导入，首爬让位现役任务
+            started = False
     names = await games_service.names_for(clean)
     rows = []
     for a in clean:

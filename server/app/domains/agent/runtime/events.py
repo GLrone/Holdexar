@@ -30,9 +30,6 @@ EV_TASK_STARTED = "task.started"
 EV_TASK_PROGRESS = "task.progress"
 EV_TASK_FAILED = "task.failed"
 
-# 事件类型 → 允许入账的 payload 键集（lifecycle / message / step / task /
-# cancel 元数据各归其类；usage / tool / approval / decision 元数据
-# 随对应阶段接入时在此登记）
 EVENT_FIELDS: dict[str, frozenset[str]] = {
     EV_RUN_STATE: frozenset({"from", "to", "reason"}),
     EV_RUN_FINISHED: frozenset({"status", "error_code"}),

@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from app.domains.agent.tools.base import ToolSpec
 
-# 导航目标白名单：target 键 → 站内路径（agent 导航工具的目标集，
-# 与 web 路由表同名对齐；不在表内的目标一律拒绝执行）
 NAV_TARGETS = {
     "dashboard": "/dashboard",
     "library": "/library",

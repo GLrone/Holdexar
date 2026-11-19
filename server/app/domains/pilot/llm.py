@@ -137,7 +137,6 @@ def _sse_data_lines(aiter_lines):
     return _gen()
 
 
-# ── openai 兼容 ────────────────────────────────────────────
 
 def _openai_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
     url = base_url.rstrip("/") + "/chat/completions"
@@ -217,7 +216,6 @@ async def _openai_parse(aiter_lines):
             yield ("tool_calls", assembled)
 
 
-# ── openai-responses（Responses API）─────────────────────────────────
 
 def _responses_input(messages: list[dict]) -> tuple[str | None, list[dict]]:
     """内部消息 → Responses input 项：system 提为 instructions，
@@ -351,7 +349,6 @@ async def _responses_parse(aiter_lines):
         yield ("tool_calls", calls)
 
 
-# ── anthropic（Messages API）────────────────────────────────────────
 
 def _anthropic_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
     """内部消息 → Anthropic 形态：system 提顶、工具结果转 tool_result 块、
@@ -377,7 +374,6 @@ def _anthropic_convert(messages: list[dict]) -> tuple[str | None, list[dict]]:
                     "input": json.loads(tc["function"]["arguments"] or "{}"),
                 })
         elif role == "tool":
-            # Anthropic 无 tool 角色：工具结果以 tool_result 块收进 user 轮
             blocks = [{
                 "type": "tool_result",
                 "tool_use_id": m.get("tool_call_id") or "",
@@ -474,7 +470,6 @@ async def _anthropic_parse(aiter_lines):
         yield ("context", ctx_input)
 
 
-# ── ollama（本地 /api/chat，ndjson）───────────────────────────────────
 
 def _ollama_request(base_url: str, api_key: str, model: str, messages: list[dict], tools: list[dict] | None) -> tuple[str, dict, dict]:
     url = base_url.rstrip("/") + "/api/chat"
@@ -530,7 +525,6 @@ async def _ollama_parse(aiter_lines):
                 yield ("context", prompt_eval)
 
 
-# ── 分发 ─────────────────────────────────────────────────────────────
 
 _PARSE = {"openai": _openai_parse, "openai-responses": _responses_parse, "anthropic": _anthropic_parse, "ollama": _ollama_parse}
 _REQUEST = {"openai": _openai_request, "openai-responses": _responses_request, "anthropic": _anthropic_request, "ollama": _ollama_request}
@@ -588,7 +582,7 @@ async def chat_stream(
     except PilotLlmError as e:
         _log_provider_failure(protocol, e)
         raise
-    except Exception as e:  # noqa: BLE001 — 协议解析与网络边界统一产出诊断
+    except Exception as e:  # noqa: BLE001
         if isinstance(e, (httpx.TimeoutException, TimeoutError)):
             code = "provider_timeout"
         elif isinstance(e, httpx.HTTPError):
@@ -601,10 +595,6 @@ async def chat_stream(
         _log_provider_failure(protocol, wrapped)
         raise wrapped from e
 
-
-# ── 服务商智能识别：网址 + 密钥 → 协议 / 服务商 / 可用模型清单 ──────────
-# host 指纹表给协议与服务商默认值（对齐「目录服务商免配置」的思路）；
-# 真实模型清单以端点探测为准（GET 各协议模型列表），比静态目录新鲜。
 
 _KNOWN_HOSTS: list[tuple[str, str, str, list[str]]] = [
     ("api.deepseek.com", "openai", "DeepSeek", ["deepseek-chat", "deepseek-reasoner"]),

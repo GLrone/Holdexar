@@ -8,20 +8,16 @@
 不给写工具，落回只读或指引。"""
 from __future__ import annotations
 
-from app.domains.agent.tools.policy import GUARD_WORDS as _GUARD_WORDS  # 守卫词唯一来源（agent.tools.policy）
+from app.domains.agent.tools.policy import GUARD_WORDS as _GUARD_WORDS
 
-# 怎么做类（指引）：疑问词用复合词形，「今天天气怎么样」这类日常寒暄不会命中
 _HOW_TO_WORDS = (
     "怎么设置", "怎么添加", "怎么加", "怎么弄", "如何设置", "如何添加", "在哪",
     "哪里设置", "怎么用", "教程", "怎么打开", "如何打开",
 )
-# 设提醒类：渠道词（提醒 / 告诉我）+ 条件词（低于 / 史低 等）同时出现
 _ALERT_CHANNEL_WORDS = ("提醒", "告诉我")
 _ALERT_COND_WORDS = ("低于", "以下", "史低", "跌到", "跌至", "降至", "打")
-# 关注类（「值得关注」是评价语不是关注动作，需排除）
 _MONITOR_WORDS = ("加进关注", "加入关注", "关注一下", "帮我关注", "关注")
 _MONITOR_BLOCK_WORDS = ("值得关注",)
-# 价格 / 找游戏类
 _PRICE_WORDS = (
     "价格", "史低", "最低价", "值不值", "值得买", "值得入手", "多少钱", "贵不",
     "几折", "折扣", "降价", "打折吗", "入手", "等等党", "还差多少",
@@ -39,7 +35,6 @@ FIND_GAMES = "find_games"
 NAVIGATE = "navigate"
 CHAT = "chat"
 
-# 导航直通：动词与页面别名同时命中即执行（不过模型）；别名键与 tools.NAV_TARGETS 对齐
 _NAV_VERBS = (
     "打开", "看看", "看一下", "看下", "跳到", "跳转", "切到", "切换到", "前往",
     "带我去", "进入", "回到", "返回", "查看", "逛逛", "我要看", "去",
@@ -63,7 +58,6 @@ _NAV_ALIASES: dict[str, tuple[str, ...]] = {
     "logs": ("日志",),
     "settings": ("设置", "配置"),
 }
-# 疑问/否定/复合提问形态不直通（交给模型深入理解，防「设置在哪」「看看关注里有没有打折」误跳）
 _NAV_BLOCK_WORDS = (
     "怎么", "如何", "哪", "吗", "什么", "为什么", "为啥",
     "别去", "别打开", "不要去", "不要打开", "别跳", "先别",

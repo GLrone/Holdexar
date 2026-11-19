@@ -59,11 +59,8 @@ _DOMAIN_STATUSES = {
 class RunCancellationUnavailable(ValueError):
     """No live execution handle belongs to the requested run."""
 
-# 事件回放单页上限：客户端以 after_seq 游标翻页，页大小不改变账本全量可读性
 _REPLAY_PAGE_LIMIT = 200
 
-# 重启收尸覆盖的未终态集合：进程内执行者已随进程消失，这些状态的 run
-# 不可能再推进
 _ORPHAN_STATUSES = (RUN_QUEUED, RUN_RUNNING, RUN_AWAITING_APPROVAL)
 
 
@@ -75,8 +72,6 @@ def _now():
     return get_beijing_time_obj().replace(tzinfo=None)
 
 
-# 进程启动时刻（模块导入即进程启动）：收尸只认上一进程遗留的 run——
-# 后台收拾链可能晚于首个用户请求跑完，开门后新建的 run 是活 run 不得误收敛
 _PROCESS_STARTED_AT = _now()
 
 
@@ -128,9 +123,6 @@ async def create_run(
     return {"run_id": rid, "session_id": sid, "status": RUN_QUEUED}
 
 
-# 非交互 run 的统一挂靠会话：调度桥 / CLI / 手动受理的运行账本都锚在
-# 这一行（agent_runs.session_id 非空外键）；领航台会话列表走 pilot
-# SessionStore（JSONL 文件），不受此行影响
 SYSTEM_SESSION_ID = "runtime"
 
 

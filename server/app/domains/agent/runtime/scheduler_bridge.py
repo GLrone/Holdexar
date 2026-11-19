@@ -26,12 +26,7 @@ _current_run: ContextVar[str | None] = ContextVar("agent_current_run", default=N
 # 监听器按 job_id 投给在飞 run（监听器跑在调度器分发上下文，拿不到 ContextVar）
 _RUNNING_JOB_RUNS: dict[str, str] = {}
 
-# job 型运行账保留窗口：调度流水只服务「最近跑没跑、为什么没跑」，
-# 过窗级联删除（agent_events 外键 CASCADE）；task/fake run（领航会话
-# 回放依据）不受本清理影响
 JOB_RUN_RETENTION_DAYS = 30
-# 分块删除（每块一个事务过写闸）：一次长 DELETE 会长时间持写锁，与
-# 遥测保留模块同一硬要求；删不完留给下一轮
 _PRUNE_CHUNK = 5000
 _PRUNE_MAX_CHUNKS = 20
 
@@ -44,7 +39,7 @@ async def _append_step(run_id: str, step: str, summary: dict | None) -> bool:
             {"step": step, "summary": dict(summary or {})},
         )
         return True
-    except Exception:  # noqa: BLE001 —— 流水失败不影响 job 体
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             f"记录运行流水「{step}」失败，本段流水已丢弃",
@@ -94,7 +89,7 @@ async def run_accounted(
         )
         run_id = created["run_id"]
         _RUNNING_JOB_RUNS[job_id] = run_id
-    except Exception:  # noqa: BLE001 —— 账本不可用不拖垮业务
+    except Exception:  # noqa: BLE001
         log_event(
             logger,
             f"定时任务「{job_id}」建立运行账本失败，业务照常执行",

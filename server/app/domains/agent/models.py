@@ -44,15 +44,10 @@ class AgentRun(Base):
     session_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("agent_sessions.id", ondelete="CASCADE")
     )
-    # 执行器标识：fake（Runtime 骨架验证）→ 后续阶段接入真实执行器
     runner: Mapped[str] = mapped_column(String(16), default="fake")
     # 触发来源：manual / scheduled / event
     trigger: Mapped[str] = mapped_column(String(16), default="manual")
-    # 执行器专属参数（fake：scenario/steps/step_delay；真实执行器：
-    # model/protocol 等），随 runner 类型自解释，不另开列
     meta: Mapped[dict | None] = mapped_column(JSON)
-    # queued / running / awaiting_approval / done / failed / cancelled /
-    # budget_exhausted（合法迁移表见 runtime/state.py）
     status: Mapped[str] = mapped_column(String(24), default="queued")
     # 终态错误码（failed 的机器归因；cancelled 无错误码）
     error_code: Mapped[str | None] = mapped_column(String(64))

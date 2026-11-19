@@ -162,7 +162,7 @@ async def web_search(query: str) -> dict:
         return {"kind": "empty", "note": "bad_query"}
     try:
         proxy = await proxies_service.resolve_proxy_url()
-    except Exception:  # noqa: BLE001 — 出口解析失败按无代理直试
+    except Exception:  # noqa: BLE001
         proxy = None
     html = ""
     try:
@@ -222,7 +222,6 @@ async def notify_test() -> dict:
     return _shared.rows_result("notify", [{"k": "", "vKey": "notifySent", "tone": "ok"}])
 
 
-# ─────────────────────── 感知面：日志 / 诊断证据 / 订阅同步 ───────────────────────
 
 # 日志行的结果词片段：时间 [结果词] 模块中文名 · 主句 │ 键=值
 _LOG_LINE_TAG_RE = re.compile(r"\[([^\]]{1,6})\]")
@@ -320,7 +319,7 @@ async def sync_subscriptions() -> dict:
         try:
             await proxies_service.refresh_clash_subscription(int(s.get("id") or 0))
             rows.append({"k": label, "vKey": "subsSynced", "tone": "ok"})
-        except Exception as e:  # noqa: BLE001 —— 单订阅失败不影响其余
+        except Exception as e:  # noqa: BLE001
             rows.append({"k": label, "vKey": "subsFailed", "v": str(e)[:60], "tone": "bad"})
     return _shared.rows_result("subs", rows, total=len(rows))
 

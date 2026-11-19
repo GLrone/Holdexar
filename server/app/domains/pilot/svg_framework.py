@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-# 视觉意图识别关键词（用于动态增强提示）
 _VISUAL_KEYWORDS = (
     "画", "图", "svg", "SVG", "绘制", "流程图", "架构图", "拓扑图", "走势图",
     "对比图", "柱状图", "折线图", "甘特图", "思维导图", "决策树", "可视化", "图表",
@@ -18,7 +17,6 @@ def is_visual_request(question: str) -> bool:
     return any(w in q for w in _VISUAL_KEYWORDS)
 
 
-# Holdexar 专属 SVG 设计规范与框架提示词
 SVG_FRAMEWORK_PROMPT = """
 【Holdexar 专属 SVG 矢量图形设计规范与预设框架】
 当输出 SVG 图形或图表时，必须遵循 Holdexar 的深海蓝/Steam 现代工业美学，切勿使用粗糙的原生拼接：

@@ -146,16 +146,12 @@ class TestAgentLoop:
         assert done["type"] == "done" and done["source"] == "llm"
         assert executed == [("get_price_briefing", 292030, False)]
         assert done["tools"] == ["get_price_briefing: 测试游戏"]
-        # 时间线随 done 全量下发（前端历史轮按它还原过程）
         assert done["steps"] == [{"label": "price", "status": "ok", "data": {"name": "测试游戏"}}]
         assert usage["tokens"] == 120
-        # 上下文占用随 done 下发（前端输入区状态栏数据源）
         assert done["ctx_budget"] == pilot_context.HISTORY_BUDGET_TOKENS
         assert done["ctx_tokens"] > 0
-        # 过程链数据：整轮工时与会话归档边界随 done 下发（链头与记忆条目数据源）
         assert isinstance(done["elapsed_ms"], int) and done["elapsed_ms"] >= 0
         assert done["archived_through"] == 0
-        # 工具结果沉淀为结构化卡片（前端组件渲染数据层）
         assert done["cards"] == [{"kind": "price", **{**_FACTS, "appid": 292030}}]
 
     @pytest.mark.asyncio
@@ -183,7 +179,6 @@ class TestAgentLoop:
         card_ev = next(e for e in events if e["type"] == "card")
         assert card_ev["name"] == "get_price_briefing"
         assert card_ev["card"]["kind"] == "price"
-        # 先见卡后收终态：card 落在 tool 与 done 之间
         assert types.index("tool") < types.index("card") < types.index("done")
         done = events[-1]
         assert done["cards"] == [card_ev["card"]]
@@ -210,7 +205,6 @@ class TestAgentLoop:
         )
         events = [e async for e in service.ask_stream("查两次同一个", session_id="s-dedupe")]
         card_events = [e for e in events if e["type"] == "card"]
-        # 第二次同结果只在终态账本记一份：首帧带卡，重帧为空结算（前端撤骨架）
         assert [e["card"] for e in card_events] == [card_events[0]["card"], None]
         assert card_events[0]["card"] is not None
         done = events[-1]
@@ -425,7 +419,6 @@ class TestAgentLoop:
             _tool_stub(executed, {"kind": "denied", "note": "guarded"}),
         )
         events = [e async for e in service.ask_stream("批量把所有游戏加进关注")]
-        # 守卫拒绝无卡可发：card 结算帧仍下发给前端撤骨架，但 card 为空
         card_events = [e for e in events if e["type"] == "card"]
         assert len(card_events) == 1 and card_events[0]["card"] is None
         started = next(e for e in events if e["type"] == "tool_start")
@@ -524,7 +517,6 @@ class TestAgentLoop:
         assert [s["label"] for s in phases[0]["steps"]] == ["price"]
         assert phases[1]["thinking"] == "再看史低"
         assert phases[0]["terminal"] is False and phases[1]["terminal"] is True
-        # phases 是权威记录：整轮 thinking / steps / answer 均由它派生
         assert done["thinking"] == "先看价格再看史低"
         assert done["steps"] == [s for p in phases for s in p["steps"]]
         assert done["answer"] == "我去查一下。结论：值得等史低。"
@@ -564,7 +556,6 @@ class TestAgentLoop:
         await service.ask("把它加进关注", session_id="s-h")
         second = seen_messages[1]
         roles = [m["role"] for m in second]
-        # system + 环境事实（user 位）+ 上一轮问答（user/assistant）+ 当前问题
         assert roles.count("user") == 3
         assert roles.count("system") >= 1
         assert any(m.get("role") == "assistant" and m.get("content") == "好" for m in second)
@@ -593,11 +584,9 @@ class TestAgentLoop:
         await service.ask("找一款值得一试的角色扮演大作", session_id="s-prefix")
         await service.ask("再推荐一款策略游戏", session_id="s-prefix")
         first, second = seen_messages[0], seen_messages[1]
-        # 上一轮请求的完整序列在本轮请求头部逐字节重现（含意图笔记）
         assert len(second) > len(first)
         for i, m in enumerate(first):
             assert second[i] == m, f"前缀在第 {i} 条分叉：{m.get('role')}"
-        # 账本侧：本轮入账 = 问句 + 意图笔记 + 终答
         state = await service.get_store().load("s-prefix")
         assert [m.get("role") for m in state.turns[0]["messages"]] == ["user", "system", "assistant"]
 
@@ -884,7 +873,6 @@ class TestNavigate:
             "execute_tool",
             _tool_stub(executed, {"kind": "navigate", "target": "alerts", "path": "/alerts"}),
         )
-        # 非固定句式（无导航动词）不走直通，由模型决定调用
         events = [e async for e in service.ask_stream("帮我把提醒那页调出来", session_id="s-nav")]
         done = events[-1]
         assert done["type"] == "done" and done["source"] == "llm"
@@ -906,11 +894,9 @@ class TestNavigateDirect:
         assert pilot_intent.nav_target("看看我的关注") == "follows"
         assert pilot_intent.nav_target("带我去账单页") == "bills"
         assert pilot_intent.nav_target("回到首页") == "dashboard"
-        # 疑问/否定/守卫形态不直通
         assert pilot_intent.nav_target("怎么打开设置") is None
         assert pilot_intent.nav_target("别去设置页") is None
         assert pilot_intent.nav_target("批量打开所有页面") is None
-        # 有动词无对象 / 有对象无动词
         assert pilot_intent.nav_target("打开看看") is None
         assert pilot_intent.nav_target("设置一下") is None
 
@@ -921,7 +907,6 @@ class TestNavigateDirect:
 
     @pytest.mark.asyncio
     async def test_deterministic_nav_short_circuits_llm(self, monkeypatch):
-        # LLM 关闭也直通：导航是本地动作，不依赖模型可用性
         _patch_ready(monkeypatch, cfg={**_CFG, "enabled": False})
         executed = []
         monkeypatch.setattr(
@@ -1053,14 +1038,12 @@ class TestSessionTools:
         assert head["startTurn"] == 9 and head["turnCount"] == 3
         assert head["summaryThrough"] == 9
 
-        # 往回翻：跳过最新 3 轮，读 4 轮 → 覆盖被蒸馏区间
         back = await pilot_tools_mod.execute_tool(
             "read_session", {"sid": "tool-s2", "offset": 3, "count": 4})
         assert back["startTurn"] == 5 and back["turnCount"] == 4
         assert "价格 1005 元" in back["digest"] and "价格 1008 元" in back["digest"]
         assert "价格 1011 元" not in back["digest"]
 
-        # 越界不报错，取得到多少给多少
         edge = await pilot_tools_mod.execute_tool(
             "read_session", {"sid": "tool-s2", "offset": 50, "count": 4})
         assert edge["turnCount"] >= 0 and edge["kind"] == "rows"
@@ -1336,7 +1319,7 @@ class TestCtxBreakdown:
         assert s["usage_in"] == 18 and s["usage_out"] == 10
         assert s["cache_read_tokens"] == 5
         assert s["cache_base_tokens"] == 10
-        assert s["ttft_n"] == 2  # 两轮都有内容增量且用量回传，各计一次首字
+        assert s["ttft_n"] == 2
         assert s["decode_out"] == 10
 
 
@@ -1375,7 +1358,7 @@ class TestToolCatalog:
         result = asyncio.run(service.ask("巫师3多少钱", session_id="catalog-plain"))
         assert seen[0] == set(service.pilot_tools.CORE_TOOLS)
         assert "bills_summary" not in seen[0]
-        assert "tool_catalog" not in result  # 没解锁就不写这条账
+        assert "tool_catalog" not in result
 
     def test_list_tools_expands_mid_turn(self, monkeypatch):
         _patch_ready(monkeypatch)
@@ -1387,8 +1370,8 @@ class TestToolCatalog:
         result = asyncio.run(service.ask("同步一下账单", session_id="catalog-expand"))
         core = set(service.pilot_tools.CORE_TOOLS)
         extra = set(service.pilot_tools.expandable_tools())
-        assert seen[0] == core            # 首次请求：只有核心切面
-        assert seen[1] == core | extra    # 解锁后：本步之后的请求立刻带上其余工具
+        assert seen[0] == core
+        assert seen[1] == core | extra
         assert "bills_summary" in seen[1] and "bills_summary" not in seen[0]
         assert set(result["tool_catalog"]) == extra
 
@@ -1407,7 +1390,7 @@ class TestToolCatalog:
         _patch_ready(monkeypatch)
         seen = self._capture(monkeypatch, [[("answer", "再答"), ("usage", (100, 5))]])
         asyncio.run(service.ask("那再看看", session_id="catalog-keep"))
-        assert "bills_summary" in seen[0]  # 下一轮仍带展开后的工具表
+        assert "bills_summary" in seen[0]
 
     def test_session_expanded_tools_ignores_empty_and_missing(self):
         class _St:
@@ -1429,7 +1412,6 @@ class TestHistoryBudget:
         assert pilot_context.derive_history_budget(-5) == pilot_context.HISTORY_BUDGET_TOKENS
 
     def test_scales_with_window_below_cost_line(self):
-        # 成本线以下：有效窗口（窗口 − 回答预留 − 安全垫）按比例归历史，再扣非历史开销
         window = 16384
         usable = window - pilot_context._OUTPUT_RESERVE_TOKENS - pilot_context._WINDOW_BUFFER_TOKENS
         scaled = int(usable * pilot_context.HISTORY_BUDGET_RATIO)
@@ -1439,14 +1421,10 @@ class TestHistoryBudget:
         assert pilot_context.derive_history_budget(window, -100) == scaled
 
     def test_cost_line_caps_large_windows(self):
-        # 窗口决定「装得下多少」，成本线决定「值不值得装这么多」——大窗口不再线性放开。
-        # 每轮每个请求都要重发整段历史，一次缓存未命中就是整段全量重算的账单。
         assert pilot_context.derive_history_budget(200_000) == pilot_context.HISTORY_COST_TOKENS
         assert pilot_context.derive_history_budget(1_000_000) == pilot_context.HISTORY_COST_TOKENS
-        # 成本线是「一次请求的总量」：固定开销照扣，扣完剩下的才是历史
         assert (pilot_context.derive_history_budget(200_000, 5000)
                 == pilot_context.HISTORY_COST_TOKENS - 5000)
-        # 小窗口本来就在线以下，成本线不动它
         assert (pilot_context.derive_history_budget(16384)
                 < pilot_context.derive_history_budget(200_000))
 
@@ -1476,17 +1454,13 @@ class TestSystemPromptCapabilities:
 
     def test_declares_autonomy_and_evidence_discipline(self):
         prompt = service._SYSTEM_PROMPT
-        # 证据纪律：日期与数字必须有工具证据，禁止按惯例补
         assert "日期、价格、折扣" in prompt
         assert "严禁按「历年惯例」" in prompt
-        # 开放问题不自我设限：说做不到之前必须先查完整能力
         assert "list_tools" in prompt
         assert "绝不要说「我没有这个能力」" in prompt
-        # 呈现与导航能力仍在（模型不得声称无渲染/无法跳转能力）
         assert "<svg>" in prompt
         assert "navigate" in prompt
         assert "Markdown 表格" in prompt
-        # 批量动作走提议确认
         assert "propose_bulk" in prompt
 
     def test_prompt_is_not_a_tool_catalog(self):
@@ -1519,7 +1493,6 @@ class TestPruneOldToolResults:
         kept = [m for m in out if m["role"] == "tool" and m["content"] != pilot_context.CLEARED_TOOL_RESULT]
         assert len(cleared) == 8 - pilot_context.KEEP_RECENT_TOOL_GROUPS
         assert len(kept) == pilot_context.KEEP_RECENT_TOOL_GROUPS
-        # 传入的列表不被改动：这是视图，不是存储
         assert all(m["content"] != pilot_context.CLEARED_TOOL_RESULT for m in msgs)
 
     def test_noop_within_keep_window(self):
@@ -1543,12 +1516,11 @@ class TestPruneOldToolResults:
 
         full = pilot_context.assemble(st, "现在呢", None, budget=10 ** 9)
         pruned = pilot_context.prune_old_tool_results(full)
-        # 预算卡在「清得动、装不下整轮」之间：该清老工具结果，而不是丢轮次
         budget = pilot_context.estimate_messages(pruned) + 10
         assert budget < pilot_context.estimate_messages(full)
         out = pilot_context.assemble(st, "现在呢", None, budget=budget)
         assert any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in out)
-        assert any("回答0" in str(m.get("content")) for m in out)  # 最早那轮没被让位丢掉
+        assert any("回答0" in str(m.get("content")) for m in out)
 
     @staticmethod
     def _named_groups(count: int, name: str, *, kind: str = "rows", size: int = 400) -> list[dict]:
@@ -1597,9 +1569,7 @@ class TestPruneOldToolResults:
             })
         full = pilot_context.assemble(st, "现在呢", None, budget=10 ** 9)
         full_tokens = pilot_context.estimate_messages(full)
-        # 触发线上：正常触发线是 1.0（体量恰好等于预算 → 不动）
         plain = pilot_context.assemble(st, "现在呢", None, budget=full_tokens)
-        # 闲置触发线 0.9：同样体量下先把老工具结果清掉
         idle = pilot_context.assemble(st, "现在呢", None, budget=full_tokens,
                                       prune_ratio=pilot_context.IDLE_PRUNE_TRIGGER_RATIO)
         assert not any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in plain)
@@ -1621,7 +1591,7 @@ class TestRetainBoundary:
         turns = self._turns(500, 200)
         boundary = pilot_context.retain_boundary(turns, 200_000)
         retained = sum(pilot_context.estimate_messages(t["messages"]) for t in turns[boundary:])
-        assert boundary < 490                     # 远早于「留两轮」(498)，这才是大窗口的意义
+        assert boundary < 490
         assert retained >= pilot_context.derive_retain_tokens(200_000)
         assert retained < pilot_context.derive_retain_tokens(200_000) * 1.5
 
@@ -1631,15 +1601,12 @@ class TestRetainBoundary:
         assert pilot_context.retain_boundary(turns, 200_000) == 2
 
     def test_retain_scales_with_window_then_caps_at_cost_line(self):
-        # 窗口未知 → 0（调用方退回轮数下限）
         assert pilot_context.derive_retain_tokens(None) == 0
         assert pilot_context.derive_retain_tokens(0) == 0
-        # 成本线以下按窗口比例；保留段恒在历史预算以内（压缩才有腾挪空间）
         small = pilot_context.derive_retain_tokens(16384)
         assert small == pytest.approx(
             (16384 - pilot_context._OUTPUT_RESERVE_TOKENS) * pilot_context.RETAIN_RATIO, abs=1)
         assert small < pilot_context.derive_history_budget(16384)
-        # 成本线以上：200k 与 1M 的逐字保留段一样厚——否则保留段自己就把预算吃满
         assert (pilot_context.derive_retain_tokens(200_000)
                 == pilot_context.derive_retain_tokens(1_000_000)
                 == int(pilot_context.HISTORY_COST_TOKENS * pilot_context.RETAIN_RATIO))
@@ -1658,7 +1625,6 @@ class TestSummaryBudget:
                 > pilot_context.derive_summary_max_tokens(200_000))
 
     def test_old_hard_cap_is_gone(self):
-        # 历史上摘要被钉在 380 token / 300 字；大窗口下那等于把历史丢掉
         assert pilot_context.derive_summary_max_tokens(1_000_000) > 380 * 10
 
 
@@ -1677,7 +1643,7 @@ class TestCompactPlan:
         from app.domains.pilot.session import SessionState
 
         st = SessionState(sid="s")
-        st.turns = TestRetainBoundary._turns(3, 10)   # 区间远小于摘要上限的倍数
+        st.turns = TestRetainBoundary._turns(3, 10)
         assert pilot_context.compact_plan(st, None) is None
 
     def test_plan_carries_boundary_and_budget(self):
@@ -1709,7 +1675,6 @@ class TestUsageCorrection:
         assert service._measure_correction(st, 0) == 1.0
 
     def test_underestimate_is_corrected_upwards(self):
-        # 真实跑了 2000，本地只估到 800（低估）→ 预算按 2.0 收紧，但夹在上限
         st = self._St([{"resp": {"first_in": 2_000, "ctx_tokens": 800}}])
         assert service._measure_correction(st, 0) == service._CORRECTION_MAX
 
@@ -1726,7 +1691,6 @@ class TestUsageCorrection:
                 < pilot_context.derive_history_budget(200_000, 5000))
 
     def test_history_budget_passes_correction_through(self):
-        # 工具表体量随版本演化：按当前真实开销反推一个「真实/估值 = 1.3」的样本
         tools_tokens = pilot_context.estimate_tokens(json.dumps(
             service.pilot_tools.tool_specs(), ensure_ascii=False))
         st = self._St([{"resp": {"first_in": int((1_000 + tools_tokens) * 1.3),
@@ -1771,7 +1735,6 @@ class TestContextWindowConfig:
     def test_manual_window_beats_auto(self):
         assert pilot_config._resolve_window(32000, 200000) == (32000, "manual")
         assert pilot_config._resolve_window(None, 200000) == (200000, "auto")
-        # 表外模型不拒绝猜测：按兜底窗口估算（source=fallback，前端提示可手填覆盖）
         assert pilot_config._resolve_window(None, None) == (
             model_windows.FALLBACK_CONTEXT_WINDOW,
             "fallback",
@@ -1887,7 +1850,7 @@ class TestCompactBreakerAndLedger:
         self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
         store = service.get_store()
         sid = "sess-full-view"
-        for i in range(3):  # 每轮约 3000 token：3 轮超预算，让位到 2 轮正好装得下
+        for i in range(3):
             await store.append_turn(sid, {
                 "q": f"问题{i}",
                 "resp": {"answer": "答" * 1875},
@@ -1900,7 +1863,6 @@ class TestCompactBreakerAndLedger:
         state = await store.load(sid)
         base, compacted = await service._assemble_for_model(state, "新问题", None, {**_CFG})
         assert compacted is True and calls["compact"] == 1
-        # 压缩后带存档的视图明显小于未压缩的全量历史
         assert pilot_context.estimate_messages(base) < state.markers[-1]["pre_tokens"]
 
     @pytest.mark.asyncio
@@ -1911,7 +1873,7 @@ class TestCompactBreakerAndLedger:
         self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
         store = service.get_store()
         sid = "sess-prune-shortcut"
-        for i in range(9):  # 9 组工具结果：留下最近 5 组，清掉 4 组即回到预算内
+        for i in range(9):
             await store.append_turn(sid, {
                 "q": f"问题{i}",
                 "resp": {"answer": f"回答{i}"},
@@ -1929,9 +1891,9 @@ class TestCompactBreakerAndLedger:
         state = await store.load(sid)
         full = pilot_context.full_view(state, "新问题", None)
         budget = pilot_context.HISTORY_BUDGET_TOKENS
-        assert pilot_context.estimate_messages(full) > budget          # 压力确实越线
+        assert pilot_context.estimate_messages(full) > budget
         assert pilot_context.estimate_messages(
-            pilot_context.prune_old_tool_results(full)) <= budget       # 但清得动
+            pilot_context.prune_old_tool_results(full)) <= budget
         base, compacted = await service._assemble_for_model(state, "新问题", None, {**_CFG})
         assert compacted is False and calls["compact"] == 0
         assert any(m.get("content") == pilot_context.CLEARED_TOOL_RESULT for m in base)
@@ -1945,14 +1907,13 @@ class TestCompactBreakerAndLedger:
         state = await self._seed_big_turns("sess-manual")
         await service._assemble_for_model(state, "问", None, cfg)
         await service._assemble_for_model(state, "问", None, cfg)
-        assert calls["compact"] == 2  # 已达熔断线
+        assert calls["compact"] == 2
         self._patch_split_stream(monkeypatch, compact_fail=False, calls=calls)
         result = await service.compact_session_now(state, cfg)
         assert result["ok"] is True
         assert result["post_tokens"] < result["pre_tokens"]
-        assert calls["compact"] == 3  # 手动压缩不受熔断限制
+        assert calls["compact"] == 3
         assert service._compact_failures.get("sess-manual") is None
-        # 熔断已重置；但手动压缩后暂无可蒸馏轮次，自动压缩不再发起调用
         await service._assemble_for_model(state, "问", None, cfg)
         assert calls["compact"] == 3
 
@@ -2008,7 +1969,6 @@ class TestToolExecutionWatch:
         assert stamps == sorted(stamps) and stamps[0] >= 50
         tool_ev = [e for e in events if e["type"] == "tool"][0]
         assert tool_ev["status"] == "ok" and tool_ev["duration_ms"] >= 250
-        # 心跳只走流式事件，不改变账本形态（步骤与 done 与既有一致）
         assert events[-1]["steps"] == [{"label": "follows", "status": "ok", "data": {"count": 1}}]
 
     @pytest.mark.asyncio
@@ -2095,7 +2055,7 @@ class TestAgentNudge:
 
     @staticmethod
     def _patch_scripts(monkeypatch, scripts, calls):
-        _patch_ready(monkeypatch)  # 配置/用量替身（本类再覆写 chat_stream 为逐请求脚本）
+        _patch_ready(monkeypatch)
         it = iter(scripts)
 
         async def _chat(**kw):
@@ -2116,9 +2076,7 @@ class TestAgentNudge:
         events = [e async for e in service.ask_stream("最近有什么值得关注的高分史低大作？", session_id="s-nudge1")]
         done = events[-1]
         assert done["type"] == "done" and done["answer"] == "补上结论。" and done["reason"] is None
-        # 两阶段：第一次空转被追问，第二次给出终答
         assert [e for e in events if e["type"] == "step_start"][-1]["step"] == 2
-        # 追问消息随发送原样入账（账本重放保前缀缓存）：问句 + 意图笔记 + 追问 + 终答
         state = await service.get_store().load("s-nudge1")
         roles = [m.get("role") for m in state.turns[-1]["messages"]]
         assert roles == ["user", "system", "system", "assistant"]
@@ -2134,11 +2092,9 @@ class TestAgentNudge:
         events = [e async for e in service.ask_stream("最近有什么值得关注的高分史低大作？", session_id="s-nudge2")]
         done = events[-1]
         assert "真实结论。" in done["answer"]
-        # 第一次请求之后收到追问系统消息（在对话末尾），第二次请求正常执行
         first_msgs, second_msgs = calls[0], calls[1]
         assert len(second_msgs) == len(first_msgs) + 1
         assert "没有实际调用工具" in second_msgs[-1]["content"]
-        # 宣告文本不进模型对话（只留展示层）
         assert all("我来深入查一下" not in str(m.get("content")) for m in second_msgs)
 
     @pytest.mark.asyncio
@@ -2262,7 +2218,6 @@ class TestDecisionAgent:
     def test_single_game_query_suppresses_list_cards(self):
         from app.domains.pilot.decision import DECISION_AGENT
         card = {"kind": "games", "items": [{"name": "赛博朋克2077"}, {"name": "黑神话"}]}
-        # 1. 针对单款游戏的问句：抑制全量列表卡片
         dec = DECISION_AGENT.decide_card(
             tool_name="list_follows",
             result=card,
@@ -2274,7 +2229,6 @@ class TestDecisionAgent:
         assert dec.should_emit is False
         assert dec.reason == "single_game_query"
 
-        # 2. 明确请求列表的问句：正常放行渲染
         dec_list = DECISION_AGENT.decide_card(
             tool_name="list_follows",
             result=card,
@@ -2289,7 +2243,6 @@ class TestDecisionAgent:
     def test_diagnostic_tool_suppression(self):
         from app.domains.pilot.decision import DECISION_AGENT
         card = {"kind": "rows", "titleKey": "proxies", "rows": [{"k": "node1"}]}
-        # 1. 普通非诊断问句：抑制技术诊断卡片
         dec = DECISION_AGENT.decide_card(
             tool_name="proxy_pool_status",
             result=card,
@@ -2301,7 +2254,6 @@ class TestDecisionAgent:
         assert dec.should_emit is False
         assert dec.reason == "internal_diagnostic"
 
-        # 2. 技术诊断问句：正常放行渲染
         dec_diag = DECISION_AGENT.decide_card(
             tool_name="proxy_pool_status",
             result=card,
@@ -2318,7 +2270,6 @@ class TestDecisionAgent:
         fam_card = {"kind": "family", "members": [{"steamId": "123", "personaName": "Tom"}]}
         ach_card = {"kind": "achievements", "unlocked": 10, "total": 81, "completionRate": 12}
 
-        # 规则/攻略问句抑制个人信息卡片
         dec_fam = DECISION_AGENT.decide_card(
             tool_name="family_status",
             result=fam_card,
@@ -2341,7 +2292,6 @@ class TestDecisionAgent:
         assert dec_ach.should_emit is False
         assert dec_ach.reason == "game_achievement_query"
 
-        # 查看个人进度放行渲染
         dec_fam_ok = DECISION_AGENT.decide_card(
             tool_name="family_status",
             result=fam_card,
@@ -2364,11 +2314,9 @@ class TestDecisionAgent:
 
     def test_nav_target_blocked_on_compound_and_action_queries(self):
         from app.domains.pilot.intent import nav_target
-        # 复合动作或提问不直通导航
         assert nav_target("去设置修改密钥") is None
         assert nav_target("看看我的关注里有没有打折") is None
         assert nav_target("去关注列表找找黑神话") is None
-        # 纯粹导航直通
         assert nav_target("打开设置") == "settings"
         assert nav_target("去关注列表") == "follows"
 
@@ -2381,13 +2329,11 @@ class TestDecisionAgent:
             assert props["emit_card"]["type"] == "boolean"
 
     def test_skeleton_hint_accurate_and_not_leaking(self):
-        # 决策代理按意图与参数抑制骨架占位
         assert service._stream_card_hint("list_follows", [], arguments={"emit_card": False}, question="查看关注") is None
         assert service._stream_card_hint("list_follows", [], arguments={}, question="黑神话在不在我的关注里？") is None
         assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="黑神话为什么价格没刷新？") is None
         assert service._stream_card_hint("family_status", [], arguments={}, question="家庭共享怎么开？") is None
         assert service._stream_card_hint("steam_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") is None
-        # 放行情况
         assert service._stream_card_hint("list_follows", [], arguments={}, question="查看我的关注列表") == "rows"
         assert service._stream_card_hint("proxy_pool_status", [], arguments={}, question="体检网络节点代理池") == "rows"
         assert service._stream_card_hint("epic_free", [], arguments={}, question="目前有什么可以领取的免费喜加一游戏吗？") == "epic"
@@ -2395,7 +2341,6 @@ class TestDecisionAgent:
     def test_free_offers_rows_suppressed_by_default_unless_explicit(self):
         from app.domains.pilot.decision import DECISION_AGENT
         steam_card = {"kind": "rows", "titleKey": "steamFree", "rows": [{"k": "System Shock 2", "vKey": "steamFree"}]}
-        # 1. 默认聊天对话：作为内部推导事实抑制原始数据表发卡
         dec = DECISION_AGENT.decide_card(
             tool_name="steam_free",
             result=steam_card,
@@ -2407,7 +2352,6 @@ class TestDecisionAgent:
         assert dec.should_emit is False
         assert dec.reason == "internal_data_for_synthesis"
 
-        # 2. 显式要求发卡：emit_card=True 放行
         dec_explicit = DECISION_AGENT.decide_card(
             tool_name="steam_free",
             result=steam_card,
@@ -2509,7 +2453,6 @@ class TestCardLedger:
         note = [m for m in seen["messages"]
                 if m.get("role") == "system" and "已向用户呈现过" in str(m.get("content"))]
         assert note and "艾尔登法环" in note[0]["content"]
-        # 静态清单卡近轮已呈现：本轮不再发卡（模型可用 emit_card=true 强制）
         assert not [e for e in events if e["type"] == "card" and e.get("card")]
         assert not events[-1]["phases"][0]["cards"]
 
@@ -2563,14 +2506,12 @@ class TestParallelReadTools:
 
         monkeypatch.setattr(service.pilot_tools, "execute_tool", _slow)
         events = [e async for e in service.ask_stream("黑神话在关注里吗", session_id="s-par")]
-        # 并行证明：第二个工具在第一个还在跑时就已启动（顺序执行会差 ≥0.3s）
         assert started["list_alerts"] - started["list_follows"] < 0.15
         tool_evs = [e for e in events if e["type"] == "tool"]
         assert [e["name"] for e in tool_evs] == ["list_follows", "list_alerts"]
         assert all(e["status"] == "ok" for e in tool_evs)
         done = events[-1]
         assert [s["label"] for s in done["phases"][0]["steps"]] == ["follows", "alerts"]
-        # 两个工具结果都回灌模型（账本里两条 tool 消息；turn_messages 不下发 SSE）
         state = await service.get_store().load("s-par")
         tool_msgs = [m for t in state.turns for m in (t.get("messages") or [])
                      if m.get("role") == "tool"]
@@ -2616,7 +2557,7 @@ class TestTurnStepClosure:
 
         async def _hang(name, arguments, guarded=False, sid=None):
             entered.set()
-            await asyncio.Event().wait()  # 永不返回：等收口取消
+            await asyncio.Event().wait()
 
         monkeypatch.setattr(service.pilot_tools, "execute_tool", _hang)
         state = await service.get_store().load_or_new("s-stop")
@@ -2632,11 +2573,8 @@ class TestTurnStepClosure:
         assert entered.is_set()
         await agen.aclose()
         await asyncio.sleep(0.05)  # 让被取消的在飞任务走完取消流程
-        # 收口前：tool_start 已声明、尚未结算 → 运行态占位在场
         assert captured["before"][0]["steps"] == [{"label": "follows", "status": "running", "data": {}}]
-        # 收口后：统一归为 stopped 终态，phases 无 running 残留
         assert captured["after"][0]["steps"] == [{"label": "follows", "status": "stopped", "data": {}}]
-        # 中断轮不落账：账本文件从未创建
         assert not (service.get_store().base / "s-stop.jsonl").exists()
 
     @pytest.mark.asyncio
@@ -2868,7 +2806,7 @@ class TestDeterministicPrefetch:
                             _tool_stub([], _FACTS))
         events = [e async for e in service.ask_stream(
             "《测试游戏》多少钱？顺便推荐几个类似的游戏", session_id="s-compound")]
-        assert seen_tools and seen_tools[0]  # 工具表仍在场
+        assert seen_tools and seen_tools[0]
         names = [e["name"] for e in events if e["type"] == "tool_start"]
         assert names and names[0] == "get_price_briefing"
 
@@ -2880,7 +2818,6 @@ class TestEmptyStreakBreaker:
     async def test_empty_streak_injects_convergence_note(self, monkeypatch):
         seen_notes = []
         rounds = {"n": 0}
-        # 前 4 轮各调一次 web_search（返回空），第 5 轮给终答
         scripts = [[("tool_calls", [{"id": f"t{i}", "name": "web_search",
                                      "arguments": {"query": f"q{i}"}}])] for i in range(4)]
         scripts.append([("answer", "没查到相关数据，建议去对应页面看看。")])
@@ -2948,9 +2885,7 @@ class TestMaxStepsFallback:
         calls = {"tools": 0}
 
         async def _rounds(**kw):
-            # 每次都要求调工具，永不给终答——模拟步数耗尽
             if kw.get("tools") is None:
-                # 兜底调用：无工具表，产出总结
                 yield ("answer", "综合已查到的数据，结论如下：暂无可推荐项。")
                 return
             rounds["n"] += 1
@@ -2980,8 +2915,8 @@ class TestTruncationGuard:
 
     def test_looks_truncated_needs_tool_and_mid_clause(self):
         assert service._looks_truncated("根据系统侧同步的价格事件数据，10月10", 1, []) is True
-        assert service._looks_truncated("结论：值得。", 1, []) is False   # 完整短句
-        assert service._looks_truncated("10月10", 0, []) is False        # 无工具结果不判
+        assert service._looks_truncated("结论：值得。", 1, []) is False
+        assert service._looks_truncated("10月10", 0, []) is False
 
 
 class TestSelfNarrationGuard:
@@ -3005,7 +2940,6 @@ class TestSelfNarrationGuard:
         assert service._is_self_narration("   \n\n ") is True
 
     def test_trailing_narration_on_short_body(self):
-        # 正文给了依据但收尾停在「我接着去查」——计划没走完就交卷
         assert service._is_self_narration("找到了 appid 是 2050650。我把它入库并查价格。") is True
 
     @pytest.mark.asyncio
@@ -3076,7 +3010,6 @@ class TestFollowupDomainGate:
 
     def test_out_of_domain_question_gets_no_followups(self):
         from app.domains.pilot.decision import suggest_followups
-        # 外设行情 / 别家平台活动 / 饰品市场 / 赛事：本产品没有数据源，追问无从谈起
         for q in ("蝰蛇v3pro现在是史低吗，值不值得现在买？",
                   "QQ超级会员SVIP10要用15万成长值直接升，为什么还要扣",
                   "CS2的M9刺刀生锈最近为什么一直跌价？",
@@ -3085,27 +3018,22 @@ class TestFollowupDomainGate:
 
     def test_in_domain_question_still_gets_followups(self):
         from app.domains.pilot.decision import suggest_followups
-        # 意图路由到本产品能力即算域内：问句措辞未必带域内词，闸不能误杀
         assert suggest_followups("最近有哪些游戏降价了？", "find_games", [], None, tools_ran=0)
         assert suggest_followups("帮我关注某款游戏", "add_monitor", [], None, tools_ran=0)
-        # 问句带域内窄词同理
         assert suggest_followups("Steam 夏促什么时候开始？", "chat", [], None, tools_ran=0)
 
     def test_out_of_domain_object_overrides_in_domain_intent(self):
         from app.domains.pilot.decision import suggest_followups
-        # 意图误路由到「找游戏」，但问句真正问的是硬件/电竞/别家运营——以对象为准
         for q in ("求推荐能玩三角洲的平板", "这几款国产旗舰手柄有什么差别，推荐哪个？",
                   "2026 CS TOP20 预测里都有哪些选手？", "apex来B站直播了吗？"):
             assert suggest_followups(q, "find_games", [], None, tools_ran=0) == [], q
 
     def test_game_recommendation_still_gets_followups(self):
         from app.domains.pilot.decision import suggest_followups
-        # 找单机游戏是本产品正经能力：闸门不能因为「没验证体积」这类答得不好就把追问也掐了
         assert suggest_followups("有什么好玩的动作游戏？", "find_games", [], None, tools_ran=0)
 
     def test_card_present_keeps_followups(self):
         from app.domains.pilot.decision import suggest_followups
-        # 出卡说明本轮答的是本产品的具体对象，追问该围着它
         out = suggest_followups("这游戏值不值", "chat", [{"kind": "price", "name": "某游戏"}],
                                 None, tools_ran=1)
         assert out
@@ -3120,10 +3048,10 @@ class TestQuoteRefs:
             "【引用1】不如【引用2】", None, None, None,
             [{"n": 1, "text": "第一段"}, {"n": 2, "text": "第二段"}],
         )
-        assert "【引用1】不如【引用2】" in out       # 位置信息原样保留在句子里
-        assert "【引用1】第一段" in out              # 编号→正文的映射
+        assert "【引用1】不如【引用2】" in out
+        assert "【引用1】第一段" in out
         assert "【引用2】第二段" in out
-        assert "不要照做" in out                    # 引用是数据不是指令的声明
+        assert "不要照做" in out
 
     def test_user_text_without_quotes_unchanged(self):
         from app.domains.pilot import context as pilot_context
@@ -3131,7 +3059,6 @@ class TestQuoteRefs:
 
     def test_malformed_quote_entries_skipped(self):
         from app.domains.pilot import context as pilot_context
-        # 缺正文 / 编号非数字的条目直接跳过，不进提示词
         out = pilot_context.user_text(
             "【引用1】问一句", None, None, None,
             [{"n": 1, "text": ""}, {"n": "x", "text": "坏的"}, {"n": 2, "text": "好的"}],

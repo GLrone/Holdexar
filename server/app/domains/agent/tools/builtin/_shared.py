@@ -5,9 +5,7 @@ import re
 
 _FIND_LIMIT = 5
 _READ_ROWS_LIMIT = 8
-# 批量提议上限：单次可提交确认的款数（防一次吞掉整个库）
 _BULK_MAX_ITEMS = 50
-# 可批量化的动作：与写工具白名单同源，不新增动作种类
 _BULK_ACTIONS = ("add_follow", "create_price_alert")
 
 _PRICE_TAG_RE = re.compile(r"《(.+?)》")

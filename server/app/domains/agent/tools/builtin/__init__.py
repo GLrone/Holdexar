@@ -36,7 +36,6 @@ for _mod in (catalog, prices, tracking, offers, account, system, runtime_tools,
             raise ValueError(f"重复注册工具: {_spec.name}")
         _SPEC_BY_NAME[_spec.name] = _spec
 
-# 模型可见顺序 = 旧 tool_specs() 书写顺序（行为等价的一部分）
 _ORDER = (
     "search_games",
     "search_steam",

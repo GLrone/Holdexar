@@ -33,7 +33,6 @@ async def present_ui(
             "reason": f"未知的 UI 组件类型 '{component_id}'，只允许使用注册中心白名单内的组件。",
         }
 
-    # 规范化展示密度
     valid_density = density if density in ("compact", "standard", "expanded") else "standard"
     instance_id = f"ui_{component_id}_{uuid.uuid4().hex[:8]}"
 

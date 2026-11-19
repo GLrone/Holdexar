@@ -4,8 +4,6 @@
 的一致性由 test_agent_tools.py 钉住。"""
 from __future__ import annotations
 
-# ─── 只读工具：清单与诊断（全只读，不设守卫；行形态见 _rows_result）───
-
 _READ_TOOLS = (
     "list_follows",
     "list_alerts",
@@ -67,7 +65,6 @@ _READ_TOOLS = (
 
 _NET_TOOLS = ("web_search",)
 
-# 写工具（守卫词命中即拒）：单对象、可逆、1:1 用户动作
 _WRITE_TOOLS = (
     "acknowledge_update",
     "add_follow",
@@ -79,7 +76,6 @@ _WRITE_TOOLS = (
     "monitor_include",
 )
 
-# 快捷动作白名单（+ 菜单点选直达）：无参、确定性好、单击即用户显式意图
 QUICK_TOOLS = frozenset({
     "list_follows", "list_alerts", "list_bundle_follows", "hb_monthly", "epic_free",
     "steam_free", "top_games", "price_drops", "rates_overview", "calendar_events",
@@ -88,7 +84,6 @@ QUICK_TOOLS = frozenset({
     "find_deletables",
 })
 
-# 同步刷新工具（幂等拉取，不设守卫；结果行 vKey 走 syncDone/syncFailed）
 _SYNC_TOOLS = (
     "sync_wallet",
     "sync_library",
@@ -103,8 +98,6 @@ _SYNC_TOOLS = (
     "notify_test",
 )
 
-# 运行面调度工具（第三层权限，见下方同名区块说明）：不写用户数据，
-# kind 进登记表白名单；破坏性动作不入表，模型无从调用。
 _TASK_TOOLS = (
     "list_tasks",
     "start_task",
@@ -118,10 +111,8 @@ BUDGET_DEFAULT_S = 20.0
 BUDGET_SLOW_S = 240.0
 BUDGET_TASK_S = 60.0
 _TOOL_BUDGET_S: dict[str, float] = {
-    # 网络往返类（工具内另有 12s 请求超时，预算给足往返与解析）
     "search_steam": 40.0, "web_search": 40.0, "hb_monthly": 40.0, "epic_free": 40.0,
     "steam_free": 40.0, "calendar_events": 40.0, "rates_overview": 40.0,
-    # 重扫 / 聚合类（跨表聚合与全量扫描显著更慢）
     "diagnose_price": 60.0, "bills_summary": 60.0, "achievements_summary": 60.0,
     "level_profile": 60.0, "challenges_overview": 60.0,
     "list_family_library": 60.0, "list_owned": 60.0, "top_games": 60.0,
@@ -191,7 +182,6 @@ def tool_step(name: str, result: dict) -> dict:
             "status": "ok" if items else "empty",
             "data": {"count": len(items)},
         }
-    # 游戏清单卡类只读工具：结果行在 items（找游戏同款富卡）
     if name in ("top_games", "price_drops", "list_follows", "list_wishlist",
                 "list_owned", "list_family_library"):
         items = result.get("items") or []
@@ -208,7 +198,6 @@ def tool_step(name: str, result: dict) -> dict:
             "data": {},
         }
     if name == "read_attachment":
-        # 附件区间读取：取到内容 = ok；附件不存在 = empty（note 已说明原因）
         got = bool(result.get("content"))
         return {
             "label": "attachmentRead",
@@ -234,7 +223,6 @@ def tool_step(name: str, result: dict) -> dict:
             "data": data,
         }
     if name in _TASK_TOOLS:
-        # 调度类结果同样是行卡；行色调决定时间线状态（busy/warn ≠ 成功）
         rows = result.get("rows") or []
         tone = (rows[0].get("tone") if rows else None) or "ok"
         return {
@@ -249,7 +237,6 @@ def tool_step(name: str, result: dict) -> dict:
             "data": {},
         }
     if name in _WRITE_TOOLS or name in _SYNC_TOOLS:
-        # 写与同步的结果也是行卡：时间线只给动作名（结果进卡片与正文）
         rows = result.get("rows") or []
         return {
             "label": LABELS.get(name, name),
@@ -380,9 +367,6 @@ LABELS: dict[str, str] = {
 }
 
 
-# ─── 模型可见工具表的默认切面（每次请求都全量在场的固定开销）───
-# 核心集覆盖四条用户主流程（找游戏 / 看价格 / 关注提醒 / 免费与活动）与会话、偏好、
-# 附件、导航，以及真实账本里调用过的全部工具；其余工具由 list_tools 展开后追加。
 LIST_TOOLS = "list_tools"
 
 CORE_TOOLS: frozenset[str] = frozenset({
@@ -399,8 +383,6 @@ CORE_TOOLS: frozenset[str] = frozenset({
     LIST_TOOLS,
 })
 
-# 能产出卡片的工具（与 service 的 _CARD_KIND_HINTS / _CARD_HINT_ROWS_TOOLS 同源）：
-# 只有这些工具需要 emit_card 开关，其余工具带它只是白占固定开销。
 CARD_KIND_HINTS: dict[str, str] = {
     "get_price_briefing": "price",
     "get_region_prices": "regions",

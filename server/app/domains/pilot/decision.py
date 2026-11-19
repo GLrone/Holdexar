@@ -25,7 +25,6 @@ _CORE_CARD_KINDS = {
 }
 _MAX_CARDS_PER_TURN = 4
 
-# 典型非价格咨询特征词（涉及硬件、性能、玩法、剧情等）
 _NON_PRICE_KEYWORDS = (
     "配置", "显卡", "cpu", "内存", "优化", "帧率", "画质", "卡顿", "闪退",
     "打不开", "黑屏", "启动不了", "好玩吗", "好不好玩", "评价", "通关", "攻略",
@@ -33,46 +32,38 @@ _NON_PRICE_KEYWORDS = (
     "汉化", "补丁", "按键", "怎么过", "怎么打",
 )
 
-# 单对象核验工具集
 _SINGLE_ITEM_CHECK_TOOLS = frozenset({
     "list_follows", "list_alerts", "list_owned", "list_wishlist", "list_family_library",
 })
 
-# 技术状态与底层诊断工具集
 _DIAGNOSTIC_TOOLS = frozenset({
     "proxy_pool_status", "proxy_exit_detail", "proxy_latency_test",
     "write_gate_status", "recent_job_failures", "diagnose_price", "list_tasks",
 })
 
-# 纯数据提供类工具集（供大模型推导与综合，默认不外泄为 UI 原始表格卡片）
 _DATA_SYNTHESIS_TOOLS = frozenset({
     "steam_free", "hb_monthly", "calendar_events", "rates_overview",
 })
 
-# 系统技术排查特征词
 _DIAGNOSTIC_KEYWORDS = (
     "代理", "节点", "网络", "延迟", "写闸", "报错", "为什么抓取",
     "排查", "体检", "诊断", "失败任务", "抓取任务", "抓取状态", "丢包", "超时",
 )
 
-# 家庭规则/机制咨询特征词
 _FAMILY_RULES_KEYWORDS = (
     "怎么", "如何", "规则", "限制", "最多几人", "锁区吗", "教程",
     "开启", "邀请", "能不能共享", "退组", "cd", "冷却", "共享机制",
 )
 
-# 个人家庭成员查看特征词
 _PERSONAL_FAMILY_KEYWORDS = (
     "我的家庭", "看家庭", "家庭成员", "谁在家庭", "家里有谁", "家庭组里有谁", "家庭成员列表",
 )
 
-# 游戏成就难度/通关特征词
 _GAME_ACHIEVEMENT_KEYWORDS = (
     "难吗", "好拿吗", "难度", "几周目", "白金难不难", "怎么全成就", "攻略",
     "全成就难", "全成就容易", "难不难",
 )
 
-# 个人成就进度查看特征词
 _PERSONAL_ACHIEVEMENT_KEYWORDS = (
     "我的成就", "成就进度", "解锁了几个", "看了看成就", "完成率",
     "白金奖杯数", "我的奖杯", "成就列表", "成就概况",
@@ -86,16 +77,13 @@ class CardDecision:
     should_emit: bool
     card: dict | None
     kind: str | None
-    status: str  # "rendered" | "suppressed"
-    reason: str  # "ok" | "suppressed_by_model" | "low_confidence" | "no_price_intent" | "quota_exceeded" | "empty"
+    status: str
+    reason: str
     summary: str | None = None
 
 
-# 跨轮去重的卡种：静态清单类可抑制（同内容已呈现过）；价格/对比类不抑制
-# ——价格随刷新轮变化，重复询问往往正是要看最新价
 _REPEATABLE_SUPPRESS_KINDS = frozenset({"games", "family", "achievements", "rows", "epic"})
 
-# 追问键白名单（前端按 pilot.followup.{key} 取双语词条，缺词即丢弃该条）
 _FOLLOWUP_KEYS = frozenset({
     "saleNext", "saleLive", "saleWatch", "priceDropsRecent", "openCalendar",
     "compareRegions", "priceHistory", "similarGames", "addFollow", "setAlert",
@@ -104,7 +92,6 @@ _FOLLOWUP_KEYS = frozenset({
     "switchNode", "checkFailures", "listAlerts",
 })
 
-# 意图 → 候选追问（按序取前若干条；带 {name} 的需有本轮游戏对象才成立）
 _FOLLOWUP_BY_INTENT: dict[str, tuple[str, ...]] = {
     "price_analysis": ("priceHistory", "compareRegions", "similarGames", "addFollow", "setAlert"),
     "find_games": ("highRated", "budgetFriendly", "ownedSkip", "priceDropsRecent"),
@@ -115,7 +102,6 @@ _FOLLOWUP_BY_INTENT: dict[str, tuple[str, ...]] = {
     "chat": (),
 }
 
-# 问句特征 → 追加候选（覆盖「意图路由没认出来」的开放问题）
 _FOLLOWUP_BY_TOPIC: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("大促", "特卖", "促销", "打折活动", "夏促", "秋促", "冬促", "史低", "什么时候开始"),
      ("saleNext", "saleLive", "saleWatch", "openCalendar")),
@@ -124,16 +110,13 @@ _FOLLOWUP_BY_TOPIC: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("降价", "跌了", "新低", "便宜了"), ("priceDropsRecent", "myFollows", "hotDeals")),
     (("汇率", "折合", "换算"), ("compareRegions",)),
     (("家庭", "共享"), ("familyOverlap",)),
-    # 全区比价口径：不一定命中价格意图词（「划算」「最便宜」不在价格词表里）
     (("哪个区", "哪个地区", "全区", "各区", "各区域", "比价", "划算", "最便宜", "哪里买"),
      ("compareRegions", "priceHistory", "setAlert", "priceDropsRecent")),
     (("代理", "节点", "延迟", "网络", "超时"), ("testLatency", "switchNode", "checkFailures")),
-    # 排障口径：现象描述类问句往往不含任何业务关键词
     (("没更新", "不更新", "没刷新", "为什么", "报错", "异常", "失败", "卡住", "不动了"),
      ("checkFailures", "testLatency", "switchNode")),
 )
 
-# 意图与主题都没命中时按本轮卡片兜底（有卡就有得问，别退回与所问无关的通用推荐）
 _FOLLOWUP_BY_CARD: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("price", "regions", "compare"), ("priceHistory", "compareRegions", "similarGames",
                                        "addFollow", "setAlert")),
@@ -143,10 +126,6 @@ _FOLLOWUP_BY_CARD: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
 )
 
 
-# 本产品能力域信号：问句沾不上任何一条时，本轮不产出产品追问
-# ——鼠标行情、赛事比分、别家游戏机制这类问题硬塞「看降价/查促销」等于把回答拖成跑题。
-# 只收「本产品确实有数据源」的窄词，不收「史低/价格」这类通用词：外设、饰品、
-# 别家平台活动也问「多少钱/值不值」，把它们算进来等于没设这道闸。
 _DOMAIN_HINT: tuple[str, ...] = (
     "steam", "愿望单", "喜加一", "夏促", "秋促", "冬促", "特卖", "区服",
     "俄区", "土区", "港区", "港服", "国区", "阿根廷", "土耳其", "激活码",
@@ -154,11 +133,8 @@ _DOMAIN_HINT: tuple[str, ...] = (
     "节点", "延迟", "刷新", "入库", "促销日历",
 )
 
-# 意图已被路由到本产品能力：问句措辞未必带域内词，但确实答的是本产品的事
 _DOMAIN_INTENTS = frozenset({"price_analysis", "find_games", "add_monitor", "create_alert"})
 
-# 能力外对象词：命中即说明本产品根本没这类数据（手柄/平板是硬件、选手/直播是电竞、
-# 联动/榜单是别家平台的运营）。意图误路由到「找游戏」时靠它把追问闸回去。
 _OUT_OF_DOMAIN: tuple[str, ...] = (
     "手柄", "鼠标", "键盘", "耳机", "电源", "显卡", "主板", "内存", "硬盘",
     "平板", "手机", "笔记本", "主机", "外设", "显示器", "路由器",
@@ -190,7 +166,6 @@ def suggest_followups(question: str, intent: str, cards: list[dict],
     for words, keys in _FOLLOWUP_BY_TOPIC:
         if any(w in q for w in words):
             _add(keys)
-    # 意图与主题都空手时按本轮卡片兜底：有卡说明答的是具体对象，追问就该围着它
     if not ordered:
         kinds = {str(c.get("kind") or "") for c in (cards or []) if isinstance(c, dict)}
         for want, keys in _FOLLOWUP_BY_CARD:
@@ -209,14 +184,10 @@ def suggest_followups(question: str, intent: str, cards: list[dict],
                 name = str(card.get("name") or "").strip()
                 if name:
                     break
-    # 本轮一次工具都没跑成：给一条「换个说法再查」的退路，别只给不相关推荐
     if not tools_ran and "retryWeb" not in ordered:
         ordered.append("retryWeb")
     if not ordered:
         return []
-    # 问句与出卡都沾不上本产品能力域时，一条都不给：宁可没有追问，也不给跑题的。
-    # 意图被路由到本产品能力（比价/找游戏/加关注/设提醒）也算域内——问句措辞未必带域内词；
-    # 但问句里出现能力外对象（硬件/电竞/别家运营）时以对象为准，那才是用户真正问的东西。
     _in_domain = (intent in _DOMAIN_INTENTS or any(w in q for w in _DOMAIN_HINT)) \
         and not any(w in q for w in _OUT_OF_DOMAIN)
     if not (_in_domain or any(isinstance(c, dict) for c in cards or [])):
@@ -368,9 +339,6 @@ class DecisionAgent:
             return None
         if recent_cards and base_hint in _REPEATABLE_SUPPRESS_KINDS and not explicit_allow:
             args_h = args or {}
-            # 骨架期拿不到结果卡，仅按工具参数可得的身份粗探：无身份参数的
-            # 清单/概况类工具，近轮同 kind 已呈现时不再挂骨架（结果期还有
-            # 精确身份裁决）；带 query/appid 的检索不在此列
             if not any(args_h.get(a) for a in ("appid", "query", "name")) \
                     and any(k == base_hint for k, _ in recent_cards):
                 return None
@@ -392,7 +360,6 @@ class DecisionAgent:
         近轮已呈现过即不再重复发卡，价格/对比类不受此限（价格会变）。"""
         args = arguments or {}
 
-        # 1. 外层模型显式控制：允许模型主动关闭卡片渲染
         if args.get("emit_card") is False:
             return CardDecision(
                 should_emit=False,
@@ -403,7 +370,6 @@ class DecisionAgent:
                 summary="模型显式指定 emit_card=False，卡片未向用户展示",
             )
 
-        # 2. 空结果、失败或拒绝
         if base_card is None or result.get("kind") in ("failed", "timeout", "denied", "not_found"):
             return CardDecision(
                 should_emit=False,
@@ -418,7 +384,6 @@ class DecisionAgent:
         intent_info = self.evaluate_intent(question)
         explicit_allow = args.get("emit_card") is True
 
-        # 3. 置信度与意图门禁（置信度不足时弃权发卡）
         if kind in ("price", "regions", "compare"):
             if intent_info["is_non_price"] and not explicit_allow:
                 return CardDecision(
@@ -526,7 +491,6 @@ class DecisionAgent:
                     summary="问句为游戏成就难度咨询，已抑制个人成就概况卡片",
                 )
 
-        # 4. 跨轮卡片账本：静态清单类同内容卡近轮已呈现过，不重复发卡
         if recent_cards and kind in _REPEATABLE_SUPPRESS_KINDS and not explicit_allow:
             identity = _card_identity(kind, base_card)
             if identity and (kind, identity) in recent_cards:
@@ -539,7 +503,6 @@ class DecisionAgent:
                     summary="近几轮已向用户呈现过同内容卡片，本轮不重复发卡",
                 )
 
-        # 5. 配额与去重门禁
         if base_card in current_cards:
             return CardDecision(
                 should_emit=False,
@@ -578,7 +541,6 @@ class DecisionAgent:
                 summary="同类型列表卡片去重",
             )
 
-        # 6. 准入通过，组装卡片摘要供大模型回灌感知
         summary = self._summarize_card(base_card)
         return CardDecision(
             should_emit=True,

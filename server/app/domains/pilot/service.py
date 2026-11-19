@@ -45,7 +45,6 @@ from app.domains.pilot import tools as pilot_tools
 logger = logging.getLogger(__name__)
 
 _MAX_STEPS = 8
-# 数据型意图：答案应来自工具事实。模型宣告要查却一步工具未调时，循环追问一次
 _DATA_INTENTS = frozenset({
     pilot_intent.PRICE_ANALYSIS, pilot_intent.FIND_GAMES,
     pilot_intent.ADD_MONITOR, pilot_intent.CREATE_ALERT,
@@ -59,33 +58,27 @@ _NUDGE_ANNOUNCED = (
     "（系统提示）你刚才宣告了要查询但没有实际调用工具。"
     "请立即调用所需的工具获取真实数据；若确实无需工具，直接输出最终结论。"
 )
-# 空转检测：同一工具 + 同一组参数连续命中这么多次即追加提醒（只提醒，不否决调用）
 _STUCK_REPEAT_LIMIT = 2
 _NUDGE_STUCK = (
     "（系统提示）你已经连续用同样的参数调用同一个工具 {n} 次，上一次的结果在前面，"
     "先读它。重复同样的调用拿不到新东西：请换参数、换另一个工具、"
     "或者证据已经够了就直接给结论（没有证据的部分如实说没查到）。"
 )
-# 连续空结果熔断：连续这么多次工具返回空/无数据时，回灌提醒强制收敛——
-# 搜索类工具反复空返回时模型会陷入「换词再搜」死循环直到步数耗尽交白卷
 _EMPTY_STREAK_LIMIT = 3
 _NUDGE_EMPTY_STREAK = (
     "（系统提示）你已经连续 {n} 次调用的工具都没有返回有效数据。"
     "继续换词重试大概率还是空——请立刻停止检索，基于目前已有的信息给出结论；"
     "确实查不到的部分，如实告诉用户「没有查到相关数据」，不要编造。"
 )
-# 步数耗尽兜底：已跑过工具却未走终答轮时，禁工具再要一次总结，避免白卷
 _FALLBACK_SUMMARY_PROMPT = (
     "（系统提示）本轮工具调用已达上限。请立刻基于上面已经拿到的全部工具结果，"
     "直接输出给用户的最终回答：先给结论，再列依据；没有查到的部分如实说明「未查到」，"
     "不得编造数据。不要再调用任何工具。"
 )
-# 终答疑似截断：已跑过工具、有卡片可呈现，正文却短到不像完整回答——追问补全一次
 _NUDGE_TRUNCATED = (
     "（系统提示）你刚才的回答看起来没写完就停了。请接着把结论补完整："
     "该给的数据/清单/依据要交代清楚，不要停在一句话中间。"
 )
-# 自我叙述：终答只说了「我要做什么 / 用户问的是什么」，一句结论都没给
 _NUDGE_NARRATION = (
     "（系统提示）你刚才只是描述了你准备做什么，没有给出用户要的答案。"
     "请立刻把查到的事实写成结论交给用户：先给结论，再列依据；"
@@ -110,7 +103,6 @@ _LEAK_MARKERS = (
     "I need to check", "让我看看有哪些工具", "我的规则", "按照规则",
     "<｜DSML｜", "emit_card",
 )
-# 外泄正文里常见「自述在做什么」的自指句式，按行判据覆盖（段内没空行也认得出）
 _LEAK_LINE_HINTS = (
     "我需要", "我应该", "让我", "我手头", "我注意到", "我看一下", "我先确认",
     "I should", "I need to", "Let me", "I'll check",
@@ -126,7 +118,6 @@ def _looks_like_thinking(part: str) -> bool:
     if not lines:
         return False
     hits = sum(1 for ln in lines if any(h in ln for h in _LEAK_LINE_HINTS))
-    # 外泄思考往往是开头一大段自述，正文里偶尔一句「我先看看」不算
     return hits >= 2 or (hits == 1 and len(lines) <= 3)
 
 
@@ -135,8 +126,6 @@ _TOOL_ENVELOPE_RE = re.compile(
     r"<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>|<｜DSML｜parameter.*?</｜DSML｜parameter>",
     re.S,
 )
-# 自我叙述：终答里只有「我要做什么 / 用户问的是什么」，没有一句是给用户的结论。
-# 这类输出被模型当终答交了，用户看到的是助手在自言自语——要一次真回答，不是再描述一遍
 _NARRATION_LEAD = (
     "我来", "让我", "我这就", "我先", "我先去", "我去", "我再", "我重新", "我接着",
     "我马上", "我看看", "我看一下", "我查一下", "我确认", "我核实", "我试着", "我准备",
@@ -148,12 +137,9 @@ _NARRATION_META = (
     "这个问题得", "这个问题需要", "最合理的做法", "我的规则", "按照规则", "根据规则",
     "我没有那个上下文", "先说明一个情况", "先说明一个关键事实",
 )
-# 小写也要收：模型常写 "let me / i'll"，既有 _LEAK_LINE_HINTS 只收了首字母大写形态
 _NARRATION_EN = ("let me", "i'll", "i need to", "i should", "let's", "actually,",
                  "i want to", "i will")
-# 交付信号：正文里确实带了数据 / 清单 / 结论——有这些就不算空转
 _NARRATION_PAYLOAD = ("¥", "元", "%", "|", "## 结论", "**结论", "结论：")
-# 收尾停在自述上时，正文短到这个长度以内才算「计划没走完就交卷」
 _NARRATION_TAIL_MAX_CHARS = 200
 
 
@@ -184,7 +170,6 @@ def _is_self_narration(text: str) -> bool:
         return True
     if all(_sent_is_narration(s) for s in sents):
         return True
-    # 收尾停在「我接着去查」上：计划还没走完就被当成终答交了
     return _sent_is_narration(sents[-1]) and len(body) < _NARRATION_TAIL_MAX_CHARS
 
 
@@ -201,8 +186,6 @@ def _strip_leaked_thinking(text: str) -> str:
         return text
     text = _TOOL_ENVELOPE_RE.sub("", text)
     text = re.sub(r"</?｜DSML｜(invoke|tool_calls|parameter)[^>]*>", "", text)
-    # 外泄的思考通常整段趴在开头（模型先盘算再作答）或结尾（答完又自言自语），
-    # 只切这两端的连续块——从中间某个命中点一路切到末尾会把真正的回答一起删掉。
     kept = ""
     for parts in (re.split(r"\n\s*\n", text.strip()), text.strip().splitlines()):
         parts = [p for p in parts if p.strip()]
@@ -218,29 +201,19 @@ def _strip_leaked_thinking(text: str) -> str:
         if kept:
             break
     kept = _TOOL_ENVELOPE_RE.sub("", kept)
-    # 信封被切掉一半时残留的孤立闭合标签
     kept = re.sub(r"</?｜DSML｜(invoke|tool_calls|parameter)[^>]*>", "", kept)
     kept = re.sub(r"\n{3,}", "\n\n", kept).strip()
     return kept or text.strip()
 
 
-# 确定性预取：数据型问句在首轮模型请求前先把事实取回来注入，模型一轮直接
-# 综合——省掉「模型选工具→执行→再综合」里第一段等待。关键词只收无歧义形态，
-# 目标解析不唯一即弃权交还 agent 循环（低置信不行动）。
 _PREFETCH_REGION_WORDS = ("全区", "各区", "哪个区", "哪个地区", "各区域", "比价")
-# 免费游戏预取词：只收「明确在问免费游戏」的形态。"白嫖"单独出现太歧义
-# （社会用语/吐槽里常见），必须与游戏词同现才算（见 _prefetch_plan 的合取判据）
 _PREFETCH_FREE_WORDS = ("喜加一", "免费游戏", "免费领", "限时免费", "白送游戏")
 _PREFETCH_FREE_WEAK = ("白嫖",)
 _PREFETCH_CALENDAR_WORDS = ("活动", "日历")
 _PREFETCH_RATES_WORDS = ("汇率",)
 _PREFETCH_NOTE_HEAD = "（系统侧同步·仅供参照）以下是与本轮提问直接对应的实时预取事实（当轮刚取回的真实数据，非缓存、非估计）："
-# 工具执行期心跳节拍（秒）：执行不再静默——每拍上报一次已用时长，前端据此显示进度
 _TOOL_TICK_S = 1.0
-# 单阶段思考预算（字符）：超限后该阶段不再累加与下发思考增量，避免单个阶段拉成长文本
 _THINK_BUDGET_CHARS = 32000
-# 压缩连败熔断：连续 N 次「压缩调用失败」后跳过自动压缩（手动压缩不受限且成功即重置）。
-# 每轮都重试一次失败的压缩调用会白烧月度配额——熔断只是成本闸，进程内计数、重启重置无碍正确性。
 _COMPACT_FAIL_LIMIT = 2
 _compact_failures: dict[str, int] = {}
 _RESPONDED_KEYS = ("answer", "thinking", "think_ms", "source", "reason", "facts", "cards", "steps", "tools",
@@ -250,20 +223,13 @@ _RESPONDED_KEYS = ("answer", "thinking", "think_ms", "source", "reason", "facts"
                    "cache_base_tokens", "decode_ms", "decode_out", "ttft_ms", "ttft_n",
                    "tool_catalog", "diagnostic")
 
-# 只带附件不带提问时的默认问句（附件本体已落盘，模型按引用清单取用）
 _ATTACH_ONLY_QUESTION = "请查看我附带的附件。"
-# 提问本体超内联阈值时的替换形态：留一段开头便于用户与模型辨认，其余进附件
 _INLINE_HEAD_CHARS = 200
 
 _store: pilot_session.SessionStore | None = None
 
-# 正在工作中的会话（ask 流在途）：唯一事实源是 agent 流本身，router 挂/摘；
-# 进程内存态——重启即清零，与「流在途」的生命周期天然一致
 _RUNNING_SIDS: set[str] = set()
 
-# 在飞轮的提问原文（sid → 本轮流式受理到的那一问）。与 _RUNNING_SIDS 同生命周期：
-# 刷新/重开表面后据此显示「正在进行的是哪一问」，而不是让那一轮凭空消失。
-# 刻意不落账本——被取消/中断的轮次不留任何账本痕迹（既有契约）。
 _INFLIGHT_QUESTIONS: dict[str, str] = {}
 
 
@@ -679,7 +645,6 @@ def _card_of(tool_name: str, result: dict) -> dict | None:
     return None
 
 
-# 行卡类工具回落 rows；卡片类型映射唯一事实源在 agent/tools/projection.py
 _CARD_HINT_ROWS_TOOLS = pilot_tools._CARD_HINT_ROWS_TOOLS
 
 
@@ -699,7 +664,6 @@ def _card_kind_hint(tool_name: str) -> str | None:
 _MAX_CARDS_PER_TURN = 4
 
 
-# 跨轮卡片账本的回看窗口（轮数）与清单（供决策代理与模型同步消费）
 _RECENT_CARD_TURNS = 6
 
 
@@ -779,8 +743,6 @@ async def _prefetch_plan(question: str, appid: int | None, state, intent: str) -
             matches = await pilot_tools.search_games(q, query=title)
             if len(matches) == 1:
                 target = int(matches[0].get("appid") or 0) or None
-    # 强制单轮作答的门：问句是纯数据咨询（复合推荐 / 写动作 / 硬件玩法类
-    # 问句仍给完整工具表让模型自行补查），价格族再叠加目标零歧义
     pure_ask = (intent not in (pilot_intent.CREATE_ALERT, pilot_intent.ADD_MONITOR)
                 and not any(w in q for w in pilot_intent._FIND_WORDS)
                 and not any(w in q for w in _PF_NON_PRICE_WORDS))
@@ -994,18 +956,18 @@ async def _assemble_for_model(state, question: str, appid: int | None, cfg: dict
         return msgs, False
     if not pilot_context.needs_compaction(
             pilot_context.prune_old_tool_results(full), budget=budget):
-        return msgs, False  # 免费清理已够：省下一次真花钱的压缩调用
+        return msgs, False
     if _compact_failures.get(state.sid, 0) >= _COMPACT_FAIL_LIMIT:
         return msgs, False
     plan = pilot_context.compact_plan(state, cfg.get("context_window"), tool_limit)
     if plan is None:
-        return msgs, False  # 无可蒸馏轮次或区间太小：压缩无改善空间，非失败
+        return msgs, False
     pre_tokens = pilot_context.estimate_messages(full)
     result = await pilot_context.compact(state, cfg, sys_prompt=sys_prompt,
                                          tool_limit=tool_limit, plan=plan)
     if result is None:
         if len(_compact_failures) > 256:
-            _compact_failures.clear()  # 会话删除后的陈旧键顺手清掉
+            _compact_failures.clear()
         _compact_failures[state.sid] = _compact_failures.get(state.sid, 0) + 1
         return msgs, False
     text, through, usage = result
@@ -1147,11 +1109,9 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     sys_prompt = await _build_system_prompt()
     system = [{"role": "system", "content": sys_prompt}]
     minimal = _minimal_base(state, question, appid, view_context, element_refs, quotes)
-    # 环境事实（今天几号 / 结算区 / 已拥有数 / 启用区服）：每轮现取，紧跟 system，
-    # 不入账本——模型据此判断「下一个」是相对哪天、报价该按哪个区
     try:
         env_msgs = await pilot_context.environment_message()
-    except Exception as e:  # noqa: BLE001 — 取数失败只是少一段事实，问答照常
+    except Exception as e:  # noqa: BLE001
         env_msgs = None
         log_event(logger, "装配环境事实失败，本轮问答不带环境事实",
                   level=logging.WARNING, detail={"原因": str(e)})
@@ -1159,12 +1119,10 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     # 本轮入账 = 实际发给模型的每一条新消息（问句 + 各注入笔记），下一轮从
     # 账本逐字重放：重放序列与上一轮请求逐字节一致，跨轮前缀缓存才可复用
     new_msgs = [base[-1]]
-    # 中断续跑：先把上一轮已完成的事实在场（在确定性同步与卡片账本之前）
     resume_note = _resume_note(resume)
     if resume_note is not None:
         messages.append(resume_note)
         new_msgs.append(resume_note)
-    # 确定性层同步（意图路由 / 守卫状态 / 近轮卡片账本）跟随当前请求
     note = _deterministic_note(question, intent)
     if note is not None:
         messages.append(note)
@@ -1174,8 +1132,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     if ledger_note is not None:
         messages.append(ledger_note)
         new_msgs.append(ledger_note)
-    # 确定性预取：resume 轮已有回灌事实，不重复取。预取事实以 user 角色紧跟
-    # 当前问句；强制档首轮请求不带工具表，模型一轮作答
     prefetch = await _prefetch_facts(question, appid, state, intent, recent_cards) \
         if resume is None else None
     prefetch_emitted = False
@@ -1183,27 +1139,21 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         messages.append(prefetch["note"])
         new_msgs.append(prefetch["note"])
     overflow_retried = False
-    # 本会话可见的工具表：核心切面 + 已解锁（会话级单向，见 session_expanded_tools）。
-    # 本轮若调用 list_tools，就地解锁——本步之后的请求立刻能看到新工具。
     unlocked: set[str] = set(expanded or ())
     ctx_tokens = pilot_context.estimate_messages(messages)
     ctx_budget = _history_budget(cfg, sys_prompt, expanded=frozenset(unlocked),
                                  state=state)
 
     turn_started_at = time.monotonic()
-    # 阶段记录：一次问答按循环步分段，每段自成一个展示单元（思考 / 前言正文 / 工具步骤）
     phases: list[dict] = []
     announced_step = 0
     phase_think_chars = 0
     usage_total = [0, 0]
-    # 本轮第一次请求的输入侧真实用量：后续步骤视图里带着工具结果，与本轮
-    # 起始视图不是同一个东西，校正估值只认这一个数（context._measure_correction）
     first_in: int | None = None
     # 缓存计量桶（跨请求累计；None=provider 从未报告该桶，区别于 0）
     cache_read_total: int | None = None
     cache_write_total: int | None = None
     cache_base_total = 0
-    # 逐请求计时：等待首增量（请求起点→首个内容增量）与解码期（首个增量→流结束）
     # （仅在使用量同步回传的请求计入速度口径——没有 token 数的墙钟不进分母）
     ttft_ms_total = 0.0
     ttft_n = 0
@@ -1213,8 +1163,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
     cards: list[dict] = []
     last_game: dict | None = None
     reason: str | None = None
-    # 思考工时：思考通道活跃墙钟累计（首 thinking delta 开表，answer/tool_calls/轮末收表），
-    # 同时计入所在阶段
     think_open_at: float | None = None
     think_ms_total = 0.0
 
@@ -1228,7 +1176,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             think_open_at = None
 
     base_url = pilot_llm.effective_base_url(cfg["protocol"], cfg["base_url"])
-    # 一轮问答共用一个客户端：agent 循环跨轮复用连接，免每轮重新握手
     client = pilot_llm.http_client(base_url)
     inflight: asyncio.Task | None = None
     try:
@@ -1240,17 +1187,15 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         empty_streak = 0
         empty_streak_nudged = False
         tools_ran = 0
-        exhausted = True  # 循环因步数耗尽退出（正常终答 break 时置 False）
+        exhausted = True
         while step < _MAX_STEPS:
             phase = {"step": step + 1, "thinking": [], "text": [], "steps": [],
                      "cards": [], "think_ms": 0.0, "truncated": False, "terminal": False}
             phases.append(phase)
             phase_think_chars = 0
-            # 阶段定界：同一阶段只声明一次（溢出回收重跑本步时不再重发）
             if phase["step"] != announced_step:
                 announced_step = phase["step"]
                 yield {"type": "step_start", "step": phase["step"]}
-            # 确定性预取步骤挂进第 1 阶段时间线（溢出回收重建阶段时一并重挂）
             if phase["step"] == 1 and prefetch is not None:
                 for item in prefetch["items"]:
                     phase["steps"].append(item["step"])
@@ -1310,7 +1255,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                     if kind == "thinking":
                         if think_open_at is None:
                             think_open_at = time.monotonic()
-                        # 单阶段预算：超限后本阶段不再累加与下发思考增量（模型侧推理不受影响）
                         if phase_think_chars + len(delta) > _THINK_BUDGET_CHARS:
                             phase["truncated"] = True
                             continue
@@ -1331,7 +1275,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                         decode_ms_total += req_ended_at - first_delta_at
                         decode_out_total += req_out
             except pilot_llm.PilotLlmError as e:
-                # 溢出回收：首轮且尚无流出时丢弃历史（仅存档 + 当前问题）重试一次
                 if (step == 0 and not emitted and not overflow_retried
                         and state is not None and (state.turns or state.summary)
                         and pilot_context.looks_like_overflow(str(e))):
@@ -1339,15 +1282,13 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                     messages = system + list(minimal)
                     new_msgs = [minimal[-1]]
                     ctx_tokens = pilot_context.estimate_messages(messages)
-                    phases.pop()  # 本步未流出任何内容，阶段记录一并撤回
+                    phases.pop()
                     continue
                 raise
 
             step += 1
             assistant = {"role": "assistant", "content": "".join(round_answer) or None}
             if not tool_calls:
-                # 追问一次：模型空转（零输出零工具）或只宣告要查却一步工具未调
-                # ——回灌系统提示再给一轮；宣告文本只留展示层，不进模型对话
                 text = "".join(round_answer)
                 if not nudged and step < _MAX_STEPS:
                     if not text:
@@ -1356,10 +1297,8 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                           and any(w in text for w in _ANNOUNCE_WORDS)):
                         nudge = {"role": "system", "content": _NUDGE_ANNOUNCED}
                     elif _is_self_narration(text):
-                        # 只自述不交付：模型把「我要去查」当成终答交了，追问一次要真结论
                         nudge = {"role": "system", "content": _NUDGE_NARRATION}
                     elif _looks_truncated(text, tools_ran, cards):
-                        # 终答过短却有工具结果/卡片：像是话说到一半断了，追问一次补全
                         nudge = {"role": "system", "content": _NUDGE_TRUNCATED}
                     else:
                         nudge = None
@@ -1368,14 +1307,12 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                         messages.append(nudge)
                         new_msgs.append(nudge)
                         continue
-                # 终答轮：assistant 消息回写进会话历史（下一轮模型可见上文）
                 phase["terminal"] = True
                 messages.append(assistant)
                 new_msgs.append(assistant)
                 exhausted = False
                 break
 
-            # 模型要求调工具：assistant 消息（含 tool_calls）入列，执行后回灌
             assistant["tool_calls"] = [
                 {
                     "id": t["id"],
@@ -1387,12 +1324,9 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             messages.append(assistant)
             new_msgs.append(assistant)
             write_seen = 0
-            # list_tools 解锁：本步之后的请求就带上其余工具。解锁会改工具表、
-            # 进而作废本步之前的前缀缓存——这是每会话一次的开销，换来之后稳定。
             if any(t["name"] == pilot_tools.LIST_TOOLS for t in tool_calls):
                 unlocked |= pilot_tools.expandable_tools()
 
-            # 空转检测：同工具+同参数连续命中上限时回灌提醒（只提醒，不否决本次调用）
             if not stuck_nudged:
                 signature = json.dumps(
                     [(t["name"], t.get("arguments") or {}) for t in tool_calls],
@@ -1416,14 +1350,12 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 """工具结果结算（时间线 + 卡片裁决 + 回灌消息）——顺序/并行两路共用。"""
                 nonlocal last_game, empty_streak, empty_streak_nudged
                 step_data = pilot_tools.tool_step(t["name"], result)
-                # tool_start 已声明运行态占位，结算按声明序原位回填；无占位时兜底追加
                 pending = next((s for s in phase["steps"] if s.get("status") == "running"), None)
                 if pending is not None:
                     pending.update(step_data)
                 else:
                     phase["steps"].append(step_data)
                 tool_log.append(_tool_summary(t["name"], result))
-                # 连续空结果熔断：累加空/无数据返回的连击，达上限回灌收敛提醒（一次）
                 if _is_empty_result(result):
                     empty_streak += 1
                     if (not empty_streak_nudged and empty_streak >= _EMPTY_STREAK_LIMIT
@@ -1436,7 +1368,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 else:
                     empty_streak = 0
                 yield {"type": "tool", "name": t["name"], "duration_ms": duration_ms, **step_data}
-                # card 结算帧：内部决策代理统一裁决是否下发可视化卡片
                 base_card = _card_of(t["name"], result)
                 card_dec = DECISION_AGENT.decide_card(
                     tool_name=t["name"],
@@ -1470,8 +1401,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                         yield {"type": "card", "name": "propose_bulk", "card": p_dec.card}
                 if t["name"] in ("add_follow", "create_price_alert") and result.get("appid"):
                     last_game = {"appid": result["appid"], "name": result.get("name")}
-                # 本轮讨论对象：价格/全区比价/多游对比工具各自带名称，追问要靠它填
-                # {name}——写动作没发生时（纯查询轮）也得认得出来
                 if last_game is None or not str(last_game.get("name") or "").strip():
                     _n = str(result.get("name") or "").strip()
                     _a = result.get("appid")
@@ -1498,8 +1427,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 )
                 return {"kind": "failed", "tool": name, "note": type(exc).__name__}
 
-            # 只读批次并行：模型一次给多个只读调用时并发执行（读间无顺序依赖），
-            # 声明按模型序、结算帧按模型序回流；含写/同步/调度调用时保持顺序执行
             if len(tool_calls) > 1 and all(t["name"] in pilot_tools._READ_TOOLS for t in tool_calls):
                 batch: list[dict] = []
                 for t in tool_calls:
@@ -1531,7 +1458,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                             if b["task"].done():
                                 try:
                                     b["result"] = b["task"].result()
-                                except Exception as e:  # noqa: BLE001 — 同顺序路径：失败回灌
+                                except Exception as e:  # noqa: BLE001
                                     b["result"] = await _failed_result(b["t"]["name"], e)
                                 b["finished_at"] = now
                             else:
@@ -1545,7 +1472,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                                     yield {"type": "tool_progress", "name": b["t"]["name"],
                                            "label": b["label"], "elapsed_ms": used_ms}
                         inflight_tasks = {b["task"] for b in batch if b["result"] is None}
-                    # 全部落定后按模型序结算（含已就绪但排在慢工具后面的）
                     for b in batch:
                         duration_ms = int((b["finished_at"] - b["started_at"]) * 1000)
                         async for frame in _emit_result(b["t"], b["result"], duration_ms):
@@ -1566,7 +1492,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                                                       question=question, recent_cards=recent_cards)}
                 guarded = pilot_intent.is_guarded(question)
                 if t["name"] in pilot_tools._WRITE_TOOLS:
-                    # 单轮写动作上限：第 3 个起一律拒绝（堵「一句话连发」）
                     write_seen += 1
                     guarded = guarded or write_seen > 2
                 started_at = time.monotonic()
@@ -1580,7 +1505,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                     if done:
                         try:
                             result = inflight.result()
-                        except Exception as e:  # noqa: BLE001 —— 工具自身失败不吞整轮：归因为失败步骤回灌模型
+                        except Exception as e:  # noqa: BLE001
                             result = await _failed_result(t["name"], e)
                         break
                     used_ms = int((time.monotonic() - started_at) * 1000)
@@ -1590,7 +1515,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                             await inflight
                         result = {"kind": "timeout", "tool": t["name"], "budget_s": int(budget_s)}
                         break
-                    # 执行期心跳：两侧都静默时前端仍有"仍在执行 · 已用 N 秒"的活信号
                     yield {"type": "tool_progress", "name": t["name"],
                            "label": meta_label, "elapsed_ms": used_ms}
                 inflight = None
@@ -1598,10 +1522,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
                 async for frame in _emit_result(t, result, duration_ms):
                     yield frame
 
-        # 步数耗尽兜底：已跑过工具却未走终答轮时，禁工具再要一次总结——
-        # 避免「调了一堆工具却交白卷」（D1 空回答的另一形态）。这次调用不计步数、
-        # 不带工具表，模型只能基于已有工具结果作答。兜底产出若仍是自述（"我去查一下"），
-        # 带一次反自述提醒再要一轮——否则白卷照交，只是换了个说法
         summary_diagnostic: dict | None = None
         for attempt in ((_FALLBACK_SUMMARY_PROMPT, _NUDGE_NARRATION)
                         if exhausted and tools_ran > 0 else ()):
@@ -1627,16 +1547,12 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
             except pilot_llm.PilotLlmError as e:
                 summary_diagnostic = e.to_diagnostic()
     finally:
-        # 流被中断（客户端断开 / 服务端取消）时在飞工具一并取消，不留后台孤儿
         if inflight is not None and not inflight.done():
             inflight.cancel()
-        # 回合收口：未结算步骤统一归为 stopped（正常轮全部已结算，此处为恒等操作；
-        # 异常 / 取消路径经此收口后 phases 不残留 running，取消异常照常上抛不吞）
         _settle_running_steps(phases)
         await client.aclose()
 
     _think_close()
-    # 步数耗尽且兜底也没产出正文：明确归因，前端翻成用户语言——不静默交白卷
     if exhausted:
         tail_text = "".join(phases[-1].get("text") or []) if phases else ""
         if not tail_text.strip():
@@ -1645,14 +1561,8 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         phase["thinking"] = "".join(phase["thinking"])
         phase["text"] = "".join(phase["text"])
         phase["think_ms"] = int(phase["think_ms"] * 1000) or None
-        # 自述段打标记：前端按 phases 取终答时据此跳过，两端口径同源（不再各判一次）
         if phase["text"].strip():
             phase["narration"] = _is_self_narration(phase["text"])
-    # phases 是唯一权威记录；thinking / steps / answer 由它派生，供旧前端与旧账本口径消费
-    # 末段是自述（"我去查一下"）就丢掉：那是过程不是结论，留着等于替模型把白卷交了。
-    # 只切末尾——前面的前言是流式时真实给用户看过的内容，留着；
-    # phases 与 steps 照原样留档，过程链与步骤账本仍要看到这一轮发生过什么。
-    # 兜底轮整轮自述且只有它一段时（phases 长度 1）不切：那时确实没有别的内容可交
     _answer_phases = list(phases)
     while len(_answer_phases) > 1 and _is_self_narration(_answer_phases[-1]["text"]):
         _answer_phases.pop()
@@ -1664,7 +1574,6 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         await pilot_config.add_usage(usage_total[0], usage_total[1])
     if state is not None and last_game:
         state.last_game = last_game
-    # 只记本轮新解锁的（老账本里已有的事实不必每轮重抄一遍）
     newly_unlocked = sorted(unlocked - set(expanded or ()))
     _followups = DECISION_AGENT.suggest_followups(
         question, intent, cards, last_game, tools_ran=tools_ran)
@@ -1685,9 +1594,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         "ctx_breakdown": _ctx_breakdown(base, state, question, appid, sys_prompt,
                                         view_context, element_refs,
                                         expanded=frozenset(unlocked)),
-        # 本轮新解锁的工具（会话级单向）：账本据此在重启后重建工具表切面
         **({"tool_catalog": newly_unlocked} if newly_unlocked else {}),
-        # 命中率按本轮全部请求聚合（单次请求的比率不代表整轮；provider 未报则不出）
         "cache_hit_rate": (min(1.0, cache_read_total / cache_base_total)
                            if cache_read_total is not None and cache_base_total > 0 else None),
         "usage_in": usage_total[0],
@@ -1702,10 +1609,7 @@ async def _agent_stream(base: list[dict], state, question: str, appid: int | Non
         "ttft_n": ttft_n,
         "elapsed_ms": int((time.monotonic() - turn_started_at) * 1000),
         "archived_through": state.summary_through if state is not None else None,
-        # 本轮追问（结构化 key+args，文案由前端 i18n 承载）；无候选时不带该键，
-        # 前端回落固定开场推荐
         **({"followups": _followups} if _followups else {}),
-        # 本轮新增消息（会话入账用）；ask_stream 在下发前摘除，不进 SSE
         "turn_messages": new_msgs,
         **({"diagnostic": summary_diagnostic} if summary_diagnostic else {}),
     }
@@ -1839,7 +1743,7 @@ async def confirm_proposal(sid: str, pid: str, approve: bool) -> dict:
                     ok_done = bool(await pilot_tools.wishlist_follows.unfollow(target_id))
                 else:
                     ok_done = False
-            except Exception:  # noqa: BLE001 — 单项失败不影响其余
+            except Exception:  # noqa: BLE001
                 ok_done = False
             if ok_done:
                 done.append({"key": key, "name": item.get("name")})
@@ -1864,7 +1768,7 @@ async def confirm_proposal(sid: str, pid: str, approve: bool) -> dict:
                     appid, target_type=str(args.get("target_type") or "historic_low"),
                     target_value_fen=fen,
                 )
-        except Exception:  # noqa: BLE001 — 单项失败不影响其余，失败清单随结果返回
+        except Exception:  # noqa: BLE001
             res = None
         if res and res.get("appid"):
             done.append({"appid": appid, "name": res.get("name") or item.get("name")})
@@ -2104,8 +2008,6 @@ async def ask(question: str, appid: int | None = None, session_id: str | None = 
             last_diagnostic = event.get("diagnostic") or last_diagnostic
     if result is None:
         result = _empty("none", "llm_failed", None)
-        # 流式里已经拿到上游原文就别丢：否则界面只剩一句「模型暂时不可用」，
-        # 用户无从判断是没配服务、通道没额度还是网络断了
         if last_diagnostic:
             result["diagnostic"] = last_diagnostic
     return {**result, "cached": False}
@@ -2183,7 +2085,6 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         yield {"type": "error", "reason": "bad_request"}
         return
     state = await get_store().load_or_new(session_id) if session_id else None
-    # 附件吸收：提问本体超长时落盘换引用（消息体只留开头片段），随问附件按会话校验收编
     q, att_refs, att_msg = await _absorb_attachments(
         state.sid if state is not None else None, q, attachments)
     if not q:
@@ -2194,7 +2095,6 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         if not probe:
             _log_decision(entry)
 
-    # 导航直通：动词+页面别名命中即执行，不过模型（LLM 关闭/超限同样生效）
     nav_target = pilot_intent.nav_target(q)
     if intent == pilot_intent.NAVIGATE and nav_target:
         resp = await _navigate_direct(nav_target)
@@ -2235,7 +2135,6 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         yield {"type": "done", "q": q, **resp}
         return
 
-    # 本会话已解锁的工具（账本事实）：工具表切面对整轮一致，避免中途切换击穿前缀缓存
     unlocked = session_expanded_tools(state)
     base, compacted = await _assemble_for_model(
         state, q, appid, cfg,
@@ -2273,7 +2172,6 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
     except pilot_llm.PilotLlmError as error:
         diagnostic = error.to_diagnostic()
         last_diagnostic = diagnostic
-        # 循环内已流出的内容不收回；无流出时降级为确定性事实
         if result is None:
             resp = await _fallback_deterministic(q, appid, state, intent)
             resp["reason"] = "llm_failed" if resp["source"] != "guide" else resp["reason"]
@@ -2299,7 +2197,6 @@ async def _ask_stream_body(question: str, appid: int | None = None, session_id: 
         result = _empty("none", "llm_failed", None)
     if att_refs:
         result["attachments"] = att_refs
-    # 编号引用随本轮入账：刷新/重开会话后气泡仍能按编号还原成胶囊（正文在 quotes 里）
     if quotes:
         result["quotes"] = quotes
     turn_messages = result.pop("turn_messages", [])

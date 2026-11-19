@@ -10,8 +10,8 @@ from app.domains.monitoring import service as monitoring_service
 from app.domains.rates import service as rates_service
 from app.domains.regions import service as regions_service
 
-_BUNDLE_MEMBERS_LIMIT = 30   # bundle_detail 成员截断线（超出只给 total）
-_RATES_MAX_POINTS = 72       # 汇率走势抽样上限（与价格走势同量级）
+_BUNDLE_MEMBERS_LIMIT = 30
+_RATES_MAX_POINTS = 72
 
 
 async def game_detail(appid: int) -> dict:

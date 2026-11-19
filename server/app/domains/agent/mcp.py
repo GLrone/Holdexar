@@ -186,7 +186,7 @@ async def _supervise(commands: asyncio.Queue) -> None:
             if cmd == "exit":
                 done.set_result(None)
                 return
-        except Exception as exc:  # noqa: BLE001 — 失败降级为关闭态，原因经 status 投影
+        except Exception as exc:  # noqa: BLE001
             _last_error = str(exc)[:200]
             cm, _manager, _token = None, None, None
         if not done.done():

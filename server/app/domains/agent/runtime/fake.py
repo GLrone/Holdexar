@@ -35,7 +35,7 @@ async def execute_fake_run(
     step_delay: float = 0.0,
 ) -> None:
     token = REGISTRY.token_of(run_id)
-    if token is None:  # 未注册即执行：无取消通道，建本地令牌兜底
+    if token is None:
         from app.domains.agent.runtime.cancellation import CancelToken
 
         token = CancelToken()
@@ -52,7 +52,7 @@ async def execute_fake_run(
                 return
             if step_delay > 0:
                 if await token.wait(step_delay):
-                    break  # 延时中被取消：停止继续执行
+                    break
             await agent_service.append_event(
                 run_id, agent_events_spec.EV_STEP_COMPLETED,
                 {"step": n, "summary": f"fake step {n}"})

@@ -71,7 +71,6 @@ async def wait_event(run_id: str, event_type: str, timeout: float = 5.0) -> list
     raise AssertionError(f"timeout waiting for event {event_type}")
 
 
-# ── 状态机（纯函数）──────────────────────────────────────────────
 
 from app.domains.agent.runtime.state import TRANSITIONS  # noqa: E402
 
@@ -80,7 +79,7 @@ class TestStateMachine:
     def test_legal_transition_matrix(self):
         for current, targets in TRANSITIONS.items():
             for target in targets:
-                assert_transition(current, target)  # 不抛即合法
+                assert_transition(current, target)
 
     def test_terminal_has_no_outgoing(self):
         all_states = (
@@ -108,7 +107,6 @@ class TestStateMachine:
                 assert_transition(current, target)
 
 
-# ── 存储与生命周期 ────────────────────────────────────────────────
 
 class TestStore:
     @pytest.mark.asyncio
@@ -204,7 +202,6 @@ class TestTransitionGuards:
             await agent_service.apply_transition(rid, RUN_RUNNING)
 
 
-# ── 事件账本：seq / 持久化 / 回放 / 边界 ─────────────────────────
 
 class TestEventLedger:
     @pytest.mark.asyncio
@@ -242,7 +239,6 @@ class TestEventLedger:
     @pytest.mark.asyncio
     async def test_payload_boundary(self, db):
         rid = (await agent_service.create_run())["run_id"]
-        # 敏感键剔除 + 白名单外键丢弃（端到端）
         seq = await agent_service.append_event(
             rid, ev.EV_STEP_COMPLETED,
             {"step": 1, "api_key": "sk-secret", "cookie": "a=b", "rogue": 1},
@@ -253,11 +249,9 @@ class TestEventLedger:
         dumped = json.dumps([e["payload"] for e in events])
         assert "api_key" not in dumped
         assert "rogue" not in dumped
-        # 纯函数层：超限摘要化
         truncated = ev.build_payload(ev.EV_STEP_COMPLETED, {"step": 1, "summary": "x" * 20000})
         assert truncated["truncated"] is True
         assert truncated["bytes"] > 8192
-        # 纯函数层：未知事件类型 fail-closed——外部数据一字节不入账，只留拒绝标记
         rejected = ev.build_payload("rogue_type", {"rogue": "x", "api_key": "k"})
         assert rejected == {"rejected": "unknown_event_type"}
         assert ev.build_payload("rogue_type", None) == {"rejected": "unknown_event_type"}
@@ -282,7 +276,6 @@ class TestEventLedger:
         ]
 
 
-# ── 取消语义 ─────────────────────────────────────────────────────
 
 class TestCancellation:
     @pytest.mark.asyncio
@@ -301,7 +294,6 @@ class TestCancellation:
             meta={"scenario": "success", "steps": 8, "step_delay": 0.05}))["run_id"]
         await agent_service.start_run(rid)
         await wait_status(rid, {RUN_RUNNING})
-        # 等首步完成再取消：同时证明「已完成步保留」与「后续步不再执行」
         await wait_event(rid, ev.EV_STEP_COMPLETED)
         await agent_service.cancel_run(rid)
         run = await wait_status(rid, {RUN_CANCELLED})
@@ -310,7 +302,7 @@ class TestCancellation:
         completed = [e for e in events if e["event_type"] == ev.EV_STEP_COMPLETED]
         started = [e for e in events if e["event_type"] == ev.EV_STEP_STARTED]
         assert 1 <= len(completed) < 8
-        assert len(started) == len(completed) + 1  # 取消时的当前步有 started 无 completed
+        assert len(started) == len(completed) + 1
 
     @pytest.mark.asyncio
     async def test_cancel_idempotent(self, db):
@@ -341,14 +333,12 @@ class TestCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_orphan_running_converges_directly(self, db):
-        # 无活跃执行者的 running（进程内孤儿形态）：直接收敛
         rid = (await agent_service.create_run())["run_id"]
         await agent_service.apply_transition(rid, RUN_RUNNING)
         result = await agent_service.cancel_run(rid)
         assert result == {"accepted": True, "status": RUN_CANCELLED}
 
 
-# ── 重启收尸 ─────────────────────────────────────────────────────
 
 class TestReconcile:
     @pytest.mark.asyncio
@@ -393,7 +383,6 @@ class TestReconcile:
         assert (await agent_service.get_run(rid))["status"] == RUN_QUEUED
 
 
-# ── 写路径（全局单写者调度）与 DDL ───────────────────────────────
 
 class TestWritePathAndDDL:
     @pytest.mark.asyncio
@@ -416,7 +405,6 @@ class TestWritePathAndDDL:
             sql = (await session.execute(text(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_events'"
             ))).scalar_one()
-            # 表级唯一约束（SQLite 以 autoindex 承载，约束名保留在建表 SQL）
             assert "ux_agent_event_run_seq" in sql and "UNIQUE" in sql
             run_indexes = (await session.execute(text(
                 "PRAGMA index_list('agent_runs')"))).fetchall()
@@ -424,12 +412,11 @@ class TestWritePathAndDDL:
             assert {"ix_agent_run_session", "ix_agent_run_status"} <= names
             ev_indexes = (await session.execute(text(
                 "PRAGMA index_list('agent_events')"))).fetchall()
-            assert any(row[2] for row in ev_indexes)  # (run_id, seq) 唯一约束在位
+            assert any(row[2] for row in ev_indexes)
             fk = (await session.execute(text("PRAGMA foreign_key_list('agent_runs')"))).fetchall()
             assert any(row[2] == "agent_sessions" for row in fk)
 
 
-# ── API 冒烟（mini app，只挂 agent router）───────────────────────
 
 class TestApi:
     @pytest_asyncio.fixture
