@@ -8,9 +8,6 @@ import (
 	"testing"
 )
 
-// writeFixtureDB 建存量库夹具：业务表与 FTS5 表各落数行并落 user_version；
-// 写完不关闭（连接在测试结束时由 cleanup 关闭），数据停留于 WAL 侧车未
-// checkpoint（写入量远小于 1000 页自动检查点阈值）。
 func writeFixtureDB(t *testing.T, path string, version int) *sql.DB {
 	t.Helper()
 	writer, err := Open(path)
@@ -32,7 +29,6 @@ func writeFixtureDB(t *testing.T, path string, version int) *sql.DB {
 	return writer
 }
 
-// 正常读 34：版本读取、版本不超前放行、快检 ok 三条主路径。
 func TestSchemaVersionReadAndGate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "holdexar.db")
 	writeFixtureDB(t, path, 34)
@@ -52,7 +48,6 @@ func TestSchemaVersionReadAndGate(t *testing.T) {
 	}
 }
 
-// 伪造 user_version=35：高于支持版本时拒绝，文案与 Python 侧逐字同义。
 func TestEnsureSupportedVersionRejectsNewer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "holdexar.db")
 	writeFixtureDB(t, path, 35)
@@ -67,8 +62,6 @@ func TestEnsureSupportedVersionRejectsNewer(t *testing.T) {
 	}
 }
 
-// 伪造 user_version=33：低于支持版本时同样拒绝——本程序不含迁移链，
-// 落后库静默放行会在缺表/缺约束的老库上以 500 面目失败（G7-B R1）。
 func TestEnsureSupportedVersionRejectsOlder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "holdexar.db")
 	writeFixtureDB(t, path, 33)
@@ -83,7 +76,6 @@ func TestEnsureSupportedVersionRejectsOlder(t *testing.T) {
 	}
 }
 
-// 库文件不存在必须报错，且不创建库文件与侧车文件。
 func TestSchemaVersionMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent.db")
 
@@ -106,8 +98,6 @@ func TestSchemaVersionMissingFile(t *testing.T) {
 	}
 }
 
-// 只读连接穿透 WAL：写库不 checkpoint 时，版本值与 FTS5 数据只存在于
-// WAL 侧车，只读连接仍读到；主库文件单独复制后读到旧值作对照。
 func TestReadOnlySeesUncheckpointedWAL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "holdexar.db")
 	writeFixtureDB(t, path, 34)
@@ -117,8 +107,6 @@ func TestReadOnlySeesUncheckpointedWAL(t *testing.T) {
 		t.Fatalf("WAL 侧车文件应存在且非空: %v", err)
 	}
 
-	// 主库文件单独复制（不带侧车）：其中 user_version 仍是 0，
-	// 证明 34 只存在于 WAL——原库经侧车读出 34 即穿透证据。
 	main, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("主库文件读取失败: %v", err)

@@ -1,13 +1,11 @@
-//go:build windows
-
-// Package updateguard 升级验收期的数据保护：启动授权校验、写保护、页面就绪位。
-// 语义对齐 app/core/update_data.py（validate_startup / update-ready / 写保护中间件）。
+// Package updateguard 提供升级验收期的启动校验、API 写保护与页面就绪标记。
 package updateguard
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/store"
 )
@@ -28,33 +27,28 @@ var (
 
 type state struct {
 	protected   atomic.Bool
-	attemptID   atomic.Value // string
-	token       atomic.Value // string
+	attemptID   atomic.Value
+	token       atomic.Value
 	pageReady   atomic.Bool
-	dataDirPath atomic.Value // string
+	dataDirPath atomic.Value
 }
 
 var current state
 
-// Active 验收保护是否生效（健康载荷的 writeProtected 位）。
 func Active() bool { return current.protected.Load() }
 
-// AttemptID 当前验收事务 ID。
 func AttemptID() string {
 	value, _ := current.attemptID.Load().(string)
 	return value
 }
 
-// PageReady 页面验收就绪位。
 func PageReady() bool { return current.pageReady.Load() }
 
-// DataDir 受保护数据目录。
 func DataDir() string {
 	value, _ := current.dataDirPath.Load().(string)
 	return value
 }
 
-// MarkerPath data/backups/.restore.lock。
 func MarkerPath(dataDir string) string {
 	return filepath.Join(dataDir, "backups", ".restore.lock")
 }
@@ -92,18 +86,7 @@ func txChildrenRegistered(tx map[string]any, pid int) bool {
 	return false
 }
 
-func processAlive(pid int) bool {
-	handle, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	_ = handle
-	// Windows 无 0 信号探测：OpenProcess 判定
-	return processAliveWin(pid)
-}
-
-// validateStartup 启动授权：无保护标记且无验收环境 → 正常启动；
-// 有标记/环境 → 逐项校验（3 秒登记窗口）并返回数据令牌。
+// validateStartup 无 update 标记与环境时直接放行，否则在 3s 窗口内校验事务登记并核对令牌。
 func validateStartup(dataDir string) (string, error) {
 	marker, err := readMarker(dataDir)
 	if err != nil {
@@ -190,8 +173,6 @@ func numberValue(value any) float64 {
 	return result
 }
 
-// Activate 启动期调用：校验通过后进入验收保护态（写保护+验收位）。
-// 返回数据令牌（未处于保护态时为空串）。
 func Activate(dataDir string) (string, error) {
 	token, err := validateStartup(dataDir)
 	if err != nil {
@@ -207,16 +188,15 @@ func Activate(dataDir string) (string, error) {
 	return token, nil
 }
 
-// SetPageReady 页面验收就绪（update-ready 端点调用）。
 func SetPageReady(attemptID string) error {
-	if !Active() || AttemptID() != attemptID {
+	if !Active() || AttemptID() == "" || AttemptID() != attemptID {
 		return ErrNotDuringCheck
 	}
 	current.pageReady.Store(true)
 	return nil
 }
 
-// Token 写闸维护授权令牌（与恢复/收缩维护共用放行通道）。
+// Token 返回当前升级验收期的数据保护令牌（未激活时为空）。
 func Token() string {
 	value, _ := current.token.Load().(string)
 	return value
@@ -226,30 +206,46 @@ func dbPathOf(dataDir string) string {
 	return filepath.Join(dataDir, "holdexar.db")
 }
 
-// ClearProtection 验收提交后解除保护位。
 func ClearProtection() {
 	current.protected.Store(false)
 	current.pageReady.Store(false)
 }
 
-// HandleUpdateReady POST /system/update-ready：页面验收就绪登记。
 func HandleUpdateReady(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		AttemptID string `json:"attemptId"`
+	w.Header().Set("Content-Type", "application/json")
+	if !access.PeerIsLoopback(r.RemoteAddr) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "该操作仅限本机执行"})
+		return
 	}
-	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&body)
-	if err := SetPageReady(body.AttemptID); err != nil {
-		w.Header().Set("Content-Type", "application/json")
+	if r.Body == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		return
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192))
+	var body map[string]any
+	if err := dec.Decode(&body); err != nil || body == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		return
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "请求体无效"})
+		return
+	}
+	attemptID, _ := body["attemptId"].(string)
+	if err := SetPageReady(attemptID); err != nil {
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{"detail": "当前不在更新验收期间"})
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ready": true})
 }
 
-// Middleware 验收期写保护：非 GET/HEAD/OPTIONS 的 /api/* 一律 503，
-// 仅放行本端点（对齐原实现的「正在完成更新」语义）。
+// Middleware 验收期内拦截非安全方法的 /api/* 请求并返回 503，仅放行 update-ready。
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if Active() && r.Method != http.MethodGet && r.Method != http.MethodHead &&

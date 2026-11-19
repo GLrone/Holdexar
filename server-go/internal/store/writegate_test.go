@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,8 +26,6 @@ func openTestDB(t *testing.T) (*sql.DB, string) {
 	return db, path
 }
 
-// 8 写者经 WithWrite 并发 3 秒：事务全部串行成功，零错误零 busy。
-// 同参数历史基线 17139 笔提交。
 func TestWithWriteConcurrent(t *testing.T) {
 	db, path := openTestDB(t)
 	if _, err := db.Exec("CREATE TABLE counter(n INTEGER)"); err != nil {
@@ -71,7 +72,6 @@ func TestWithWriteConcurrent(t *testing.T) {
 	t.Logf("8 写者 3 秒提交 %d 笔，零错误零 busy（历史基线 17139）", total)
 }
 
-// 后台持闸期间，交互请求先于其后入队的新后台请求获得移交。
 func TestInteractivePriorityHandoff(t *testing.T) {
 	db, path := openTestDB(t)
 	g := NewWriteGate(db, path)
@@ -102,7 +102,6 @@ func TestInteractivePriorityHandoff(t *testing.T) {
 	}
 }
 
-// 持闸不释放时排队者按 waitTimeout 报错；释放后闸恢复可用。
 func TestWaitTimeout(t *testing.T) {
 	db, path := openTestDB(t)
 	g := NewWriteGate(db, path)
@@ -127,7 +126,6 @@ func TestWaitTimeout(t *testing.T) {
 	lease.Done()
 }
 
-// 持闸超过阈值告警一次（不强制释放）。
 func TestHoldWarn(t *testing.T) {
 	db, path := openTestDB(t)
 	g := NewWriteGate(db, path)
@@ -166,8 +164,6 @@ func TestHoldWarn(t *testing.T) {
 	}
 }
 
-// 同进程双锁实例互斥与超时报错。真实双进程互斥未测：LockFileEx 为内核
-// 字节锁，跨进程同样生效，属平台保证。
 func TestCrossProcessLockExclusive(t *testing.T) {
 	lockPath := processWriteLockPath(filepath.Join(t.TempDir(), "lock.db"))
 	ctx := context.Background()
@@ -195,8 +191,6 @@ func TestCrossProcessLockExclusive(t *testing.T) {
 	unlockFile(f2)
 }
 
-// 两个闸实例指向同一库：文件锁兜底跨实例互斥，第二闸超时报错，
-// 且其内部已授予的写者位被正确回收。
 func TestTwoGatesMutualExclusive(t *testing.T) {
 	db, path := openTestDB(t)
 	g1 := NewWriteGate(db, path)
@@ -215,4 +209,38 @@ func TestTwoGatesMutualExclusive(t *testing.T) {
 		t.Fatalf("释放后第二闸应可取得: %v", err)
 	}
 	l2.Done()
+}
+
+func TestNewWriteGateResolvesNTFSJunctionToSameLockHash(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS junction test only applies on Windows")
+	}
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	junctionDir := filepath.Join(root, "junction")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junctionDir, realDir).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J failed: %v (%s)", err, out)
+	}
+	realPath := filepath.Join(realDir, "holdexar.db")
+	junctionPath := filepath.Join(junctionDir, "holdexar.db")
+
+	dbReal, err := Open(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbReal.Close()
+	dbJunc, err := Open(junctionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbJunc.Close()
+
+	g1 := NewWriteGate(dbReal, realPath)
+	g2 := NewWriteGate(dbJunc, junctionPath)
+	if g1.lockPath != g2.lockPath {
+		t.Fatalf("junction lockPath mismatch:\n  real: %s\n  junc: %s", g1.lockPath, g2.lockPath)
+	}
 }

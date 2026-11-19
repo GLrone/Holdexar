@@ -1,27 +1,19 @@
-// Package secretbox：凭据静态加密与数据主密钥托管。
-//
-// 密文格式 enc1:<b64url(nonce)>:<b64url(密文+认证标签)>，AAD 恒空，是跨运行时
-// 不变量：Go 与 Python 侧写的密文必须互解。HKDF 盐/info 常量与密钥文件 JSON
-// 形状逐字节固定，不得改动。
-//
-// 密钥分层：数据主密钥（DMK）由 keyring 三模式提供（legacy 机器派生 / DPAPI /
-// 口令 scrypt，见 keyring.go）；用途子密钥 = HKDF-SHA256(master, salt=固定,
-// info="holdexar:secretbox:<用途>")，跨用途解密直接失败。
+// Package secretbox 凭据静态加密（AES-GCM + HKDF-SHA256）。
+// 密文格式 enc1:<b64url(nonce)>:<b64url(ct+tag)>，AAD 恒空；跨运行时逐字节固定。
+// 用途子密钥 = HKDF-SHA256(DMK, salt=purposeSalt, info="holdexar:secretbox:<用途>")。
 package secretbox
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 	"unicode/utf8"
-
-	"golang.org/x/crypto/hkdf"
 
 	"holdexar/server-go/internal/config"
 )
@@ -43,14 +35,10 @@ var (
 	purposeSalt = []byte("holdexar:secretbox:purpose")
 )
 
-// ── 错误类型（调用方按类型区分降级路径）─────────────────────
-
-// SecretBoxError 凭据解密失败（密文被篡改、派生密钥不符、格式不识别或锁定态）。
 type SecretBoxError struct{ msg string }
 
 func (e *SecretBoxError) Error() string { return e.msg }
 
-// KeyringError 密钥托管操作失败（封装不可用 / 口令不正确 / 文件损坏）。
 type KeyringError struct{ msg string }
 
 func (e *KeyringError) Error() string { return e.msg }
@@ -65,21 +53,15 @@ func keyringErr(msg string) error          { return &KeyringError{msg: msg} }
 func keyringErrf(f string, a ...any) error { return &KeyringError{msg: fmt.Sprintf(f, a...)} }
 func keyLockedErr(msg string) error        { return &KeyLockedError{msg: msg} }
 
-// ── 用途派生 ─────────────────────────────────────────────
-
-// IsEncrypted 值是否为 enc1: 密文（存量明文为 false）。
 func IsEncrypted(value string) bool {
 	return value != "" && strings.HasPrefix(value, Prefix)
 }
 
-// DerivePurposeKey 主密钥 → 用途子密钥（各用途 info 不同，彼此计算独立）。
 func DerivePurposeKey(master []byte, purpose string) []byte {
 	return hkdfBytes(master, purposeSalt, []byte("holdexar:secretbox:"+purpose))
 }
 
-// LegacyMaster legacy 数据主密钥：机器指纹 + 安装盐 → HKDF-SHA256。
-// 指纹与安装盐的获取顺序对齐 Python：注册表指纹 → 机器文件指纹 → 数据目录
-// 随机兜底文件；安装盐缺失时落盘新随机数。
+// LegacyMaster 由机器指纹或目录兜底密钥与安装盐经 HKDF-SHA256 派生主密钥。
 func LegacyMaster(dataDir string) ([]byte, error) {
 	fingerprint, err := machineFingerprintOrFallback(dataDir)
 	if err != nil {
@@ -93,15 +75,13 @@ func LegacyMaster(dataDir string) ([]byte, error) {
 }
 
 func hkdfBytes(ikm, salt, info []byte) []byte {
-	r := hkdf.New(sha256.New, ikm, salt, info)
-	out := make([]byte, keyBytes)
-	_, _ = io.ReadFull(r, out)
+	out, err := hkdf.Key(sha256.New, ikm, salt, string(info), keyBytes)
+	if err != nil {
+		panic(err)
+	}
 	return out
 }
 
-// ── 封装 / 解封 ──────────────────────────────────────────
-
-// EncryptWith 用指定主密钥封装（换钥重加密用；空串原样返回）。
 func EncryptWith(plaintext, purpose string, master []byte) (string, error) {
 	if plaintext == "" {
 		return "", nil
@@ -111,7 +91,6 @@ func EncryptWith(plaintext, purpose string, master []byte) (string, error) {
 	return Prefix + b64Encode(nonce) + ":" + b64Encode(sealed), nil
 }
 
-// DecryptWith 用指定主密钥解封（换钥重加密用）。失败抛 SecretBoxError。
 func DecryptWith(token, purpose string, master []byte) (string, error) {
 	nonce, sealed, err := parseToken(token)
 	if err != nil {
@@ -124,7 +103,6 @@ func DecryptWith(token, purpose string, master []byte) (string, error) {
 	return decodePlain(plain)
 }
 
-// EncryptSecret 明文 → enc1: 密文（当前主密钥）。空串原样返回。
 func EncryptSecret(plaintext, purpose string) (string, error) {
 	dataDir, err := resolveDataDir()
 	if err != nil {
@@ -133,7 +111,6 @@ func EncryptSecret(plaintext, purpose string) (string, error) {
 	return EncryptSecretIn(dataDir, plaintext, purpose)
 }
 
-// DecryptSecret enc1: 密文 → 明文（候选链）。空串原样返回，非密文格式报错。
 func DecryptSecret(token, purpose string) (string, error) {
 	dataDir, err := resolveDataDir()
 	if err != nil {
@@ -142,7 +119,6 @@ func DecryptSecret(token, purpose string) (string, error) {
 	return DecryptSecretIn(dataDir, token, purpose)
 }
 
-// EncryptSecretIn 明文 → enc1: 密文，数据目录显式注入（多实例 / 测试用）。
 func EncryptSecretIn(dataDir, plaintext, purpose string) (string, error) {
 	master, err := ResolveDMK(dataDir)
 	if err != nil {
@@ -151,8 +127,6 @@ func EncryptSecretIn(dataDir, plaintext, purpose string) (string, error) {
 	return EncryptWith(plaintext, purpose, master)
 }
 
-// DecryptSecretIn enc1: 密文 → 明文，数据目录显式注入。
-// 候选链：当前主密钥 → 换钥过渡记录旧主密钥 → legacy 兜底（非 legacy 模式时）。
 func DecryptSecretIn(dataDir, token, purpose string) (string, error) {
 	if token == "" {
 		return "", nil
@@ -183,8 +157,7 @@ func DecryptSecretIn(dataDir, token, purpose string) (string, error) {
 	return "", secretBoxErr("凭据解密失败")
 }
 
-// candidateKeys 解密候选密钥（顺序即优先级）。
-// 当前主密钥解析失败（口令未解锁 / 文件损坏）直接报错：锁定态不得绕过。
+// candidateKeys 按「当前 DMK → 过渡旧密钥 → legacy」顺序生成候选密钥；当前 DMK 不可用时直接报错。
 func candidateKeys(purpose, dataDir string) ([][]byte, error) {
 	master, err := ResolveDMK(dataDir)
 	if err != nil {
@@ -209,10 +182,7 @@ func candidateKeys(purpose, dataDir string) ([][]byte, error) {
 	return keys, nil
 }
 
-// ── enc1 编解码 ──────────────────────────────────────────
-
 func parseToken(token string) (nonce, sealed []byte, err error) {
-	// 对齐 Python 切片语义：短于前缀的输入 rest 为空串，走「格式不完整」
 	var rest string
 	if len(token) >= len(Prefix) {
 		rest = token[len(Prefix):]
@@ -257,12 +227,10 @@ func decodePlain(plain []byte) (string, error) {
 	return string(plain), nil
 }
 
-// ── AES-256-GCM / 随机数 ─────────────────────────────────
-
 func gcmSeal(key, nonce, plain []byte) []byte {
 	g, err := gcmCipher(key)
 	if err != nil {
-		panic(err) // 32 字节密钥恒可建 GCM
+		panic(err)
 	}
 	return g.Seal(nil, nonce, plain, nil)
 }
@@ -294,23 +262,21 @@ func gcmCipher(key []byte) (cipher.AEAD, error) {
 func randBytes(n int) []byte {
 	b := make([]byte, n)
 	if _, err := crand.Read(b); err != nil {
-		panic(err) // 系统熵源不可用属致命配置
+		panic(err)
 	}
 	return b
 }
 
 func hexEncode(b []byte) string { return fmt.Sprintf("%x", b) }
 
-// resolveDataDir 全局数据目录（密钥文件落点）；显式注入场景走 *In 变体。
 func resolveDataDir() (string, error) { return config.ResolveDataDir() }
 
 func mustJSONString(s string) string {
 	b, err := json.Marshal(s)
 	if err != nil {
-		panic(err) // string 恒可序列化
+		panic(err)
 	}
 	return string(b)
 }
 
-// NewSecretBoxError 供跨包构造锁定态/解密语义错误（HTTP 层按类型映射状态码）。
 func NewSecretBoxError(msg string) error { return secretBoxErr(msg) }

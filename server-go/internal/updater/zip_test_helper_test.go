@@ -1,6 +1,3 @@
-//go:build windows
-
-// zip_test_helper_test.go 测试夹具：内存 zip 构造器。
 package updater
 
 import (

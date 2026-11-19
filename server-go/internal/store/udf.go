@@ -8,7 +8,6 @@ import (
 	"modernc.org/sqlite"
 )
 
-// cjkRanges CJK 三段区间：部首扩展/音标/主平面、谚文、兼容表意。
 var cjkRanges = [][2]rune{
 	{0x2E80, 0x9FFF},
 	{0xAC00, 0xD7AF},
@@ -26,9 +25,7 @@ func hasCJK(token string) bool {
 	return false
 }
 
-// nameBigram 名称 → 空格分隔的 2-gram 影子检索文本：含 CJK 的词内滑窗成片
-// （单字产出为空），其余词原样保留；去重保序。与 FTS5 unicode61 分词口径配套，
-// 写入侧触发器与查询侧必须共用本函数。
+// nameBigram 将 CJK 词拆成去重保序 2-gram，写入触发器与查询侧必须保持同口径。
 func nameBigram(text string) string {
 	var out []string
 	seen := make(map[string]struct{})
@@ -64,7 +61,6 @@ func udfText(v driver.Value) string {
 	}
 }
 
-// nameBigramUDF 触发器两参拼接：name + " " + name_en，空参按空串计。
 func nameBigramUDF(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
 	var name, nameEn string
 	if len(args) > 0 {

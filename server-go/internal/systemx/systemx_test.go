@@ -13,7 +13,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// infoKeys / readinessKeys 与 Python 侧响应逐字段对齐的形状契约。
 var (
 	infoKeys = []string{
 		"app", "version", "python", "platform",
@@ -36,7 +35,6 @@ func newTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-// stubSources 替换数据目录与前端产物判定，避免测试触碰真实文件系统。
 func stubSources(t *testing.T, dataDir string, distReady bool) {
 	t.Helper()
 	origDataDir, origDist := resolveDataDir, distDirReady
@@ -140,7 +138,6 @@ func TestReadinessReadyAndNotReady(t *testing.T) {
 		t.Fatalf("activeJobId 空闲应为 null（键在场），实际 %v", body["activeJobId"])
 	}
 
-	// 未就绪态：库连接关闭后仍回 200，reason 承载数据库不可达原因。
 	if err := db.Close(); err != nil {
 		t.Fatalf("关闭内存库失败：%v", err)
 	}
@@ -168,7 +165,6 @@ func TestRegisterRoutes(t *testing.T) {
 			t.Fatalf("GET %s 响应为空", path)
 		}
 	}
-	// 非读方法按 405 拒绝。
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/info", nil))
 	if rec.Code != http.StatusMethodNotAllowed {

@@ -10,8 +10,7 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// PrepareDatabaseAuthorized 携带维护授权令牌的准备：更新验收期间恢复保护
-// 标记（purpose=update）由令牌匹配放行。
+// PrepareDatabaseAuthorized 同 PrepareDatabase，传入非空 maintenanceToken 时放行 purpose=update 升级验收保护标记。
 func PrepareDatabaseAuthorized(ctx context.Context, path, maintenanceToken string) (*sql.DB, error) {
 	return prepareDatabase(ctx, path, maintenanceToken)
 }
@@ -36,20 +35,16 @@ func prepareDatabase(ctx context.Context, path, maintenanceToken string) (*sql.D
 		return nil, fmt.Errorf("数据库准备未能取得写入保护: %w", err)
 	}
 	defer unlock()
-	// 保护标记按用途分派：update=令牌放行（updateguard 已先校验），restore=阶段
-	// 处置（CheckRestoreMarker），maintenance=陈旧清理；update/restore 存在时
-	// 不做陈旧维护标记清理——两类保护永不按 pid 年龄回收
+	// 保护标记按用途分派：CheckRestoreMarker 处理 restore 阶段，update 仅凭非空令牌放行，二者均不走陈旧 PID 清理。
 	if err := store.CheckRestoreMarker(abs); err != nil {
 		return nil, fmt.Errorf("已保留原库并停止启动: %w", err)
 	}
 	switch {
 	case store.IsUpdateMarker(abs):
 		if maintenanceToken == "" {
-			// purpose=update 的验收保护标记：未持令牌的启动不得触碰
 			return nil, fmt.Errorf("已保留原库并停止启动: %w", store.ErrMaintenanceProtected)
 		}
 	case store.HasRestoreMarker(abs):
-		// 阶段处置已由 CheckRestoreMarker 完成
 	default:
 		if err := store.CheckMaintenance(abs); err != nil {
 			return nil, fmt.Errorf("已保留原库并停止启动: %w", err)

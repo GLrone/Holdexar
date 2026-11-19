@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"holdexar/server-go/internal/store"
+	"holdexar/server-go/internal/timeutil"
 )
 
 var migrationTableDeclaration = regexp.MustCompile(`(?i)^CREATE TABLE\s+("?[a-z_][a-z_0-9]*"?)\s*\(`)
@@ -156,7 +157,7 @@ func upgradeDatabase(ctx context.Context, db *sql.DB, version int) error {
 }
 
 func ensureCurrentSeedData(ctx context.Context, conn *sql.Conn) error {
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600))
+	now := time.Now().In(timeutil.Beijing)
 	sqlText := strings.NewReplacer("{{bootstrap_time}}", now.Format("2006-01-02 15:04:05.000000"), "{{bootstrap_day}}", now.Format("2006-01-02")).Replace(strings.ReplaceAll(store.CurrentSeedSQL(), "\r\n", "\n"))
 	parts := strings.Split(strings.TrimSpace(sqlText), "\n\n")
 	for _, part := range parts {

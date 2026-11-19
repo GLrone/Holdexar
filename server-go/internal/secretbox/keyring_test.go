@@ -56,7 +56,6 @@ func TestModeOfDefaults(t *testing.T) {
 }
 
 func TestRecordJSONShapePinned(t *testing.T) {
-	// 键序与分隔符逐字节对齐 Python json.dumps(record, ensure_ascii=False)
 	dpapi := dumpRecordJSON(map[string]any{"v": fileVersion, "mode": ModeDPAPI, "blob": "AAA"})
 	if dpapi != `{"v": 1, "mode": "dpapi", "blob": "AAA"}` {
 		t.Fatalf("dpapi 记录形状漂移: %s", dpapi)
@@ -182,7 +181,6 @@ func TestDPAPIRoundTrip(t *testing.T) {
 	if _, err := unwrapDPAPI(map[string]any{"blob": "abcde"}); err == nil || err.Error() != "DPAPI 密钥记录不完整" {
 		t.Fatalf("坏 padding blob 文案漂移: %v", err)
 	}
-	// 字母表外字符丢弃后成空串：与 Python 一致落到系统解封失败文案
 	if _, err := unwrapDPAPI(map[string]any{"blob": "!!"}); err == nil || err.Error() != "系统凭据无法解封（换了 Windows 用户或机器？）" {
 		t.Fatalf("空 blob 文案漂移: %v", err)
 	}

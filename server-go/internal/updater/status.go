@@ -1,40 +1,28 @@
-//go:build windows
-
-// status.go 换装状态查询与确认：换装成功首次启动的 justUpdated 投影、
-// staging 就绪的 pending 投影、确认闭合账本、放弃更新清暂存。
 package updater
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"holdexar/hostkit"
 )
 
-// readTransaction 读安装根事务账本（layout.read_transaction 等价）。
 func readTransaction(root string) map[string]any {
-	raw, err := os.ReadFile(filepath.Join(root, "state", "transaction.json"))
+	tx, err := hostkit.ReadTransaction(root)
 	if err != nil {
-		return nil
-	}
-	var tx map[string]any
-	if json.Unmarshal(raw, &tx) != nil {
 		return nil
 	}
 	return tx
 }
 
 func readCurrentState(root string) map[string]any {
-	raw, err := os.ReadFile(filepath.Join(root, "state", "current.json"))
-	if err != nil {
+	state, err := hostkit.ReadCurrentState(root)
+	if err != nil || state == nil {
 		return nil
 	}
-	var state map[string]any
-	if json.Unmarshal(raw, &state) != nil {
-		return nil
-	}
-	return state
+	return state.Raw
 }
 
 func txString(tx map[string]any, key string) string {
@@ -47,7 +35,6 @@ func txBool(tx map[string]any, key string) bool {
 	return value
 }
 
-// completedUpdateTransaction 事务已提交且与当前版本闭合的判定。
 func (s *Service) completedUpdateTransaction(tx map[string]any) bool {
 	if tx == nil || txString(tx, "attemptId") == "" || txString(tx, "stage") != "committed" {
 		return false
@@ -61,8 +48,7 @@ func (s *Service) completedUpdateTransaction(tx map[string]any) bool {
 		(!txBool(tx, "dataHadDatabase") && !txBool(tx, "dataPrepared"))
 }
 
-// readDiagnosis 更新诊断投影：三候选路径取最新，事务在途时按 attemptId 配对；
-// 已提交事务强制投影 committed 形态（对齐 updater._read_update_diagnosis）。
+// readDiagnosis 按候选路径顺序读取更新诊断并按 attemptId 配对，已提交事务强制投影 committed 形态。
 func (s *Service) readDiagnosis() map[string]any {
 	root := s.InstallRoot
 	candidates := []string{
@@ -124,7 +110,7 @@ func (s *Service) readDiagnosis() map[string]any {
 	return data
 }
 
-// JustUpdated 已提交更新的未确认成功提示（无则 nil 语义 → 空 map 返回）。
+// JustUpdated 返回已提交更新的未确认成功提示；无记录或已确认时返回 nil。
 func (s *Service) JustUpdated() map[string]any {
 	data := s.readDiagnosis()
 	if !txBool(data, "success") || stringOf(data["stage"]) != "committed" {
@@ -173,7 +159,6 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// releaseNotesFromFile 换装成功提示的说明兜底（随包 latest.json / RELEASE_NOTES）。
 func (s *Service) releaseNotesFromFile() string {
 	candidates := []string{
 		filepath.Join(s.InstallRoot, "release", "latest.json"),
@@ -198,7 +183,6 @@ func (s *Service) releaseNotesFromFile() string {
 	return ""
 }
 
-// AcknowledgeUpdate 确认本次更新报告已查看（诊断文件内 acknowledged 置位）。
 func (s *Service) AcknowledgeUpdate() map[string]any {
 	data := s.readDiagnosis()
 	if !txBool(data, "success") || stringOf(data["stage"]) != "committed" ||
@@ -231,9 +215,6 @@ func (s *Service) AcknowledgeUpdate() map[string]any {
 	return map[string]any{"acknowledged": true, "updated": true}
 }
 
-// PendingStatus staging 就绪状态（前端「重启以完成更新」提示依据）。
-// swapFailed 投影换装失败标记（前端给「重新下载」出路），justUpdated 投影
-// 换装成功首次启动事实。
 func (s *Service) PendingStatus() map[string]any {
 	tx := readTransaction(s.InstallRoot)
 	diagnosis := s.readDiagnosis()
@@ -265,12 +246,12 @@ func (s *Service) PendingStatus() map[string]any {
 	}
 	var manifest map[string]any
 	if json.Unmarshal(raw, &manifest) != nil {
-		return result // 坏 manifest 视为无暂存
+		return result
 	}
 	tag := stringOf(manifest["tag"])
 	completed := stringOf(diagnosis["stage"]) == "committed" && txBool(diagnosis, "success") &&
 		stringOf(diagnosis["targetVersion"]) == s.Version
-	installedTarget := (installing || completed) && strings.TrimPrefix(tag, "v") == s.Version
+	installedTarget := (installing || completed) && hostkit.VersionFromTag(tag) == s.Version
 	result["pending"] = txBool(manifest, "ready") && !installedTarget
 	result["tag"] = tag
 	return result
@@ -280,5 +261,3 @@ func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
 }
-
-var _ = fmt.Sprintf

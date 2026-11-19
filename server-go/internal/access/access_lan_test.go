@@ -8,7 +8,6 @@ import (
 	"testing"
 )
 
-// resetLAN 局域网状态隔离：每个用例收尾恢复默认回环-only 与零限速。
 func resetLAN(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
@@ -20,7 +19,6 @@ func resetLAN(t *testing.T) {
 	})
 }
 
-// 环境变量强制开启优先于设置 KV 通道。
 func TestEnvForcedLAN(t *testing.T) {
 	resetLAN(t)
 	if EnvForced() || LANEnabled() {
@@ -40,7 +38,6 @@ func TestEnvForcedLAN(t *testing.T) {
 	}
 }
 
-// KV 通道开关随设置读写（无环境变量时生效状态即缓存值）。
 func TestSetLANEnabledFollowsKV(t *testing.T) {
 	resetLAN(t)
 	if !SetLANEnabled(true) || !LANEnabled() {
@@ -51,7 +48,6 @@ func TestSetLANEnabledFollowsKV(t *testing.T) {
 	}
 }
 
-// Host 白名单：本机地址放行、重绑定域名拒绝、关闭回落回环-only。
 func TestExtraHostsGate(t *testing.T) {
 	resetLAN(t)
 	SetExtraHosts([]string{"192.168.1.5:28765", "192.168.1.5", "[fe80::1]:28765", "LOCALHOST"})
@@ -77,31 +73,33 @@ func TestExtraHostsGate(t *testing.T) {
 	}
 }
 
-// 中间件：局域网模式放行本机地址 Host（公开路径直达、非公开路径到会话闸）；
-// 重绑定域名仍 421。
 func TestMiddlewareLANHostPassAndRebindReject(t *testing.T) {
 	resetLAN(t)
 	gate := New()
 	handler := gate.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
+	SetLANEnabled(true)
 	SetExtraHosts([]string{"192.168.1.5"})
-	req := httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/health", nil)
-	req.Host = "192.168.1.5:28765"
+	request := func(path string) *http.Request {
+		req := httptest.NewRequest("GET", "http://192.168.1.5:28765"+path, nil)
+		req.RemoteAddr = "192.168.1.25:51234"
+		return req
+	}
+	req := request("/api/v1/health")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("本机地址 Host 应过闸，实际 %d", rec.Code)
 	}
-	attacker := httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/health", nil)
+	attacker := request("/api/v1/health")
 	attacker.Host = "rebound.attacker.example"
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, attacker)
 	if rec.Code != http.StatusMisdirectedRequest {
 		t.Fatalf("重绑定域名应 421，实际 %d", rec.Code)
 	}
-	private := httptest.NewRequest("GET", "http://192.168.1.5:28765/api/v1/monitor", nil)
-	private.Host = "192.168.1.5:28765"
+	private := request("/api/v1/monitor")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, private)
 	if rec.Code != http.StatusUnauthorized {
@@ -109,7 +107,6 @@ func TestMiddlewareLANHostPassAndRebindReject(t *testing.T) {
 	}
 }
 
-// Origin 闸复用 Host 白名单：局域网同源请求通过。
 func TestOriginAllowedLANOrigin(t *testing.T) {
 	resetLAN(t)
 	SetExtraHosts([]string{"192.168.1.5"})
@@ -121,7 +118,6 @@ func TestOriginAllowedLANOrigin(t *testing.T) {
 	}
 }
 
-// 解锁限速：连续失败达阈值锁定，成功清零。
 func TestUnlockRateLimit(t *testing.T) {
 	resetLAN(t)
 	if UnlockLockedSeconds() != 0 {
@@ -139,7 +135,6 @@ func TestUnlockRateLimit(t *testing.T) {
 	}
 }
 
-// 访问密码形态：12 位 URL 安全字符。
 func TestGeneratePasswordShape(t *testing.T) {
 	pw := GeneratePassword()
 	if len(pw) != 12 {
@@ -150,7 +145,6 @@ func TestGeneratePasswordShape(t *testing.T) {
 	}
 }
 
-// 环境密码通道（值 strip）。
 func TestEnvPasswordChannel(t *testing.T) {
 	t.Setenv(EnvAccessPassword, " secret-lan-pw ")
 	if EnvPassword() != "secret-lan-pw" {
@@ -158,7 +152,6 @@ func TestEnvPasswordChannel(t *testing.T) {
 	}
 }
 
-// 本机地址集至少含回环，且不含链路本地段。
 func TestLocalIPsIncludesLoopback(t *testing.T) {
 	ips := LocalIPs()
 	has := func(want string) bool {
@@ -176,5 +169,46 @@ func TestLocalIPsIncludesLoopback(t *testing.T) {
 		if strings.HasPrefix(ip, "169.254.") {
 			t.Fatalf("链路本地地址应被过滤：%v", ips)
 		}
+	}
+}
+
+func TestPerIPUnlockBackoffAndPeerKey(t *testing.T) {
+	resetLAN(t)
+	cases := []struct {
+		remote string
+		want   string
+	}{
+		{"", "unknown"},
+		{"127.0.0.1:51234", "loopback"},
+		{"[::1]:51234", "loopback"},
+		{"[::1]", "loopback"},
+		{"[::ffff:127.0.0.1]:51234", "loopback"},
+		{"192.0.2.1:1234", "192.0.2.1"},
+		{"192.168.1.25:51234", "192.168.1.25"},
+		{"[::ffff:192.168.1.25]:51234", "192.168.1.25"},
+		{"[2001:db8::1]:51234", "2001:db8::1"},
+	}
+	for _, tc := range cases {
+		if got := PeerKey(tc.remote); got != tc.want {
+			t.Fatalf("PeerKey(%q)=%q, want %q", tc.remote, got, tc.want)
+		}
+	}
+
+	attacker := PeerKey("192.168.1.25:51234")
+	other := PeerKey("192.168.1.26:51234")
+	loopback := PeerKey("127.0.0.1:51234")
+	for range 5 {
+		RecordUnlockFailureFor(attacker)
+	}
+	if UnlockLockedSeconds(attacker) <= 0 {
+		t.Fatal("攻击对端应进入锁定")
+	}
+	if UnlockLockedSeconds(loopback) != 0 || UnlockLockedSeconds(other) != 0 {
+		t.Fatalf("远端限速不应波及回环或其他设备: loopback=%v other=%v",
+			UnlockLockedSeconds(loopback), UnlockLockedSeconds(other))
+	}
+	RecordUnlockSuccessFor(attacker)
+	if UnlockLockedSeconds(attacker) != 0 {
+		t.Fatal("RecordUnlockSuccessFor 应清零目标对端锁定")
 	}
 }

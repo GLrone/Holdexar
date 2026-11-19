@@ -1,51 +1,50 @@
-// 局域网访问模式的状态持有层：开关、本机地址集、解锁限速（对齐 Python
-// core/lan_access.py）。信任模型：默认关闭＝纯回环（行为与历史版本一致）。
-// 开启后 Host 闸放行本机网卡地址，局域网浏览器凭访问密码自助换会话
-// （/api/v1/session/unlock）。本文件只持内存态与纯计算；持久化（设置 KV）
-// 与凭据读写归 settings 域。
 package access
 
 import (
 	"crypto/rand"
 	"encoding/base64"
 	"net"
+	"net/netip"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"holdexar/hostkit"
 )
 
-// 环境变量：HOLDEXAR_ACCESS=lan 强制开启（先于设置页存在的 NAS 无窗口
-// 场景）；密码值本身只从环境读取，绝不入源码。
+// 环境变量名；HOLDEXAR_ACCESS=lan 强制开启局域网模式。
 const (
 	EnvAccess         = "HOLDEXAR_ACCESS"
 	EnvAccessPassword = "HOLDEXAR_ACCESS_PASSWORD"
 )
 
-// 解锁失败限速：连续失败达阈值后全局锁定一段时间（局域网信任假设下的
-// 防穷举底线；成功一次即清零）。锁定窗过期后再次穷举的，锁时按轮次加倍
-// （渐进式升级，防「过期-再锁」循环维持无限解锁拒绝）。
+// 按对端分桶限速：连续 5 次失败锁定 30s，后续轮次翻倍至 10m 上限；桶上限 512，满时先清未锁定/已过期桶再随机驱逐。
 const (
 	unlockMaxFails = 5
 	unlockLockTime = 30 * time.Second
 	unlockLockMax  = 10 * time.Minute
+	peerCap        = 512
 )
+
+type peerState struct {
+	fails     int
+	lockUntil time.Time
+	cycle     int
+}
 
 var (
-	lanMu           sync.Mutex
-	lanEnabled      bool
-	unlockFailCount int
-	unlockLockUntil time.Time
-	unlockLockCycle int // 连续锁定轮次（锁窗过期后再次触发则递增）
+	lanMu      sync.Mutex
+	lanEnabled bool
+	peersMu    sync.Mutex
+	peers      = make(map[string]*peerState)
 )
 
-// EnvForced 环境变量是否强制开启（区别于设置 KV 通道）。
 func EnvForced() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv(EnvAccess)), "lan")
 }
 
-// LANEnabled 局域网模式是否生效（环境变量强制开启优先于设置 KV 的缓存结果）。
 func LANEnabled() bool {
 	lanMu.Lock()
 	defer lanMu.Unlock()
@@ -60,13 +59,10 @@ func SetLANEnabled(enabled bool) bool {
 	return LANEnabled()
 }
 
-// EnvPassword 无窗口场景由环境变量直接指定访问密码；未设置返回空串。
 func EnvPassword() string {
 	return strings.TrimSpace(os.Getenv(EnvAccessPassword))
 }
 
-// GeneratePassword 生成 12 位随机访问密码（URL 安全字符，手机可输入；
-// Python token_urlsafe(9) 同参同形）。
 func GeneratePassword() string {
 	buf := make([]byte, 9)
 	if _, err := rand.Read(buf); err != nil {
@@ -75,35 +71,20 @@ func GeneratePassword() string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// LocalIPs 本机全部网卡地址（字面量集合，供 Host 闸放行局域网直连）：
-// 回环集 + 主机名解析 + UDP connect 探测的默认出口源地址，滤链路本地段。
+// LocalIPs 返回回环与本机活动网卡非链路本地地址集合。
 func LocalIPs() []string {
 	ips := map[string]struct{}{"127.0.0.1": {}, "::1": {}, "localhost": {}}
-	if host, err := os.Hostname(); err == nil {
-		if addrs, err := net.LookupHost(host); err == nil {
-			for _, addr := range addrs {
-				ips[addr] = struct{}{}
-			}
-		}
-	}
-	// 路由表探测：向外连接的本机源地址（多网卡时补齐默认出口地址）
-	if conn, err := net.DialTimeout("udp", "223.5.5.5:53", 500*time.Millisecond); err == nil {
-		if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
-			ips[addr.IP.String()] = struct{}{}
-		}
-		conn.Close()
+	for _, ip := range hostkit.LocalIPs() {
+		ips[ip] = struct{}{}
 	}
 	out := make([]string, 0, len(ips))
 	for ip := range ips {
-		if ip != "" && !strings.HasPrefix(ip, "169.254.") {
-			out = append(out, ip)
-		}
+		out = append(out, ip)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
-// RefreshExtraHosts 按当前开关同步 Host 闸白名单：开＝本机地址集，关＝回环-only。
 func RefreshExtraHosts() {
 	if LANEnabled() {
 		SetExtraHosts(LocalIPs())
@@ -112,53 +93,116 @@ func RefreshExtraHosts() {
 	SetExtraHosts(nil)
 }
 
-// UnlockLockedSeconds 解锁通道剩余锁定秒数（0＝可尝试）。
-func UnlockLockedSeconds() float64 {
-	lanMu.Lock()
-	defer lanMu.Unlock()
-	if unlockLockUntil.IsZero() {
+// PeerKey 从对端地址提取分桶 IP；回环统一归入 "loopback"，空地址归入 "unknown"。
+func PeerKey(remoteAddr string) string {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if host == "" {
+		return "unknown"
+	}
+	addr, perr := netip.ParseAddr(host)
+	if perr != nil {
+		return host
+	}
+	addr = addr.Unmap()
+	if addr.IsLoopback() {
+		return "loopback"
+	}
+	return addr.String()
+}
+
+func resolvePeer(peer ...string) string {
+	if len(peer) > 0 && strings.TrimSpace(peer[0]) != "" {
+		return strings.TrimSpace(peer[0])
+	}
+	return "loopback"
+}
+
+func getPeer(peer string) *peerState {
+	if s, ok := peers[peer]; ok {
+		return s
+	}
+	if len(peers) >= peerCap {
+		now := time.Now()
+		for k, v := range peers {
+			if v.lockUntil.Before(now) {
+				delete(peers, k)
+				if len(peers) < peerCap {
+					break
+				}
+			}
+		}
+		for len(peers) >= peerCap {
+			for k := range peers {
+				delete(peers, k)
+				break
+			}
+		}
+	}
+	s := &peerState{}
+	peers[peer] = s
+	return s
+}
+
+func UnlockLockedSeconds(peer ...string) float64 {
+	target := resolvePeer(peer...)
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	s, ok := peers[target]
+	if !ok || s.lockUntil.IsZero() {
 		return 0
 	}
-	remaining := time.Until(unlockLockUntil)
+	remaining := time.Until(s.lockUntil)
 	if remaining <= 0 {
 		return 0
 	}
 	return remaining.Seconds()
 }
 
-// RecordUnlockFailure 记录一次解锁失败；连续失败达阈值进入锁定窗口。
-// 锁窗过期后再次穷举的，锁时按连续轮次加倍（上限 10 分钟）。
-func RecordUnlockFailure() {
-	lanMu.Lock()
-	defer lanMu.Unlock()
-	unlockFailCount++
-	if unlockFailCount >= unlockMaxFails {
+func RecordUnlockFailure(peer ...string) {
+	target := resolvePeer(peer...)
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	s := getPeer(target)
+	s.fails++
+	if s.fails >= unlockMaxFails {
 		lock := unlockLockTime
-		for i := 0; i < unlockLockCycle && lock < unlockLockMax; i++ {
+		for i := 0; i < s.cycle && lock < unlockLockMax; i++ {
 			lock *= 2
 		}
 		if lock > unlockLockMax {
 			lock = unlockLockMax
 		}
-		unlockLockUntil = time.Now().Add(lock)
-		unlockFailCount = 0
-		unlockLockCycle++
+		s.lockUntil = time.Now().Add(lock)
+		s.fails = 0
+		s.cycle++
 	}
 }
 
-// RecordUnlockSuccess 解锁成功清零失败计数、锁定与升级轮次。
-func RecordUnlockSuccess() {
-	lanMu.Lock()
-	defer lanMu.Unlock()
-	unlockFailCount = 0
-	unlockLockUntil = time.Time{}
-	unlockLockCycle = 0
+func RecordUnlockSuccess(peer ...string) {
+	target := resolvePeer(peer...)
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	delete(peers, target)
 }
 
-// ResetUnlockState 测试隔离：清空限速状态。
+func RecordUnlockFailureFor(peer string) {
+	RecordUnlockFailure(peer)
+}
+
+func RecordUnlockSuccessFor(peer string) {
+	RecordUnlockSuccess(peer)
+}
+
 func ResetUnlockState() {
-	lanMu.Lock()
-	defer lanMu.Unlock()
-	unlockFailCount = 0
-	unlockLockUntil = time.Time{}
+	peersMu.Lock()
+	defer peersMu.Unlock()
+	peers = make(map[string]*peerState)
 }

@@ -1,7 +1,5 @@
 //go:build windows
 
-// DPAPI 系统凭据封装（仅 Windows）：随机主密钥的用户级封装层。Linux/NAS
-// 形态的对应保护层是口令封装模式（keyring.go passphrase）。
 package secretbox
 
 import (
@@ -11,7 +9,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// dpapiEntropy DPAPI 附加熵（第二因素）：blob 被其他进程拿到也无法在白盒外解封。
+// dpapiEntropy DPAPI 附加熵，防止无此上下文的外部进程直接解封 blob。
 var dpapiEntropy = []byte("holdexar:keyring:dpapi:v1")
 
 func DpapiAvailable() bool { return true }

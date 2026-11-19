@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-// Open 后逐连接核对生产同款 PRAGMA 参数。
 func TestOpenPragmas(t *testing.T) {
 	db, _ := openTestDB(t)
 	checks := []struct {
@@ -13,12 +12,12 @@ func TestOpenPragmas(t *testing.T) {
 		want   any
 	}{
 		{"journal_mode", "wal"},
-		{"synchronous", int64(1)}, // NORMAL
+		{"synchronous", int64(1)},
 		{"journal_size_limit", int64(67108864)},
 		{"foreign_keys", int64(1)},
 		{"cache_size", int64(-262144)},
 		{"mmap_size", int64(0)},
-		{"temp_store", int64(2)}, // MEMORY
+		{"temp_store", int64(2)},
 		{"busy_timeout", int64(60000)},
 	}
 	for _, c := range checks {
@@ -30,7 +29,6 @@ func TestOpenPragmas(t *testing.T) {
 			t.Fatalf("PRAGMA %s = %v，期望 %v", c.pragma, got, c.want)
 		}
 	}
-	// PRAGMA 参数随 DSN 应用到每个新连接
 	for i := 0; i < 3; i++ {
 		conn, err := db.Conn(context.Background())
 		if err != nil {
@@ -54,7 +52,6 @@ func TestOpenPragmas(t *testing.T) {
 	}
 }
 
-// name_bigram UDF 输出与手算值断言。
 func TestNameBigramUDF(t *testing.T) {
 	db, _ := openTestDB(t)
 	cases := []struct {
@@ -64,8 +61,8 @@ func TestNameBigramUDF(t *testing.T) {
 	}{
 		{"只狼：影逝二度", "Sekiro", "只狼 狼： ：影 影逝 逝二 二度 Sekiro"},
 		{"黑神话悟空", "Black Myth", "黑神 神话 话悟 悟空 Black Myth"},
-		{"只狼 只狼", "", "只狼"}, // 去重保序
-		{"狼", "", ""},       // 单字 CJK 产出为空
+		{"只狼 只狼", "", "只狼"},
+		{"狼", "", ""},
 		{"Elden Ring 法环", "", "Elden Ring 法环"},
 		{"", "", ""},
 	}

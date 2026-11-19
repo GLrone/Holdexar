@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"holdexar/server-go/internal/timeutil"
 )
 
 //go:embed bootstrap_schema.sql
@@ -15,7 +17,6 @@ var bootstrapSchema string
 //go:embed bootstrap_seeds.sql
 var bootstrapSeeds string
 
-// InitializeFreshDatabase creates the current application schema only in an empty database.
 func InitializeFreshDatabase(ctx context.Context, db *sql.DB) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -45,7 +46,7 @@ func InitializeFreshDatabase(ctx context.Context, db *sql.DB) error {
 	if _, err := conn.ExecContext(ctx, bootstrapSchema); err != nil {
 		return fmt.Errorf("create application schema: %w", err)
 	}
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	now := time.Now().In(timeutil.Beijing)
 	seeds := strings.NewReplacer(
 		"{{bootstrap_time}}", now.Format("2006-01-02 15:04:05.000000"),
 		"{{bootstrap_day}}", now.Format("2006-01-02"),

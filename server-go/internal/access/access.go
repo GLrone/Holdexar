@@ -1,19 +1,19 @@
-// Package access：本地接口准入——进程内会话令牌 + Host/Origin 校验。
-//
-// 信任边界与现网一致的三类对手：本机其他进程（挡在「拿不到进程内令牌」）、
-// 恶意网页（DNS 重绑定由 Host 校验挡、跨端口 Cookie 携带由 Origin 校验挡）、
-// 桌面壳（同进程直取令牌，不走网络）。
+// Package access 本地 HTTP 准入（会话令牌、Host 重绑定校验与 Origin 校验）。
 package access
 
 import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
+
+	"holdexar/server-go/internal/httpx"
 )
 
 // 会话令牌的两种承载：HttpOnly Cookie（SSE 唯一能带凭据的载体）与请求头。
@@ -23,8 +23,7 @@ const (
 	apiPrefix     = "/api/"
 )
 
-// PublicPaths 无会话即可访问的 API 路径。健康检查是判活唯一入口；更新验收
-// 确认要在页面拿到会话之前调用。清单是唯一事实源，禁止在路由里另行标注。
+// PublicPaths 无需会话即可访问的 API 路径白名单（唯一事实源）。
 var PublicPaths = map[string]bool{
 	"/api/v1/health":                        true,
 	"/api/v1/system/update-ready":           true,
@@ -38,47 +37,78 @@ var PublicPaths = map[string]bool{
 	"/api/v1/session/recovery/cancel":       true,
 }
 
-// Gate 持有进程内会话令牌与 MCP 闸挂点。MCP 面未接线时 MCP 前缀为空。
 type Gate struct {
-	mu    sync.Mutex
-	token string
+	mu       sync.Mutex
+	token    string
+	sessions map[string]time.Time
+	now      func() time.Time
 
 	mcpPrefix string
 	mcpGate   func(*http.Request) int // 0=放行，401/404=拒绝；由 MCP 面接线时注册
 }
 
-// New 创建访问闸；令牌首次取用时生成。
-func New() *Gate { return &Gate{} }
+func New() *Gate { return &Gate{sessions: map[string]time.Time{}} }
 
-// Token 当前进程的会话令牌（首次调用生成，进程退出即失效）。
-// 不落盘、不进日志、不进任何响应体。
+func (g *Gate) nowTime() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
+// sessionTTL 会话有效期（12h），过期条目在后续闸判定或签发时清理。
+const sessionTTL = 12 * time.Hour
+
+// Token 返回进程内兼容会话令牌（仅测试使用），受 sessionTTL 约束并按需补发。
 func (g *Gate) Token() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.pruneLocked()
 	if g.token == "" {
-		buf := make([]byte, 32)
-		if _, err := rand.Read(buf); err != nil {
-			panic("会话令牌生成失败：" + err.Error())
-		}
-		g.token = base64.RawURLEncoding.EncodeToString(buf)
+		g.token = g.newSessionLocked()
 	}
 	return g.token
 }
 
-// Reset 丢弃当前令牌（测试隔离用）。
+func (g *Gate) newSessionLocked() string {
+	g.pruneLocked()
+	if g.sessions == nil {
+		g.sessions = map[string]time.Time{}
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		panic("会话令牌生成失败：" + err.Error())
+	}
+	tok := base64.RawURLEncoding.EncodeToString(buf)
+	g.sessions[tok] = g.nowTime().Add(sessionTTL)
+	return tok
+}
+
+func (g *Gate) pruneLocked() {
+	now := g.nowTime()
+	for tok, exp := range g.sessions {
+		if !exp.After(now) {
+			delete(g.sessions, tok)
+		}
+	}
+	if g.token != "" {
+		if _, ok := g.sessions[g.token]; !ok {
+			g.token = ""
+		}
+	}
+}
+
+// Reset 清空全部已签发会话并置空兼容令牌（安全锁定时由 InvalidateSessions 调用）。
 func (g *Gate) Reset() {
 	g.mu.Lock()
+	clear(g.sessions)
 	g.token = ""
 	g.mu.Unlock()
 }
 
-// InvalidateSessions 轮换会话令牌：既有 Cookie/头会话全部失效。安全锁定
-// 时调用——旧会话签发于解锁态，锁定后随之失效（P0 审计：锁定不轮换曾让
-// 旧会话穿透锁定态）。
 func (g *Gate) InvalidateSessions() { g.Reset() }
 
-// RegisterMCPGate 注册 MCP 路由闸：Host/Origin 之后、会话之前生效。
-// 返回 0 放行；401 凭据缺失；404 未启用。MCP 面接线前不注册即一律 404。
+// RegisterMCPGate 注册 MCP 前缀闸（Host/Origin 之后、会话之前执行）；gate 为 nil 时该前缀一律 404。
 func (g *Gate) RegisterMCPGate(pathPrefix string, gate func(*http.Request) int) {
 	g.mu.Lock()
 	g.mcpPrefix, g.mcpGate = pathPrefix, gate
@@ -99,23 +129,69 @@ func (g *Gate) mcpVerdict(path string, r *http.Request) (int, bool) {
 }
 
 func cookieValue(r *http.Request) string {
-	for _, part := range strings.Split(r.Header.Get("Cookie"), ";") {
-		key, raw, _ := strings.Cut(strings.TrimSpace(part), "=")
-		if key == SessionCookie {
-			return raw
+	for _, header := range r.Header.Values("Cookie") {
+		for _, part := range strings.Split(header, ";") {
+			key, raw, _ := strings.Cut(strings.TrimSpace(part), "=")
+			if key == SessionCookie {
+				return raw
+			}
 		}
 	}
 	return ""
 }
 
 func (g *Gate) authorized(r *http.Request) bool {
-	expected := g.Token()
-	for _, candidate := range []string{cookieValue(r), r.Header.Get(SessionHeader)} {
-		if candidate != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(expected)) == 1 {
-			return true
+	if r == nil {
+		return false
+	}
+	c1 := cookieValue(r)
+	c2 := r.Header.Get(SessionHeader)
+	if c1 == "" && c2 == "" {
+		return false
+	}
+	g.mu.Lock()
+	g.pruneLocked()
+	matched := false
+	for tok := range g.sessions {
+		if c1 != "" && subtle.ConstantTimeCompare([]byte(c1), []byte(tok)) == 1 {
+			matched = true
+		}
+		if c2 != "" && subtle.ConstantTimeCompare([]byte(c2), []byte(tok)) == 1 {
+			matched = true
 		}
 	}
-	return false
+	if !matched && g.token != "" {
+		if c1 != "" && subtle.ConstantTimeCompare([]byte(c1), []byte(g.token)) == 1 {
+			matched = true
+		}
+		if c2 != "" && subtle.ConstantTimeCompare([]byte(c2), []byte(g.token)) == 1 {
+			matched = true
+		}
+	}
+	g.mu.Unlock()
+	return matched
+}
+
+func (g *Gate) Authorized(r *http.Request) bool {
+	return g.authorized(r)
+}
+
+// PeerIsLoopback 对端物理地址是否回环（含 IPv4-mapped 回环）；空地址与非回环地址均返回 false。
+func PeerIsLoopback(remoteAddr string) bool {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil || host == "" {
+		host = remoteAddr
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
 }
 
 // 局域网模式放行的本机地址集合（字面量、小写、无端口）；空＝默认回环-only。
@@ -124,8 +200,6 @@ var (
 	extraHosts   map[string]struct{}
 )
 
-// SetExtraHosts 更新局域网模式放行的本机地址集合（内部按 Host 名规范化）；
-// 空集合＝回环-only 默认模式。
 func SetExtraHosts(hosts []string) {
 	normalized := map[string]struct{}{}
 	for _, host := range hosts {
@@ -149,18 +223,12 @@ func extraHostsHas(host string) bool {
 	return ok
 }
 
-// HostAllowed 只接受回环 Host 与局域网模式登记的本机地址，挡住 DNS 重绑定：
-// 重绑定的本质是让攻击者域名解析到本机——浏览器随后发出的请求带的是攻击者
-// 域名作为 Host，永远不在字面地址白名单里。端口不限（端口协商会换）。
-// 默认模式白名单为空＝历史行为（仅回环）。
+// HostAllowed 只放行回环与已登记本机字面地址，防御 DNS 重绑定。
 func HostAllowed(host string) bool {
 	return LoopbackHost(host) || extraHostsHas(host)
 }
 
-// LoopbackHost Host 头是否指向本机回环。仅用于 DNS 重绑定防御（攻击者域名
-// 解析到本机时其域名作 Host，永不在字面地址白名单）——禁止作为信任判定：
-// Host 是客户端可控字段，回环/局域网/代理来源的可信判定一律用对端地址
-// （P0-1：曾用它判定明文回显，被伪造 Host 实测绕过）。
+// LoopbackHost 仅用于 Host 校验防御 DNS 重绑定；不可作来源可信判定（可伪造）。
 func LoopbackHost(host string) bool {
 	switch hostnameOf(host) {
 	case "127.0.0.1", "localhost", "::1":
@@ -169,8 +237,7 @@ func LoopbackHost(host string) bool {
 	return false
 }
 
-// hostnameOf 取 Host 头的主机名部分（剥离端口；IPv6 字面量剥方括号；
-// 裸 IPv6 形态不带端口，原样返回）。
+// hostnameOf 提取小写主机名；端口非纯数字时不剥离（防 127.0.0.1:evil 绕过）。
 func hostnameOf(host string) string {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" {
@@ -186,15 +253,25 @@ func hostnameOf(host string) string {
 		return host
 	}
 	if i := strings.LastIndex(host, ":"); i >= 0 {
-		return host[:i]
+		port := host[i+1:]
+		if port != "" && isDigits(port) {
+			return host[:i]
+		}
+		return host
 	}
 	return host
 }
 
-// OriginAllowed 请求来源是否属于本应用自身。Cookie 作用域不含端口，跨端口
-// 页面会自动带上本应用会话 Cookie，必须由服务端校验 Origin。规则：带 Origin
-// 时必须与请求 Host 同源（scheme 不校验、端口必须相等）；不带放行；
-// Origin: null 属外部来源一律拒绝。
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// OriginAllowed 带 Origin 时须与 Host 同源且同端口（Cookie 作用域不含端口）；Origin: null 一律拒绝。
 func OriginAllowed(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
@@ -233,17 +310,24 @@ func OriginAllowed(r *http.Request) bool {
 	return parts.Hostname() == request.Hostname() && originPort == requestPort
 }
 
-// Middleware 统一准入：所有 /api/ 路径默认要求会话，公开路径显式白名单。
-// 非 API 路径同样受会话闸约束：无会话（锁定态）只发独立解锁页，主应用
-// 资源不可达——客户端路由守卫只是 UX，服务端分流才挡得住 UI 级绕过。
+// Middleware 校验 Host/Origin、MCP 闸与会话；未鉴权非 API 请求只返回独立解锁页。
 func (g *Gate) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+		if !HostAllowed(r.Host) {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
+			return
+		}
+		// 拦截非回环对端伪造回环 Host。
+		if LoopbackHost(r.Host) && !PeerIsLoopback(r.RemoteAddr) {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
+			return
+		}
+		if !LANEnabled() && !extraHostsHas(r.Host) && !PeerIsLoopback(r.RemoteAddr) {
+			writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
+			return
+		}
 		if !strings.HasPrefix(path, apiPrefix) {
-			if !HostAllowed(r.Host) {
-				writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
-				return
-			}
 			if !g.authorized(r) {
 				serveLockedPage(w, r)
 				return
@@ -251,12 +335,13 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !HostAllowed(r.Host) {
-			writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"detail": "请求来源不被信任"})
-			return
-		}
+		// OPTIONS 仅放行回环对端或已鉴权请求，阻断未鉴权局域网对端探测方法。
 		if r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
+			if PeerIsLoopback(r.RemoteAddr) || g.authorized(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeJSON(w, http.StatusForbidden, map[string]any{"detail": "请求来源不被信任"})
 			return
 		}
 		if !OriginAllowed(r) {
@@ -287,25 +372,49 @@ func (g *Gate) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// Issue 把会话令牌写进响应 Cookie（HttpOnly + SameSite=Strict；回环 HTTP 下
-// 不能置 Secure，浏览器会拒收）。
+// Issue 签发 per-login 会话令牌并写入 HttpOnly + SameSite=Strict Cookie（回环 HTTP 不置 Secure）。
 func (g *Gate) Issue(w http.ResponseWriter) {
+	g.mu.Lock()
+	tok := g.newSessionLocked()
+	g.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookie,
-		Value:    g.Token(),
+		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
+func (g *Gate) RevokeSession(w http.ResponseWriter, r *http.Request) {
+	if r != nil {
+		c1 := cookieValue(r)
+		c2 := r.Header.Get(SessionHeader)
+		g.mu.Lock()
+		for _, candidate := range []string{c1, c2} {
+			if candidate == "" {
+				continue
+			}
+			delete(g.sessions, candidate)
+			if g.token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(g.token)) == 1 {
+				g.token = ""
+			}
+		}
+		g.mu.Unlock()
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	if w != nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:     SessionCookie,
+			Value:    "",
+			Path:     "/",
+			Expires:  time.Unix(0, 0).UTC(),
+			MaxAge:   -1,
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+		})
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	httpx.WriteJSON(w, status, payload)
 }

@@ -46,7 +46,6 @@ func TestStagingFileLifecycle(t *testing.T) {
 	if got := UnwrapStaging(back, newM); hexOf(got) != hexOf(old) {
 		t.Fatal("读回后解封不一致")
 	}
-	// 写后无残留临时文件
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 || entries[0].Name() != stagingFile {
 		t.Fatalf("目录残留异常: %v", entries)
@@ -59,7 +58,6 @@ func TestStagingFileLifecycle(t *testing.T) {
 		t.Fatal("删除后不应判待收尾")
 	}
 
-	// 损坏记录：读报错、判待收尾、StagingMaster 上浮
 	if err := os.WriteFile(stagingPath(dir), []byte("{bad"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +76,6 @@ func TestStagingMasterCurrentKeyPath(t *testing.T) {
 	dir := t.TempDir()
 	ResetState()
 	t.Cleanup(ResetState)
-	// 口令模式锁定：过渡记录解不出（保留记录等解锁，不报错）
 	m := randBytes(keyBytes)
 	rec, _ := WrapPassphrase(m, "pw")
 	if err := WriteRecord(dir, rec); err != nil {
@@ -91,7 +88,6 @@ func TestStagingMasterCurrentKeyPath(t *testing.T) {
 	if err != nil || got != nil {
 		t.Fatalf("锁定态应返回 nil: %v %v", got, err)
 	}
-	// 解锁后用当前主密钥解开
 	LoadUnlockedKey(m)
 	old := randBytes(keyBytes)
 	if err := WriteStaging(dir, WrapStaging(old, m)); err != nil {
@@ -104,7 +100,6 @@ func TestStagingMasterCurrentKeyPath(t *testing.T) {
 }
 
 func TestStagingMasterLegacyFormatCompat(t *testing.T) {
-	// 旧格式：记录自带 mode，按记录自解（dpapi 封装旧主密钥）
 	if !DpapiAvailable() {
 		t.Skip("DPAPI 仅 Windows")
 	}

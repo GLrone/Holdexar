@@ -1,13 +1,14 @@
 package migration
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -622,12 +623,12 @@ func migrateProxySubscriptionIdentity(ctx context.Context, conn *sql.Conn) error
 		return err
 	}
 	for _, members := range groups {
-		sort.Slice(members, func(i, j int) bool {
-			a, b := rank(members[i].state), rank(members[j].state)
-			if a != b {
-				return a < b
+		slices.SortFunc(members, func(a, b migrationProxyIdentity) int {
+			ra, rb := rank(a.state), rank(b.state)
+			if c := cmp.Compare(ra, rb); c != 0 {
+				return c
 			}
-			return members[i].id > members[j].id
+			return cmp.Compare(b.id, a.id)
 		})
 		for i, member := range members {
 			keep := 0

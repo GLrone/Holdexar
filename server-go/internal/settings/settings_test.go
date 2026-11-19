@@ -16,8 +16,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// newTestEnv 真实临时库 + 真实写闸 + 已装配路由；凭据主密钥托管指向
-// 同一临时数据目录（测试隔离，不触真实数据目录）。
 func newTestEnv(t *testing.T) (*sql.DB, http.Handler) {
 	t.Helper()
 	dir := t.TempDir()
@@ -68,7 +66,7 @@ const defaultBody = `{"account":{"steam_id":"","steam_api_key":"","has_api_key":
 	`"onboarding_done":false,"auto_price":true,"backup_auto":true,"update_notified":"",` +
 	`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
 	`"theme":"dark","mcp_enabled":false,` +
-	`"lan_access":{"enabled":false,"env_forced":false,"has_password":false},` +
+	`"lan_access":{"enabled":false,"env_forced":false,"has_password":false,"password_source":"none"},` +
 	`"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
 
 func TestGetSettingsDefaults(t *testing.T) {
@@ -87,7 +85,7 @@ func TestGetSettingsSeeded(t *testing.T) {
 	seedKV(t, db, "account.steam_id", `"76561198000000000"`)
 	seedKV(t, db, "account.steam_api_key", `"abcd1234efgh"`)
 	seedKV(t, db, "ui.onboarding_done", `true`)
-	seedKV(t, db, "crawl.auto_price", `"false"`) // 字符串 "false" 是 Python truthy
+	seedKV(t, db, "crawl.auto_price", `"false"`)
 	seedKV(t, db, "ui.update_notified", `"1.2.3"`)
 	seedKV(t, db, "ui.theme", `"light"`)
 	seedKV(t, db, "mcp.enabled", `true`)
@@ -99,7 +97,7 @@ func TestGetSettingsSeeded(t *testing.T) {
 		`"onboarding_done":true,"auto_price":true,"backup_auto":true,"update_notified":"1.2.3",` +
 		`"update_skipped":"","update_notify":true,"update_auto":false,"direct_notice_seen":false,` +
 		`"theme":"light","mcp_enabled":true,` +
-		`"lan_access":{"enabled":false,"env_forced":false,"has_password":false},` +
+		`"lan_access":{"enabled":false,"env_forced":false,"has_password":false,"password_source":"none"},` +
 		`"mcp_running":false,"mcp_error":"","mcp_forced_by_env":false}`
 	if got := rec.Body.String(); got != want {
 		t.Fatalf("种子形状不一致\n got: %s\nwant: %s", got, want)
@@ -108,7 +106,7 @@ func TestGetSettingsSeeded(t *testing.T) {
 
 func TestGetSettingsUndecryptableKeyDegrades(t *testing.T) {
 	db, h := newTestEnv(t)
-	seedKV(t, db, "account.steam_api_key", `"enc1:QUJDREVGR0g"`) // 伪密文，解密必失败
+	seedKV(t, db, "account.steam_api_key", `"enc1:QUJDREVGR0g"`)
 	rec := do(t, h, http.MethodGet, "/api/v1/settings", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("状态码 = %d, want 200", rec.Code)
@@ -117,14 +115,11 @@ func TestGetSettingsUndecryptableKeyDegrades(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("响应解析失败：%v", err)
 	}
-	// 解密失败按无凭据降级（Python SecretBoxError → default 同径）。
 	if resp.Account.HasAPIKey || resp.Account.SteamAPIKey != "" {
 		t.Fatalf("解密失败降级形状不符：%+v", resp.Account)
 	}
 }
 
-// TestPutSecretKeyRoundTrip 凭据写读全链：PUT 明文 → 库内 enc1: 密文 →
-// GET 掩码回显 → 同数据目录 secretbox 解密还原明文；掩码回显与空串不落库。
 func TestPutSecretKeyRoundTrip(t *testing.T) {
 	db, h := newTestEnv(t)
 	rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":" sk-test-abcd1234 "}}`)
@@ -132,7 +127,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 		t.Fatalf("状态码 = %d, body %s", rec.Code, rec.Body.String())
 	}
 
-	// 库内是 enc1: 前缀密文（JSON 字符串），不是明文。
 	var stored string
 	if err := db.QueryRow(
 		"SELECT value_json FROM app_settings WHERE key = ?", keySteamAPIKey).Scan(&stored); err != nil {
@@ -143,7 +137,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 	}
 	token := strings.Trim(stored, `"`)
 
-	// GET 掩码回显（**** + 末 4 字符）。
 	var resp settingsResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("响应解析失败：%v", err)
@@ -152,7 +145,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 		t.Fatalf("掩码回显不符：%+v", resp.Account)
 	}
 
-	// 同数据目录下 secretbox 解密还原明文（purpose 与 Python _secret_purpose 同径）。
 	plain, err := secretbox.DecryptSecretIn(resolveDataDir(), token, secretbox.SecretPurpose(keySteamAPIKey))
 	if err != nil {
 		t.Fatalf("密文解密失败：%v", err)
@@ -161,7 +153,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 		t.Fatalf("还原明文不符：%q", plain)
 	}
 
-	// 掩码回显不落库：库内密文不变。
 	before := stored
 	if rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":"****1234"}}`); rec.Code != http.StatusOK {
 		t.Fatalf("掩码回显请求状态码 = %d", rec.Code)
@@ -175,7 +166,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 		t.Fatalf("掩码回显不应落库：%s -> %s", before, after)
 	}
 
-	// 空串不落库（Python `if key` 短路同径）。
 	if rec := do(t, h, http.MethodPut, "/api/v1/settings", `{"account":{"steam_api_key":"  "}}`); rec.Code != http.StatusOK {
 		t.Fatalf("空串请求状态码 = %d", rec.Code)
 	}
@@ -188,7 +178,6 @@ func TestPutSecretKeyRoundTrip(t *testing.T) {
 	}
 }
 
-// TestGetSeededRealTokenMask 存量密文行（先于 Go 写入存在）GET 解密掩码。
 func TestGetSeededRealTokenMask(t *testing.T) {
 	db, h := newTestEnv(t)
 	token, err := secretbox.EncryptSecretIn(resolveDataDir(), "seedkey9999", secretbox.SecretPurpose(keySteamAPIKey))
@@ -227,7 +216,6 @@ func TestPutSettingsRoundTrip(t *testing.T) {
 	if acct["steam_id"] != "76561198" {
 		t.Fatalf("steam_id = %v, want 76561198（去空白）", acct["steam_id"])
 	}
-	// 凭据已加密落库：掩码回显 + 在场标记。
 	if acct["steam_api_key"] != "****9988" || acct["has_api_key"] != true {
 		t.Fatalf("凭据掩码回显不符：%+v", acct)
 	}
@@ -246,8 +234,6 @@ func TestPutSettingsRoundTrip(t *testing.T) {
 		}
 	}
 
-	// 落库文本与 updated_at 快照核对（CAST 绕开驱动对 DATETIME 声明列的
-	// 扫描侧 time.Time 转换，直读存储字节）。
 	var raw, updated string
 	if err := db.QueryRow(
 		"SELECT value_json, CAST(updated_at AS TEXT) FROM app_settings WHERE key = ?", keyTheme).
@@ -261,7 +247,6 @@ func TestPutSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("updated_at = %q, want 北京裸时刻 YYYY-MM-DD HH:MM:SS.ffffff", updated)
 	}
 
-	// 二次 GET 与写后读完全一致。
 	rec2 := do(t, h, http.MethodGet, "/api/v1/settings", "")
 	if rec2.Body.String() != rec.Body.String() {
 		t.Fatalf("写后读与二次 GET 不一致\n after: %s\n again: %s", rec.Body.String(), rec2.Body.String())
@@ -341,7 +326,7 @@ func TestPutLaxBoolAndNullSemantics(t *testing.T) {
 	db, h := newTestEnv(t)
 	cases := []struct {
 		body string
-		want string // value_json 读回值
+		want string
 	}{
 		{`{"onboarding_done":"TRUE"}`, `true`},
 		{`{"onboarding_done":0}`, `false`},
@@ -393,8 +378,6 @@ func TestPutInvalidThemeIgnored(t *testing.T) {
 	}
 }
 
-// TestPutConcurrentNoDeadlock 真实写闸下并发 PUT：各写独立字段互不覆盖，
-// 主题并发只落两值之一，全部请求 200 且不挂死。
 func TestPutConcurrentNoDeadlock(t *testing.T) {
 	_, h := newTestEnv(t)
 	srv := httptest.NewServer(h)
@@ -485,8 +468,6 @@ func mustRequest(name, url, body string) *http.Request {
 	return req
 }
 
-// TestPutMCPEnabledTriggersHook mcp_enabled 落库成功后触发运行时重载回调；
-// 未携带该字段时不触发（Python 写入口 reapply 同径）。
 func TestPutMCPEnabledTriggersHook(t *testing.T) {
 	_, h := newTestEnv(t)
 	var fired int
@@ -506,7 +487,6 @@ func TestPutMCPEnabledTriggersHook(t *testing.T) {
 	}
 }
 
-// TestGetMCPStatusProjection 注入运行态快照后 GET 的三个运行态字段跟随投影。
 func TestGetMCPStatusProjection(t *testing.T) {
 	_, h := newTestEnv(t)
 	prev := MCPStatus

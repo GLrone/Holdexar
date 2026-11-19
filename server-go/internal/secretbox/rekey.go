@@ -11,21 +11,15 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// 全库密文换钥重加密 + 密钥防护模式切换编排。
-//
-// 唯一事实源清单（新增密文列必须登记到这里，否则换钥后读不出）：
-//   - steam_accounts.cookies         用途 steam-cookies
-//   - app_settings.value_json        用途 kv:<key>（account.steam_api_key 等凭据键）
-//   - app_settings.plugins.registry  嵌套 config 密文用途 plugin:<id>:<field>
-//   - proxy_subscriptions.url        用途 proxy-subscription
-//   - subscription_snapshots.url     用途 proxy-subscription
-//   - proxies.username / .password   用途 proxy-credential
-//
-// 换钥协议（顺序不可调换）：先落新密钥文件（过渡记录要用新主密钥封装）→
-// 落过渡记录 → 单事务全库重加密 → 成功删过渡记录 / 失败回滚密钥文件并删记录。
-// 任意一步被强杀，库内密文要么旧（过渡记录可解）要么新（密钥文件可解）。
+// 加密列事实源清单（新增密文列须同步登记，否则换钥后无法解密）：
+//   - steam_accounts.cookies         (steam-cookies)
+//   - app_settings.value_json        (kv:<key>)
+//   - app_settings[plugins.registry] (plugin:<id>:<field>)
+//   - proxy_subscriptions.url        (proxy-subscription)
+//   - subscription_snapshots.url     (proxy-subscription)
+//   - proxies.username / .password   (proxy-credential)
+// 协议顺序：写新密钥文件 → 写过渡记录 → 单事务全库重加密 → 成功删过渡记录 / 失败回滚文件并删记录。
 
-// 换钥触达的加密用途串。
 const (
 	PurposeSteamCookies      = "steam-cookies"
 	PurposeProxySubscription = "proxy-subscription"
@@ -40,7 +34,6 @@ func SecretPurpose(key string) string {
 	return "kv:" + key
 }
 
-// Counts 全库换钥各表条数（键名与 Python 侧返回字典一致）。
 type Counts struct {
 	AccountCookies   int `json:"accountCookies"`
 	SettingSecrets   int `json:"settingSecrets"`
@@ -49,20 +42,17 @@ type Counts struct {
 	ProxyCredentials int `json:"proxyCredentials"`
 }
 
-// SwitchResult 模式切换结果。
 type SwitchResult struct {
 	Mode   string `json:"mode"`
 	Counts Counts `json:"counts"`
 }
 
-// ResumeResult 启动续跑结果。
 type ResumeResult struct {
 	Resumed bool   `json:"resumed"`
 	Reason  string `json:"reason,omitempty"`
 	Counts  Counts `json:"counts"`
 }
 
-// ReencryptAll 库内全部敏感密文从 oldMaster 迁到 newMaster（单事务）。
 func ReencryptAll(ctx context.Context, gate *store.WriteGate, oldMaster, newMaster []byte) (Counts, error) {
 	var counts Counts
 	err := gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {
@@ -76,7 +66,6 @@ func ReencryptAll(ctx context.Context, gate *store.WriteGate, oldMaster, newMast
 	return counts, nil
 }
 
-// migrateValue 单个密文值换钥；非密文 / 空值返回空串（调用方跳过，不写回）。
 func migrateValue(token, purpose string, old, new []byte) (string, error) {
 	if token == "" || !IsEncrypted(token) {
 		return "", nil
@@ -101,7 +90,6 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		}
 	}
 
-	// steam_accounts.cookies
 	var cookieUpds []struct{ steamID, token string }
 	if err := scanEach(ctx, conn, "SELECT steam_id, cookies FROM steam_accounts",
 		func(scan func(...any) error) (bool, error) {
@@ -127,7 +115,6 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		counts.AccountCookies++
 	}
 
-	// app_settings.value_json（JSON 列：密文以 JSON 字符串落库）
 	var kvUpds []struct{ key, raw string }
 	if err := scanEach(ctx, conn, "SELECT key, value_json FROM app_settings",
 		func(scan func(...any) error) (bool, error) {
@@ -151,7 +138,7 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 			}
 			s, ok := jsonStringValue(raw.String)
 			if !ok {
-				return true, nil // 非字符串值（对象/数字）不属凭据语义
+				return true, nil
 			}
 			token, err := migrate(s, SecretPurpose(key), old, new)
 			if err != nil {
@@ -171,7 +158,6 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		counts.SettingSecrets++
 	}
 
-	// proxy_subscriptions.url
 	var subUpds []struct {
 		id    int64
 		token string
@@ -204,7 +190,6 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		counts.Subscriptions++
 	}
 
-	// subscription_snapshots.url
 	var snapUpds []struct {
 		id    int64
 		token string
@@ -237,7 +222,6 @@ func reencryptScan(ctx context.Context, conn *sql.Conn, old, new []byte, toleran
 		counts.Snapshots++
 	}
 
-	// proxies.username / password
 	type proxyUpd struct {
 		id                 int64
 		username, password string
@@ -346,7 +330,6 @@ func migratePluginRegistry(raw string, old, new []byte, migrate func(string, str
 	return string(encoded), err
 }
 
-// scanEach 遍历查询结果；fn 返回 false 停止。
 func scanEach(ctx context.Context, conn *sql.Conn, query string, fn func(scan func(...any) error) (bool, error)) error {
 	rows, err := conn.QueryContext(ctx, query)
 	if err != nil {
@@ -365,7 +348,6 @@ func scanEach(ctx context.Context, conn *sql.Conn, query string, fn func(scan fu
 	return rows.Err()
 }
 
-// jsonStringValue JSON 文本顶层为字符串时返回其值。
 func jsonStringValue(raw string) (string, bool) {
 	var parsed any
 	dec := json.NewDecoder(strings.NewReader(raw))
@@ -377,12 +359,8 @@ func jsonStringValue(raw string) (string, bool) {
 	return s, ok
 }
 
-// ── 模式切换编排 ─────────────────────────────────────────
-
-// SwitchMode 切换密钥防护模式并完成全库换钥。
-// mode=legacy 换钥到机器派生主密钥后删除密钥文件；dpapi 仅 Windows；
-// passphrase 返回后进程处于已解锁态。当前为口令模式且锁定时须提供
-// currentPassphrase。失败时不改变库与密钥文件。
+// SwitchMode 切换密钥模式并全库重加密（legacy 完成后删密钥文件；dpapi 仅 Windows；passphrase 返回已解锁态）。
+// 当前为 passphrase 模式时（含已解锁态）必须验证 currentPassphrase；失败不改库与密钥文件。
 func SwitchMode(ctx context.Context, gate *store.WriteGate, dataDir, mode string, passphrase, currentPassphrase string) (SwitchResult, error) {
 	switch mode {
 	case ModeLegacy, ModeDPAPI, ModePassphrase:
@@ -394,7 +372,7 @@ func SwitchMode(ctx context.Context, gate *store.WriteGate, dataDir, mode string
 	if err != nil {
 		return SwitchResult{}, err
 	}
-	if oldMode == ModePassphrase && currentUnlockedKey() == nil {
+	if oldMode == ModePassphrase {
 		ok := false
 		if currentPassphrase != "" {
 			ok, err = Unlock(dataDir, currentPassphrase)
@@ -446,14 +424,14 @@ func SwitchMode(ctx context.Context, gate *store.WriteGate, dataDir, mode string
 		return SwitchResult{}, err
 	}
 	if mode == ModePassphrase {
-		LoadUnlockedKey(newMaster) // 刚设的口令即当前会话口令
+		LoadUnlockedKey(newMaster)
+	} else {
+		ResetState()
 	}
 	return SwitchResult{Mode: mode, Counts: counts}, nil
 }
 
-// reencryptWithStaging 按崩溃恢复协议执行：新密钥文件 → 过渡记录 → 换钥 → 清理。
-// record 为新密钥文件内容；legacy 方向为 nil（新主密钥可由本机材料重算，
-// legacy 兜底恒可用，该方向不落密钥文件）。
+// reencryptWithStaging 执行崩溃安全换钥；切往 legacy 时 record 为 nil（不落密钥文件）。
 func reencryptWithStaging(ctx context.Context, gate *store.WriteGate, dataDir string, oldMaster, newMaster []byte, record map[string]any) (Counts, error) {
 	oldRecord := SnapshotRecord(dataDir)
 	staged := WrapStaging(oldMaster, newMaster)
@@ -482,18 +460,12 @@ func reencryptWithStaging(ctx context.Context, gate *store.WriteGate, dataDir st
 	return counts, nil
 }
 
-// ── 崩溃续跑 ─────────────────────────────────────────────
-
-// MigrationPending 是否存在未收尾的换钥（崩溃遗留的过渡记录）。
 func MigrationPending(dataDir string) bool {
 	rec, err := ReadStaging(dataDir)
 	return err != nil || rec != nil
 }
 
-// ResumePendingMigration 启动时收尾被打断的换钥。
-// 过渡记录存在 ⇒ 库内密文只可能是旧的（换钥是单事务），用旧主密钥重跑换钥
-// 到当前密钥即可，重跑幂等：已是新密文的行在解密阶段失败并被跳过。
-// 口令模式下解不出旧密钥时保留记录等用户解锁，不做破坏性动作。
+// ResumePendingMigration 续跑中断的换钥：用过渡记录旧主密钥容错重加密至当前主密钥；未解锁时保留记录。
 func ResumePendingMigration(ctx context.Context, gate *store.WriteGate, dataDir string, passphrase string) (ResumeResult, error) {
 	if !MigrationPending(dataDir) {
 		return ResumeResult{Resumed: false, Reason: "无待收尾的换钥"}, nil
@@ -501,7 +473,7 @@ func ResumePendingMigration(ctx context.Context, gate *store.WriteGate, dataDir 
 
 	oldMaster, err := StagingMaster(dataDir, passphrase)
 	if err != nil {
-		return ResumeResult{}, err // 过渡记录损坏：与 Python 一致按启动失败上浮
+		return ResumeResult{}, err
 	}
 	if oldMaster == nil {
 		return ResumeResult{Resumed: false, Reason: "过渡记录需要口令解锁"}, nil
@@ -530,7 +502,6 @@ func ResumePendingMigration(ctx context.Context, gate *store.WriteGate, dataDir 
 	return ResumeResult{Resumed: true, Counts: counts}, nil
 }
 
-// resumeReencrypt 续跑换钥：逐行容忍「已经是新密文」的行。
 func resumeReencrypt(ctx context.Context, gate *store.WriteGate, oldMaster, newMaster []byte) (Counts, error) {
 	var counts Counts
 	err := gate.WithWrite(ctx, store.PriorityInteractive, func(conn *sql.Conn) error {

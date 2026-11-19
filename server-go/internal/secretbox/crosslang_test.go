@@ -11,10 +11,7 @@ import (
 	"testing"
 )
 
-// 跨语言兼容矩阵：Python 侧（真实 app.core.secretbox/keyring）与 Go 侧互为
-// 编解码方。夹具脚本与全部数据目录都在 t.TempDir() 内，测试结束自动清理；
-// 密钥材料只在结果文件内传递，断言与日志只输出条数与布尔结论。
-// server/.venv 不可用的环境整组跳过。
+// 跨语言加解密兼容测试（依赖 server/.venv，缺失时自动跳过）。
 
 const fixturePass = "fixture-pass-123"
 
@@ -231,7 +228,6 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 	ResetState()
 	t.Cleanup(ResetState)
 
-	// ── 方向一：Python 加密 → Go 解密 ──
 	for _, mode := range []string{"legacy", "dpapi", "passphrase"} {
 		t.Run("py2go-"+mode, func(t *testing.T) {
 			dataDir := filepath.Join(root, "py-"+mode)
@@ -278,7 +274,6 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 				if unlocked == nil || hex.EncodeToString(unlocked) != res["master_hex"].(string) {
 					t.Fatal("scrypt 口令解封主密钥与 Python 导出不一致")
 				}
-				// 锁定态必须拒绝，不得绕过
 				ResetState()
 				s0 := samples[0]
 				if _, err := DecryptSecretIn(dataDir, s0["token"].(string), s0["purpose"].(string)); err == nil || !strings.Contains(err.Error(), "锁定") {
@@ -304,7 +299,6 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 		})
 	}
 
-	// ── 方向二：Go 加密 → Python 解密 ──
 	for _, mode := range []string{"legacy", "dpapi", "passphrase"} {
 		t.Run("go2py-"+mode, func(t *testing.T) {
 			dataDir := filepath.Join(root, "go-"+mode)
@@ -336,7 +330,7 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 			}
 
 			samples := make([]map[string]any, 0, len(purposes)*len(plains))
-			LoadUnlockedKey(master) // passphrase 全链封装需解锁态；其余模式无副作用
+			LoadUnlockedKey(master)
 			for i, purpose := range purposes {
 				for j, plain := range plains {
 					var token string
@@ -365,7 +359,6 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 				}
 				req["expect_legacy_hex"] = hex.EncodeToString(legacy)
 			}
-			// 过渡记录交叉解封（Go 封 → Python 解）
 			legacyMaster, lerr := LegacyMaster(dataDir)
 			if lerr != nil {
 				t.Fatal(lerr)
@@ -378,7 +371,6 @@ func TestCrossLanguageCredentialMatrix(t *testing.T) {
 			reqPath := filepath.Join(root, "go-"+mode+"-req.json")
 			outPath := filepath.Join(root, "go-"+mode+"-res.json")
 			writeJSONFile(t, reqPath, req)
-			// 脚本参数序：argv[4]=输出、argv[5]=请求
 			runPyFixture(t, pyExe, script, dataDir, outPath, serverDir, "decrypt", dataDir, outPath, reqPath)
 			res := readJSONFile(t, outPath)
 			if int(res["ok"].(float64)) != len(samples) {

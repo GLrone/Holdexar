@@ -10,7 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,7 +39,7 @@ func notify(ctx context.Context, options Options, writes []kvWrite, kicks []stri
 	for _, write := range writes {
 		keys = append(keys, write.key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	if options.Bus != nil {
 		options.Bus.Publish("settings.changed", events.KV{Key: "keys", Val: keys})
 	}
@@ -56,7 +56,7 @@ func SetValues(ctx context.Context, gate *store.WriteGate, options Options, valu
 	for key := range values {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	writes := make([]kvWrite, 0, len(keys))
 	for _, key := range keys {
 		raw, e := json.Marshal(values[key])
@@ -360,7 +360,7 @@ func (h *handler) handleFetchPut(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, detailNull())
 			return
 		}
-		sort.Strings(kicks)
+		slices.Sort(kicks)
 		h.notify(r.Context(), writes, kicks)
 	}
 	h.handleFetchGet(w, r)

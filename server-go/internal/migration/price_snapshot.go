@@ -8,6 +8,7 @@ import (
 	"holdexar/server-go/internal/bundles"
 	"holdexar/server-go/internal/derived"
 	"holdexar/server-go/internal/rates"
+	"holdexar/server-go/internal/timeutil"
 )
 
 func migratePriceSnapshot(ctx context.Context, conn *sql.Conn) error {
@@ -16,7 +17,7 @@ func migratePriceSnapshot(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	overrides, order := derived.LoadSeriesOverrides(dataDir)
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60))
+	now := time.Now().In(timeutil.Beijing)
 	if err := rates.RecomputeCNYPrices(ctx, conn); err != nil {
 		return err
 	}

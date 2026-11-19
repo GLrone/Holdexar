@@ -1,39 +1,35 @@
-// diagnostics.go 系统三诊断面（等价 Python domains/system/router.py 的
-// write-scheduler / logs / diagnostics）：写调度快照、运行日志回放、五段
-// 聚合机器证据面（一面失败不拖垮整体）。
 package systemx
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"time"
 
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/eventstream"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/store"
 )
 
-// DiagnosticsDeps 三诊断面依赖面。Cycles/JobRuns 经主 mux 自取（复用已迁
-// 端点投影）；ClashRunning/ClashSubID 由 serverd 注入订阅内核运行态。
+// DiagnosticsDeps 诊断面依赖。
 type DiagnosticsDeps struct {
 	Gate         *store.WriteGate
 	Ring         *eventstream.Ring
 	ClashRunning func() bool
 	ClashSubID   func(ctx context.Context) *int64
+	Cycles       func(ctx context.Context, limit int) ([]map[string]any, error)
+	JobRuns      func(ctx context.Context, limit int) (map[string]any, error)
 }
 
-// writeLockWaitWarnMS 写账等写锁预警阈值（毫秒）。
 const writeLockWaitWarnMS = 30000
 
-// RegisterDiagnostics 装配 GET /api/v1/system/write-scheduler、/system/logs、
-// /system/diagnostics。
 func RegisterDiagnostics(mux *http.ServeMux, db *sql.DB, deps DiagnosticsDeps) {
 	mux.HandleFunc("GET /api/v1/system/write-scheduler", func(w http.ResponseWriter, r *http.Request) {
 		if deps.Gate == nil {
@@ -60,20 +56,12 @@ func RegisterDiagnostics(mux *http.ServeMux, db *sql.DB, deps DiagnosticsDeps) {
 		writeJSON(w, http.StatusOK, map[string]any{"lines": lines})
 	})
 	mux.HandleFunc("GET /api/v1/system/diagnostics", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, diagnosticsSnapshot(r.Context(), db, mux, deps))
+		writeJSON(w, http.StatusOK, diagnosticsSnapshot(r.Context(), db, deps))
 	})
 }
 
-// diagValErr 校验错误项（Pydantic query 校验实测形状）。
-type diagValErr struct {
-	Type  string `json:"type"`
-	Loc   []any  `json:"loc"`
-	Msg   string `json:"msg"`
-	Input any    `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type diagValErr = httpx.ValErr
 
-// queryLimit 分页参数校验（缺省回默认；越界/非整回 422 形状）。
 func queryLimit(r *http.Request, fallback, minValue, maxValue int) (int, *diagValErr) {
 	raw := r.URL.Query().Get("limit")
 	if raw == "" {
@@ -97,13 +85,13 @@ func queryLimit(r *http.Request, fallback, minValue, maxValue int) (int, *diagVa
 	return n, nil
 }
 
-// diagnosticsSnapshot 五段聚合（全部只读，一面失败降级 {"error": 原文[:200]}）。
-func diagnosticsSnapshot(ctx context.Context, db *sql.DB, mux *http.ServeMux, deps DiagnosticsDeps) map[string]any {
-	identity := diagSection(func() map[string]any { return identitySection(ctx, db, deps) })
-	cycles := diagSection(func() map[string]any { return cyclesSection(ctx, mux) })
-	jobRuns := diagSection(func() map[string]any { return jobRunsSection(ctx, mux) })
-	writeLedger := diagSection(func() map[string]any { return writeLedgerSection(deps) })
-	backlog := diagSection(func() map[string]any { return backlogSection(ctx, db) })
+// diagnosticsSnapshot 聚合五段诊断面，单面失败降级为 {"error": ...}。
+func diagnosticsSnapshot(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) map[string]any {
+	identity := diagSection(func() (map[string]any, error) { return identitySection(ctx, db, deps) })
+	cycles := diagSection(func() (map[string]any, error) { return cyclesSection(ctx, deps) })
+	jobRuns := diagSection(func() (map[string]any, error) { return jobRunsSection(ctx, deps) })
+	writeLedger := diagSection(func() (map[string]any, error) { return writeLedgerSection(deps), nil })
+	backlog := diagSection(func() (map[string]any, error) { return backlogSection(ctx, db) })
 
 	signals := []map[string]any{}
 	lastCycle := map[string]any{}
@@ -168,18 +156,18 @@ func signal(code, severity, text string) map[string]any {
 	return map[string]any{"code": code, "severity": severity, "text": text}
 }
 
-// diagSection 单面异常降级（Python _diagnostics_section 同构）。
-func diagSection(fn func() map[string]any) (out map[string]any) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			out = map[string]any{"error": clipDiag(fmt.Sprintf("%v", recovered))}
-		}
-	}()
-	return fn()
+func diagSection(fn func() (map[string]any, error)) map[string]any {
+	out, err := fn()
+	if err != nil {
+		return map[string]any{"error": clipDiag(err.Error())}
+	}
+	return out
 }
 
-// identitySection 身份面：实例是谁、现在走什么通道。
-func identitySection(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) map[string]any {
+func identitySection(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) (map[string]any, error) {
+	if db == nil {
+		return nil, errors.New("数据库未就绪")
+	}
 	strategy := kvStrategy(db)
 	var explicit bool
 	var raw sql.NullString
@@ -194,9 +182,6 @@ func identitySection(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) map[
 	}
 	clashRunning := deps.ClashRunning != nil && deps.ClashRunning()
 	systemProxy, _ := netenv.ResolveSystemProxy(ctx)
-	if systemProxy == "" {
-		systemProxy = ""
-	}
 	dataDir := resolveDataDir()
 	identity := map[string]any{
 		"app_version":          config.Version(),
@@ -212,11 +197,10 @@ func identitySection(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) map[
 	if systemProxy != "" {
 		identity["system_proxy"] = systemProxy
 	}
-	return identity
+	return identity, nil
 }
 
-// kvStrategy proxy.strategy 读取（pinned/clash 归一 proxy_first，Python
-// get_strategy 同口径）。
+// kvStrategy 读取 proxy.strategy（pinned/clash 归一为 proxy_first）。
 func kvStrategy(db *sql.DB) string {
 	var raw sql.NullString
 	if err := db.QueryRow(
@@ -237,8 +221,7 @@ func kvStrategy(db *sql.DB) string {
 	return text
 }
 
-// poolAvailableExits 可用出口计数（手动池 enabled&ok + 当前订阅 ACTIVE/STALE
-// 且有 L2 证据的节点按出口 IP 去重；agent 工具 pool_stats 直读近似同口径）。
+// poolAvailableExits 统计可用出口数（手动池 enabled&ok + 当前订阅 ACTIVE/STALE 且有 L2 节点按出口 IP 去重）。
 func poolAvailableExits(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) int {
 	var poolOK int
 	if err := db.QueryRowContext(ctx,
@@ -276,29 +259,35 @@ func poolAvailableExits(ctx context.Context, db *sql.DB, deps DiagnosticsDeps) i
 	return poolOK + len(okIdents)
 }
 
-// cyclesSection 价格轮面：最近 5 轮（经主 mux 复用 /crawl/cycles 投影）。
-func cyclesSection(ctx context.Context, mux *http.ServeMux) map[string]any {
-	var cycles []map[string]any
-	if err := muxGet(ctx, mux, "/api/v1/crawl/cycles?limit=5", &cycles); err != nil {
-		return map[string]any{"error": clipDiag(err.Error())}
+func cyclesSection(ctx context.Context, deps DiagnosticsDeps) (map[string]any, error) {
+	if deps.Cycles == nil {
+		return nil, errors.New("未装配")
+	}
+	cycles, err := deps.Cycles(ctx, 5)
+	if err != nil {
+		return nil, err
 	}
 	var last any
 	if len(cycles) > 0 {
 		last = cycles[0]
 	}
-	return map[string]any{"last": last, "recent": cycles}
+	return map[string]any{"last": last, "recent": cycles}, nil
 }
 
-// jobRunsSection 作业面：最近 10 次生产作业台账（经主 mux 复用投影）。
-func jobRunsSection(ctx context.Context, mux *http.ServeMux) map[string]any {
-	var out map[string]any
-	if err := muxGet(ctx, mux, "/api/v1/proxypool/job-runs?limit=10", &out); err != nil {
-		return map[string]any{"error": clipDiag(err.Error())}
+func jobRunsSection(ctx context.Context, deps DiagnosticsDeps) (map[string]any, error) {
+	if deps.JobRuns == nil {
+		return nil, errors.New("未装配")
 	}
-	return out
+	out, err := deps.JobRuns(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		return map[string]any{}, nil
+	}
+	return out, nil
 }
 
-// writeLedgerSample 写账样本一条。
 type writeLedgerSample struct {
 	Time       string `json:"time"`
 	Message    string `json:"message"`
@@ -307,7 +296,6 @@ type writeLedgerSample struct {
 	LockwaitMS *int64 `json:"lockwait_ms"`
 }
 
-// writeLedgerSection 写账面：环形缓冲最近 8 条「写库分段完成」。
 func writeLedgerSection(deps DiagnosticsDeps) map[string]any {
 	samples := []writeLedgerSample{}
 	if deps.Ring != nil {
@@ -316,8 +304,7 @@ func writeLedgerSection(deps DiagnosticsDeps) map[string]any {
 	return map[string]any{"samples": samples}
 }
 
-// parseWriteLedgerLines 环形日志 → 写账样本（Python _parse_write_ledger 同构：
-// 旧→新扫，取最近 limit 条；值形如 "12毫秒" 只取数字）。
+// parseWriteLedgerLines 从新到旧扫描环形日志，提取最近 limit 条写账样本。
 func parseWriteLedgerLines(lines []string, limit int) []writeLedgerSample {
 	out := []writeLedgerSample{}
 	for i := len(lines) - 1; i >= 0 && len(out) < limit; i-- {
@@ -371,7 +358,6 @@ func digitsOnly(value string) string {
 	return sb.String()
 }
 
-// maxLockWait 样本中的最大等写锁（无样本回 0,false）。
 func maxLockWait(section map[string]any) (int64, bool) {
 	raw, ok := section["samples"].([]writeLedgerSample)
 	if !ok {
@@ -387,6 +373,9 @@ func maxLockWait(section map[string]any) (int64, bool) {
 }
 
 func jobRunItems(section map[string]any) []map[string]any {
+	if typed, ok := section["items"].([]map[string]any); ok {
+		return typed
+	}
 	raw, _ := section["items"].([]any)
 	out := make([]map[string]any, 0, len(raw))
 	for _, item := range raw {
@@ -397,32 +386,20 @@ func jobRunItems(section map[string]any) []map[string]any {
 	return out
 }
 
-// backlogSection 待补欠账面（空区行不算欠账；冷却 4 分钟直读近似，
-// Python has_pending_missing 的恢复排除面 Go 侧未迁——登记差异）。
-func backlogSection(ctx context.Context, db *sql.DB) map[string]any {
-	cutoff := time.Now().UTC().Add(8*time.Hour).Add(-4 * time.Minute).Format("2006-01-02 15:04:05")
+// backlogSection 检查非空区且距上次更新超 4 分钟的 missing 价格行数。
+func backlogSection(ctx context.Context, db *sql.DB) (map[string]any, error) {
+	if db == nil {
+		return nil, errors.New("数据库未就绪")
+	}
+	cutoff := time.Now().UTC().Add(8 * time.Hour).Add(-4 * time.Minute).Format("2006-01-02 15:04:05")
 	var exists bool
 	if err := db.QueryRowContext(ctx,
 		`SELECT EXISTS(SELECT 1 FROM game_current_prices
 		 WHERE price_status='missing' AND region_code!='' AND updated_at < ?)`,
 		cutoff).Scan(&exists); err != nil {
-		panic(err)
+		return nil, err
 	}
-	return map[string]any{"missing_pending": exists}
-}
-
-// muxGet 经主 mux 进程内调用已迁只读端点。
-func muxGet(ctx context.Context, mux *http.ServeMux, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://holdexar.internal"+path, nil)
-	if err != nil {
-		return err
-	}
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		return fmt.Errorf("内部请求失败（%d）", rec.Code)
-	}
-	return json.Unmarshal(rec.Body.Bytes(), out)
+	return map[string]any{"missing_pending": exists}, nil
 }
 
 func clipDiag(text string) string {

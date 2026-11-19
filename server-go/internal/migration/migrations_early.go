@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
+
+	"holdexar/server-go/internal/timeutil"
 )
 
 var earlyMigrationSteps = map[int]migrationStep{
@@ -115,7 +117,7 @@ func migrateBundlePriceUnits(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	for _, values := range references {
-		sort.Float64s(values)
+		slices.Sort(values)
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT p.id,p.price,p.original_price,p.cny_fen,p.currency,p.bundle_id,b.must_purchase_as_set
 		FROM bundle_region_prices p LEFT JOIN bundles b ON b.bundle_id=p.bundle_id
@@ -326,7 +328,7 @@ func migrateFXHistoryCanonical(ctx context.Context, conn *sql.Conn) error {
 }
 
 func migrateMonitoringSources(ctx context.Context, conn *sql.Conn, projectOnly bool) error {
-	now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*60*60)).Format("2006-01-02 15:04:05")
+	now := time.Now().In(timeutil.Beijing).Format("2006-01-02 15:04:05")
 	const projectFlag = "(COALESCE(board_pool,0)=1 OR COALESCE(manual_pool,0)=1)"
 	where := "active=1"
 	if projectOnly {

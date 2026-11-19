@@ -1,7 +1,5 @@
 //go:build windows
 
-// steamlocal_windows_test.go VDF 解析表测 + 注册表桩注入 + 导入 422/404/成功
-// 写键（Python steam_local.py / router.py:323-341 形状锚点）。
 package settings
 
 import (
@@ -45,7 +43,6 @@ const sampleLoginusers = `// Steam account records
 }
 `
 
-// TestParseLoginusers 表测：steamid64 过滤、转义解码、块结构异常回空。
 func TestParseLoginusers(t *testing.T) {
 	accounts := parseLoginusers(sampleLoginusers)
 	if len(accounts) != 2 {
@@ -65,7 +62,6 @@ func TestParseLoginusers(t *testing.T) {
 	}
 }
 
-// steamRouteFixture 注册表根桩（指向夹具目录）+ 真 mux。
 func steamRouteFixture(t *testing.T, loginusers string) (*sql.DB, *store.WriteGate, func(method, path, body string) *httptest.ResponseRecorder) {
 	t.Helper()
 	dir := t.TempDir()
@@ -107,7 +103,6 @@ func steamRouteFixture(t *testing.T, loginusers string) (*sql.DB, *store.WriteGa
 	return db, gate, do
 }
 
-// TestSteamLocalListAndImport 账号列表形状 + 导入成功写 account.steam_id。
 func TestSteamLocalListAndImport(t *testing.T) {
 	db, _, do := steamRouteFixture(t, sampleLoginusers)
 	rec := do("GET", "/api/v1/settings/steam-local-accounts", "")
@@ -143,7 +138,6 @@ func TestSteamLocalListAndImport(t *testing.T) {
 	}
 }
 
-// TestSteamLocalImportGuards 422 长度形状 + 404 不可用文案。
 func TestSteamLocalImportGuards(t *testing.T) {
 	_, _, do := steamRouteFixture(t, sampleLoginusers)
 	for _, body := range []string{`{"steam_id": "123"}`, `{}`, `{"steam_id": 76561198000000011}`} {
@@ -152,12 +146,10 @@ func TestSteamLocalImportGuards(t *testing.T) {
 			t.Fatalf("%s 应 422：%d %s", body, rec.Code, rec.Body.String())
 		}
 	}
-	// 不存在的账号（解析出的两账号之外）
 	rec := do("POST", "/api/v1/settings/steam-local-accounts/import", `{"steam_id": "76561111111111111"}`)
 	if rec.Code != 404 || !strings.Contains(rec.Body.String(), "本机 Steam 账号记录已不可用") {
 		t.Fatalf("缺席账号应 404：%d %s", rec.Code, rec.Body.String())
 	}
-	// steam.exe 缺席的根 → 列表为空
 	_, _, doEmpty := steamRouteFixture(t, "")
 	rec = doEmpty("GET", "/api/v1/settings/steam-local-accounts", "")
 	empty := decodeSteam(t, rec)

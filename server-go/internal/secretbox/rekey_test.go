@@ -10,7 +10,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// rekeyEnv 建最小换钥环境：隔离库 + 写闸 + 五张密文表（列名与线上一致）。
 func rekeyEnv(t *testing.T) (dir string, gate *store.WriteGate, db *sql.DB) {
 	t.Helper()
 	dir = t.TempDir()
@@ -35,7 +34,6 @@ func rekeyEnv(t *testing.T) (dir string, gate *store.WriteGate, db *sql.DB) {
 	return dir, store.NewWriteGate(db, dbPath), db
 }
 
-// seedCiphertexts 以指定主密钥写全链样值；返回各明文以便换钥后核对。
 func seedCiphertexts(t *testing.T, db *sql.DB, master []byte) map[string]string {
 	t.Helper()
 	must := func(token string, err error) string {
@@ -152,7 +150,6 @@ func TestSwitchModeToPassphraseAndBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertAllDecrypt(t, db, newMaster, seed)
-	// 非密文 / 明文 / 空值行未被改写
 	if got := dbScalar(t, db, `SELECT cookies FROM steam_accounts WHERE steam_id='sid-plain'`); got != "plaintext-cookie" {
 		t.Fatalf("明文行被误改: %q", got)
 	}
@@ -163,8 +160,7 @@ func TestSwitchModeToPassphraseAndBack(t *testing.T) {
 		t.Fatalf("明文订阅行被误改: %q", got)
 	}
 
-	// 切回 legacy：密钥文件删除，全库回到机器派生主密钥
-	res2, err := SwitchMode(ctx, gate, dir, ModeLegacy, "", "")
+	res2, err := SwitchMode(ctx, gate, dir, ModeLegacy, "", "new-pass")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,12 +185,55 @@ func TestSwitchModeValidation(t *testing.T) {
 	}
 }
 
+func TestSwitchModeFromUnlockedPassphraseRequiresCurrentPassphrase(t *testing.T) {
+	ctx := context.Background()
+	dir, gate, db := rekeyEnv(t)
+	ResetState()
+	t.Cleanup(ResetState)
+	legacy, err := LegacyMaster(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := seedCiphertexts(t, db, legacy)
+
+	if _, err := SwitchMode(ctx, gate, dir, ModePassphrase, "pass-one", ""); err != nil {
+		t.Fatal(err)
+	}
+	if locked, err := IsLocked(dir); err != nil || locked {
+		t.Fatalf("设完口令模式应处于解锁态: locked=%v err=%v", locked, err)
+	}
+
+	for _, tc := range []struct {
+		target, newPass, curPass string
+	}{
+		{ModeLegacy, "", ""},
+		{ModeLegacy, "", "wrong-pass"},
+		{ModePassphrase, "pass-two", ""},
+		{ModePassphrase, "pass-two", "wrong-pass"},
+	} {
+		_, err := SwitchMode(ctx, gate, dir, tc.target, tc.newPass, tc.curPass)
+		if err == nil || err.Error() != "当前口令不正确或未提供，无法切换保护方式" {
+			t.Fatalf("%+v 未被正确拒绝: %v", tc, err)
+		}
+	}
+	if mode, err := ModeOf(dir); err != nil || mode != ModePassphrase {
+		t.Fatalf("拒绝后模式不应变化: %q %v", mode, err)
+	}
+
+	if _, err := SwitchMode(ctx, gate, dir, ModePassphrase, "pass-two", "pass-one"); err != nil {
+		t.Fatalf("正确 currentPassphrase 改口令失败: %v", err)
+	}
+	if _, err := SwitchMode(ctx, gate, dir, ModeLegacy, "", "pass-two"); err != nil {
+		t.Fatalf("正确 currentPassphrase 切回 legacy 失败: %v", err)
+	}
+	assertAllDecrypt(t, db, legacy, seed)
+}
+
 func TestSwitchModeFailsClosedOnUndecryptable(t *testing.T) {
 	ctx := context.Background()
 	dir, gate, db := rekeyEnv(t)
 	ResetState()
 	t.Cleanup(ResetState)
-	// 一行用陌生主密钥封装：换钥必须整体失败并回滚，不留半迁移
 	rogue := randBytes(keyBytes)
 	bad := mustJSONString(mustEncrypt(t, "orphan", SecretPurpose("account.steam_api_key"), rogue))
 	exec := func(q string, args ...any) {
@@ -239,7 +278,6 @@ func TestResumePendingMigration(t *testing.T) {
 	}
 	seed := seedCiphertexts(t, db, legacy)
 
-	// 模拟崩溃窗口：新钥文件与过渡记录已落，库未重加密
 	newMaster := randBytes(keyBytes)
 	rec, err := WrapPassphrase(newMaster, "crash-pass")
 	if err != nil {
@@ -306,7 +344,6 @@ func TestResumeTolerantPartialMigration(t *testing.T) {
 	if err := WriteStaging(dir, WrapStaging(legacy, newMaster)); err != nil {
 		t.Fatal(err)
 	}
-	// 一半旧行、一半已换新行：续跑只迁旧的一半
 	if _, err := db.Exec(`INSERT INTO steam_accounts (steam_id, cookies) VALUES ('sid-old', ?)`,
 		mustEncrypt(t, "old-plain", PurposeSteamCookies, legacy)); err != nil {
 		t.Fatal(err)
@@ -340,7 +377,6 @@ func TestResumeCrashBeforeFileSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 崩溃发生在写密钥文件之前：过渡记录封的旧钥 == 当前钥 → 只清记录
 	if err := WriteStaging(dir, WrapStaging(legacy, legacy)); err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +392,6 @@ func TestResumeCrashBeforeFileSwap(t *testing.T) {
 	}
 }
 
-// DecryptIn 取库内密文并用指定主密钥解回（测试辅助）。
 func DecryptIn(t *testing.T, db *sql.DB, q, purpose string, master []byte) string {
 	t.Helper()
 	var token string

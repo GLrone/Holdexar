@@ -1,28 +1,28 @@
-// Package httpapi：net/http 原生服务骨架（健康端点、SPA 静态托管、统一 404）。
 package httpapi
 
 import (
-	"encoding/json"
 	"net/http"
+
+	"holdexar/server-go/internal/access"
+	"holdexar/server-go/internal/httpx"
 )
 
-// Server 服务骨架的路由与依赖。
 type Server struct {
 	App     string
 	Version string
 	DataDir string
-	// DistDir 前端构建产物目录；index.html 缺失时按「仅 API」运行，全部路径回 404。
-	DistDir string
-	// SchedulerReady 调度器就绪状态；调度器接入后由启动链赋值。
-	SchedulerReady bool
-	// UpdateWriteProtected / UpdatePageReady 更新验收期间的运行保护位。
-	UpdateWriteProtected bool
-	UpdatePageReady      bool
-	// Register 业务模块路由装配方；nil 时仅骨架路由（health / 静态 / 统一 404）。
-	Register func(mux *http.ServeMux)
+	// DistDir 前端构建产物目录；index.html 缺失时静态路由回 404。
+	DistDir          string
+	SchedulerReady   bool
+	SchedulerReadyFn func() bool
+	// UpdateWriteProtected 更新验收期写保护位（UpdateWriteProtectedFn 优先；UpdatePageReady 未启用，实际读取 updateguard.PageReady）。
+	UpdateWriteProtected   bool
+	UpdateWriteProtectedFn func() bool
+	UpdatePageReady        bool
+	Gate                   *access.Gate
+	Register               func(mux *http.ServeMux)
 }
 
-// Handler 装配全部路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	if s.Register != nil {
@@ -34,24 +34,15 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// handleAPINotFound 未匹配的 API 路径统一回 404（文案与线上一致）。
 func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Not Found"})
 }
 
-// detailNull 错误响应体：{"detail": null}。
 func detailNull() map[string]any {
 	return map[string]any{"detail": nil}
 }
 
-// writeJSON JSON 响应体不带尾随换行。
+// writeJSON JSON 响应体不带尾随换行，禁用 HTML 转义。
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	httpx.WriteJSON(w, status, payload)
 }

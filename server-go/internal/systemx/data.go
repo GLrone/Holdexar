@@ -1,14 +1,18 @@
 package systemx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,12 +25,10 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// RestartExitCode 恢复换库后的重启请求退出码：窗口宿主据此重启服务并凭
-// 新引导票据重载页面（跨进程契约，窗口宿主与开发监视同值）。
+// RestartExitCode 恢复换库后的重启请求退出码（跨进程契约，与 windowhost/devwatch 同值）。
 const RestartExitCode = 75
 
-// RegisterData 数据维护与用户数据面：原位恢复、空间回收、加密导出、
-// 旧爬虫库导入、密钥保护。onRequestRestart 在响应送达后触发服务重启。
+// RegisterData 注册备份恢复、空间收缩、加密导出、密钥保护与旧库导入端点。
 func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, sessions *access.Gate, dataDir string,
 	backups *backup.Service, onRequestRestart func()) {
 	mux.HandleFunc("POST /api/v1/system/backup/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
@@ -122,9 +124,9 @@ func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, session
 			writeData(w, nil, statusError{http.StatusBadRequest, "请求体无法读取"})
 			return
 		}
-		// 解锁失败限速：与局域网解锁通道共享同一限速器——两条通道认证的是
-		// 同一把口令，任一通道穷举都触发全局锁定（共同根因修复）。
-		if remaining := access.UnlockLockedSeconds(); remaining > 0 {
+		// 解锁失败限速：与局域网解锁通道共享同一限速器，按来源对端分桶隔离。
+		peer := access.PeerKey(r.RemoteAddr)
+		if remaining := access.UnlockLockedSeconds(peer); remaining > 0 {
 			writeData(w, nil, statusError{http.StatusTooManyRequests,
 				fmt.Sprintf("解锁失败次数过多，%.0f 秒后可重试", remaining)})
 			return
@@ -135,20 +137,27 @@ func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, session
 			return
 		}
 		if !ok {
-			access.RecordUnlockFailure()
+			access.RecordUnlockFailureFor(peer)
 			writeData(w, nil, statusError{http.StatusBadRequest, "口令不正确"})
 			return
 		}
-		access.RecordUnlockSuccess()
+		access.RecordUnlockSuccessFor(peer)
 		writeData(w, map[string]any{"ok": true, "security": secretbox.Status(dataDir)}, nil)
 	})
 	mux.HandleFunc("POST /api/v1/system/security/lock", func(w http.ResponseWriter, r *http.Request) {
 		secretbox.Lock()
-		// 会话随之轮换：旧会话签发于解锁态，锁定后必须失效（P0 审计修复）
-		sessions.InvalidateSessions()
+		// 会话随之轮换并给当前请求重签会话 Cookie：旧会话签发于解锁态，锁定后全部失效。
+		if sessions != nil {
+			sessions.InvalidateSessions()
+			sessions.Issue(w)
+		}
 		writeData(w, map[string]any{"ok": true, "security": secretbox.Status(dataDir)}, nil)
 	})
 	mux.HandleFunc("POST /api/v1/import-legacy", func(w http.ResponseWriter, r *http.Request) {
+		if !access.PeerIsLoopback(r.RemoteAddr) {
+			writeData(w, nil, statusError{http.StatusForbidden, "该操作仅限本机执行"})
+			return
+		}
 		var req struct {
 			Path string `json:"path"`
 		}
@@ -161,16 +170,69 @@ func RegisterData(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, session
 	})
 }
 
-// importLegacySnapshot 旧爬虫库（steam_games / steam_prices）最新快照并入：
-// current 表每 (appid, 区服) 取最新一条，history 落同一条，派生与人民币价同事务。
-func importLegacySnapshot(ctx context.Context, db *sql.DB, gate *store.WriteGate, path string) (map[string]any, error) {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return nil, statusError{http.StatusNotFound, fmt.Sprintf("文件不存在: %s", path)}
+func validateLegacyImportPath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsRune(raw, 0) {
+		return "", statusError{http.StatusBadRequest, "数据库文件路径无效"}
 	}
-	legacy, err := sql.Open("sqlite", "file:"+fmt.Sprintf("%s", toSlash(path))+"?mode=ro")
+	if strings.HasPrefix(raw, `\\.\`) || strings.HasPrefix(raw, `\\?\`) ||
+		strings.HasPrefix(raw, `\??\`) || strings.HasPrefix(raw, `\\`) ||
+		strings.HasPrefix(raw, `//`) {
+		return "", statusError{http.StatusBadRequest, "不支持网络或设备路径"}
+	}
+	cleaned := filepath.Clean(raw)
+	if strings.HasPrefix(cleaned, `\\`) || strings.HasPrefix(cleaned, `//`) || !filepath.IsAbs(cleaned) {
+		return "", statusError{http.StatusBadRequest, "数据库文件路径必须为本机绝对路径"}
+	}
+	switch strings.ToLower(filepath.Ext(cleaned)) {
+	case ".db", ".sqlite", ".sqlite3":
+	default:
+		return "", statusError{http.StatusBadRequest, "仅支持导入 .db、.sqlite 或 .sqlite3 文件"}
+	}
+	return cleaned, nil
+}
+
+func sqliteReadOnlyURI(cleaned string) string {
+	slash := filepath.ToSlash(cleaned)
+	if !strings.HasPrefix(slash, "/") {
+		slash = "/" + slash
+	}
+	return (&url.URL{Scheme: "file", Path: slash, RawQuery: "mode=ro"}).String()
+}
+
+// importLegacySnapshot 从旧爬虫库取各 (appid, 区服) 最新快照并写入 current/history 与派生列。
+func importLegacySnapshot(ctx context.Context, db *sql.DB, gate *store.WriteGate, path string) (map[string]any, error) {
+	cleaned, err := validateLegacyImportPath(path)
 	if err != nil {
 		return nil, err
+	}
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, statusError{http.StatusNotFound, "指定的数据库文件不存在"}
+		}
+		return nil, statusError{http.StatusBadRequest, "数据库文件无法读取"}
+	}
+	if !info.Mode().IsRegular() {
+		return nil, statusError{http.StatusBadRequest, "目标不是普通文件"}
+	}
+	file, err := os.Open(cleaned)
+	if err != nil {
+		return nil, statusError{http.StatusBadRequest, "数据库文件无法读取"}
+	}
+	fileInfo, statErr := file.Stat()
+	var header [16]byte
+	_, readErr := io.ReadFull(file, header[:])
+	_ = file.Close()
+	if statErr != nil || !fileInfo.Mode().IsRegular() {
+		return nil, statusError{http.StatusBadRequest, "目标不是普通文件"}
+	}
+	if readErr != nil || string(header[:]) != "SQLite format 3\x00" {
+		return nil, statusError{http.StatusBadRequest, "文件不是有效的 SQLite 数据库"}
+	}
+	legacy, err := sql.Open("sqlite", sqliteReadOnlyURI(cleaned))
+	if err != nil {
+		return nil, statusError{http.StatusBadRequest, "数据库文件无法打开"}
 	}
 	defer legacy.Close()
 	type priceRow struct {
@@ -252,7 +314,6 @@ func importLegacySnapshot(ctx context.Context, db *sql.DB, gate *store.WriteGate
 			if name == "" {
 				name = fmt.Sprintf("AppID_%d", appid)
 			}
-			// 默认值对齐原模型（default=False/0 的 NOT NULL 列）
 			if _, err := conn.ExecContext(ctx, `INSERT INTO games(appid, name, family_sharing, trading_cards,
 				is_epic, is_hb, hl_flag, pp_flag, diff_fen, is_adult, is_visual_novel,
 				removed_strikes, positive_reviews, review_count, view_count)
@@ -334,17 +395,6 @@ func successStatus(success bool) string {
 	return "failed"
 }
 
-func toSlash(path string) string {
-	out := make([]rune, 0, len(path))
-	for _, r := range path {
-		if r == '\\' {
-			r = '/'
-		}
-		out = append(out, r)
-	}
-	return string(out)
-}
-
 func deref(value *string) string {
 	if value == nil {
 		return ""
@@ -359,8 +409,6 @@ type statusError struct {
 
 func (e statusError) Error() string { return e.msg }
 
-// busyAsUnavailable 写入竞争映射 503（语义对齐原实现「稍后重试」；
-// 保留具体拒因便于诊断）。
 func busyAsUnavailable(err error) error {
 	if err == nil {
 		return nil
@@ -372,7 +420,6 @@ func busyAsUnavailable(err error) error {
 	return err
 }
 
-// classifyExport 口令过短 400，凭据锁定 409，其余原样。
 func classifyExport(err error) error {
 	if err == nil {
 		return nil
@@ -388,7 +435,6 @@ func classifyExport(err error) error {
 	return err
 }
 
-// classifyKeyring 密钥托管失败 400。
 func classifyKeyring(err error) error {
 	if err == nil {
 		return nil
@@ -400,7 +446,6 @@ func classifyKeyring(err error) error {
 	return err
 }
 
-// writeData 统一 JSON 出口：状态码语义见各 classify。
 func writeData(w http.ResponseWriter, value any, err error) {
 	status := http.StatusOK
 	if err != nil {
@@ -420,7 +465,14 @@ func writeData(w http.ResponseWriter, value any, err error) {
 		}
 		value = map[string]string{"detail": detail}
 	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	_, _ = w.Write(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}))
 }

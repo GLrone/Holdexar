@@ -2,7 +2,6 @@ package logredact
 
 import "testing"
 
-// 六规则各一案（对齐 Python core/logging.py:95-101）+ 幂等 + 畸形 URL 整体掩码。
 func TestRedactSixRules(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"proxy-link", "import vless://a1b2c3d4-uuid@host:443?x=1 失败", "import vless://*** 失败"},
@@ -27,7 +26,6 @@ func TestRedactSixRules(t *testing.T) {
 	}
 }
 
-// 幂等：已抹过的行再抹一次结果不变。
 func TestRedactIdempotent(t *testing.T) {
 	lines := []string{
 		"import vless://a1b2c3d4-uuid@host:443?x=1 失败",
@@ -46,8 +44,6 @@ func TestRedactIdempotent(t *testing.T) {
 	}
 }
 
-// 路径型 token 第二道网：整段长随机串 → 整条 URL 降级主机形态；
-// 普通路径（词语段/纯数字段/带点资产名）保留。
 func TestMaskTokenURLs(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"token-path", "订阅校验 https://data.steamhl.com/api/v1/pq/Abcdef123456Ghij 完成", "订阅校验 https://data.steamhl.com/*** 完成"},
@@ -63,7 +59,6 @@ func TestMaskTokenURLs(t *testing.T) {
 	}
 }
 
-// RedactURL：保留 scheme+host，路径与查询打码；畸形/空输入整体掩码不抛异常。
 func TestRedactURL(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"", ""},

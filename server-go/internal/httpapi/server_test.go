@@ -1,10 +1,14 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"holdexar/server-go/internal/access"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -12,7 +16,6 @@ func newTestServer(t *testing.T) *Server {
 	return &Server{App: "Holdexar", Version: "0.3.6-beta", DataDir: t.TempDir()}
 }
 
-// unsetForTest 恢复现场地删除单个环境变量（t.Setenv 只能设值不能删除）。
 func unsetForTest(t *testing.T, key string) {
 	t.Helper()
 	saved, had := os.LookupEnv(key)
@@ -53,7 +56,6 @@ func assertDetailNull(t *testing.T, body map[string]any) {
 	}
 }
 
-// doFrom 指定对端地址发请求（health 的对端信任分级测试用）。
 func doFrom(t *testing.T, srv *Server, method, target, remoteAddr string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -63,7 +65,6 @@ func doFrom(t *testing.T, srv *Server, method, target, remoteAddr string) *httpt
 	return rec
 }
 
-// TestHealthDefaultShape 回环对端（桌面壳）：完整快照含 pid/dataDir/路径。
 func TestHealthDefaultShape(t *testing.T) {
 	unsetForTest(t, "HOLDEXAR_UPDATE_ATTEMPT_ID")
 	srv := newTestServer(t)
@@ -99,23 +100,61 @@ func TestHealthDefaultShape(t *testing.T) {
 	}
 }
 
-// TestHealthRemotePeerMinimal 远端对端（局域网/外部）：只获判活最小面，
-// 不泄露 pid/数据目录/可执行路径（P0 审计修复）。
 func TestHealthRemotePeerMinimal(t *testing.T) {
 	unsetForTest(t, "HOLDEXAR_UPDATE_ATTEMPT_ID")
+	gate := access.New()
 	srv := newTestServer(t)
+	srv.Gate = gate
+
 	rec := doFrom(t, srv, "GET", "/api/v1/health", "192.168.1.5:51234")
 	body := decodeJSON(t, rec.Body.Bytes())
-	if len(body) != 4 {
-		t.Fatalf("远端字段数=%d，应为 4：%v", len(body), body)
+	if len(body) != 1 || body["status"] != "ok" {
+		t.Fatalf("未鉴权远端应只返回 status:ok，实际=%v", body)
+	}
+
+	t.Setenv("HOLDEXAR_UPDATE_ATTEMPT_ID", "attempt-secret")
+	rec = doFrom(t, srv, "GET", "/api/v1/health", "192.168.1.5:51234")
+	body = decodeJSON(t, rec.Body.Bytes())
+	if len(body) != 1 || body["status"] != "ok" {
+		t.Fatalf("更新期间未鉴权远端不得泄露字段，实际=%v", body)
+	}
+	unsetForTest(t, "HOLDEXAR_UPDATE_ATTEMPT_ID")
+
+	w := httptest.NewRecorder()
+	gate.Issue(w)
+	cookie := w.Result().Cookies()[0]
+	authRec := httptest.NewRecorder()
+	authReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	authReq.RemoteAddr = "192.168.1.5:51234"
+	authReq.AddCookie(cookie)
+	srv.Handler().ServeHTTP(authRec, authReq)
+	held := decodeJSON(t, authRec.Body.Bytes())
+	if len(held) != 4 {
+		t.Fatalf("持会话远端字段数=%d，应为 4：%v", len(held), held)
 	}
 	for _, key := range []string{"pid", "dataDir", "executable"} {
-		if _, present := body[key]; present {
-			t.Fatalf("远端响应不得含 %s（P0-1 回归）", key)
+		if _, present := held[key]; present {
+			t.Fatalf("持会话远端不得含 %s", key)
 		}
 	}
-	if body["status"] != "ok" || body["app"] != "Holdexar" {
-		t.Fatalf("最小面不符：%v", body)
+	if held["status"] != "ok" || held["app"] != "Holdexar" || held["version"] != "0.3.6-beta" {
+		t.Fatalf("持会话远端最小面不符：%v", held)
+	}
+
+	v6Rec := doFrom(t, srv, "GET", "/api/v1/health", "[::1]")
+	v6Body := decodeJSON(t, v6Rec.Body.Bytes())
+	if len(v6Body) != 7 || v6Body["dataDir"] != srv.DataDir {
+		t.Fatalf("IPv6 回环未返回完整快照：%v", v6Body)
+	}
+}
+
+func TestWriteJSONNoEscapeHTMLAndNoTrailingNewline(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]string{"text": "a&b<c>d"})
+	got := rec.Body.Bytes()
+	want := []byte(`{"text":"a&b<c>d"}`)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("writeJSON=%q, want %q", got, want)
 	}
 }
 
@@ -138,6 +177,48 @@ func TestHealthUpdateAttemptFields(t *testing.T) {
 	}
 	if body["writeProtected"] != false || body["pageReady"] != false {
 		t.Fatalf("保护位=%v/%v，缺省应为显式 false", body["writeProtected"], body["pageReady"])
+	}
+}
+
+func TestHealthAuthenticatedLANHidesUpdateFieldsAndUsesDynamicCallbacks(t *testing.T) {
+	t.Setenv("HOLDEXAR_UPDATE_ATTEMPT_ID", "attempt-lan-secret")
+	gate := access.New()
+	srv := newTestServer(t)
+	srv.Gate = gate
+	schedReady := true
+	writeProtected := true
+	srv.SchedulerReadyFn = func() bool { return schedReady }
+	srv.UpdateWriteProtectedFn = func() bool { return writeProtected }
+
+	w := httptest.NewRecorder()
+	gate.Issue(w)
+	cookie := w.Result().Cookies()[0]
+
+	lanRec := httptest.NewRecorder()
+	lanReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	lanReq.RemoteAddr = "192.168.1.25:55555"
+	lanReq.AddCookie(cookie)
+	srv.Handler().ServeHTTP(lanRec, lanReq)
+	if lanRec.Code != http.StatusOK {
+		t.Fatalf("持会话局域网对端状态码=%d，应为 200", lanRec.Code)
+	}
+	lanBody := decodeJSON(t, lanRec.Body.Bytes())
+	for _, hidden := range []string{"updateAttemptId", "updateDataProtocol", "writeProtected", "pageReady", "pid", "dataDir", "executable"} {
+		if _, exists := lanBody[hidden]; exists {
+			t.Fatalf("持会话局域网对端不得暴露 %s：%v", hidden, lanBody)
+		}
+	}
+	if lanBody["schedulerReady"] != true {
+		t.Fatalf("SchedulerReadyFn 未生效：%v", lanBody)
+	}
+
+	loopRec := doFrom(t, srv, "GET", "/api/v1/health", "127.0.0.1:55555")
+	loopBody := decodeJSON(t, loopRec.Body.Bytes())
+	if loopBody["updateAttemptId"] != "attempt-lan-secret" {
+		t.Fatalf("回环对端应返回 updateAttemptId，实际=%v", loopBody)
+	}
+	if loopBody["writeProtected"] != true || loopBody["schedulerReady"] != true {
+		t.Fatalf("动态回调保护位/调度位未生效：%v", loopBody)
 	}
 }
 

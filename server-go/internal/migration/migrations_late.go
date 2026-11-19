@@ -8,12 +8,13 @@ import (
 	"math"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"holdexar/server-go/internal/proxypool"
+	"holdexar/server-go/internal/timeutil"
 )
 
 var lateMigrationSteps = map[int]migrationStep{
@@ -75,7 +76,7 @@ func migrationDropProjections(ctx context.Context, conn *sql.Conn, retired map[s
 	for table := range retired {
 		owners = append(owners, table)
 	}
-	sort.Strings(owners)
+	slices.Sort(owners)
 	for _, table := range owners {
 		columns, err := migrationColumns(ctx, conn, table)
 		if err != nil {
@@ -123,7 +124,7 @@ func migrationDropProjections(ctx context.Context, conn *sql.Conn, retired map[s
 				return err
 			}
 		}
-		sort.Strings(dropped)
+		slices.Sort(dropped)
 		for _, name := range dropped {
 			if err := migrationExec(ctx, conn, "ALTER TABLE "+migrationQuoteIdent(table)+" DROP COLUMN "+migrationQuoteIdent(name)); err != nil {
 				return err
@@ -529,7 +530,7 @@ func migrateProviderConfig(ctx context.Context, conn *sql.Conn) error {
 		if err != nil {
 			return err
 		}
-		now := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600)).Format("2006-01-02 15:04:05.000000")
+		now := time.Now().In(timeutil.Beijing).Format("2006-01-02 15:04:05.000000")
 		pairs := [][2]string{{"pilot.llm.providers", string(encoded)}, {"pilot.llm.active", `"legacy-v1"`}}
 		if key, exists := values["api_key"]; exists && migrationTruthy(key) {
 			pairs = append(pairs, [2]string{"pilot.llm.provider_key.legacy-v1", rawValues["api_key"]})
@@ -693,7 +694,7 @@ func migrateNodeCooldown(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	deadlines := map[string]time.Time{}
-	nowLocal := time.Now().In(time.FixedZone("Asia/Shanghai", 8*3600))
+	nowLocal := time.Now().In(timeutil.Beijing)
 	now := time.Date(nowLocal.Year(), nowLocal.Month(), nowLocal.Day(), nowLocal.Hour(), nowLocal.Minute(), nowLocal.Second(), nowLocal.Nanosecond(), time.UTC)
 	for rows.Next() {
 		var sub int64

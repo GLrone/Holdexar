@@ -37,7 +37,6 @@ func TestEnc1RoundTrip(t *testing.T) {
 	if got, _ := EncryptWith("", "steam-cookies", master); got != "" {
 		t.Fatal("空串必须原样返回")
 	}
-	// 全链路径空串原样返回；显式解封路径与 Python 一致报格式不完整
 	if got, err := DecryptSecretIn(t.TempDir(), "", "steam-cookies"); got != "" || err != nil {
 		t.Fatalf("空串全链解封应原样返回: %q %v", got, err)
 	}
@@ -91,14 +90,12 @@ func TestHKDFRFC5869Vector(t *testing.T) {
 	if hex.EncodeToString(got) != want {
 		t.Fatalf("HKDF-SHA256 与 RFC 5869 向量不符: %s", hex.EncodeToString(got))
 	}
-	// salt=nil 等价全零盐（与 Python HKDF salt=None 一致）
 	if hex.EncodeToString(hkdfBytes(ikm, nil, stagingInfo)) != hex.EncodeToString(hkdfBytes(ikm, make([]byte, 32), stagingInfo)) {
 		t.Fatal("nil 盐与全零盐派生不一致")
 	}
 }
 
 func TestUnb64LenientLikePython(t *testing.T) {
-	// Python validate=False：字母表外字符丢弃后按带 padding 解码（长度须仍对齐 4）
 	a, err := unb64("c3Ry$$$$MTIz")
 	if err != nil {
 		t.Fatal(err)
@@ -144,11 +141,9 @@ func TestFormatReject(t *testing.T) {
 			t.Fatalf("错误文案漂移: %q != %q", err.Error(), c.want)
 		}
 	}
-	// 病态输入（空 nonce 等）统一按解密失败拒绝，不得 panic
 	if _, err := DecryptWith("enc1:!!:!!", "steam-cookies", master); err == nil {
 		t.Fatal("病态密文未被拒绝")
 	}
-	// 篡改密文体：认证标签必须拒绝
 	token, _ := EncryptWith("v", "steam-cookies", master)
 	parts := strings.Split(token, ":")
 	replacement := "A"
@@ -159,7 +154,6 @@ func TestFormatReject(t *testing.T) {
 	if _, err := DecryptWith(tampered, "steam-cookies", master); err == nil {
 		t.Fatal("篡改密文未被拒绝")
 	}
-	// 截断密文体：必须报错
 	if _, err := DecryptWith(parts[0]+":"+parts[1]+":"+parts[2][:len(parts[2])-2], "steam-cookies", master); err == nil {
 		t.Fatal("截断密文未被拒绝")
 	}

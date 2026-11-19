@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,10 +14,8 @@ import (
 	"golang.org/x/crypto/scrypt"
 )
 
-// 数据主密钥托管：三模式（落点数据目录 secret.master；文件不存在 = legacy）。
-// legacy 主密钥由机器指纹 + 安装盐派生；dpapi 主密钥为随机数经系统凭据封装；
-// passphrase 主密钥为随机数经口令 scrypt 派生的 KEK 封装，解锁前凭据不可读写。
-// 进程内只保留口令模式解封后的主密钥（不落盘），重启即失效。
+// 数据主密钥三模式（secret.master 缺失=legacy）：legacy 机器派生、dpapi 系统凭据、passphrase 口令 scrypt。
+// 仅 passphrase 模式在进程内缓存已解封主密钥，重启失效。
 
 const (
 	ModeLegacy     = "legacy"
@@ -35,15 +33,12 @@ const (
 	scryptDKLen = keyBytes
 )
 
-// ── 进程内解封态 ─────────────────────────────────────────
-
 var (
 	lockMu      sync.Mutex
 	unlockedKey []byte
 )
 
-// ResetState 清进程内主密钥缓存（换钥 / 换数据目录 / 测试隔离后调用）：
-// 显式擦除字节后置 nil（GC 复制语义下尽力擦除，锁定后不留可回收明文）。
+// ResetState 清零并置空进程内主密钥缓存。
 func ResetState() {
 	lockMu.Lock()
 	defer lockMu.Unlock()
@@ -53,14 +48,12 @@ func ResetState() {
 	unlockedKey = nil
 }
 
-// LoadUnlockedKey 把已解封的主密钥写入进程态（换钥成功后由调用方回填）。
 func LoadUnlockedKey(key []byte) {
 	lockMu.Lock()
 	defer lockMu.Unlock()
 	unlockedKey = bytes.Clone(key)
 }
 
-// Lock 清空进程内主密钥（口令模式回到锁定态）。
 func Lock() { ResetState() }
 
 func currentUnlockedKey() []byte {
@@ -69,11 +62,8 @@ func currentUnlockedKey() []byte {
 	return bytes.Clone(unlockedKey)
 }
 
-// ── 模式判定 ─────────────────────────────────────────────
-
 func masterPath(dataDir string) string { return filepath.Join(dataDir, masterFile) }
 
-// ReadRecord 读取密钥文件（不存在返回 nil；损坏或非对象报 KeyringError）。
 func ReadRecord(dataDir string) (map[string]any, error) {
 	data, err := os.ReadFile(masterPath(dataDir))
 	if err != nil {
@@ -109,7 +99,6 @@ func ModeOf(dataDir string) (string, error) {
 	return "", keyringErrf("未知的密钥模式：'%s'", mode)
 }
 
-// IsLocked 口令模式且尚未解锁时为 true（其余模式恒 false）。
 func IsLocked(dataDir string) (bool, error) {
 	mode, err := ModeOf(dataDir)
 	if err != nil {
@@ -118,9 +107,6 @@ func IsLocked(dataDir string) (bool, error) {
 	return mode == ModePassphrase && currentUnlockedKey() == nil, nil
 }
 
-// DpapiAvailable 系统凭据保护是否可用（仅 Windows）。
-
-// Status 面向界面的状态投影（不泄露主密钥）。
 func Status(dataDir string) map[string]any {
 	mode, err := ModeOf(dataDir)
 	if err != nil {
@@ -136,10 +122,7 @@ func Status(dataDir string) map[string]any {
 	}
 }
 
-// ── 主密钥解析 ───────────────────────────────────────────
-
-// ResolveDMK 返回当前主密钥；口令模式未解锁抛 KeyLockedError。
-// legacy / dpapi 每次重算（可随时重算，无陈旧缓存问题）；口令模式用进程内解封态。
+// ResolveDMK 返回当前主密钥（legacy/dpapi 每次重算，passphrase 未解锁返回 KeyLockedError）。
 func ResolveDMK(dataDir string) ([]byte, error) {
 	mode, err := ModeOf(dataDir)
 	if err != nil {
@@ -165,7 +148,6 @@ func ResolveDMK(dataDir string) ([]byte, error) {
 	return unwrapDPAPI(rec)
 }
 
-// Unlock 口令模式解锁：口令正确则写入进程态主密钥，返回是否成功。
 func Unlock(dataDir string, passphrase string) (bool, error) {
 	rec, err := ReadRecord(dataDir)
 	if err != nil {
@@ -179,15 +161,12 @@ func Unlock(dataDir string, passphrase string) (bool, error) {
 		return false, err
 	}
 	if key == nil {
-		return false, nil // 口令不正确
+		return false, nil
 	}
 	LoadUnlockedKey(key)
 	return true, nil
 }
 
-// ── DPAPI 封装 ───────────────────────────────────────────
-
-// WrapDPAPI 随机主密钥 → DPAPI 封装记录（仅 Windows）。
 func WrapDPAPI(master []byte, dataDir string) (map[string]any, error) {
 	if !DpapiAvailable() {
 		return nil, keyringErr("系统凭据保护在当前平台不可用")
@@ -218,13 +197,7 @@ func unwrapDPAPI(rec map[string]any) ([]byte, error) {
 	return master, nil
 }
 
-// ── 口令封装（scrypt 派生 KEK + AES-256-GCM）────────────────
-
-// ── 口令封装记录校验（P0-2：记录来自不可信文件，昂贵派生前全量校验）──
-
-// KDF 参数边界：age 以 log2(N)≤22 硬顶限制不可信文件的解锁工作量（x/crypto
-// 自身只有相对 maxInt 的关系式，64 位平台拦不住大 N 内存耗尽）；内存帽按 NAS
-// 实测裁决前的保守值收紧。
+// KDF 参数硬顶（log2(N)≤22、峰值内存 ≤256MiB），防止不可信文件触发内存耗尽。
 const (
 	kdfNMin     = 1 << 12
 	kdfNMax     = 1 << 22
@@ -234,8 +207,7 @@ const (
 	gcmTagBytes = 16
 )
 
-// scryptMu 口令派生串行化：合法高成本参数也不允许并发叠加内存（派生只由
-// 解锁/换钥/改口令触发，低频操作）。
+// scryptMu 串行化口令派生，避免并发叠加 KDF 内存。
 var scryptMu sync.Mutex
 
 type passphraseRecord struct {
@@ -244,9 +216,7 @@ type passphraseRecord struct {
 	sealed      []byte
 }
 
-// validatePassphraseRecord 校验并解析口令封装记录：算法白名单、KDF 参数
-// 边界、盐/Nonce/密文长度。全部通过才允许派生——参数缺失不做默认降级，
-// 非法记录在昂贵调用前拒绝（恶意大 N 曾可致解锁内存耗尽）。
+// validatePassphraseRecord 在 scrypt 派生前校验算法、参数边界与密文字段长度（禁止缺省降级）。
 func validatePassphraseRecord(rec map[string]any) (*passphraseRecord, error) {
 	if v, ok := pyIntStrict(rec, "v"); !ok || v != fileVersion {
 		return nil, keyringErrf("密钥记录版本非法：%v", rec["v"])
@@ -298,8 +268,7 @@ func validatePassphraseRecord(rec map[string]any) (*passphraseRecord, error) {
 	return &passphraseRecord{n: n, r: r, p: p, dk: dk, salt: salt, nonce: nonce, sealed: sealed}, nil
 }
 
-// pyIntStrict 严格整型提取：字段缺失/为 null 返回 false（不做默认降级——
-// pyIntOr 的默认值分支仅服务兼容读，不可用于不可信记录）。
+// pyIntStrict 字段缺失或为 null 返回 false，不做默认降级。
 func pyIntStrict(m map[string]any, key string) (int, bool) {
 	if v, present := m[key]; !present || v == nil {
 		return 0, false
@@ -307,7 +276,6 @@ func pyIntStrict(m map[string]any, key string) (int, bool) {
 	return pyIntOr(m, key, 0)
 }
 
-// WrapPassphrase 随机主密钥 → 口令封装记录。
 func WrapPassphrase(master []byte, passphrase string) (map[string]any, error) {
 	if passphrase == "" {
 		return nil, keyringErr("口令不能为空")
@@ -330,8 +298,6 @@ func WrapPassphrase(master []byte, passphrase string) (map[string]any, error) {
 	}, nil
 }
 
-// unwrapPassphrase 口令封装 → 主密钥；口令不正确返回 nil。
-// 记录先经全量校验（廉价拒绝），再进入昂贵派生。
 func unwrapPassphrase(rec map[string]any, passphrase string) ([]byte, error) {
 	parsed, err := validatePassphraseRecord(rec)
 	if err != nil {
@@ -345,16 +311,12 @@ func unwrapPassphrase(rec map[string]any, passphrase string) ([]byte, error) {
 	}
 	plain, ok := gcmOpen(kek, parsed.nonce, parsed.sealed)
 	if !ok {
-		return nil, nil // 认证标签不符 = 口令错误
+		return nil, nil
 	}
 	return plain, nil
 }
 
-// ── 密钥文件落盘 ─────────────────────────────────────────
-
-// WriteRecord 密钥文件落盘（先写临时文件再替换：断电时要么旧要么新，不留半截）。
-// JSON 形状与 Python json.dumps(ensure_ascii=False) 逐字节一致（键序固定、
-// 分隔符 ", "/": "）。
+// WriteRecord 以固定键序与 ", "/": " 分隔符原子写入 secret.master。
 func WriteRecord(dataDir string, rec map[string]any) error {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return keyringErrf("密钥文件写入失败（数据目录不可写？）：%v", err)
@@ -362,7 +324,6 @@ func WriteRecord(dataDir string, rec map[string]any) error {
 	return writeAtomicText(masterPath(dataDir), dumpRecordJSON(rec), "密钥文件写入失败（数据目录不可写？）")
 }
 
-// RemoveRecord 删除密钥文件（回到 legacy 模式）。
 func RemoveRecord(dataDir string) error {
 	if err := os.Remove(masterPath(dataDir)); err != nil && !os.IsNotExist(err) {
 		return err
@@ -370,7 +331,6 @@ func RemoveRecord(dataDir string) error {
 	return nil
 }
 
-// SnapshotRecord 读取密钥文件原始字节（换钥失败回滚用）；不存在返回 nil。
 func SnapshotRecord(dataDir string) []byte {
 	data, err := os.ReadFile(masterPath(dataDir))
 	if err != nil {
@@ -379,7 +339,6 @@ func SnapshotRecord(dataDir string) []byte {
 	return data
 }
 
-// RestoreRecord 按原始字节恢复密钥文件（先临时后替换）；nil = 删除。
 func RestoreRecord(dataDir string, raw []byte) error {
 	if raw == nil {
 		return RemoveRecord(dataDir)
@@ -397,7 +356,6 @@ func RestoreRecord(dataDir string, raw []byte) error {
 	return nil
 }
 
-// writeAtomicText 先写临时文件再替换；POSIX 收紧 0600，Windows 走 ACL 继承。
 func writeAtomicText(path, text, errPrefix string) error {
 	tmp := withTmpSuffix(path)
 	if err := os.WriteFile(tmp, []byte(text), 0o600); err != nil {
@@ -412,16 +370,13 @@ func writeAtomicText(path, text, errPrefix string) error {
 	return nil
 }
 
-// withTmpSuffix 临时文件名：末段后缀替换为 .tmp（对齐 Path.with_suffix(".tmp")，
-// secret.master → secret.tmp、secret.master.staging → secret.master.tmp）。
+// withTmpSuffix 将末段扩展名替换为 .tmp（对齐 Path.with_suffix(".tmp")）。
 func withTmpSuffix(path string) string {
 	if i := strings.LastIndexByte(path, '.'); i >= 0 {
 		return path[:i] + ".tmp"
 	}
 	return path + ".tmp"
 }
-
-// ── 记录序列化（Python json.dumps 形状）────────────────────
 
 // 记录键序 = Python 字典插入序；未知键按字典序追加在末尾保确定性。
 var recordKeyOrder = map[string][]string{
@@ -468,7 +423,7 @@ func dumpOrdered(b *strings.Builder, m map[string]any, order []string) {
 			rest = append(rest, k)
 		}
 	}
-	sort.Strings(rest)
+	slices.Sort(rest)
 	for _, k := range rest {
 		writeKV(k, m[k])
 	}
@@ -511,9 +466,6 @@ func dumpValue(b *strings.Builder, key string, v any) {
 	}
 }
 
-// ── Python 值语义窄面复刻 ─────────────────────────────────
-
-// pyStr Python str() 窄面复刻（记录字段诊断与 base64 取值用）。
 func pyStr(v any) string {
 	switch t := v.(type) {
 	case nil:
@@ -536,7 +488,6 @@ func pyStr(v any) string {
 	return ""
 }
 
-// pyStrOrEmpty Python str(x or "")：假值（None/空串/0/False）回空串。
 func pyStrOrEmpty(v any) string {
 	if !pyTruthy(v) {
 		return ""
@@ -561,7 +512,6 @@ func pyTruthy(v any) bool {
 	return true
 }
 
-// pyIntOr Python kdf.get(key, default) 后 int() 的窄面复刻；不可解析返回 false。
 func pyIntOr(m map[string]any, key string, def int) (int, bool) {
 	v, present := m[key]
 	if !present || v == nil {
@@ -575,7 +525,7 @@ func pyIntOr(m map[string]any, key string, def int) (int, bool) {
 			return int(n), true
 		}
 		if f, err := t.Float64(); err == nil {
-			return int(f), true // int() 向零截断
+			return int(f), true
 		}
 		return 0, false
 	case float64:

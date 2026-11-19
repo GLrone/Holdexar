@@ -1,7 +1,3 @@
-// Package settings：settings 域读写（KV 配置，首个走写闸的写路径）。
-// 读路径直查 app_settings；写路径必须经 store.WriteGate 串行落库，
-// 凭据加密等纯计算在闸外完成，闸内只做库写。
-// MCP 运行态经函数字段注入（serverd 装配 agent 实现），未注入时按未在役形状输出。
 package settings
 
 import (
@@ -19,11 +15,11 @@ import (
 	"holdexar/server-go/internal/access"
 	"holdexar/server-go/internal/config"
 	"holdexar/server-go/internal/events"
+	"holdexar/server-go/internal/httpx"
 	"holdexar/server-go/internal/secretbox"
 	"holdexar/server-go/internal/store"
 )
 
-// app_settings 键（与 Python 侧 KV 键一致）。
 const (
 	keySteamID        = "account.steam_id"
 	keySteamAPIKey    = "account.steam_api_key"
@@ -37,13 +33,16 @@ const (
 	keyDirectNotice   = "ui.direct_notice_seen"
 	keyTheme          = "ui.theme"
 	keyMCPEnabled     = "mcp.enabled"
-	// 局域网访问模式（内存态归 access 包，这里持持久化事实）
-	keyLANEnabled  = "access.lan_enabled"
-	keyLANPassword = "access.lan_password"
+	keyLANEnabled     = "access.lan_enabled"
+	keyLANPassword    = "access.lan_password"
 )
 
-// resolveDataDir 数据目录判定（凭据主密钥托管挂在其下），Register 时调用
-// 一次；测试可替换。与 systemx 同款装配。
+const (
+	KeyLANEnabled      = keyLANEnabled
+	KeyLANPassword     = keyLANPassword
+	KeyLANPasswordHash = keyLANPassword + "_hash"
+)
+
 var resolveDataDir = func() string {
 	dir, err := config.ResolveDataDir()
 	if err != nil {
@@ -55,6 +54,8 @@ var resolveDataDir = func() string {
 type Options struct {
 	Bus     *events.Bus
 	Changed func(context.Context, []string, []string)
+	// SessionGate 改密时吊销已签发解锁会话（nil 不轮换）。
+	SessionGate *access.Gate
 }
 
 func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, options ...Options) {
@@ -69,12 +70,10 @@ func Register(mux *http.ServeMux, db *sql.DB, gate *store.WriteGate, options ...
 	registerSteamLocalRoutes(mux, h)
 }
 
-// OnMCPEnabledWrite mcp.enabled 落库成功后的运行时重载回调；cmd/serverd 注入
-// agent 侧实现（函数字段注入，避免 settings → agent 依赖）。nil 时跳过。
+// OnMCPEnabledWrite mcp.enabled 落库后回调（包级变量注入以解耦 agent；nil 跳过）。
 var OnMCPEnabledWrite func()
 
-// MCPStatus MCP 运行态快照（GET 的 mcp_running/mcp_error/mcp_forced_by_env）；
-// cmd/serverd 注入 agent 侧实现，nil 保持未在役占位形状。
+// MCPStatus MCP 运行态快照钩子（nil 返回未在役占位）。
 var MCPStatus func() (running bool, errText string, forcedByEnv bool)
 
 type handler struct {
@@ -85,19 +84,17 @@ type handler struct {
 }
 
 type accountPayload struct {
-	// SteamID Python dict 原值透传（真相为字符串；异常类型不收口）。
 	SteamID     any    `json:"steam_id"`
 	SteamAPIKey string `json:"steam_api_key"`
 	HasAPIKey   bool   `json:"has_api_key"`
 }
 
-// lanAccessPayload 局域网访问模式状态（Python LanAccessState 同形）：
-// 密码原文永不回显（P0-1：回环判定曾用可伪造的 Host 头，已取消回显能力），
-// 读取面只有 has_password 布尔；设置/修改走独立的输入端点。
+// lanAccessPayload 口令原文永不回显，仅暴露 has_password 与 password_source。
 type lanAccessPayload struct {
-	Enabled     bool `json:"enabled"`
-	EnvForced   bool `json:"env_forced"`
-	HasPassword bool `json:"has_password"`
+	Enabled        bool   `json:"enabled"`
+	EnvForced      bool   `json:"env_forced"`
+	HasPassword    bool   `json:"has_password"`
+	PasswordSource string `json:"password_source"`
 }
 
 type settingsResponse struct {
@@ -113,10 +110,9 @@ type settingsResponse struct {
 	Theme            string           `json:"theme"`
 	MCPEnabled       bool             `json:"mcp_enabled"`
 	LanAccess        lanAccessPayload `json:"lan_access"`
-	// MCP 运行态：cmd/serverd 注入 agent 侧快照；未注入时恒为未在役形状。
-	MCPRunning     bool   `json:"mcp_running"`
-	MCPError       string `json:"mcp_error"`
-	MCPForcedByEnv bool   `json:"mcp_forced_by_env"`
+	MCPRunning       bool             `json:"mcp_running"`
+	MCPError         string           `json:"mcp_error"`
+	MCPForcedByEnv   bool             `json:"mcp_forced_by_env"`
 }
 
 func (h *handler) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +124,6 @@ func (h *handler) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// readSettings 聚合 GET 全量形状：KV 各键 + 缺省（Python get_settings 同源）。
 func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 	resp := &settingsResponse{}
 
@@ -191,21 +186,31 @@ func (h *handler) readSettings(ctx context.Context) (*settingsResponse, error) {
 	if MCPStatus != nil {
 		resp.MCPRunning, resp.MCPError, resp.MCPForcedByEnv = MCPStatus()
 	}
-	// 局域网访问模式状态：内存态开关 + 环境密码优先的密码解析（Python
-	// _lan_state 同径）。明文密码永不回显：设置/修改走独立输入端点，读取
-	// 只给 has_password 布尔（P0-1：回环判定曾依赖可伪造的 Host 头）。
-	stored, err := ReadSecret(ctx, h.db, h.dataDir, keyLANPassword)
-	if err != nil {
+	hasUserHash := false
+	if v, err := h.kvValue(ctx, KeyLANPasswordHash); err != nil {
 		return nil, err
+	} else if v.present && pyBool(v.val) {
+		hasUserHash = true
 	}
-	password := access.EnvPassword()
-	if password == "" {
-		password = stored
+	hasLegacySecret := false
+	if !hasUserHash {
+		stored, err := ReadSecret(ctx, h.db, h.dataDir, keyLANPassword)
+		if err != nil {
+			return nil, err
+		}
+		hasLegacySecret = stored != ""
+	}
+	passwordSource := "none"
+	if hasUserHash || hasLegacySecret {
+		passwordSource = "user"
+	} else if access.EnvPassword() != "" {
+		passwordSource = "env"
 	}
 	resp.LanAccess = lanAccessPayload{
-		Enabled:     access.LANEnabled(),
-		EnvForced:   access.EnvForced(),
-		HasPassword: password != "",
+		Enabled:        access.LANEnabled(),
+		EnvForced:      access.EnvForced(),
+		HasPassword:    passwordSource != "none",
+		PasswordSource: passwordSource,
 	}
 	return resp, nil
 }
@@ -215,7 +220,6 @@ type kvValue struct {
 	val     any
 }
 
-// kvValue 读单键并反序列化 value_json；缺行/NULL 视为不存在（Python 返回 default 同径）。
 func (h *handler) kvValue(ctx context.Context, key string) (kvValue, error) {
 	var raw sql.NullString
 	err := h.db.QueryRowContext(ctx,
@@ -238,8 +242,6 @@ func (h *handler) kvValue(ctx context.Context, key string) (kvValue, error) {
 	return kvValue{present: true, val: val}, nil
 }
 
-// ReadBool 读单键布尔值：缺行/NULL 返回 def（Python get_value(key, def) 同径，
-// 值按 Python bool() 语义收口）。
 func ReadBool(ctx context.Context, db *sql.DB, key string, def bool) (bool, error) {
 	var raw sql.NullString
 	err := db.QueryRowContext(ctx,
@@ -260,7 +262,6 @@ func ReadBool(ctx context.Context, db *sql.DB, key string, def bool) (bool, erro
 	return pyBool(val), nil
 }
 
-// ReadSecret 兼容明文凭据，密文不可解时返回空值。
 func ReadSecret(ctx context.Context, db *sql.DB, dataDir, key string) (string, error) {
 	var raw sql.NullString
 	err := db.QueryRowContext(ctx, `SELECT value_json FROM app_settings WHERE key=?`, key).Scan(&raw)
@@ -288,7 +289,45 @@ func ReadSecret(ctx context.Context, db *sql.DB, dataDir, key string) (string, e
 	return plain, nil
 }
 
-// maskKey 掩码回显：保留末 4 字符（Steam Key 恒 ASCII，字符/字节切片同形）。
+func ReadValue(ctx context.Context, db *sql.DB, key string) (string, error) {
+	var raw sql.NullString
+	err := db.QueryRowContext(ctx,
+		"SELECT value_json FROM app_settings WHERE key = ?", key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !raw.Valid {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var val any
+	if err := json.Unmarshal([]byte(raw.String), &val); err != nil {
+		return "", err
+	}
+	s, _ := val.(string)
+	return s, nil
+}
+
+func DeleteValue(ctx context.Context, conn *sql.Conn, key string) error {
+	_, err := conn.ExecContext(ctx, `DELETE FROM app_settings WHERE key = ?`, key)
+	return err
+}
+
+func (h *handler) lanPasswordExists(ctx context.Context) (bool, error) {
+	if v, err := h.kvValue(ctx, KeyLANPasswordHash); err != nil {
+		return false, err
+	} else if v.present && pyBool(v.val) {
+		return true, nil
+	}
+	stored, err := ReadSecret(ctx, h.db, h.dataDir, keyLANPassword)
+	if err != nil {
+		return false, err
+	}
+	if stored != "" {
+		return true, nil
+	}
+	return access.EnvPassword() != "", nil
+}
+
 func maskKey(key string) string {
 	r := []rune(key)
 	if len(r) == 0 {
@@ -300,7 +339,6 @@ func maskKey(key string) string {
 	return "****"
 }
 
-// orEmpty Python `值 or ""`：假值回空串，真值原样（字符串外的异常类型透传）。
 func orEmpty(v kvValue) any {
 	if !v.present || !pyBool(v.val) {
 		return ""
@@ -308,7 +346,6 @@ func orEmpty(v kvValue) any {
 	return v.val
 }
 
-// pyBool Python bool() 语义：None/空串/零值/空容器为假，其余为真。
 func pyBool(v any) bool {
 	switch x := v.(type) {
 	case nil:
@@ -328,7 +365,6 @@ func pyBool(v any) bool {
 	return true
 }
 
-// pyStrOr Python `值 or 默认` 后 str()：标量直转，容器退化为 JSON 文本。
 func pyStrOr(v any, def string) string {
 	if !pyBool(v) {
 		return def
@@ -353,7 +389,6 @@ func pyStrOr(v any, def string) string {
 	return string(b)
 }
 
-// pyFloatStr Python float str() 近似：整值补 .0，科学计数走 g 格式。
 func pyFloatStr(f float64, raw string) string {
 	if !strings.ContainsAny(raw, ".eE") {
 		return raw
@@ -372,12 +407,32 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	req, vErrs, fatal := parseUpdate(body)
 	if fatal != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": []any{*fatal}})
+		httpx.WriteValidationError(w, *fatal)
 		return
 	}
 	if len(vErrs) > 0 {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": vErrs})
+		httpx.WriteValidationError(w, vErrs...)
 		return
+	}
+	// 局域网访问密码至少 8 位（422）；空串清密或已有口令（含 env）改密时
+	// 触发会话轮换，吊销已签发解锁会话。
+	rotateSession := false
+	if req.lanAccess != nil && req.lanAccess.password != nil {
+		pw := strings.TrimSpace(*req.lanAccess.password)
+		if pw == "" {
+			rotateSession = true
+		} else if !strings.HasPrefix(pw, "****") {
+			if len([]rune(pw)) < 8 {
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "访问密码至少 8 位"})
+				return
+			}
+			prev, perr := h.lanPasswordExists(r.Context())
+			if perr != nil {
+				writeJSON(w, http.StatusInternalServerError, detailNull())
+				return
+			}
+			rotateSession = prev
+		}
 	}
 	writes, err := h.buildWrites(req)
 	if err != nil {
@@ -392,11 +447,9 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, detailNull())
 			return
 		}
-		// mcp.enabled 变更后运行时重应用（Python 写入口 reapply 同径）
 		if req.mcpEnabled != nil && OnMCPEnabledWrite != nil {
 			OnMCPEnabledWrite()
 		}
-		// 局域网开关/密码变更即时生效：内存态同步 + Host 闸白名单刷新
 		if req.lanAccess != nil {
 			if req.lanAccess.enabled != nil {
 				access.SetLANEnabled(*req.lanAccess.enabled)
@@ -410,12 +463,18 @@ func (h *handler) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, detailNull())
 		return
 	}
+	if rotateSession && h.options.SessionGate != nil {
+		// 改密/清密后重置会话令牌，仅为当前响应重签发 Cookie。
+		h.options.SessionGate.Reset()
+		h.options.SessionGate.Issue(w)
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 type kvWrite struct {
 	key   string
-	value string // JSON 序列化文本（value_json 存 JSON 文本）
+	value string
+	drop  bool
 }
 
 func WriteValue(ctx context.Context, conn *sql.Conn, key string, value any) error {
@@ -426,14 +485,22 @@ func WriteValue(ctx context.Context, conn *sql.Conn, key string, value any) erro
 	return applyWrites(ctx, conn, []kvWrite{{key: key, value: string(raw)}})
 }
 
-// applyWrites 单事务批量落库（Python set_values 批量同形；一行一 updated_at 快照）。
 func applyWrites(ctx context.Context, conn *sql.Conn, writes []kvWrite) error {
 	if len(writes) == 0 {
 		return nil
 	}
 	rows := make([][2]string, 0, len(writes))
 	for _, write := range writes {
+		if write.drop {
+			if _, err := conn.ExecContext(ctx, `DELETE FROM app_settings WHERE key = ?`, write.key); err != nil {
+				return err
+			}
+			continue
+		}
 		rows = append(rows, [2]string{write.key, write.value})
+	}
+	if len(rows) == 0 {
+		return nil
 	}
 	raw, err := json.Marshal(rows)
 	if err != nil {
@@ -444,37 +511,19 @@ func applyWrites(ctx context.Context, conn *sql.Conn, writes []kvWrite) error {
 	return err
 }
 
-// beijingNow 本地挂钟北京时间（UTC+8 固定，无夏令时），裸时刻字符串与
-// Python DateTime 列存储格式一致。
 func beijingNow() string {
 	return time.Now().UTC().Add(8 * time.Hour).Format("2006-01-02 15:04:05.000000")
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	httpx.WriteJSON(w, status, payload)
 }
 
 func detailNull() map[string]any {
-	return map[string]any{"detail": nil}
+	return httpx.DetailNull()
 }
 
-// ---- 请求体校验（形状对齐 FastAPI/Pydantic 实测锚点） ----
-
-// valErr 校验错误项：type/loc/msg/input 与 Pydantic 输出逐字段一致。
-type valErr struct {
-	Type  string         `json:"type"`
-	Loc   []any          `json:"loc"`
-	Msg   string         `json:"msg"`
-	Input any            `json:"input"`
-	Ctx   map[string]any `json:"ctx,omitempty"`
-}
+type valErr = httpx.ValErr
 
 const (
 	errStringType     = "string_type"
@@ -491,16 +540,14 @@ const (
 	errJSONInvalidMsg = "JSON decode error"
 )
 
-// lanAccessUpdate 局域网访问模式写入意图（Python LanAccessUpdate 同形）。
 type lanAccessUpdate struct {
 	enabled  *bool
 	password *string
 }
 
-// updateReq 校验后的写入意图；nil 表示该字段不在请求中（含显式 null）。
 type updateReq struct {
 	steamID          *string
-	steamAPIKey      *string // 已 strip 的明文；加密在 buildWrites 闸外完成
+	steamAPIKey      *string
 	onboardingDone   *bool
 	autoPrice        *bool
 	backupAuto       *bool
@@ -514,8 +561,6 @@ type updateReq struct {
 	lanAccess        *lanAccessUpdate
 }
 
-// parseUpdate 解析并校验 PUT 请求体：全部字段错误合并上报（Pydantic 非短路同径）。
-// fatal 为整体形状错误（非法 JSON / 顶层非对象），直接替代字段级结果。
 func parseUpdate(body []byte) (*updateReq, []valErr, *valErr) {
 	if len(body) == 0 {
 		return nil, nil, &valErr{Type: errMissing, Loc: []any{"body"}, Msg: errMissingMsg, Input: nil}
@@ -632,9 +677,8 @@ func parseUpdate(body []byte) (*updateReq, []valErr, *valErr) {
 	return req, nil, nil
 }
 
-// buildWrites 校验后的写入意图 → KV 写列表（值已 JSON 序列化）。
-// 凭据加密在此完成：纯计算放闸外，落库统一经写闸单事务。
-// 掩码回显（**** 前缀）与空串不落库（Python 掩码防回写同径）。
+// buildWrites 将写入意图转为 KV 写操作（纯加密计算在写闸外完成）；
+// **** 掩码不回写，steam_api_key 空串跳过，lan_access.password 空串清双键。
 func (h *handler) buildWrites(req *updateReq) ([]kvWrite, error) {
 	var writes []kvWrite
 	push := func(key string, val any) {
@@ -678,7 +722,6 @@ func (h *handler) buildWrites(req *updateReq) ([]kvWrite, error) {
 	if req.directNoticeSeen != nil {
 		push(keyDirectNotice, *req.directNoticeSeen)
 	}
-	// 主题只认两值，异常值忽略（防脏配置）。
 	if req.theme != nil && (*req.theme == "dark" || *req.theme == "light") {
 		push(keyTheme, *req.theme)
 	}
@@ -690,21 +733,21 @@ func (h *handler) buildWrites(req *updateReq) ([]kvWrite, error) {
 			push(keyLANEnabled, *req.lanAccess.enabled)
 		}
 		if req.lanAccess.password != nil {
-			// 前端掩码回显不回写；空串不落库（下次解锁自动重生成，Python 同径）
 			password := strings.TrimSpace(*req.lanAccess.password)
-			if password != "" && !strings.HasPrefix(password, "****") {
-				sealed, err := secretbox.EncryptSecretIn(h.dataDir, password, secretbox.SecretPurpose(keyLANPassword))
-				if err != nil {
-					return nil, err
-				}
-				push(keyLANPassword, sealed)
+			if password == "" {
+				writes = append(writes,
+					kvWrite{key: KeyLANPasswordHash, drop: true},
+					kvWrite{key: keyLANPassword, drop: true},
+				)
+			} else if !strings.HasPrefix(password, "****") {
+				push(KeyLANPasswordHash, access.HashPassword(password))
+				writes = append(writes, kvWrite{key: keyLANPassword, drop: true})
 			}
 		}
 	}
 	return writes, nil
 }
 
-// wantStr 字符串字段校验（Pydantic string_type 同径）。
 func wantStr(raw any, loc ...string) (string, *valErr) {
 	s, ok := raw.(string)
 	if !ok {
@@ -713,8 +756,6 @@ func wantStr(raw any, loc ...string) (string, *valErr) {
 	return s, nil
 }
 
-// wantBool 布尔字段宽松强转：真值集 {true,false,t,f,y,n,yes,no,on,off,1,0}
-// 大小写不敏感，0/1 数值合法，越界数值/容器拒绝（Pydantic lax 实测同径）。
 func wantBool(raw any, loc ...string) (bool, *valErr) {
 	switch x := raw.(type) {
 	case bool:
@@ -741,7 +782,6 @@ func wantBool(raw any, loc ...string) (bool, *valErr) {
 	return false, &valErr{Type: errBoolType, Loc: locAny("body", loc), Msg: errBoolTypeMsg, Input: raw}
 }
 
-// locAny 前缀 + 变长段（["body","theme"] / ["body","account","steam_id"]）。
 func locAny(prefix string, parts []string) []any {
 	out := make([]any, 0, len(parts)+1)
 	out = append(out, prefix)

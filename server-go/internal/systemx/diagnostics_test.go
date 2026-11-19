@@ -1,22 +1,27 @@
-// diagnostics_test.go 三诊断面测试：logs 夹取/422、write-scheduler 形状、
-// 五段聚合形状与一面失败不拖垮（Python router.py:131/448/606 形状锚点）。
 package systemx
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"holdexar/server-go/internal/eventstream"
+	"holdexar/server-go/internal/netenv"
 	"holdexar/server-go/internal/store"
 )
 
 func diagFixture(t *testing.T, tables bool) (*sql.DB, *eventstream.Ring, *http.ServeMux) {
 	t.Helper()
+	cleanup := netenv.ResetTakeoverForTest(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	})
+	t.Cleanup(cleanup)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "holdexar.db")
 	db, err := store.Open(path)
@@ -54,7 +59,6 @@ func diagDo(mux *http.ServeMux, method, path string) *httptest.ResponseRecorder 
 	return rec
 }
 
-// TestSystemLogsLimitClamp 默认 200、越界 422（ge=1/le=2000 实测形状）。
 func TestSystemLogsLimitClamp(t *testing.T) {
 	_, ring, mux := diagFixture(t, true)
 	for i := 0; i < 5; i++ {
@@ -113,8 +117,6 @@ func TestSystemLogsLimitClamp(t *testing.T) {
 	}
 }
 
-// TestWriteSchedulerSnapshot 写调度快照形状（键名对齐 Python
-// write_scheduler_diagnostics；pool 段为 Go 闸快照字段——登记差异）。
 func TestWriteSchedulerSnapshot(t *testing.T) {
 	_, _, mux := diagFixture(t, true)
 	rec := diagDo(mux, "GET", "/api/v1/system/write-scheduler")
@@ -148,13 +150,11 @@ func decodeDiag(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	return out
 }
 
-// TestDiagnosticsFiveSections 五段聚合形状 + 信号派生。
 func TestDiagnosticsFiveSections(t *testing.T) {
 	db, ring, mux := diagFixture(t, true)
 	if _, err := db.Exec(`INSERT INTO app_settings(key,value_json,updated_at) VALUES('proxy.strategy','"proxy_first"','2026-11-14 10:00:00')`); err != nil {
 		t.Fatal(err)
 	}
-	// 手动池两条启用一条 ok → pool_available_exits ≥ 1（proxy_first 不产池不可用信号）
 	if _, err := db.Exec(`INSERT INTO proxies(id,enabled,status) VALUES(1,1,'ok'),(2,1,'unknown')`); err != nil {
 		t.Fatal(err)
 	}
@@ -193,18 +193,13 @@ func TestDiagnosticsFiveSections(t *testing.T) {
 	}
 }
 
-// TestDiagnosticsSectionFailure 一面失败不拖垮：缺表段落降级 {"error":...}，
-// 其余段照常（Python _diagnostics_section 同语义）。
 func TestDiagnosticsSectionFailure(t *testing.T) {
-	_, _, mux := diagFixture(t, false) // 不建业务表：identity/backlog 读数失败
+	_, _, mux := diagFixture(t, false)
 	rec := diagDo(mux, "GET", "/api/v1/system/diagnostics")
 	if rec.Code != 200 {
 		t.Fatalf("诊断面自身必须可用：%d %s", rec.Code, rec.Body.String())
 	}
 	body := decodeDiag(t, rec)
-	// 缺表面降级不拖垮整体：backlog 读失败落 error；identity 的 KV/池计数
-	// 读失败走缺省软降级（仍输出完整键集）；cycles/job_runs 经 mux 自取
-	// 得 404 归 error。聚合壳必须完整。
 	if _, ok := body["backlog"].(map[string]any)["error"]; !ok {
 		t.Fatalf("backlog 段应降级为 error：%s", rec.Body.String())
 	}
@@ -220,5 +215,66 @@ func TestDiagnosticsSectionFailure(t *testing.T) {
 	}
 	if len(body["signals"].([]any)) != 0 {
 		t.Fatal("失败面不得产信号")
+	}
+}
+
+func TestDiagnosticsDirectDepsAndSignals(t *testing.T) {
+	cleanup := netenv.ResetTakeoverForTest(func(_ context.Context, _, _ string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.2.3.4")}, nil
+	})
+	t.Cleanup(cleanup)
+
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "holdexar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`CREATE TABLE app_settings (key VARCHAR(100) PRIMARY KEY, value_json TEXT, updated_at DATETIME);
+	CREATE TABLE proxies (id INTEGER PRIMARY KEY, enabled BOOLEAN, status VARCHAR(16));
+	CREATE TABLE game_current_prices (appid BIGINT, region_code VARCHAR(8), price_status VARCHAR(16), updated_at DATETIME);`); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	RegisterDiagnostics(mux, db, DiagnosticsDeps{
+		Gate: store.NewWriteGate(db, filepath.Join(dir, "gate.lock")),
+		Ring: eventstream.NewRing(16),
+		Cycles: func(_ context.Context, limit int) ([]map[string]any, error) {
+			if limit != 5 {
+				t.Fatalf("expected limit 5, got %d", limit)
+			}
+			return []map[string]any{{"id": 7, "status": "failed", "error": "网络超时"}}, nil
+		},
+		JobRuns: func(_ context.Context, limit int) (map[string]any, error) {
+			if limit != 10 {
+				t.Fatalf("expected limit 10, got %d", limit)
+			}
+			return map[string]any{
+				"total": 2,
+				"items": []any{
+					map[string]any{"id": 1, "status": "failed"},
+					map[string]any{"id": 2, "status": "success"},
+				},
+			}, nil
+		},
+	})
+
+	rec := diagDo(mux, "GET", "/api/v1/system/diagnostics")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decodeDiag(t, rec)
+	cycles := body["cycles"].(map[string]any)
+	if cycles["last"].(map[string]any)["status"] != "failed" {
+		t.Fatalf("unexpected cycles section: %v", cycles)
+	}
+	jobRuns := body["job_runs"].(map[string]any)
+	if jobRuns["total"] != float64(2) {
+		t.Fatalf("unexpected job_runs section: %v", jobRuns)
+	}
+	signals := body["signals"].([]any)
+	if len(signals) != 2 {
+		t.Fatalf("expected 2 signals (last_cycle_failed + job_runs_failed), got %v", signals)
 	}
 }

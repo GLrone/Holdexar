@@ -1,8 +1,5 @@
 //go:build windows
 
-// steamlocal_windows.go 本机 Steam 客户端账号发现（等价 Python
-// domains/settings/steam_local.py）：注册表三视图枚举 Steam 根目录 →
-// config/loginusers.vdf 解析可导入账号。前端「导入本机账号」数据源。
 package settings
 
 import (
@@ -21,7 +18,6 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-// steamAccount loginusers.vdf 账号条目（Python parse_loginusers 输出同形）。
 type steamAccount struct {
 	SteamID     string `json:"steam_id"`
 	PersonaName string `json:"persona_name"`
@@ -35,7 +31,6 @@ const (
 
 var steamTokenRe = regexp.MustCompile(`"(?:\\.|[^"\\])*"|//[^\r\n]*|[{}]|[^\s{}"]+`)
 
-// decodeSteamToken VDF token 去引号 + 反转义（Python _decode_token 同构）。
 func decodeSteamToken(token string) string {
 	if len(token) < 2 || token[0] != '"' || token[len(token)-1] != '"' {
 		return token
@@ -55,7 +50,6 @@ func decodeSteamToken(token string) string {
 	})
 }
 
-// isSteamID64 token 是否落在 SteamID64 数值区间。
 func isSteamID64(value string) bool {
 	n, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
@@ -64,8 +58,6 @@ func isSteamID64(value string) bool {
 	return steamID64Base <= n && n <= steamID64Base+(1<<32)-1
 }
 
-// parseLoginusers loginusers.vdf 原文 → 账号列表（users 块内 steamid64 →
-// PersonaName；块结构异常一律回空，Python ValueError 同语义）。
 func parseLoginusers(contents string) []steamAccount {
 	var tokens []string
 	for _, token := range steamTokenRe.FindAllString(contents, -1) {
@@ -113,7 +105,6 @@ func parseLoginusers(contents string) []steamAccount {
 	return nil
 }
 
-// readSteamAccount 单个账号块内的 PersonaName（遇到 "}" 收束）。
 func readSteamAccount(tokens []string, position int) (string, int, bool) {
 	persona := ""
 	for position < len(tokens) {
@@ -141,7 +132,6 @@ func readSteamAccount(tokens []string, position int) (string, int, bool) {
 	return "", 0, false
 }
 
-// skipVDFBlock 跳过一个完整花括号块，返回收尾 "}" 之后的位置。
 func skipVDFBlock(tokens []string, position int) (int, bool) {
 	depth := 1
 	for position < len(tokens) && depth > 0 {
@@ -159,9 +149,6 @@ func skipVDFBlock(tokens []string, position int) (int, bool) {
 	return position, true
 }
 
-// steamRoots 本机注册表 Steam 根目录候选（HKCU/HKLM 的 Steam 键与
-// App Paths × WOW64 三视图；exe 值取父目录，normcase 去重保序）。
-// var 为测试注入缝。
 var steamRoots = registeredSteamRoots
 
 func registeredSteamRoots() []string {
@@ -187,7 +174,7 @@ func registeredSteamRoots() []string {
 			}
 			valueNames := location.values
 			if valueNames == nil {
-				valueNames = []string{""} // App Paths 的默认值（未命名值）
+				valueNames = []string{""}
 			}
 			for _, name := range valueNames {
 				value, _, err := key.GetStringValue(name)
@@ -213,7 +200,6 @@ func registeredSteamRoots() []string {
 	return roots
 }
 
-// expandUserHome Python Path.expanduser 近似：~ 前缀换主目录。
 func expandUserHome(path string) string {
 	if path == "~" || strings.HasPrefix(path, `~\`) || strings.HasPrefix(path, "~/") {
 		if home, err := os.UserHomeDir(); err == nil {
@@ -223,8 +209,6 @@ func expandUserHome(path string) string {
 	return path
 }
 
-// discoverLocalSteamAccounts 全部注册根扫描：steam.exe 在场 + loginusers
-// 未超限才解析；账号按 steam_id 首见去重。
 func discoverLocalSteamAccounts(roots []string) []steamAccount {
 	accounts := map[string]steamAccount{}
 	order := []string{}
@@ -261,7 +245,6 @@ func discoverLocalSteamAccounts(roots []string) []steamAccount {
 	return out
 }
 
-// registerSteamLocalRoutes 装配本机账号发现两端点（GET 列表 / POST 导入）。
 func registerSteamLocalRoutes(mux *http.ServeMux, h *handler) {
 	mux.HandleFunc("GET /api/v1/settings/steam-local-accounts", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"accounts": discoverLocalSteamAccounts(steamRoots())})
@@ -289,11 +272,11 @@ func registerSteamLocalRoutes(mux *http.ServeMux, h *handler) {
 			writeJSON(w, http.StatusInternalServerError, detailNull())
 			return
 		}
+		h.notify(r.Context(), []kvWrite{{key: keySteamID}}, nil)
 		writeJSON(w, http.StatusOK, account)
 	})
 }
 
-// decodeSteamIDImport steam_id 校验（min_length=max_length=17 实测锚点）。
 func decodeSteamIDImport(w http.ResponseWriter, r *http.Request) (string, *valErr) {
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {

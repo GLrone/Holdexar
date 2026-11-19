@@ -1,13 +1,11 @@
-//go:build windows
-
-// download.go 下载暂存状态机：并发探测（Range 0-0 判存在+测延迟）→ 按延迟
-// 升序断点续传下载（停滞/速率双闸换道）→ 分片边界自查取消 → sha256 双闸 →
-// 解包 → 逐文件校验值入 staging 清单。失败归因机器可读（code 字段）。
 package updater
 
 import (
 	"archive/zip"
+	"bytes"
+	"cmp"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,19 +13,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"crypto/rand"
 	"net/url"
-	"sort"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// 进度形态对齐 Python _PROGRESS：phase/received/total/percent/speed/channel/
-// code/error/ok/running。Go 侧以互斥保护（Python 靠 dict 原子替换，Go 需显式锁）。
 type progressState struct {
 	mu   sync.Mutex
 	data progressData
@@ -37,9 +33,9 @@ type progressState struct {
 type progressData struct {
 	running  bool
 	phase    string
-	percent  any // float64 或 nil
+	percent  any
 	received int64
-	total    any // int64 或 nil
+	total    any
 	error    string
 	ok       bool
 	code     string
@@ -101,23 +97,19 @@ func channelOrNil(label string) any {
 
 var ErrCancelled = errors.New("已取消下载")
 
-// AssetMissing 发布资产不存在（404/体积不符）：版本尚未真正发布或被撤下。
-// 与「网络不通」分开——前者重试无意义，前端据此给不同文案。
 type AssetMissing struct{ Message string }
 
 func (e *AssetMissing) Error() string { return e.Message }
 
-// Service 更新链运行态：进度单例 + 环境依赖（路径/版本/通道提供方）。
 type Service struct {
 	mu          sync.Mutex
 	progress    progressState
 	DataDir     string
 	InstallRoot string
 	Version     string
-	// Channels 候选下载通道（内核代理/本地混合端口/直连），每次下载现取。
-	Channels func() []Channel
-	// Log 关键事件一行式记录（可空）。
-	Log func(string, ...any)
+	HTTPClient  *http.Client
+	Channels    func() []Channel
+	Log         func(string, ...any)
 }
 
 func (s *Service) stagingDir() string {
@@ -133,8 +125,7 @@ func (s *Service) dataDir() string {
 	return filepath.Join(s.InstallRoot, "data")
 }
 
-// CheckUpdate 对比最新版本与当前版本：清单优先（一次请求拿全），GitHub API
-// 兜底；两者皆不可达返回 available=False，绝不抛——检查失败≠更新失败。
+// CheckUpdate 优先校验签名清单，不可达时回退 GitHub API；均失败返回 available=false。
 func (s *Service) CheckUpdate(client *http.Client) map[string]any {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
@@ -142,11 +133,11 @@ func (s *Service) CheckUpdate(client *http.Client) map[string]any {
 	if data := fetchManifest(client); data != nil {
 		return s.payloadFromManifest(data)
 	}
-	return checkViaAPI(client)
+	return checkViaAPI(client, s.Version)
 }
 
 func (s *Service) payloadFromManifest(data map[string]any) map[string]any {
-	latest := strings.TrimLeft(stringOf(data["version"]), "vV")
+	latest := versionFromTag(stringOf(data["version"]))
 	if latest == "" {
 		return map[string]any{"available": false, "reason": "bad_manifest"}
 	}
@@ -155,9 +146,12 @@ func (s *Service) payloadFromManifest(data map[string]any) map[string]any {
 	if asset == nil {
 		return map[string]any{"available": false, "reason": "no_asset"}
 	}
-	// 资产缺 sha256 = 发布侧残缺：有更新也不能进「无校验下载」的口子。
+	// 资产缺 sha256 或载荷校验表 = 发布侧残缺：有更新也不能进无校验下载。
 	digest := strings.TrimSpace(stringOf(asset["sha256"]))
-	if digest == "" {
+	if !hex64Re.MatchString(digest) {
+		return map[string]any{"available": false, "reason": "bad_manifest"}
+	}
+	if _, ok := validPayloadFiles(asset["files"]); !ok {
 		return map[string]any{"available": false, "reason": "bad_manifest"}
 	}
 	tag := stringOf(data["tag"])
@@ -184,7 +178,6 @@ func (s *Service) payloadFromManifest(data map[string]any) map[string]any {
 	}
 }
 
-// Progress 下载/校验/解包进度（轮询端点读）。
 func (s *Service) Progress() map[string]any {
 	s.progress.mu.Lock()
 	empty := s.progress.data.phase == "" && !s.progress.data.running && s.progress.data.received == 0 &&
@@ -196,7 +189,6 @@ func (s *Service) Progress() map[string]any {
 	return s.progress.snapshot()
 }
 
-// MarkDownloadStarting 原子置位下载中状态，防并发竞争。
 func (s *Service) MarkDownloadStarting(tag string, expectedSize int64) bool {
 	s.progress.mu.Lock()
 	defer s.progress.mu.Unlock()
@@ -212,13 +204,11 @@ func (s *Service) MarkDownloadStarting(tag string, expectedSize int64) bool {
 	return true
 }
 
-// CancelDownload 置位取消旗标，下载循环在分片边界自查退出（.part 保留续传）。
 func (s *Service) CancelDownload() map[string]any {
 	s.progress.set(func() { s.progress.data.cancel = true })
 	return map[string]any{"cancelled": true}
 }
 
-// ClearStaging 放弃本次更新：清暂存目录；下载中先置取消旗标再删。
 func (s *Service) ClearStaging() map[string]any {
 	s.progress.set(func() {
 		if s.progress.data.running {
@@ -230,25 +220,75 @@ func (s *Service) ClearStaging() map[string]any {
 	return map[string]any{"cleared": true}
 }
 
-// Download 下载 release zip 到 staging 并解包校验（fire-and-forget 的执行体；
-// 调用方先 MarkDownloadStarting）。返回值结构与 Python download_update 一致。
 func (s *Service) Download(ctx context.Context, tag string, expectedSHA256, assetName string, expectedSize int64, notes string) map[string]any {
-	if strings.TrimSpace(expectedSHA256) == "" {
-		s.finishProgress("verify_failed", "更新源未提供完整性校验值，已拒绝下载（更新源不可信或残缺）")
-		return map[string]any{"ok": false, "error": "更新源未提供完整性校验值"}
+	client := s.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
+	release := fetchManifest(client)
+	if release == nil {
+		s.finishProgress("verify_failed", "签名更新清单不可用，已拒绝下载")
+		return map[string]any{"ok": false, "error": "签名更新清单不可用，已拒绝下载"}
+	}
+	releaseTag := stringOf(release["tag"])
+	if releaseTag == "" {
+		if ver := versionFromTag(stringOf(release["version"])); ver != "" {
+			releaseTag = "v" + ver
+		}
+	}
+	if tag != releaseTag {
+		s.finishProgress("verify_failed", "请求的更新版本与签名清单不一致")
+		return map[string]any{"ok": false, "error": "请求的更新版本与签名清单不一致"}
+	}
+	if !versionGT(versionFromTag(tag), versionFromTag(s.Version)) {
+		s.finishProgress("verify_failed", "目标版本不高于当前版本，已拒绝下载")
+		return map[string]any{"ok": false, "error": "目标版本不高于当前版本，已拒绝下载"}
+	}
+	assets, _ := release["assets"].([]any)
+	asset := pickAsset(assets, "")
+	if asset == nil {
+		s.finishProgress("verify_failed", "签名清单缺少应用安装包")
+		return map[string]any{"ok": false, "error": "签名清单缺少应用安装包"}
+	}
+	signedAsset := stringOf(asset["name"])
+	if !assetPattern.MatchString(signedAsset) {
+		s.finishProgress("verify_failed", "签名清单应用安装包名称非法")
+		return map[string]any{"ok": false, "error": "签名清单应用安装包名称非法"}
+	}
+	if _, ok := validPayloadFiles(asset["files"]); !ok {
+		s.finishProgress("verify_failed", "签名清单缺少有效的载荷校验表")
+		return map[string]any{"ok": false, "error": "签名清单缺少有效的载荷校验表"}
+	}
+	signedSHA256 := strings.ToLower(strings.TrimSpace(stringOf(asset["sha256"])))
+	signedSize, sizeOK := int64Of(asset["size"])
+	if !hex64Re.MatchString(signedSHA256) || !sizeOK || signedSize < 0 {
+		s.finishProgress("verify_failed", "签名清单缺少有效的安装包校验值")
+		return map[string]any{"ok": false, "error": "签名清单缺少有效的安装包校验值"}
+	}
+	if (strings.TrimSpace(expectedSHA256) != "" && strings.ToLower(strings.TrimSpace(expectedSHA256)) != signedSHA256) ||
+		(strings.TrimSpace(assetName) != "" && assetName != signedAsset) ||
+		(expectedSize > 0 && expectedSize != signedSize) {
+		s.finishProgress("verify_failed", "下载参数与签名清单不一致")
+		return map[string]any{"ok": false, "error": "下载参数与签名清单不一致"}
+	}
+	expectedSHA256 = signedSHA256
+	assetName = signedAsset
+	expectedSize = signedSize
+	notes = stringOf(release["notes"])
+
 	staging := s.stagingDir()
 	part := filepath.Join(staging, partName)
 	metaPath := filepath.Join(staging, downloadMetaName)
 	_ = os.Remove(filepath.Join(staging, StagingManifest))
 
-	// 续传基线与资产绑定：元数据（tag/asset/size/sha256）完全一致且未超目标
-	// 大小才保留 .part 接着下；任一不符视为其他版本或损坏残留，从头开始。
+	// 仅当 .part 元数据与签名清单完全一致且未超大小时断点续传，否则清除重下。
 	metaValid := false
 	if info, err := os.Stat(part); err == nil {
 		if raw, rerr := os.ReadFile(metaPath); rerr == nil {
+			dec := json.NewDecoder(bytes.NewReader(raw))
+			dec.UseNumber()
 			var oldMeta map[string]any
-			if json.Unmarshal(raw, &oldMeta) == nil &&
+			if dec.Decode(&oldMeta) == nil &&
 				stringOf(oldMeta["tag"]) == tag &&
 				stringOf(oldMeta["asset"]) == assetName &&
 				numberEquals(oldMeta["size"], expectedSize) &&
@@ -265,12 +305,18 @@ func (s *Service) Download(ctx context.Context, tag string, expectedSHA256, asse
 		`{"tag":%q,"asset":%q,"size":%d,"sha256":%q}`, tag, assetName, expectedSize, expectedSHA256)), 0o644)
 
 	s.progress.set(func() {
+		s.progress.data.running = true
+		s.progress.data.phase = "probe"
+		if expectedSize > 0 {
+			s.progress.data.total = expectedSize
+			s.progress.data.percent = float64(0)
+		}
 		if info, err := os.Stat(part); err == nil {
 			s.progress.data.received = info.Size()
 		}
 	})
 
-	result := s.runDownload(ctx, staging, part, metaPath, tag, expectedSHA256, assetName, expectedSize, notes)
+	result := s.runDownload(ctx, staging, part, metaPath, tag, expectedSHA256, assetName, expectedSize, notes, release)
 	s.progress.set(func() { s.progress.data.running = false })
 	return result
 }
@@ -283,7 +329,7 @@ func (s *Service) finishProgress(code, message string) {
 	})
 }
 
-func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag, expectedSHA256, assetName string, expectedSize int64, notes string) map[string]any {
+func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag, expectedSHA256, assetName string, expectedSize int64, notes string, release map[string]any) map[string]any {
 	defer func() {
 		s.progress.set(func() { s.progress.data.running = false })
 	}()
@@ -297,8 +343,7 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 		s.finishProgress("network", "所有下载通道均失败：无可用通道")
 		return map[string]any{"ok": false, "error": "所有下载通道均失败"}
 	}
-	// 「资产不存在」双成因：GitHub 直连明确 404 = 真没发；镜像 404 不作数
-	// （可能只是没同步）。全部通道 404/体积不符也按缺资产处理。
+	// 直连返回 404/410 或全部通道 404/体积异常时判定资产缺失（单镜像 404 不早退）。
 	for _, probe := range probes {
 		if probe.direct && probe.missing {
 			message := fmt.Sprintf("版本 %s 的发布资产不存在（GitHub 返回 404）", tag)
@@ -356,16 +401,12 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 		}
 		err := s.streamToFile(ctx, probe.URL, probe.Proxy, part, total, minRate, probe.Label)
 		if err == nil {
-			// 完整性闸一：字节数对不上当这条通道没干成活——不进校验阶段，
-			// 否则用户看到的是「校验失败」，真因（通道返回垃圾）被盖住。
 			got := fileSizeOrZero(part)
 			if got < minPackageBytes || (expectedSize > 0 && got != expectedSize) {
 				truncateTo(part, baseline)
 				lastErr = fmt.Errorf("通道返回内容不完整（%d 字节），换下一通道", got)
 				continue
 			}
-			// 完整性闸二：镜像可能完整返回错误内容，立即校验换道，不清文件
-			// 前先比对（失败清 .part 从头再来）。
 			actual, derr := sha256OfFile(part)
 			if derr != nil || !strings.EqualFold(actual, strings.TrimSpace(expectedSHA256)) {
 				_ = os.Remove(part)
@@ -408,7 +449,6 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 		s.finishProgress("verify_failed", message)
 		return map[string]any{"ok": false, "error": message}
 	}
-	// 解包到 staging/Holdexar/（zip 内根目录即 Holdexar/）。
 	s.progress.set(func() { s.progress.data.phase = "extract" })
 	if err := extractZip(zipPath, staging); err != nil {
 		_ = os.RemoveAll(staging)
@@ -417,8 +457,7 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 	}
 	_ = os.Remove(metaPath)
 
-	// 逐文件校验值入清单：换装宿主据此核验暂存载荷（解包后到换装前的窗口
-	// 期内文件缺失/被改，含杀软隔离，都能在换装前被拒）。
+	// 落盘逐文件 SHA-256 供换装前复核载荷未被篡改或隔离。
 	payloadRoot := filepath.Join(staging, appPayloadDir)
 	files, err := payloadHashes(payloadRoot)
 	if err != nil {
@@ -427,9 +466,14 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 		return map[string]any{"ok": false, "error": "载荷校验值计算失败：" + err.Error()}
 	}
 	manifest := map[string]any{
-		"tag": tag, "sha256": expectedSHA256, "ready": true,
-		"attempt_id": randomHex16(), "source_version": s.Version,
-		"files": files, "notes": notes,
+		"tag":              tag,
+		"sha256":           expectedSHA256,
+		"ready":            true,
+		"attempt_id":       randomHex16(),
+		"source_version":   s.Version,
+		"files":            files,
+		"notes":            notes,
+		"release_manifest": release,
 	}
 	payload, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -442,8 +486,12 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 		s.finishProgress("error", err.Error())
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
-	// 新暂存包重新具备交接资格：上一包的不支持标记作废，上次失败的安装
-	// 状态标记与交接账本一并解除（重新下载同一版本不被旧账挡住）。
+	if err := VerifyStagedTrust(staging, s.dataDir(), versionFromTag(tag)); err != nil {
+		_ = os.RemoveAll(staging)
+		s.finishProgress("verify_failed", err.Error())
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	// 暂存验签通过后清理换装失败与交接状态标记，允许新包进入换装。
 	_ = os.Remove(filepath.Join(staging, ".handoff-unsupported"))
 	_ = os.Remove(filepath.Join(s.dataDir(), SwapFailedFlag))
 	_ = os.Remove(filepath.Join(s.dataDir(), HandoffLedgerName))
@@ -458,8 +506,6 @@ func (s *Service) runDownload(ctx context.Context, staging, part, metaPath, tag,
 	return map[string]any{"ok": true, "staging": staging, "tag": tag}
 }
 
-// channelPlan 候选通道 = 通道提供方（内核代理/本地口/直连）× 镜像前缀；
-// 本地测试源（127.0.0.1/localhost）只走直连单通道。
 func (s *Service) channelPlan(assetURL string, local bool) []probeChannel {
 	if local {
 		return []probeChannel{{Channel: Channel{Label: "本地测试更新源"}, URL: assetURL, direct: true}}
@@ -484,49 +530,43 @@ func mirrorLabel(mirror string) string {
 	return "·镜像"
 }
 
-// resolveAssetURL 确定资产下载地址：清单给了确切名就直连，否则按命名规则。
-// （Python 的 API 反查兜底保留在探测失败后的重试路径——命名规则猜不出带时间
-// 戳的资产名，但发行包命名是固定的，可先按规则探测。）
 func (s *Service) resolveAssetURL(tag, assetName string) (string, bool) {
 	if base := UpdateURLFromEnv(); base != "" && assetName != "" {
-		return base + "/" + assetName, strings.Contains(base, "127.0.0.1") || strings.Contains(base, "localhost")
+		return base + "/" + assetName, true
 	}
 	if assetName != "" {
 		return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", GitHubRepo, tag, assetName), false
 	}
 	guessed := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s-win64-v%s.zip",
-		GitHubRepo, tag, appPayloadDir, strings.TrimLeft(tag, "vV"))
+		GitHubRepo, tag, appPayloadDir, versionFromTag(tag))
 	return guessed, false
 }
 
-// probeChannels 并发探测全部通道：Range 0-0 判存在+量延迟；可用者按延迟
-// 升序返回；探不到的排最后（全探不到时总得有条路可试）。
+// probeChannels 并发发送 Range 0-0 GET 探测通道并按延迟升序返回，未探通置后。
 func probeChannels(ctx context.Context, channels []probeChannel, fallbackTotal int64) []probeResult {
 	results := make([]probeResult, len(channels))
 	var wg sync.WaitGroup
 	for i := range channels {
 		channel := channels[i]
-		wg.Add(1)
-		go func(slot int, channel probeChannel) {
-			defer wg.Done()
+		wg.Go(func() {
 			started := time.Now()
 			probe := probeResult{probeChannel: channel, latency: time.Hour}
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, channel.URL, nil)
 			if err != nil {
-				results[slot] = probe
+				results[i] = probe
 				return
 			}
+			request.Header.Set("Range", "bytes=0-0")
 			resp, perr := doProbe(ctx, channel, request)
 			probe = probeWithResponse(resp, perr, channel, fallbackTotal, started)
-			results[slot] = probe
-		}(i, channel)
+			results[i] = probe
+		})
 	}
 	wg.Wait()
-	sort.SliceStable(results, func(i, j int) bool { return results[i].latency < results[j].latency })
+	slices.SortStableFunc(results, func(a, b probeResult) int { return cmp.Compare(a.latency, b.latency) })
 	return results
 }
 
-// doProbe 单通道探测请求（代理走独立 Transport）。
 func doProbe(ctx context.Context, channel probeChannel, request *http.Request) (*http.Response, error) {
 	if channel.Proxy == "" {
 		return probeClientGlobal.Do(request.WithContext(ctx))
@@ -566,8 +606,7 @@ func probeWithResponse(resp *http.Response, err error, channel probeChannel, fal
 	return probe
 }
 
-// totalFromHeaders 取整包体积：206 的总量在 content-range 尾段，200 才看
-// content-length——两者混用会把 1 字节探测响应当成整包体积。
+// totalFromHeaders 206 取 Content-Range 总量，200 取 Content-Length，防把分片长度当整包大小。
 func totalFromHeaders(header http.Header, status int) int64 {
 	if contentRange := header.Get("Content-Range"); contentRange != "" {
 		if idx := strings.LastIndex(contentRange, "/"); idx >= 0 {
@@ -589,9 +628,7 @@ func totalFromHeaders(header http.Header, status int) int64 {
 	return 0
 }
 
-// streamToFile 流式下载+断点续传+停滞/速率双闸。失败抛错（调用方换通道）。
-// 服务端不认 Range 回 200 时下载到 .full 副产物，全包完整后原子替换——
-// 避免中途失败抹掉已有续传进度。
+// streamToFile 支持断点续传与停滞/速率双闸；服务端忽略 Range 回 200 时写 .full 完成后原子替换。
 func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, expectedTotal int64, minRateBps int64, label string) error {
 	resumed := fileSizeOrZero(dest)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -606,7 +643,9 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 		Timeout:   time.Duration(downloadTimeoutSec) * time.Second,
 		Transport: transport,
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+	request, err := http.NewRequestWithContext(readCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
@@ -623,7 +662,7 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 	}
 	useSidecar := resumed > 0 && resp.StatusCode == http.StatusOK
 	if resp.StatusCode == http.StatusOK {
-		resumed = 0 // 服务端不认 Range：必须从头下
+		resumed = 0
 	}
 	total := totalFromHeaders(resp.Header, resp.StatusCode)
 	if total <= 0 {
@@ -638,26 +677,27 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 	})
 
 	target := dest
+	flags := os.O_CREATE | os.O_TRUNC | os.O_WRONLY
 	if useSidecar {
 		target = dest + ".full"
+	} else if received > 0 {
+		flags = os.O_WRONLY | os.O_APPEND
 	}
-	file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(target, flags, 0o644)
 	if err != nil {
 		return err
 	}
 	writer := file
-	if !useSidecar && received > 0 {
-		file.Close()
-		file, err = os.OpenFile(dest, os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		writer = file
-	}
 	started := time.Now()
 	windowAt := started
 	var windowBytes int64
-	stall := time.Duration(stallTimeout) * time.Second
+	stall := stallDuration
+	var timedOut atomic.Bool
+	stallTimer := time.AfterFunc(stall, func() {
+		timedOut.Store(true)
+		cancelRead()
+	})
+	defer stallTimer.Stop()
 	buf := make([]byte, 1<<20)
 	for {
 		s.progress.mu.Lock()
@@ -670,37 +710,24 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 			}
 			return ErrCancelled
 		}
-		// 停滞闸：读超时=连上了但不吐数据的半死通道，不让进度条干等。
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
 			file.Close()
 			return fmt.Errorf("下载总时长超限，换下一通道")
 		}
-		type result struct {
-			n   int
-			err error
-		}
-		done := make(chan result, 1)
-		go func() {
-			n, rerr := resp.Body.Read(buf)
-			done <- result{n, rerr}
-		}()
-		var read result
-		select {
-		case read = <-done:
-		case <-time.After(stall):
-			file.Close()
-			return fmt.Errorf("通道停滞（%ds 无数据），换下一通道", stallTimeout)
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			file.Close()
 			return ErrCancelled
 		}
-		if read.n > 0 {
-			if _, werr := writer.Write(buf[:read.n]); werr != nil {
+		stallTimer.Reset(stall)
+		n, rerr := resp.Body.Read(buf)
+		stallTimer.Reset(stall)
+		if n > 0 {
+			if _, werr := writer.Write(buf[:n]); werr != nil {
 				file.Close()
 				return werr
 			}
-			received += int64(read.n)
-			windowBytes += int64(read.n)
+			received += int64(n)
+			windowBytes += int64(n)
 			now := time.Now()
 			if now.Sub(windowAt) >= time.Second {
 				speed := int64(float64(windowBytes) / now.Sub(windowAt).Seconds())
@@ -715,8 +742,6 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 				})
 				windowAt, windowBytes = now, 0
 			}
-			// 速率闸：试跑期后平均速率低于下限判「过慢」——停滞闸抓不住
-			// 「慢但在动」的通道（曾有镜像 40KB/s 整包要一小时）。
 			if minRateBps > 0 {
 				elapsed := now.Sub(started).Seconds()
 				if elapsed >= trialSeconds && float64(received-resumed)/elapsed < float64(minRateBps) {
@@ -726,12 +751,30 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 				}
 			}
 		}
-		if read.err != nil {
-			if errors.Is(read.err, io.EOF) {
-				break // 正常结束：交给函数尾部唯一的 Close
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				break
 			}
 			file.Close()
-			return read.err
+			s.progress.mu.Lock()
+			wasCancelled := s.progress.data.cancel
+			s.progress.mu.Unlock()
+			if wasCancelled {
+				if useSidecar {
+					_ = os.Remove(target)
+				}
+				return ErrCancelled
+			}
+			if ctx.Err() != nil {
+				if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
+					return fmt.Errorf("下载总时长超限，换下一通道")
+				}
+				return ErrCancelled
+			}
+			if timedOut.Load() {
+				return fmt.Errorf("通道停滞（%ds 无数据），换下一通道", stallTimeout)
+			}
+			return rerr
 		}
 	}
 	if err := file.Close(); err != nil {
@@ -746,7 +789,7 @@ func (s *Service) streamToFile(ctx context.Context, rawURL, proxy, dest string, 
 	return nil
 }
 
-// truncateTo 把续传文件截回基线（本轮写入的都作废）；截不动就删掉宁可重下。
+// truncateTo 将超出基线的 .part 截回基线（截断失败忽略）；短于基线时删除以防补零。
 func truncateTo(path string, size int64) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -760,20 +803,32 @@ func truncateTo(path string, size int64) {
 		return
 	}
 	if info.Size() < size {
-		_ = os.Remove(path) // 禁止 truncate 补零膨胀
+		_ = os.Remove(path)
 	}
 }
 
 func extractZip(zipPath, staging string) error {
+	return extractZipWithLimit(zipPath, staging, maxExtractBytes)
+}
+
+func extractZipWithLimit(zipPath, staging string, limit int64) (retErr error) {
 	reader, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+		if retErr != nil {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	var totalWritten int64
 	for _, entry := range reader.File {
-		// PowerShell 打包器的 zip 条目用反斜杠分隔（规范要求正斜杠）：目录
-		// 条目尾部反斜杠会被当文件、路径逐级错乱——统一归一化后再计算。
+		// 归一化 zip 条目反斜杠路径，避免目录条目被误判或越界校验错乱。
 		entry.Name = strings.ReplaceAll(entry.Name, "\\", "/")
+		if entry.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("压缩包包含符号链接：%s", entry.Name)
+		}
 		target := filepath.Join(staging, filepath.FromSlash(entry.Name))
 		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(staging)+string(os.PathSeparator)) {
 			return fmt.Errorf("压缩包内路径越界：%s", entry.Name)
@@ -796,17 +851,21 @@ func extractZip(zipPath, staging string) error {
 			source.Close()
 			return fmt.Errorf("条目 %q 建文件失败：%w", entry.Name, err)
 		}
-		if _, err := io.Copy(out, source); err != nil {
-			source.Close()
-			out.Close()
-			return fmt.Errorf("条目 %q 写入失败：%w", entry.Name, err)
-		}
-		if err := out.Close(); err != nil {
-			source.Close()
-			return fmt.Errorf("条目 %q 收尾失败：%w", entry.Name, err)
-		}
+		written, copyErr := io.Copy(out, io.LimitReader(source, limit-totalWritten+1))
+		closeErr := out.Close()
 		source.Close()
+		if copyErr != nil {
+			return fmt.Errorf("条目 %q 写入失败：%w", entry.Name, copyErr)
+		}
+		totalWritten += written
+		if totalWritten > limit {
+			return fmt.Errorf("压缩包解压体积超出上限（>%d 字节）", limit)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("条目 %q 收尾失败：%w", entry.Name, closeErr)
+		}
 	}
+	_ = reader.Close()
 	_ = os.Remove(zipPath)
 	return nil
 }

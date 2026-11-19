@@ -27,7 +27,7 @@ func doReq(h http.Handler, ae string) *httptest.ResponseRecorder {
 }
 
 func TestGzipCompressesLargeResponse(t *testing.T) {
-	body := strings.Repeat(" Holdexar 压缩测试", 100) // >500 bytes
+	body := strings.Repeat(" Holdexar 压缩测试", 100)
 	h := GZip{}.Middleware(gzipHandler(body, "application/json"))
 	w := doReq(h, "gzip, deflate")
 	if w.Code != 200 {
@@ -77,7 +77,7 @@ func TestGzipSSEExempt(t *testing.T) {
 func TestGzipIdentityAddsVary(t *testing.T) {
 	body := strings.Repeat("x", 1000)
 	h := GZip{}.Middleware(gzipHandler(body, "application/json"))
-	w := doReq(h, "deflate") // 无 gzip
+	w := doReq(h, "deflate")
 	if w.Header().Get("Content-Encoding") != "" {
 		t.Fatal("identity 不应压缩")
 	}
@@ -102,7 +102,6 @@ func TestGzipExistingEncodingSkipped(t *testing.T) {
 }
 
 func TestGzipBufferedBelowThresholdOnReturn(t *testing.T) {
-	// 多次小 Write 累计仍 <500：handler 返回后透传
 	h := GZip{}.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("ab"))
@@ -115,7 +114,6 @@ func TestGzipBufferedBelowThresholdOnReturn(t *testing.T) {
 }
 
 func TestGzipBufferedCrossingThresholdCompresses(t *testing.T) {
-	// 多次小 Write 累计跨过 500：压缩启用
 	h := GZip{}.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		for i := 0; i < 60; i++ {

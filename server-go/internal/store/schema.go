@@ -10,11 +10,7 @@ import (
 	"strings"
 )
 
-// openReadOnly 只读打开存量库：mode=ro 下文件不存在即报错、不建新文件，
-// 连接不得写。WAL 模式库的 -wal/-shm 侧车由 SQLite 随主文件自行发现，
-// 只读连接以只读方式复用侧车中未 checkpoint 的内容，不触发落盘改动。
-// 不设 busy_timeout：驱动缺省即 SQLite 内建 0，锁被占立即失败（对齐
-// Python 只读通道 timeout=0）。
+// openReadOnly 以 mode=ro 且不设 busy_timeout 只读打开库，可直接读取未 checkpoint 的 WAL 侧车。
 func openReadOnly(dbPath string) (*sql.DB, error) {
 	abs, err := filepath.Abs(dbPath)
 	if err != nil {
@@ -29,8 +25,6 @@ func openReadOnly(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// ReadSchemaVersion 只读读取库结构版本（PRAGMA user_version），经 WAL
-// 侧车取最新已提交值；版本存于主库第 1 页，未 checkpoint 时以侧车为准。
 func ReadSchemaVersion(dbPath string) (int, error) {
 	db, err := openReadOnly(dbPath)
 	if err != nil {
@@ -44,9 +38,7 @@ func ReadSchemaVersion(dbPath string) (int, error) {
 	return version, nil
 }
 
-// EnsureSupportedVersion 是版本门，双向拒绝：结构版本超前说明库出自更高
-// 版本程序，无法安全降读；落后说明本程序不含迁移链（首次建库与结构升级
-// 由 Python 初始化链负责），落后库应先经 Python 侧升到当前版本再打开。
+// EnsureSupportedVersion 严格校验库 user_version 等于 supported，高于或低于均拒绝。
 func EnsureSupportedVersion(dbPath string, supported int) error {
 	current, err := ReadSchemaVersion(dbPath)
 	if err != nil {
@@ -61,8 +53,6 @@ func EnsureSupportedVersion(dbPath string, supported int) error {
 	return nil
 }
 
-// QuickCheck 只读完整性快检（PRAGMA quick_check）：完好库返回 "ok"，
-// 损伤库返回损伤描述（首 100 条，分号连接）。
 func QuickCheck(dbPath string) (string, error) {
 	db, err := openReadOnly(dbPath)
 	if err != nil {

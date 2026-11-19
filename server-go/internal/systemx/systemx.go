@@ -1,7 +1,8 @@
-// Package systemx 提供系统信息和运行状态的只读端点。
+// Package systemx 提供系统信息、会话发放、诊断与数据维护 HTTP 端点。
 package systemx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -15,14 +16,11 @@ import (
 	"holdexar/server-go/internal/crawl"
 )
 
-// githubRepo 发布仓库（owner/repo）：前端拼发布页与问题反馈链接的唯一来源。
-// config 包尚未收录该常量，暂在此声明，与品牌常量同源。
+// githubRepo 默认发布仓库标识（/api/v1/info 的 repo 字段输出）。
 const githubRepo = "GLrone/Holdexar"
 
-// dbProbeTimeout 数据库探活查询超时：readiness 不被慢库无限挂住。
 const dbProbeTimeout = 2 * time.Second
 
-// resolveDataDir 数据目录判定，Register 时调用一次；测试可替换。
 var resolveDataDir = func() string {
 	dir, err := config.ResolveDataDir()
 	if err != nil {
@@ -31,7 +29,6 @@ var resolveDataDir = func() string {
 	return dir
 }
 
-// distDirReady 前端构建产物目录存在性判定；测试可替换。
 var distDirReady = func() bool {
 	dir, err := config.WebDistDir()
 	if err != nil {
@@ -41,7 +38,6 @@ var distDirReady = func() bool {
 	return statErr == nil
 }
 
-// System 系统面只读端点的依赖。
 type System struct {
 	DB        *sql.DB
 	StartedAt time.Time
@@ -49,14 +45,12 @@ type System struct {
 	Readiness func(context.Context) (crawl.Readiness, error)
 }
 
-// Register 装配系统面只读端点：/api/v1/info 与 /api/v1/system/readiness。
 func Register(mux *http.ServeMux, db *sql.DB, readiness func(context.Context) (crawl.Readiness, error)) {
 	s := &System{DB: db, StartedAt: time.Now(), DataDir: resolveDataDir(), Readiness: readiness}
 	mux.HandleFunc("/api/v1/info", s.handleInfo)
 	mux.HandleFunc("/api/v1/system/readiness", s.handleReadiness)
 }
 
-// infoResponse 运行信息，字段名与 Python 侧逐字段一致。
 // python / platform 字段名沿用既有前端契约，值改为 Go 运行时版本与平台串。
 type infoResponse struct {
 	App           string  `json:"app"`
@@ -115,7 +109,6 @@ func (s *System) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// probeDB 数据库可达性：轻量只读查询，失败返回人话原因。
 func probeDB(db *sql.DB) (bool, string) {
 	if db == nil {
 		return false, "数据库不可达：连接未就绪"
@@ -138,12 +131,14 @@ func detailNull() map[string]any {
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
-	body, err := json.Marshal(payload)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
 		http.Error(w, "响应序列化失败", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	_, _ = w.Write(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}))
 }

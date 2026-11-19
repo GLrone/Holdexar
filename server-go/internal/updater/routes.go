@@ -1,26 +1,27 @@
-//go:build windows
-
-// routes.go 系统更新端点装配（对齐 app/domains/system/router.py 的 update-*）：
-// GET update-check / POST update-download / GET update-progress /
-// GET update-pending / POST update-ack / POST update-cancel / POST update-clear。
 package updater
 
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 )
 
-// Deps 端点装配依赖。
+var releaseNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+func validReleaseName(name string) bool {
+	return releaseNameRe.MatchString(name) && !strings.Contains(name, "..") && name != "."
+}
+
 type Deps struct {
 	DataDir     string
 	InstallRoot string
 	Version     string
-	// Channels 候选下载通道（内核代理/本地混合端口/直连），每次下载现取。
-	Channels func() []Channel
-	// Log 关键事件一行式记录（可空）。
-	Log func(string, ...any)
+	Channels    func() []Channel
+	Log         func(string, ...any)
 }
 
 var (
@@ -28,7 +29,6 @@ var (
 	once      sync.Once
 )
 
-// Get 进程级单例（下载进度是模块级单例语义）。
 func Get(deps Deps) *Service {
 	once.Do(func() {
 		singleton = &Service{
@@ -42,7 +42,6 @@ func Get(deps Deps) *Service {
 	return singleton
 }
 
-// Register 装配系统更新端点（路径与 Python 路由逐条对齐）。
 func Register(mux *http.ServeMux, deps Deps) {
 	service := Get(deps)
 	writeJSON := func(w http.ResponseWriter, status int, payload any) {
@@ -58,27 +57,46 @@ func Register(mux *http.ServeMux, deps Deps) {
 			Tag    string `json:"tag"`
 			SHA256 string `json:"sha256"`
 			Asset  string `json:"asset"`
-			Size   int64  `json:"size"`
+			Size   *int64 `json:"size"`
 			Notes  string `json:"notes"`
 		}
-		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
-		// 校验值必填：缺失即 400 拒绝——缺它就没有可信完整性锚点。
-		if req.SHA256 == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "更新源未提供校验值，已拒绝下载"})
+		if r.Body == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
 			return
 		}
-		if req.Tag == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "更新目标版本缺失，已拒绝下载"})
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := dec.Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
 			return
 		}
-		if !service.MarkDownloadStarting(req.Tag, req.Size) {
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "请求体无效"})
+			return
+		}
+		if !validReleaseName(req.Tag) || (req.Asset != "" && !validReleaseName(req.Asset)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "更新标识包含非法字符"})
+			return
+		}
+		if req.SHA256 != "" && !hex64Re.MatchString(strings.ToLower(req.SHA256)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "校验值格式无效"})
+			return
+		}
+		if !versionGT(versionFromTag(req.Tag), versionFromTag(service.Version)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"detail": "目标版本不高于当前版本"})
+			return
+		}
+		if !service.MarkDownloadStarting(req.Tag, 0) {
 			writeJSON(w, http.StatusConflict, map[string]string{"detail": "已有更新下载进行中"})
 			return
 		}
-		// fire-and-forget：下载在后台跑，前端轮询 /system/update-progress。
-		// 不得携带请求上下文——handler 返回即取消，下载协程会秒死于通道探测。
+		var expectedSize int64
+		if req.Size != nil && *req.Size > 0 {
+			expectedSize = *req.Size
+		}
+		// 后台下载必须传 context.Background()，避免 HTTP handler 返回取消请求上下文。
 		go func() {
-			_ = service.Download(context.Background(), req.Tag, req.SHA256, req.Asset, req.Size, req.Notes)
+			_ = service.Download(context.Background(), req.Tag, req.SHA256, req.Asset, expectedSize, req.Notes)
 		}()
 		writeJSON(w, http.StatusOK, map[string]any{"started": true})
 	})
@@ -92,8 +110,7 @@ func Register(mux *http.ServeMux, deps Deps) {
 		writeJSON(w, http.StatusOK, service.AcknowledgeUpdate())
 	})
 	mux.HandleFunc("POST /api/v1/system/update-cancel", func(w http.ResponseWriter, r *http.Request) {
-		// 下载中即中止（保留 .part 续传基线，下次接着下），不清暂存；
-		// 不从下载中直接拒绝——下载 125MB 时用户唯一的出路会变成等它失败。
+		// 下载进行中只置取消保留 .part 续传，仅在空闲时清暂存目录。
 		if service.progressRunning() {
 			result := service.CancelDownload()
 			result["cleared"] = false
@@ -104,7 +121,6 @@ func Register(mux *http.ServeMux, deps Deps) {
 	})
 }
 
-// progressRunning 下载是否进行中。
 func (s *Service) progressRunning() bool {
 	s.progress.mu.Lock()
 	defer s.progress.mu.Unlock()

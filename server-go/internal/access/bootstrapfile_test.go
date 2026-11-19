@@ -82,7 +82,6 @@ func TestMiddlewareConsumesOn303Only(t *testing.T) {
 		return b, b.Middleware(next)
 	}
 
-	// 303（会话发放成功）→ 文件删除
 	b, chain := newChain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusSeeOther)
 	}))
@@ -95,7 +94,6 @@ func TestMiddlewareConsumesOn303Only(t *testing.T) {
 		t.Fatalf("303 后文件必须被删除，Stat 错误：%v", err)
 	}
 
-	// 401（无效/过期）→ 文件保留，交给过期计时
 	b, chain = newChain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -108,7 +106,6 @@ func TestMiddlewareConsumesOn303Only(t *testing.T) {
 		t.Fatalf("401 后文件必须保留，Stat 错误：%v", err)
 	}
 
-	// 其他路径不触发清理
 	b, chain = newChain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusSeeOther)
 	}))
@@ -140,7 +137,7 @@ func TestPublishResetsExpiryTimer(t *testing.T) {
 	if err := b.Publish("second"); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
-	time.Sleep(60 * time.Millisecond) // 距第一次写入已超时，距第二次未超时
+	time.Sleep(60 * time.Millisecond)
 	if _, err := os.Stat(b.path); err != nil {
 		t.Fatalf("重复发布应重置过期计时，Stat 错误：%v", err)
 	}

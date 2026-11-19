@@ -8,7 +8,6 @@ import (
 	"testing"
 )
 
-// 同目录第二个实例不可抢（独占语义）。
 func TestExclusiveSameDir(t *testing.T) {
 	dir := t.TempDir()
 	release, err := AcquireProductionLock(dir)
@@ -22,7 +21,6 @@ func TestExclusiveSameDir(t *testing.T) {
 	}
 }
 
-// 释放后同目录可再抢。
 func TestReleaseThenReacquire(t *testing.T) {
 	dir := t.TempDir()
 	release, err := AcquireProductionLock(dir)
@@ -30,7 +28,7 @@ func TestReleaseThenReacquire(t *testing.T) {
 		t.Fatalf("首次抢锁失败: %v", err)
 	}
 	release()
-	release() // 幂等
+	release()
 	again, err := AcquireProductionLock(dir)
 	if err != nil {
 		t.Fatalf("释放后抢锁应成功: %v", err)
@@ -38,7 +36,6 @@ func TestReleaseThenReacquire(t *testing.T) {
 	again()
 }
 
-// 不同目录互不干扰。
 func TestDifferentDirs(t *testing.T) {
 	first, err := AcquireProductionLock(filepath.Join(t.TempDir(), "a"))
 	if err != nil {
@@ -52,7 +49,6 @@ func TestDifferentDirs(t *testing.T) {
 	defer second()
 }
 
-// 并发抢锁负案：N 路并发同目录，恰好一路成功。
 func TestConcurrentGrab(t *testing.T) {
 	dir := t.TempDir()
 	const racers = 8

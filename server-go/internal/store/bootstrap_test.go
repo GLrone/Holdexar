@@ -46,7 +46,6 @@ func TestInitializeFreshDatabaseReferenceParity(t *testing.T) {
 		t.Fatalf("schema version = %d, want 34", version)
 	}
 
-	// Fingerprints come from a pristine reference initialization, excluding FTS-generated tables.
 	schemaQuery := `SELECT type || char(0) || name || char(0) || tbl_name || char(0) || replace(sql,char(13),'')
         FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL
         AND name NOT IN ('achievement_notes','challenge_progress')

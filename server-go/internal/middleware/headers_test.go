@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -39,16 +40,23 @@ func TestSecurityHeadersOnAllResponses(t *testing.T) {
 			"https://avatars.fastly.steamstatic.com " +
 			"https://*.epicgames.com https://*.epicgamescdn.com https://*.unrealengine.com " +
 			"https://*.gamerpower.com https://*.file.myqcloud.com https://hb-prd.imgix.net; " +
-			"style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; " +
+			"style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; " +
 			"frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
-		if h.Get("Content-Security-Policy") != want {
-			t.Fatalf("%s CSP 不符: %q", path, h.Get("Content-Security-Policy"))
+		csp := h.Get("Content-Security-Policy")
+		if csp != want {
+			t.Fatalf("%s CSP 不符: %q", path, csp)
+		}
+		if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+			t.Fatalf("%s script-src 不得含 unsafe-inline: %q", path, csp)
+		}
+		for _, host := range []string{"https://avatars.fastly.steamstatic.com", "https://hb-prd.imgix.net"} {
+			if !strings.Contains(csp, host) {
+				t.Fatalf("%s img-src 缺少白名单域 %s: %q", path, host, csp)
+			}
 		}
 	}
 }
 
-// TestCacheControlTiers 缓存分档：API 不干预、指纹 immutable、无指纹一天、
-// 其余 no-cache（与 Python 实例实测锚点逐值一致）。
 func TestCacheControlTiers(t *testing.T) {
 	cases := []struct {
 		path string
@@ -63,7 +71,7 @@ func TestCacheControlTiers(t *testing.T) {
 		{"/assets/index-B1c2D3e4.css", "public, max-age=31536000, immutable"},
 		{"/logo.png", "public, max-age=86400"},
 		{"/assets/fonts/rubik.woff2", "public, max-age=86400"},
-		{"/assets/app-abcdefg.js", "public, max-age=86400"}, // 指纹段非 8 位
+		{"/assets/app-abcdefg.js", "public, max-age=86400"},
 		{"/", "no-cache"},
 		{"/index.html", "no-cache"},
 		{"/games/some-route", "no-cache"},
@@ -75,7 +83,6 @@ func TestCacheControlTiers(t *testing.T) {
 	}
 }
 
-// TestInnerCacheControlWins 内层已设 Cache-Control 时外层不覆盖（setdefault）。
 func TestInnerCacheControlWins(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -89,8 +96,6 @@ func TestInnerCacheControlWins(t *testing.T) {
 	}
 }
 
-// TestUpdateWriteProtection 更新验收期：受保护时非只读 API 回 503，
-// GET/HEAD/OPTIONS 与 update-ready 端点放行，非 API 路径不拦。
 func TestUpdateWriteProtection(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

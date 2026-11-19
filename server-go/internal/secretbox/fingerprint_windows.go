@@ -1,6 +1,5 @@
 //go:build windows
 
-// Windows 机器指纹：MachineGuid（Cryptography 注册表键，装系统时生成）。
 package secretbox
 
 import "golang.org/x/sys/windows/registry"

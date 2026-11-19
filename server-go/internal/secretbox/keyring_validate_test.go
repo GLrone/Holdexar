@@ -1,7 +1,3 @@
-//go:build windows
-
-// P0-2 回归：口令封装记录来自不可信文件——全部非法形态必须在昂贵 scrypt
-// 派生前被拒绝（恶意大 N 曾可致解锁内存耗尽）；合法记录与既有文件解锁不受影响。
 package secretbox
 
 import (
@@ -9,7 +5,6 @@ import (
 	"testing"
 )
 
-// validPassphraseRecord 生成一份合法口令封装记录作变异基底。
 func validPassphraseRecord(t *testing.T) map[string]any {
 	t.Helper()
 	master := make([]byte, keyBytes)
@@ -23,7 +18,6 @@ func validPassphraseRecord(t *testing.T) map[string]any {
 	return rec
 }
 
-// TestValidatePassphraseRecordMalicious 恶意/损坏记录形态表：全部在派生前拒绝。
 func TestValidatePassphraseRecordMalicious(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -57,7 +51,6 @@ func TestValidatePassphraseRecordMalicious(t *testing.T) {
 			if err == nil {
 				t.Fatalf("恶意记录未被拒绝（类型 %s）", tc.name)
 			}
-			// 断言拒绝发生在廉价校验层：错误来自参数校验而非派生层
 			if strings.Contains(err.Error(), "KDF 派生失败") {
 				t.Fatalf("记录应在派生前被拒绝，实际进入派生层：%v", err)
 			}
@@ -65,8 +58,6 @@ func TestValidatePassphraseRecordMalicious(t *testing.T) {
 	}
 }
 
-// TestValidatePassphraseRecordAcceptsCurrentFormat 现役格式（N=2^15/r=8/p=1）
-// 必须继续可解锁——跨语言兼容不受校验影响。
 func TestValidatePassphraseRecordAcceptsCurrentFormat(t *testing.T) {
 	rec := validPassphraseRecord(t)
 	if _, err := validatePassphraseRecord(rec); err != nil {
@@ -87,7 +78,6 @@ func TestValidatePassphraseRecordAcceptsCurrentFormat(t *testing.T) {
 	}
 }
 
-// TestUnlockConcurrentStress 并发解锁压力：串行化后全部成功且无内存异常。
 func TestUnlockConcurrentStress(t *testing.T) {
 	rec := validPassphraseRecord(t)
 	done := make(chan error, 8)

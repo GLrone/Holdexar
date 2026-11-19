@@ -8,8 +8,7 @@ import (
 	"strings"
 )
 
-// handleStatic SPA 静态托管：/assets 直出文件，其余非 API 路径回退 index.html；
-// 构建产物缺失时按「仅 API」运行，全部路径回 404。
+// handleStatic SPA 静态托管（/assets 直出、其余非 API 回退 index.html，产物缺失时静态路由回 404）。
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	index := filepath.Join(s.DistDir, "index.html")
 	if s.DistDir == "" || !fileExists(index) {
@@ -39,19 +38,16 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	s.serveFile(w, r, index)
 }
 
-// fileExists 普通文件判定（跟随符号链接）。
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
 }
 
-// assetsReady /assets 静态挂载条件：dist/assets 目录存在。
 func (s *Server) assetsReady() bool {
 	info, err := os.Stat(filepath.Join(s.DistDir, "assets"))
 	return err == nil && info.IsDir()
 }
 
-// serveFile 普通文件直出；缺失或目录回 404。
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, target string) {
 	f, err := os.Open(target)
 	if err != nil {
@@ -67,8 +63,7 @@ func (s *Server) serveFile(w http.ResponseWriter, r *http.Request, target string
 	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
 
-// insideDir 判定 path 是否位于 dir 内（相等不算）；对已存在部分解析符号
-// 链接与 `..` 之后再比。
+// insideDir 判定 path 是否位于 dir 内（含相等路径）；先解析已存在路径的符号链接与 .. 段。
 func insideDir(path, dir string) bool {
 	inner, err := canonicalPath(path)
 	if err != nil {

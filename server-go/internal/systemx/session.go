@@ -1,11 +1,7 @@
-// 会话发放：一次性引导票据 + 会话 Cookie。令牌只在进程内存里，页面无法
-// 凭空取得——桌面壳走引导票据（进程内传递），开发态走 dev 通道（打包态
-// 完全没有这条入口，发行版没有任何「本机进程可自助取会话」的途径）。
 package systemx
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -34,7 +30,6 @@ func randomNonce() string {
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
-// CreateBootstrap 生成一次性引导票据（桌面壳进程内调用，不经网络）。
 func CreateBootstrap() string {
 	bootstrapMu.Lock()
 	defer bootstrapMu.Unlock()
@@ -57,28 +52,59 @@ func consumeBootstrap(nonce string) bool {
 	return ok && expiry.After(time.Now())
 }
 
-// UnlockDeps 局域网自助解锁的依赖面：开关与密码解析由装配层注入（密码
-// 事实源在设置密文 KV 与环境变量，systemx 不反向依赖 settings）。nil 依赖
-// 时解锁端点恒 404（局域网模式未接线）。
+// UnlockDeps 局域网解锁依赖（由装配层注入，未提供时解锁端点回 404）。
 type UnlockDeps struct {
-	Enabled  func() bool
-	Password func() (string, error)
-	Fail     func()
-	Success  func()
+	Enabled func() bool
+	// Verifier 返回 PHC 验证器串；空串＝未设密码，解锁拒绝。
+	Verifier    func() (string, error)
+	FailPeer    func(string)
+	SuccessPeer func(string)
+	// 保留兼容字段，运行时统一按对端 IP 记账。
+	Fail    func()
+	Success func()
 }
 
-// RegisterSession 注册会话发放端点。devSession 控制开发态通道：关闭时
-// dev 端点回 404——发行版没有「本机进程可自助取会话」的入口。
-// unlock 局域网解锁依赖：缺省时解锁端点恒 404（默认回环-only 行为不变）。
+func isSafeNextRedirect(next string) bool {
+	if !strings.HasPrefix(next, "/") {
+		return false
+	}
+	if strings.HasPrefix(next, "//") || strings.HasPrefix(next, `/\`) {
+		return false
+	}
+	for i := 0; i < len(next); i++ {
+		if next[i] < 0x20 || next[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func recordUnlockFail(deps UnlockDeps, peer string) {
+	if deps.FailPeer != nil {
+		deps.FailPeer(peer)
+		return
+	}
+	access.RecordUnlockFailureFor(peer)
+}
+
+func recordUnlockSuccess(deps UnlockDeps, peer string) {
+	if deps.SuccessPeer != nil {
+		deps.SuccessPeer(peer)
+		return
+	}
+	access.RecordUnlockSuccessFor(peer)
+}
+
+// RegisterSession 注册引导票据、开发态会话（devSession=false 时 404）、登出与局域网解锁端点。
 func RegisterSession(mux *http.ServeMux, gate *access.Gate, devSession bool, unlock ...UnlockDeps) {
 	mux.HandleFunc("GET /api/v1/session/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		if !consumeBootstrap(r.URL.Query().Get("nonce")) {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "引导票据无效或已过期"})
 			return
 		}
-		// 只允许站内相对路径，避免变成开放跳转。
+		// 只允许站内相对路径，拒绝 //、/\ 与控制字符，避免开放跳转。
 		target := r.URL.Query().Get("next")
-		if !strings.HasPrefix(target, "/") || strings.HasPrefix(target, "//") {
+		if !isSafeNextRedirect(target) {
 			target = "/"
 		}
 		gate.Issue(w)
@@ -86,24 +112,32 @@ func RegisterSession(mux *http.ServeMux, gate *access.Gate, devSession bool, unl
 		w.WriteHeader(http.StatusSeeOther)
 	})
 	mux.HandleFunc("GET /api/v1/session/dev", func(w http.ResponseWriter, r *http.Request) {
-		if !devSession {
+		// dev 通道仅据对端物理地址判定回环，不信任可伪造的 Host 头。
+		if !devSession || !access.PeerIsLoopback(r.RemoteAddr) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Not Found"})
 			return
 		}
 		gate.Issue(w)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("POST /api/v1/session/logout", func(w http.ResponseWriter, r *http.Request) {
+		if gate != nil {
+			gate.RevokeSession(w, r)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("POST /api/v1/session/unlock", func(w http.ResponseWriter, r *http.Request) {
 		var deps UnlockDeps
 		if len(unlock) > 0 {
 			deps = unlock[0]
 		}
-		// 仅局域网模式存在此入口；默认模式语义与未注册路由一致（404）。
 		if deps.Enabled == nil || !deps.Enabled() {
 			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "Not Found"})
 			return
 		}
-		if locked := access.UnlockLockedSeconds(); locked > 0 {
+		peer := access.PeerKey(r.RemoteAddr)
+		if locked := access.UnlockLockedSeconds(peer); locked > 0 {
+			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", locked))
 			writeJSON(w, http.StatusTooManyRequests, map[string]any{"detail": fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(locked)+1)})
 			return
 		}
@@ -118,18 +152,22 @@ func RegisterSession(mux *http.ServeMux, gate *access.Gate, devSession bool, unl
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "请求体无效"})
 			return
 		}
-		expected, err := deps.Password()
+		verifier, err := deps.Verifier()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "访问密码读取失败"})
 			return
 		}
-		// 密码常数时间比较；连续失败达阈值后全局限速（防局域网内穷举）。
-		if expected == "" || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(password)), []byte(expected)) != 1 {
-			deps.Fail()
+		if verifier == "" {
+			recordUnlockFail(deps, peer)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "访问密码未设置，请先在本机设置访问密码"})
+			return
+		}
+		if !access.VerifyPassword(strings.TrimSpace(password), verifier) {
+			recordUnlockFail(deps, peer)
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"detail": "访问密码不正确"})
 			return
 		}
-		deps.Success()
+		recordUnlockSuccess(deps, peer)
 		gate.Issue(w)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})

@@ -66,7 +66,7 @@ func TestWriteGatePauseBusyRefused(t *testing.T) {
 		t.Fatalf("持闸期间暂停必须被拒：%v", err)
 	}
 	lease.Done()
-	deadline := time.Now().After(time.Now()) // 占位：释放后应可暂停
+	deadline := time.Now().After(time.Now())
 	_ = deadline
 	if err := gate.PauseWrites(context.Background()); err != nil {
 		t.Fatalf("写者位排空后必须可暂停: %v", err)

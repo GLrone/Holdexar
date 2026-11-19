@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-// TestStackOverSocket 完整叠序（安全响应头 → CORS）在真实 socket 上的冒烟：
-// 预检与简单响应的头都套上安全头（对齐 Python 最外层 _add_static_cache_headers）。
 func TestStackOverSocket(t *testing.T) {
 	srv := httptest.NewServer(Headers{}.Middleware(corsConfig().Middleware(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

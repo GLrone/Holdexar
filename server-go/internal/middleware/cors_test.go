@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-// corsConfig 与现网装配一致（main.py add_middleware 的参数形状）。
 func corsConfig() CORS {
 	return CORS{
 		AllowOrigins: []string{
@@ -56,8 +55,6 @@ func TestPreflightAllowedOrigin(t *testing.T) {
 	}
 }
 
-// TestPreflightDisallowedOrigin 清单外 Origin 回 400，且放行方法/凭据头仍在、
-// 仅缺 Access-Control-Allow-Origin（Starlette 失败响应保留基础头）。
 func TestPreflightDisallowedOrigin(t *testing.T) {
 	req := httptest.NewRequest(http.MethodOptions, "/api/v1/games", nil)
 	req.Header.Set("Origin", "http://evil.example")
@@ -71,7 +68,10 @@ func TestPreflightDisallowedOrigin(t *testing.T) {
 	if h.Get("Access-Control-Allow-Origin") != "" {
 		t.Fatalf("失败响应不得带 ACAO: %q", h.Get("Access-Control-Allow-Origin"))
 	}
-	if h.Get("Access-Control-Allow-Credentials") != "true" || h.Get("Access-Control-Max-Age") != "600" {
+	if h.Get("Access-Control-Allow-Credentials") != "" {
+		t.Fatalf("未放行 Origin 不得带 ACAC: %q", h.Get("Access-Control-Allow-Credentials"))
+	}
+	if h.Get("Access-Control-Max-Age") != "600" {
 		t.Fatalf("失败响应应保留基础头: %v", h)
 	}
 }
@@ -102,7 +102,6 @@ func TestPreflightMirrorsRequestHeaders(t *testing.T) {
 	}
 }
 
-// TestPreflightExplicitHeaders 清单外请求头进失败集合；安全表头恒放行。
 func TestPreflightExplicitHeaders(t *testing.T) {
 	c := corsConfig()
 	c.AllowHeaders = []string{"X-Allowed"}
@@ -124,8 +123,6 @@ func TestPreflightExplicitHeaders(t *testing.T) {
 	}
 }
 
-// TestSimpleResponses 简单响应放行矩阵：命中回显 Origin + 凭据 + Vary；
-// 未命中只有凭据与 Vary；无 Origin 只有 Vary。
 func TestSimpleResponses(t *testing.T) {
 	cases := []struct {
 		origin          string
@@ -135,9 +132,8 @@ func TestSimpleResponses(t *testing.T) {
 		wantPassthrough bool
 	}{
 		{origin: "http://localhost:5173", wantACAO: "http://localhost:5173", wantACAC: "true", wantVaryHas: true},
-		{origin: "http://evil.example", wantACAO: "", wantACAC: "true", wantVaryHas: true},
-		// 空值 Origin 头仍是「在场」（Starlette 仅按头存在性判），凭据位照发。
-		{origin: "", wantACAO: "", wantACAC: "true", wantVaryHas: true},
+		{origin: "http://evil.example", wantACAO: "", wantACAC: "", wantVaryHas: true},
+		{origin: "", wantACAO: "", wantACAC: "", wantVaryHas: true},
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/games", nil)
@@ -164,7 +160,6 @@ func TestSimpleResponses(t *testing.T) {
 	}
 }
 
-// TestPreflightDoesNotEnterHandler 预检不进内层；无 ACRM 头的 OPTIONS 进内层。
 func TestPreflightDoesNotEnterHandler(t *testing.T) {
 	entered := false
 	handler := corsConfig().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +183,6 @@ func TestPreflightDoesNotEnterHandler(t *testing.T) {
 	}
 }
 
-// TestSSEFlushPassthrough 流式响应经包装器后 Flush 仍可达且头已补写。
 func TestSSEFlushPassthrough(t *testing.T) {
 	handler := corsConfig().Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")

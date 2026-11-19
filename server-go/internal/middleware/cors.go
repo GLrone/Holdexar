@@ -1,6 +1,4 @@
-// Package middleware：HTTP 中间件——CORS 与安全响应头，线行为对齐 Python
-// 侧 Starlette CORSMiddleware 与 main.py 的 _add_static_cache_headers。
-// 叠序（请求流向）：安全响应头 → 访问闸 → CORS → 路由。
+// Package middleware 提供 CORS、GZip 压缩、安全响应头与静态缓存中间件。
 package middleware
 
 import (
@@ -9,15 +7,11 @@ import (
 	"strings"
 )
 
-// allMethods Starlette "*" 展开的完整方法表（含 QUERY，序同源）。
 var allMethods = []string{"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY"}
 
-// safelistedHeaders 显式 AllowHeaders 清单下仍恒放行的浏览器安全表头。
 var safelistedHeaders = []string{"accept", "accept-language", "content-language", "content-type"}
 
-// CORS 跨域中间件（Starlette CORSMiddleware 同径）。预检（OPTIONS + Origin
-// 头 + Access-Control-Request-Method 头）在此直接应答不进内层；简单响应按
-// Origin 是否在清单补放行头与 Vary。
+// CORS 跨域中间件：拦截带 Origin 与 ACRM 的 OPTIONS 预检，简单响应补放行头与 Vary。
 type CORS struct {
 	AllowOrigins     []string
 	AllowCredentials bool
@@ -58,8 +52,6 @@ func (c CORS) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// preflight 预检应答（Starlette preflight_response 同径）：失败集合非空回
-// 400「Disallowed CORS <原因>」，全过回 200「OK」；两者都携带预检基础头。
 func (c CORS) preflight(w http.ResponseWriter, r *http.Request, origin string, methods []string,
 	allowAllHeaders, allowAllOrigins bool, maxAge int, allowHeaders []string) {
 	h := w.Header()
@@ -67,11 +59,11 @@ func (c CORS) preflight(w http.ResponseWriter, r *http.Request, origin string, m
 	h.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network")
 	h.Set("Access-Control-Allow-Methods", strings.Join(methods, ", "))
 	h.Set("Access-Control-Max-Age", strconv.Itoa(maxAge))
-	if c.AllowCredentials {
-		h.Set("Access-Control-Allow-Credentials", "true")
-	}
 	var failures []string
 	if c.originAllowed(origin, allowAllOrigins) {
+		if c.AllowCredentials {
+			h.Set("Access-Control-Allow-Credentials", "true")
+		}
 		// 清单放行时回具体 Origin；全放行且不带凭据才回 "*"
 		if !allowAllOrigins || c.AllowCredentials {
 			h.Set("Access-Control-Allow-Origin", origin)
@@ -108,7 +100,6 @@ func (c CORS) preflight(w http.ResponseWriter, r *http.Request, origin string, m
 	_, _ = w.Write([]byte("OK"))
 }
 
-// originAllowed Origin 是否在放行清单（全放行为 true）。
 func (c CORS) originAllowed(origin string, allowAllOrigins bool) bool {
 	if allowAllOrigins {
 		return true
@@ -116,13 +107,12 @@ func (c CORS) originAllowed(origin string, allowAllOrigins bool) bool {
 	return contains(c.AllowOrigins, origin)
 }
 
-// corsWriter 简单响应头补写在 WriteHeader 前完成（Starlette 在响应起始帧
-// 注入同径）；未显式写头的路径由 Write / Flush 兜底。
+// corsWriter 在首个 WriteHeader / Write / Flush 前注入简单响应 CORS 头。
 type corsWriter struct {
 	http.ResponseWriter
 	cors            CORS
 	allowAllOrigins bool
-	origin          string // 请求侧 Origin（响应头里不会出现）
+	origin          string
 	hasOrigin       bool
 	wroteHeader     bool
 }
@@ -134,26 +124,21 @@ func (w *corsWriter) WriteHeader(code int) {
 	w.wroteHeader = true
 	h := w.Header()
 	switch {
-	case w.hasOrigin && w.allowAllOrigins && w.cors.AllowCredentials:
-		// Starlette simple_headers + send() 的放行矩阵：凭据位在 Origin
-		// 在场时恒下发；具体 Origin 与 "*" 互斥，未命中只补 Vary。
+	case w.hasOrigin && w.origin != "" && w.allowAllOrigins && w.cors.AllowCredentials:
+		// 仅在 Origin 命中放行条件时下发凭据头与具体 Origin。
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Set("Access-Control-Allow-Origin", w.origin)
+		appendVary(h, "Origin")
+	case w.hasOrigin && !w.allowAllOrigins && w.cors.originAllowed(w.origin, false):
 		if w.cors.AllowCredentials {
 			h.Set("Access-Control-Allow-Credentials", "true")
 		}
 		h.Set("Access-Control-Allow-Origin", w.origin)
 		appendVary(h, "Origin")
-	case w.hasOrigin && !w.allowAllOrigins && w.cors.originAllowed(w.origin, false):
-		h.Set("Access-Control-Allow-Credentials", "true")
-		h.Set("Access-Control-Allow-Origin", w.origin)
-		appendVary(h, "Origin")
-	case w.hasOrigin && w.allowAllOrigins:
+	case w.hasOrigin && w.origin != "" && w.allowAllOrigins:
 		h.Set("Access-Control-Allow-Origin", "*")
 		appendVary(h, "Origin")
 	default:
-		// 未命中清单（含无 Origin 头）：只补 Vary（Starlette else 分支同径）。
-		if w.hasOrigin && w.cors.AllowCredentials {
-			h.Set("Access-Control-Allow-Credentials", "true")
-		}
 		appendVary(h, "Origin")
 	}
 	w.ResponseWriter.WriteHeader(code)
@@ -175,7 +160,6 @@ func (w *corsWriter) Flush() {
 	}
 }
 
-// appendVary 追加一个 Vary 值（Python getlist 合并同径）。
 func appendVary(h http.Header, val string) {
 	if v := h.Get("Vary"); v != "" {
 		h.Set("Vary", v+", "+val)

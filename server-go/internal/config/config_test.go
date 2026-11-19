@@ -6,7 +6,6 @@ import (
 	"testing"
 )
 
-// unsetForTest 恢复现场地删除单个环境变量（t.Setenv 只能设值不能删除）。
 func unsetForTest(t *testing.T, key string) {
 	t.Helper()
 	saved, had := os.LookupEnv(key)
@@ -41,14 +40,17 @@ func TestResolveDataDirEnvBlankIgnored(t *testing.T) {
 	t.Setenv("HOLDEXAR_DATA_DIR", "   ")
 	t.Setenv("HOLDEXAR_INSTALL_ROOT", root)
 	t.Setenv("LOCALAPPDATA", machineRoot)
-	t.Setenv("APPDATA", "")
+	t.Setenv("APPDATA", machineRoot)
 	t.Setenv("USERPROFILE", machineRoot)
 	got, err := ResolveDataDir()
 	if err != nil {
 		t.Fatalf("空白环境变量应被跳过：%v", err)
 	}
-	if want := filepath.Join(machineRoot, "holdexar-dev"); got != want {
-		t.Fatalf("数据目录=%s，应回落开发态机器级候选 %s", got, want)
+	if want := filepath.Join(root, "holdexar-dev"); got != want {
+		t.Fatalf("数据目录=%s，应回落开发态目录 %s", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(machineRoot, "holdexar-dev")); !os.IsNotExist(err) {
+		t.Fatalf("不得触碰 LOCALAPPDATA：%v", err)
 	}
 }
 
@@ -131,7 +133,7 @@ func TestResolveDataDirRelativePointerIgnored(t *testing.T) {
 	t.Setenv("HOLDEXAR_DATA_DIR", "")
 	t.Setenv("HOLDEXAR_INSTALL_ROOT", root)
 	t.Setenv("LOCALAPPDATA", machineRoot)
-	t.Setenv("APPDATA", "")
+	t.Setenv("APPDATA", machineRoot)
 	t.Setenv("USERPROFILE", machineRoot)
 	if err := os.WriteFile(filepath.Join(root, DevPointer), []byte("relative/path\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -140,12 +142,12 @@ func TestResolveDataDirRelativePointerIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("非绝对指针应被忽略：%v", err)
 	}
-	if want := filepath.Join(machineRoot, "holdexar-dev"); got != want {
+	if want := filepath.Join(root, "holdexar-dev"); got != want {
 		t.Fatalf("数据目录=%s，应为 %s", got, want)
 	}
 }
 
-func TestResolveDataDirMachineCandidateOrder(t *testing.T) {
+func TestResolveDataDirIgnoresAppDataAndDefaultsByMode(t *testing.T) {
 	root := absPath(t.TempDir())
 	local := absPath(t.TempDir())
 	roaming := absPath(t.TempDir())
@@ -155,26 +157,106 @@ func TestResolveDataDirMachineCandidateOrder(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", local)
 	t.Setenv("APPDATA", roaming)
 	t.Setenv("USERPROFILE", home)
+
 	got, err := ResolveDataDir()
 	if err != nil {
-		t.Fatalf("机器级候选应按 LOCALAPPDATA 优先：%v", err)
+		t.Fatalf("开发态默认解析失败：%v", err)
 	}
-	if want := filepath.Join(local, "holdexar-dev"); got != want {
-		t.Fatalf("数据目录=%s，应为 %s", got, want)
+	if want := filepath.Join(root, "holdexar-dev"); got != want {
+		t.Fatalf("开发态数据目录=%s，应为 %s", got, want)
+	}
+	for _, base := range []string{local, roaming, home} {
+		entries, _ := os.ReadDir(base)
+		if len(entries) != 0 {
+			t.Fatalf("不得写入机器用户目录 %s：%v", base, entries)
+		}
+	}
+
+	origExe := executablePath
+	t.Cleanup(func() { executablePath = origExe })
+	for _, relExe := range []string{
+		filepath.Join("versions", "0.4.0", "serverd.exe"),
+		filepath.Join("versions", "0.4.0", "_internal", "serverd.exe"),
+	} {
+		pkgRoot := absPath(t.TempDir())
+		t.Setenv("HOLDEXAR_INSTALL_ROOT", "")
+		executablePath = func() (string, error) { return filepath.Join(pkgRoot, relExe), nil }
+		gotPkg, err := ResolveDataDir()
+		if err != nil {
+			t.Fatalf("打包态 (%s) 解析失败：%v", relExe, err)
+		}
+		if want := filepath.Join(pkgRoot, "data"); gotPkg != want {
+			t.Fatalf("打包态 (%s) 数据目录=%s，应为 %s", relExe, gotPkg, want)
+		}
 	}
 }
 
 func TestInstallRootFromExeLayouts(t *testing.T) {
-	root := filepath.Join(`E:`, "install")
-	cases := map[string]string{
-		filepath.Join(root, "versions", "0.3.6"): root,
-		filepath.Join(root, "updater"):           root,
-		root:                                     root,
+	origExe := executablePath
+	t.Cleanup(func() { executablePath = origExe })
+	t.Setenv("HOLDEXAR_INSTALL_ROOT", "")
+
+	root := absPath(t.TempDir())
+	cases := []string{
+		filepath.Join(root, "versions", "0.3.6", "serverd.exe"),
+		filepath.Join(root, "versions", "0.3.6", "_internal", "serverd.exe"),
+		filepath.Join(root, "updater", "UpdateHost.exe"),
+		filepath.Join(root, "serverd.exe"),
 	}
-	for exeDir, want := range cases {
-		if got := installRootFromExe(exeDir); got != want {
-			t.Fatalf("exe 目录 %s 的安装根=%s，应为 %s", exeDir, got, want)
+	for _, exe := range cases {
+		executablePath = func() (string, error) { return exe, nil }
+		got, err := InstallRoot()
+		if err != nil {
+			t.Fatalf("InstallRoot(%s) 报错：%v", exe, err)
 		}
+		if got != root {
+			t.Fatalf("exe %s 的安装根=%s，应为 %s", exe, got, root)
+		}
+	}
+}
+
+func TestWebDistDirPrefersVersionLocalOverRoot(t *testing.T) {
+	origExe := executablePath
+	t.Cleanup(func() { executablePath = origExe })
+
+	writeIndex := func(dir string) string {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	root := absPath(t.TempDir())
+	rootDist := writeIndex(filepath.Join(root, "web", "dist"))
+	verDir := filepath.Join(root, "versions", "0.4.0")
+	verDist := writeIndex(filepath.Join(verDir, "web", "dist"))
+	t.Setenv("HOLDEXAR_INSTALL_ROOT", root)
+
+	for _, exe := range []string{
+		filepath.Join(verDir, "serverd.exe"),
+		filepath.Join(verDir, "_internal", "serverd.exe"),
+	} {
+		executablePath = func() (string, error) { return exe, nil }
+		got, err := WebDistDir()
+		if err != nil {
+			t.Fatalf("WebDistDir(%s) 报错：%v", exe, err)
+		}
+		if got != verDist {
+			t.Fatalf("WebDistDir(%s)=%s，应优先版本本地 %s（根级 %s）", exe, got, verDist, rootDist)
+		}
+	}
+
+	devExe := filepath.Join(absPath(t.TempDir()), "bin", "serverd.exe")
+	executablePath = func() (string, error) { return devExe, nil }
+	gotDev, err := WebDistDir()
+	if err != nil {
+		t.Fatalf("开发态 WebDistDir 报错：%v", err)
+	}
+	if gotDev != rootDist {
+		t.Fatalf("开发态 WebDistDir=%s，应回退根级 %s", gotDev, rootDist)
 	}
 }
 

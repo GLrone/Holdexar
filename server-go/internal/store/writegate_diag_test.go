@@ -6,9 +6,6 @@ import (
 	"time"
 )
 
-// TestWriteGateDiagnosticsStates 三态钉住：空闲 / 持闸 / 双优先级排队。
-// 键名对齐 Python write_scheduler_diagnostics（busy/depth/owner_priority/
-// owner_label/waiting_interactive/waiting_background + pool）。
 func TestWriteGateDiagnosticsStates(t *testing.T) {
 	db, path := openTestDB(t)
 	if _, err := db.Exec("CREATE TABLE counter(n INTEGER)"); err != nil {
@@ -17,7 +14,6 @@ func TestWriteGateDiagnosticsStates(t *testing.T) {
 	g := NewWriteGate(db, path)
 	ctx := context.Background()
 
-	// 空闲：无持闸者、无排队、pool 段在场
 	snap := g.Diagnostics(ctx)
 	if snap["busy"] != false || snap["owner_priority"] != nil || snap["owner_label"] != nil ||
 		snap["waiting_interactive"] != 0 || snap["waiting_background"] != 0 {
@@ -28,7 +24,6 @@ func TestWriteGateDiagnosticsStates(t *testing.T) {
 		t.Fatalf("pool 段缺失或形状不对：%v", snap["pool"])
 	}
 
-	// 持闸：交互写者在位
 	lease, err := g.Acquire(ctx, PriorityInteractive)
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +36,6 @@ func TestWriteGateDiagnosticsStates(t *testing.T) {
 		t.Fatalf("持闸但不应有排队：%v", snap)
 	}
 
-	// 排队：1 交互 + 2 后台（持闸者未释放，后来者入队）
 	queued := make(chan error, 3)
 	for _, prio := range []WritePriority{PriorityBackground, PriorityInteractive, PriorityBackground} {
 		go func(p WritePriority) {
