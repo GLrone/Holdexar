@@ -10,13 +10,21 @@ export class ActivityManager {
   private readonly _items = shallowRef<Activity[]>([])
   private readonly _timers = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly _listeners = new Set<() => void>()
+  private _visibleIds: Set<string> | null = null
+  private _expiryPaused = false
 
-  /** 优先级默认值配置 */
+  /** 优先级与挽留分层：attention(50) 异常与 task(30) 运行进度可被悬停/展开
+      挽留；notice(20) 轻量结果消息是过场信息，到点即走、不被交互钉住 */
   private static readonly DEFAULT_PRIORITIES = {
     notice: 20,
     task: 30,
     system: 10,
     attention: 50,
+  }
+
+  /** 值得挽留的活动：需要用户处理的异常与进行中任务；轻量结果不在其列 */
+  private _holdable(activity: Activity): boolean {
+    return activity.needsAttention || activity.status === 'running'
   }
 
   /** 获取当前所有活动快照 */
@@ -27,6 +35,23 @@ export class ActivityManager {
   /** 获取在跑活动数量 */
   get count(): number {
     return this._items.value.length
+  }
+
+  setPresentation(visibleIds: string[], paused: boolean): void {
+    this._visibleIds = new Set(visibleIds)
+    this._expiryPaused = paused
+    for (const activity of this._items.value) {
+      if (!this._visibleIds.has(activity.id)) this._clearTimer(activity.id)
+      else if (paused && this._holdable(activity)) this._clearTimer(activity.id)
+      else if (!this._timers.has(activity.id)) this._armDuration(activity)
+    }
+  }
+
+  retry(id: string): void {
+    const callback = this.get(id)?.retry
+    if (!callback) return
+    this.remove(id)
+    callback()
   }
 
   /** 注册或原地更新活动；相同 id 自动去重并保留既有创建时间戳 */
@@ -59,6 +84,7 @@ export class ActivityManager {
         updatedAt: now,
         duration: reg.duration !== undefined ? reg.duration : existing.duration,
         retry: reg.retry !== undefined ? reg.retry : existing.retry,
+        cancel: reg.cancel !== undefined ? reg.cancel : existing.cancel,
         to: reg.to !== undefined ? reg.to : existing.to,
         toLabel: reg.toLabel !== undefined ? reg.toLabel : existing.toLabel,
         onOpen: reg.onOpen !== undefined ? reg.onOpen : existing.onOpen,
@@ -90,6 +116,7 @@ export class ActivityManager {
       updatedAt: now,
       duration: reg.duration,
       retry: reg.retry ?? null,
+      cancel: reg.cancel ?? null,
       to: reg.to ?? '',
       toLabel: reg.toLabel ?? '',
       onOpen: reg.onOpen ?? null,
@@ -128,6 +155,7 @@ export class ActivityManager {
       ...(patch.needsAttention !== undefined ? { needsAttention: patch.needsAttention } : {}),
       ...(patch.duration !== undefined ? { duration: patch.duration } : {}),
       ...(patch.retry !== undefined ? { retry: patch.retry } : {}),
+      ...(patch.cancel !== undefined ? { cancel: patch.cancel } : {}),
       ...(patch.to !== undefined ? { to: patch.to } : {}),
       ...(patch.toLabel !== undefined ? { toLabel: patch.toLabel } : {}),
       ...(patch.onOpen !== undefined ? { onOpen: patch.onOpen } : {}),
@@ -208,6 +236,8 @@ export class ActivityManager {
   private _armDuration(activity: Activity): void {
     this._clearTimer(activity.id)
     if (!activity.duration || activity.duration <= 0) return
+    if (this._visibleIds && !this._visibleIds.has(activity.id)) return
+    if (this._expiryPaused && this._holdable(activity)) return
 
     const timer = setTimeout(() => {
       this.remove(activity.id)

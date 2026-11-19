@@ -2,7 +2,7 @@
  * IslandController — 灵动岛展示控制层
  * 活动数据由 ActivityManager 持有；此处只维护可见槽位和用户选择顺序。
  */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { activityManager, ActivityManager } from './activityManager.ts'
 import type { Activity } from './types.ts'
 
@@ -44,6 +44,15 @@ export class IslandController {
     this._manager = manager
     this._manager.subscribe(() => this._syncActivities())
     this._syncActivities()
+    watch(
+      () => [this._mainId.value, this._secondaryId.value, this._expandedId.value,
+        this.isHovered.value, this.isOverviewOpen.value] as const,
+      () => this._manager.setPresentation(
+        unique([this._mainId.value, this._secondaryId.value, this._expandedId.value]),
+        this.isExpanded.value || this.isHovered.value || this.isOverviewOpen.value,
+      ),
+      { immediate: true, flush: 'sync' },
+    )
   }
 
   get sortedActivities(): Activity[] {
@@ -180,11 +189,6 @@ export class IslandController {
     this.isOverviewOpen.value = false
     this._repairSlots()
     this._commitVisibleOrder()
-  }
-
-  /** 兼容旧副岛请求入口；语义改为副岛直开。 */
-  swap(): void {
-    this.openSecondary()
   }
 
   requestSwap(): void {

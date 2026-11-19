@@ -92,6 +92,11 @@ function clearDevActivities() {
 }
 
 /* ── 预设场景注入（全使用 dev: 前缀） ── */
+/** dev:crawl 模拟取消：置为失败终态，与真实任务的取消收场同构 */
+function cancelDevCrawl() {
+  activityManager.update('dev:crawl', { status: 'failed', tone: 'error', needsAttention: true, progress: undefined, detail: t('island.playground.mockCrawlDetail') })
+}
+
 function applyPreset(preset: string) {
   clearDevActivities()
 
@@ -102,6 +107,7 @@ function applyPreset(preset: string) {
     case 'single':
       activityManager.register({
         id: 'dev:crawl',
+        cancel: cancelDevCrawl,
         source: 'crawler',
         kind: 'task',
         status: 'running',
@@ -117,6 +123,7 @@ function applyPreset(preset: string) {
     case 'dual':
       activityManager.register({
         id: 'dev:crawl',
+        cancel: cancelDevCrawl,
         source: 'crawler',
         kind: 'task',
         status: 'running',
@@ -143,6 +150,7 @@ function applyPreset(preset: string) {
     case 'quad':
       activityManager.register({
         id: 'dev:crawl',
+        cancel: cancelDevCrawl,
         source: 'crawler',
         kind: 'task',
         status: 'running',
@@ -198,6 +206,7 @@ function applyPreset(preset: string) {
     case 'crawl':
       activityManager.register({
         id: 'dev:crawl',
+        cancel: cancelDevCrawl,
         source: 'crawler',
         kind: 'task',
         status: 'running',

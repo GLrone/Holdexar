@@ -9,6 +9,7 @@ import { CYCLE_ACTIVE } from '@/lib/headerStatus'
 import { useI18n } from '@/locales'
 
 import { nextPriceCycle, type PriceCycleMark } from '@/lib/priceRefresh'
+import { useSettingsStore } from '@/stores/settings'
 
 /** 体检/重建进行中的前端状态：kind + 两层已探测计数（累计口径）。
     totalL1/totalL2 是后端下发的各层目标量（旧后端不下发，缺省 = 无百分比）。 */
@@ -238,6 +239,10 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
         title: t('island.task.running', { done: pDone, total: pTotal }),
         progress: pct,
         to: '/crawl',
+        cancel: () => {
+          const id = activeJobId.value
+          if (id !== null) crawlApi.stop(id).catch(() => { /* 取消请求失败保持现状 */ })
+        },
         priority: 30,
       })
     } else {
@@ -387,6 +392,13 @@ export const useCrawlStatusStore = defineStore('crawlStatus', () => {
       const kind = maintenance.value?.kind ?? data.kind ?? 'health'
       setMaintenance(null)
       announceMaintenanceEnded(kind, data)
+    })
+
+    /* 设置类键被别处改动（另一端/另一标签页/后端内部）：通知设置 store
+       静默重读，本会话内不再「外部改动要刷新浏览器才可见」 */
+    source.addEventListener('settings.changed', (e) => {
+      const data = JSON.parse((e as MessageEvent).data)
+      useSettingsStore().onBackendChange(data.keys)
     })
 
     source.onerror = () => {

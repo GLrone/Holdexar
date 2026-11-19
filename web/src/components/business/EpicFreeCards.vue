@@ -20,7 +20,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { metadataApi, type EpicMobileOffer, type EpicOffer } from '@/api/client'
 import { pluginsApi, pluginsChangedEvent } from '@/lib/pluginsApi'
 import { useI18n } from '@/locales'
-import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
+import { HlButton, HlEmpty, HlIcon, HlImg, HlSkeleton } from '@/components/ui'
 
 const { t } = useI18n()
 
@@ -272,7 +272,10 @@ onBeforeUnmount(() => {
           <HlImg class="epic-card__img" :src="mobile.image" :alt="mobile.title || t('epicFree.mobileCard')" loading="lazy" />
           <span class="epic-card__free">{{ t('epicFree.free') }}</span>
           <span class="epic-card__status">
-            <span class="epic-card__state epic-card__state--mobile">{{ t('epicFree.mobile') }}</span>
+            <span class="epic-card__state epic-card__state--mobile">
+              <HlIcon name="smartphone" :size="11" />
+              {{ t('epicFree.mobile') }}
+            </span>
             <span v-if="mobileEndText" class="epic-card__countdown">{{ mobileEndText }}</span>
           </span>
           <img src="/assets/logo_epic.ico" alt="" class="epic-card__mark" />
@@ -444,14 +447,17 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 
-/* 预告章换中性蓝（未开始的语义），倒计时跟随其后 */
+/* 预告章改透底弱化（未开始的语义，不与进行中抢视线），倒计时跟随其后 */
 .epic-card__status--upcoming .epic-card__state {
-  background: var(--accent);
-  color: var(--on-accent);
+  background: var(--accent-a15);
+  color: var(--accent);
 }
 
-/* 移动端章：来源语义（不是时间状态），沿用品牌蓝 */
+/* 移动端章：来源语义（不是时间状态）——实底品牌蓝 + 手机图标，与预告一眼区分 */
 .epic-card__state--mobile {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   background: var(--accent);
   color: var(--on-accent);
 }

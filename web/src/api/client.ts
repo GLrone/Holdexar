@@ -61,6 +61,7 @@ const NO_CACHE_PATHS = [
   '/bills/sync', // 账单同步进行中的快照轮询
   '/crawl/active', // 任务状态（页内刷新）
   '/crawl/jobs',
+  '/crawl/queue-specs', // 下轮队列组成（开关切换后重拉要立即可见）
   '/system/logs', // 用户点「刷新」要看新日志
   '/system/update-progress', // 更新下载进度 800ms 轮询
   '/system/update-pending',
@@ -137,10 +138,15 @@ export async function request<T>(
         !redirectingToUnlock
       ) {
         redirectingToUnlock = true
-        window.location.assign('/unlock')
+        const next = window.location.pathname + window.location.search
+        const unlockUrl = next && next !== '/' && next !== '/unlock'
+          ? `/unlock?next=${encodeURIComponent(next)}`
+          : '/unlock'
+        window.location.assign(unlockUrl)
       }
       throw new ApiError(response.status, detail)
     }
+    if (response.status === 204) return undefined as T
     return (await response.json()) as T
   })()
 
@@ -201,13 +207,14 @@ export interface SettingsPayload {
   mcp_error: string
   /** 环境变量强制开启（界面开关不可用） */
   mcp_forced_by_env: boolean
-  /** 局域网访问模式状态（Host 闸 + /session/unlock 自助解锁） */
+  /** 局域网访问模式状态；密码原文永不回显，设置走 update 的 lan_access.password */
   lan_access: {
     enabled: boolean
-    /** 环境变量强制开启：设置开关不可用 */
+    /** 环境变量强制开启：界面开关与密码均不可改 */
     env_forced: boolean
     /** 是否已设置访问密码（密码原文不回显到界面） */
     has_password: boolean
+    password_source?: 'user' | 'env' | 'none'
   }
 }
 
@@ -258,6 +265,12 @@ export interface FetchSettingsPayload {
   price_interval_hours: number
   /** 目录层随价格更新：True = 每轮价格更新带上未关注的目录游戏；下一轮生效 */
   catalog_refresh: boolean
+  /** 任务队列逐段开关（欠账补抓随轮）：下一轮组队生效 */
+  queue_missing: boolean
+  /** 任务队列逐段开关（关注与监控随轮）：下一轮组队生效 */
+  queue_pool: boolean
+  /** 任务队列逐段开关（折扣榜单随轮，仅直连模式出现在组成里）：下一轮组队生效 */
+  queue_discounts: boolean
   /** HB 月包自动刷新节奏（默认每天 02:30） */
   hb_schedule: ContentSchedule
   /** Epic 喜加一自动刷新节奏（默认每天 23:05） */
@@ -267,6 +280,12 @@ export interface FetchSettingsPayload {
 export interface LocalSteamAccountCandidate {
   steam_id: string
   persona_name: string
+}
+
+/** 下轮预期队列组成：段名 = missing/pool/discounts/catalog/specials；
+ *  kind 为通道/段身份标签（missing/specials_backfill/discounts），scope 段无 kind */
+export interface QueueSpecsPayload {
+  specs: { name: string; kind?: string | null }[]
 }
 
 export const settingsApi = {
@@ -296,7 +315,7 @@ export const settingsApi = {
     direct_notice_seen?: boolean
     /** MCP 服务开关（写入即运行时启停） */
     mcp_enabled?: boolean
-    /** 局域网访问：开关即时生效；密码只写不回读（空串不落库，掩码 **** 不回写） */
+    /** 局域网访问开关与访问密码（≥8 位；空串清密码；改/清即吊销旧解锁会话，无需旧密码） */
     lan_access?: { enabled?: boolean; password?: string }
   }) => request<SettingsPayload>('PUT', '/settings', payload),
   getFetch: () => request<FetchSettingsPayload>('GET', '/settings/fetch'),
@@ -1058,9 +1077,53 @@ export interface PilotQuoteRef {
   text: string
 }
 
+/** 局域网找回登录状态（Steam 官方登录流程的状态机投影，无凭据字段） */
+export interface RecoveryLoginState {
+  state: 'idle' | 'signing' | 'awaiting_code' | 'awaiting_confirmation' | 'finalizing' | 'done' | 'failed'
+  message: string
+  error: string
+  /** 'email' = 邮箱码；'totp' = 手机令牌码 */
+  code_hint: '' | 'email' | 'totp'
+  code_available: boolean
+  started_at: string
+  updated_at: string
+}
+
 /** 局域网访问解锁：访问密码换会话 Cookie（局域网模式关闭时后端 404） */
 export async function unlockAccess(password: string): Promise<{ ok: boolean }> {
   return request<{ ok: boolean }>('POST', '/session/unlock', { password }, { noCache: true })
+}
+
+/** 退出当前局域网解锁会话（清除会话 Cookie） */
+export async function logoutAccess(): Promise<void> {
+  return request<void>('POST', '/session/logout', undefined, { noCache: true })
+}
+
+// ─── 忘记密码找回：Steam 官方登录验证号主身份（锁定态公开通道）──────────
+
+export async function recoveryStart(
+  account: string,
+  password: string,
+): Promise<{ ok: boolean; state?: RecoveryLoginState; error?: string }> {
+  return request('POST', '/session/recovery/login/start', { account, password }, { noCache: true })
+}
+
+export async function recoverySubmitCode(
+  code: string,
+): Promise<{ ok: boolean; no_session?: boolean; state?: RecoveryLoginState; error?: string }> {
+  return request('POST', '/session/recovery/login/code', { code }, { noCache: true })
+}
+
+export async function recoveryStatus(): Promise<RecoveryLoginState> {
+  return request('GET', '/session/recovery/login/status', undefined, { noCache: true })
+}
+
+export async function recoveryCancel(): Promise<{ ok: boolean }> {
+  return request('POST', '/session/recovery/cancel', undefined, { noCache: true })
+}
+
+export async function recoveryComplete(): Promise<{ ok: boolean; error?: string }> {
+  return request('POST', '/session/recovery/complete', undefined, { noCache: true })
 }
 
 export async function askPilotStream(
@@ -2234,6 +2297,9 @@ export const crawlApi = {
     ),
   /** 价格刷新轮次（新→旧）；前端只用来看「最近一轮是否已收敛」 */
   cycles: (limit = 1) => request<PriceCycleItem[]>('GET', `/crawl/cycles${toQuery({ limit })}`),
+  /** 下轮预期队列组成：逐段开关过滤后的段名序列（组队顺序即返回顺序）。
+   *  队列组成卡的唯一数据源——开关态与组成同源，前端不自行推导。 */
+  queueSpecs: () => request<QueueSpecsPayload>('GET', '/crawl/queue-specs'),
   /** 全库最近一次成功价格观察（灵动岛时钟事实源，活表 last_success_at 的 MAX；
    *  自动轮/手动/补抓/回填的成功写入同样推进；null=从未成功观察） */
   latestObservation: () => request<{ lastSuccessAt: string | null; serverNow: string | null }>(

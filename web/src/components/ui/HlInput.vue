@@ -17,6 +17,14 @@ const props = withDefaults(
     type?: string
     /** 密钥形态：输入时始终掩码，右侧眼睛切换明文（切换不落库、只改本地视图） */
     showPassword?: boolean
+    autocomplete?: string
+    inputmode?: 'none' | 'text' | 'tel' | 'url' | 'email' | 'numeric' | 'decimal' | 'search'
+    minlength?: number | string
+    name?: string
+    autocapitalize?: string
+    autocorrect?: string
+    spellcheck?: boolean
+    ariaLabel?: string
   }>(),
   { placeholder: '', prefixIcon: '', suffixIcon: '', disabled: false, type: 'text', showPassword: false },
 )
@@ -36,6 +44,14 @@ const inputType = computed(() =>
       :type="inputType"
       :placeholder="placeholder"
       :disabled="disabled"
+      :autocomplete="autocomplete"
+      :inputmode="inputmode"
+      :minlength="minlength"
+      :name="name"
+      :autocapitalize="autocapitalize"
+      :autocorrect="autocorrect"
+      :spellcheck="spellcheck"
+      :aria-label="ariaLabel"
     />
     <button
       v-if="showPassword"

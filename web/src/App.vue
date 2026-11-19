@@ -82,6 +82,8 @@ onMounted(() => {
   // 桌面壳的关窗幕布挂载点（页面卸载时撤掉，避免壳里拿到过期引用）
   window.__hlxCloseCurtain = (on: boolean) => {
     closeCurtain.value = on
+    // teleport 到 body 的弹层（更新弹窗等）不在 .app-shell 内，跟随挂在 body 上
+    document.body.classList.toggle('hlx-curtained', on)
   }
   onUnmounted(() => {
     delete window.__hlxCloseCurtain

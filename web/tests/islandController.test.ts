@@ -79,6 +79,23 @@ test('IslandController: progress refresh preserves the user-selected layout', ()
   assert.equal(controller.expandedActivity?.progress, 20)
 })
 
+test('IslandController: updates do not take an acknowledged error out of expanded', () => {
+  const { manager, controller } = setup(['task'])
+  manager.register({ id: 'future:warning', source: 'future-feature', kind: 'system',
+    status: 'failed', title: 'New failure' })
+  controller.openMain()
+  const layout = controller.layout
+  manager.update('future:warning', { detail: 'More details' })
+  assert.deepEqual(controller.layout, layout)
+  manager.register({ id: 'future:warning', source: 'future-feature', kind: 'system',
+    status: 'failed', title: 'Refreshed failure' })
+  assert.deepEqual(controller.layout, layout)
+  manager.register({ id: 'future:new-warning', source: 'another-feature', kind: 'notice',
+    status: 'failed', title: 'Another failure', priority: 100 })
+  assert.equal(controller.primaryId, 'future:new-warning')
+  assert.equal(controller.expandedId, 'future:warning')
+})
+
 test('IslandController: secondary opens directly and fills from waiting candidates', () => {
   const { controller } = setup(['A', 'B', 'C', 'D'])
   controller.openSecondary()
@@ -171,7 +188,8 @@ test('IslandController: collapse returns the expanded task to its origin slot', 
   })
 })
 
-test('IslandController: removed and expired activities leave no stale slot or duplicate', async () => {
+test('IslandController: removed and expired activities leave no stale slot or duplicate', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   const manager = new ActivityManager()
   const controller = new IslandController(manager)
   manager.register({ id: 'A', source: 'test', title: 'A' })
@@ -179,7 +197,10 @@ test('IslandController: removed and expired activities leave no stale slot or du
   manager.register({ id: 'C', source: 'test', title: 'C' })
   controller.openSecondary()
 
-  await new Promise((resolve) => setTimeout(resolve, 30))
+  t.mock.timers.tick(30)
+  assert.equal(controller.expandedId, 'B')
+  controller.collapseExpanded()
+  t.mock.timers.tick(30)
   assert.equal(controller.primaryId, 'A')
   assert.equal(controller.expandedId, null)
   assert.equal(controller.secondaryId, 'C')

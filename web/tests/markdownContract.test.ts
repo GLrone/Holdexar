@@ -66,6 +66,19 @@ test('契约·链接：http(s) 可点击，javascript 与 data:text/html 被拒'
   assert.ok(!data.includes('href="data:text/html'), data)
 })
 
+test('契约·链接：控制字符伪装协议判定前归一，实体 tab 与编码 tab 拒成字面文本', () => {
+  const tab = mdLiteToHtml('[坏](jav&#x09;ascript:alert(1))')
+  assert.ok(!tab.includes('<a'), tab)
+  const enc = mdLiteToHtml('[坏](jav%09ascript:alert(1))')
+  assert.ok(!enc.includes('<a'), enc)
+})
+
+test('契约·链接：NUL 伪装协议退化为相对路径，href 不得为 javascript 协议', () => {
+  const nul = mdLiteToHtml('[坏](javascript\u0000:alert(1))')
+  assert.ok(!/<a href="javascript:/i.test(nul), nul)
+  assert.ok(nul.includes('<a href="javascript%EF%BF%BD:'), nul)
+})
+
 test('契约·围栏语言标记：保留 language-* class', () => {
   const html = mdLiteToHtml('```ts\nconst x = 1\n```')
   assert.ok(html.includes('<code class="language-ts">'), html)

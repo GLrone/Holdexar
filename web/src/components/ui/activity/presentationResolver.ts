@@ -201,3 +201,54 @@ export function resolvePresentation(
     showBar: isRunning,
   }
 }
+
+/** 岛面卡片动作与进度的统一视图：紧凑胶囊与展开卡共用，动作按钮只由数据能力决定 */
+export interface ActivityCardView {
+  /** 是否呈现进度条（展开态） */
+  busy: boolean
+  /** 进度百分比；null 表示不定长进度 */
+  percent: number | null
+  /** 主跳转目标（空串 = 无动作） */
+  target: string
+  /** 跳转按钮词条归类 */
+  targetLabelKind: 'task' | 'logs' | 'view'
+  canRetry: boolean
+  /** 取消回调；存在且运行中才呈现取消 */
+  cancel: (() => void) | null
+  /** 取消按钮是否可呈现（运行中且任务自带取消） */
+  cancelable: boolean
+  /** 是否提供忽略（自带取消的运行任务不重复提供） */
+  dismissible: boolean
+}
+
+export function resolveActivityCardView(
+  activity: Activity | null,
+  options: { showingPrice?: boolean } = {},
+): ActivityCardView {
+  if (!activity) {
+    return {
+      busy: false,
+      percent: null,
+      target: options.showingPrice ? '/crawl' : '',
+      targetLabelKind: 'task',
+      canRetry: false,
+      cancel: null,
+      cancelable: false,
+      dismissible: false,
+    }
+  }
+  const running = activity.status === 'running'
+  const failed = activity.status === 'failed' || activity.tone === 'error'
+  const target = activity.to || (failed ? '/logs' : '')
+  const cancel = activity.cancel ?? null
+  return {
+    busy: running && (activity.progress !== undefined || activity.kind === 'task'),
+    percent: activity.progress ?? null,
+    target,
+    targetLabelKind: target === '/logs' ? 'logs' : target === '/crawl' ? 'task' : 'view',
+    canRetry: Boolean(activity.retry),
+    cancel,
+    cancelable: cancel !== null && running,
+    dismissible: !(cancel !== null && running),
+  }
+}

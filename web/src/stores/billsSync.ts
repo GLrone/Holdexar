@@ -110,6 +110,7 @@ export const useBillsSyncStore = defineStore('billsSync', () => {
           cdk: res.cdkGames,
           rows: res.historyRows,
         }),
+        { to: '/bills' },
       )
       return res
     } catch (e) {

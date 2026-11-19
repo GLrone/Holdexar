@@ -300,14 +300,16 @@ export const useCdkRedeemStore = defineStore('cdkRedeem', () => {
     const skipped = keys.length - toActivate
     const params = { ok: ksOk.value, own: ksOwn.value, fail: ksFail.value, skipped }
     if (ksFail.value === 0) {
-      message.success(t(skipped > 0 ? 'toolbox.cdk.done.okSkipped' : 'toolbox.cdk.done.ok', params))
+      message.success(t(skipped > 0 ? 'toolbox.cdk.done.okSkipped' : 'toolbox.cdk.done.ok', params), { to: '/toolbox' })
     } else if (ksOk.value + ksOwn.value > 0) {
       message.warning(
         t(skipped > 0 ? 'toolbox.cdk.done.partialSkipped' : 'toolbox.cdk.done.partial', params),
+        { to: '/toolbox' },
       )
     } else {
       message.error(
         t(skipped > 0 ? 'toolbox.cdk.done.allFailedSkipped' : 'toolbox.cdk.done.allFailed', params),
+        { to: '/toolbox' },
       )
     }
     void loadQuota()

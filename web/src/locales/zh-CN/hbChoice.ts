@@ -19,7 +19,7 @@ const hbChoice = {
   'hbChoice.platform.origin': 'Origin',
   'hbChoice.platform.ea': 'EA App',
   'hbChoice.platform.itch': 'itch.io',
-  'hbChoice.platform.drm-free': '直接下载版',
+  'hbChoice.platform.drm-free': 'DRM 免费',
 } as const
 
 export default hbChoice

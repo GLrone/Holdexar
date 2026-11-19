@@ -288,6 +288,29 @@ async function deleteProviderNow() {
   }
 }
 
+/** 总开关与同页其他开关同口径：点击即落库（乐观更新，失败回弹并挂页头错误条）。
+    保存按钮仍负责上限/工具预算两处草稿，重复携带 enabled 幂等无害。 */
+const pilotSwitchSaving = ref(false)
+const pilotEnabledSwitch = computed({
+  get: () => pilotEnabled.value,
+  set: (on: boolean) => void togglePilotEnabled(on),
+})
+
+async function togglePilotEnabled(on: boolean) {
+  if (pilotSwitchSaving.value || pilotEnabled.value === on) return
+  const prev = pilotEnabled.value
+  pilotEnabled.value = on
+  pilotSwitchSaving.value = true
+  try {
+    await pilotApi.updateConfig({ enabled: on })
+  } catch (e) {
+    pilotEnabled.value = prev
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    pilotSwitchSaving.value = false
+  }
+}
+
 async function savePilotGlobal() {
   globalSaving.value = true
   try {
@@ -704,49 +727,78 @@ async function toggleMcp(on: boolean) {
 }
 
 /* ── 局域网访问（LAN）：开关 + 访问密码 + 本机地址投影 ──
- * 密码只写不回读：输入框永不预填服务端回显值，空值不提交——服务端对空串与
- * 掩码 **** 一律不落库，前端不参与掩码语义。本机地址来自桌面宿主桥（仅
- * 桌面壳内可用），浏览器/旧宿主保持通用指引文案。 */
+ * 密码只写不回读：输入框永不预填服务端回显值；忘记密码即在本机此处设新密
+ * （无需旧密码），改密或清密都会吊销既有解锁会话。本机地址来自桌面宿主桥。 */
 const lanEnabled = ref(false)
 const lanForced = ref(false)
 const lanHasPassword = ref(false)
-const lanToggling = ref(false)
-const lanSaving = ref(false)
-const lanPasswordInput = ref('')
+const lanPasswordSource = ref<'user' | 'env' | 'none'>('none')
+const lanBusy = ref(false)
+const lanPassword = ref('')
 const lanHosts = ref<string[]>([])
+
+const lanPasswordStateLabel = computed(() =>
+  lanPasswordSource.value === 'user'
+    ? t('settings.lan.stateUser')
+    : lanPasswordSource.value === 'env'
+      ? t('settings.lan.stateEnv')
+      : t('settings.lan.stateNone'),
+)
 
 function applyLanPayload(data: SettingsPayload) {
   if (!data.lan_access) return
   lanEnabled.value = data.lan_access.enabled
   lanForced.value = data.lan_access.env_forced
   lanHasPassword.value = data.lan_access.has_password
+  lanPasswordSource.value =
+    data.lan_access.password_source ?? (data.lan_access.has_password ? 'user' : 'none')
 }
 
-async function toggleLan(on: boolean) {
-  if (lanToggling.value || lanForced.value) return
-  lanToggling.value = true
+async function saveLanEnabled(on: boolean) {
+  if (lanBusy.value || lanForced.value) return
+  lanBusy.value = true
   try {
-    applyLanPayload((await settingsApi.update({ lan_access: { enabled: on } })).lan_access)
-    message.success(t(on ? 'settings.lan.onPost' : 'settings.lan.offPost'))
-  } catch {
-    message.error(t('settings.update.switchFailed'))
+    const data = await settingsApi.update({ lan_access: { enabled: on } })
+    applyLanPayload(data)
+    if (data.lan_access.enabled && !data.lan_access.has_password) {
+      message.warning(t('settings.lan.noPasswordWarning'))
+    } else {
+      message.success(t(on ? 'settings.lan.onPost' : 'settings.lan.offPost'))
+    }
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : t('settings.update.switchFailed'))
   } finally {
-    lanToggling.value = false
+    lanBusy.value = false
   }
 }
 
 async function saveLanPassword() {
-  const value = lanPasswordInput.value.trim()
-  if (!value || lanSaving.value) return
-  lanSaving.value = true
+  const pwd = lanPassword.value.trim()
+  if (lanBusy.value || pwd.length < 8) return
+  lanBusy.value = true
   try {
-    applyLanPayload((await settingsApi.update({ lan_access: { password: value } })).lan_access)
-    lanPasswordInput.value = ''
+    const data = await settingsApi.update({ lan_access: { password: pwd } })
+    applyLanPayload(data)
+    lanPassword.value = ''
     message.success(t('settings.lan.passwordSaved'))
-  } catch {
-    message.error(t('settings.update.switchFailed'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : t('settings.update.switchFailed'))
   } finally {
-    lanSaving.value = false
+    lanBusy.value = false
+  }
+}
+
+async function clearLanPassword() {
+  if (lanBusy.value) return
+  lanBusy.value = true
+  try {
+    const data = await settingsApi.update({ lan_access: { password: '' } })
+    applyLanPayload(data)
+    message.success(t('settings.lan.passwordCleared'))
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : t('settings.update.switchFailed'))
+  } finally {
+    lanBusy.value = false
   }
 }
 
@@ -1897,7 +1949,7 @@ onUnmounted(() => {
           <div class="pilot-form__row">
             <span class="pilot-form__label">{{ t('pilot.settings.enabled') }}</span>
             <div class="pilot-form__field pilot-form__field--inline">
-              <HlSwitch v-model="pilotEnabled" accent />
+              <HlSwitch v-model="pilotEnabledSwitch" accent :disabled="pilotSwitchSaving || globalSaving" />
               <span class="pilot-form__hint">
                 {{ t('pilot.model.current') }}：{{ pilotModel || t('pilot.model.none') }} · {{ activeProviderName }}
               </span>
@@ -2260,18 +2312,30 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div v-if="securityMode === 'passphrase'" class="settings-row">
+        <div
+          v-if="securityMode === 'passphrase' || securityStatus?.mode === 'passphrase'"
+          class="settings-row"
+        >
           <div class="settings-row__line">
             <HlInput
+              v-if="securityMode === 'passphrase'"
               v-model="newPassphrase"
+              name="new_passphrase"
               type="password"
+              show-password
+              autocomplete="new-password"
+              :aria-label="t('settings.security.passphraseLabel')"
               :placeholder="t('settings.security.passphraseLabel')"
               style="max-width: 220px"
             />
             <HlInput
               v-if="securityStatus?.mode === 'passphrase'"
               v-model="currentPassphrase"
+              name="current_passphrase"
               type="password"
+              show-password
+              autocomplete="current-password"
+              :aria-label="t('settings.security.currentPassphrasePlaceholder')"
               :placeholder="t('settings.security.currentPassphrasePlaceholder')"
               style="max-width: 220px"
             />
@@ -2620,7 +2684,7 @@ onUnmounted(() => {
       </div>
 
       <!-- 局域网访问：手机/其他电脑凭「本机地址 + 访问密码」经浏览器使用应用；
-           关闭 = 仅本机回环访问（默认）。密码只写不回读。 -->
+           关闭 = 仅本机回环访问（默认）。密码只写不回读；忘记密码即在本机此处设新密。 -->
       <div class="card settings-card" data-section="settings.section.lan">
         <div class="section-title">{{ t('settings.section.lan') }}</div>
         <div class="section-desc">{{ t('settings.lan.desc') }}</div>
@@ -2630,10 +2694,10 @@ onUnmounted(() => {
             <HlSwitch
               :model-value="lanEnabled"
               accent
-              :disabled="lanToggling || lanForced"
+              :disabled="lanBusy || lanForced"
               :label="t('settings.lan.enabledLabel')"
               :title="lanForced ? t('settings.lan.forcedHint') : t('settings.lan.enabledHint')"
-              @update:model-value="toggleLan"
+              @update:model-value="saveLanEnabled"
             />
             <span class="mcp-status" :class="lanEnabled ? 'is-ok' : ''">
               <span class="mcp-status__dot" />
@@ -2643,32 +2707,54 @@ onUnmounted(() => {
           <div class="section-desc">
             {{ lanForced ? t('settings.lan.forcedHint') : t('settings.lan.enabledHint') }}
           </div>
+          <div v-if="lanPasswordSource === 'env'" class="section-desc">
+            {{ t('settings.lan.envForced') }}
+          </div>
+          <div v-else class="section-desc">
+            {{ t('settings.lan.passwordState', { state: lanPasswordStateLabel }) }}
+            · {{ t('settings.lan.forgotHint') }}
+          </div>
         </div>
 
-        <div class="settings-row">
+        <div v-if="lanPasswordSource !== 'env'" class="settings-row">
           <div class="settings-row__line">
             <HlInput
-              v-model="lanPasswordInput"
+              v-model="lanPassword"
+              name="lan_password"
               type="password"
+              show-password
+              autocomplete="new-password"
+              minlength="8"
+              :aria-label="t('settings.lan.passwordPlaceholder')"
               :placeholder="
                 lanHasPassword
                   ? t('settings.lan.passwordPlaceholderSet')
                   : t('settings.lan.passwordPlaceholder')
               "
               style="max-width: 220px"
-              :disabled="lanSaving"
+              :disabled="lanBusy"
               @keydown.enter="saveLanPassword"
             />
             <HlButton
+              type="button"
               art="outline"
               tone="blue"
               size="sm"
-              :disabled="lanSaving || !lanPasswordInput.trim()"
-              :loading="lanSaving"
+              :disabled="lanBusy || lanPassword.trim().length < 8"
+              :loading="lanBusy"
               @click="saveLanPassword"
             >
-              {{ t('settings.lan.passwordSave') }}
+              {{ t('settings.lan.setPassword') }}
             </HlButton>
+            <HlPopconfirm
+              v-if="lanHasPassword && lanPasswordSource === 'user'"
+              :text="t('settings.lan.clearConfirm')"
+              @confirm="clearLanPassword"
+            >
+              <HlButton type="button" variant="text" size="sm" tone="red" :disabled="lanBusy">
+                {{ t('settings.lan.clearPassword') }}
+              </HlButton>
+            </HlPopconfirm>
           </div>
           <div class="section-desc">{{ t('settings.lan.passwordHint') }}</div>
         </div>

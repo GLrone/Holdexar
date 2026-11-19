@@ -45,7 +45,7 @@ export const pluginsChangedEvent = 'holdexar:plugins-changed'
 export const pluginsApi = {
   list: () => request<PluginsState>('GET', '/plugins', undefined, { noCache: true }),
   discover: (source: string, q: string) => request<{ items: PluginView[]; cached: boolean; error?: string }>(
-    'GET', `/plugins/discover?${new URLSearchParams({ source, q })}`, undefined, { noCache: true },
+    'POST', '/plugins/discover', { source, q }, { noCache: true },
   ),
   install: (plugin: PluginView) => request('POST', '/plugins/install', {
     id: plugin.manifest.id, version: plugin.manifest.version, sha256: plugin.sha256, url: plugin.url,

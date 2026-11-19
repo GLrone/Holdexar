@@ -2,10 +2,8 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { crawlApi } from '@/api/client'
 import { usePriceStatus } from '@/composables/usePriceStatus'
 import { useI18n } from '@/locales'
-import { useCrawlStatusStore } from '@/stores/crawlStatus'
 
 import { activityManager } from './activity/activityManager'
 import { IDLE_EXPANDED_ID, islandController } from './activity/islandController'
@@ -14,185 +12,47 @@ import ActivityPanel from './activity/ActivityPanel.vue'
 import PrimaryIsland from './activity/PrimaryIsland.vue'
 import SecondaryIsland from './activity/SecondaryIsland.vue'
 import { IslandLayoutMotion } from './activity/islandLayoutMotion'
+import { resolveActivityCardView } from './activity/presentationResolver'
 import type { Activity } from './activity/types'
-import { dropNotice, endTask, island, setHovered } from './island'
 
 const router = useRouter()
-const crawl = useCrawlStatusStore()
 const { t } = useI18n()
 const { kind: priceKind, label: priceLabel, color: priceColor, tip: priceTip, detail: priceDetail, stale: priceStale } = usePriceStatus()
 
-const TONE_ICON: Record<string, string> = {
-  success: 'check-circle',
-  error: 'x-circle',
-  warning: 'warning',
-  info: 'info',
-  progress: 'refresh',
-}
-
 const rootEl = ref<HTMLElement | null>(null)
 const idleStatusDismissed = ref(false)
+/** 空闲价格状态单次占岛时长：过场状态不强留用户视线 */
+const PRICE_STATUS_TTL_MS = 30_000
+let priceHideTimer: ReturnType<typeof setTimeout> | null = null
 const primaryAct = computed(() => islandController.primaryActivity)
 const secondaryAct = computed(() => islandController.secondaryActivity)
 const expandedAct = computed(() => islandController.expandedActivity)
-const legacyNotice = computed(() => island.notices.find((notice) => !activityManager.get('notice:' + notice.id)) ?? null)
-const legacyTask = computed(() => island.tasks.find((task) => !activityManager.get('task:' + task.key)) ?? null)
-const crawlRunning = computed(() => crawl.running && crawl.total > 0)
-const progDone = computed(() => crawl.roundProgress?.done ?? crawl.done)
-const progTotal = computed(() => crawl.roundProgress?.total ?? crawl.total)
-
 const mode = computed<'idle' | 'notice' | 'task'>(() => {
   const act = primaryAct.value
-  if (act) return act.kind === 'task' || act.status === 'running' ? 'task' : 'notice'
-  if (legacyNotice.value) return legacyNotice.value.sticky ? 'task' : 'notice'
-  if (legacyTask.value || crawlRunning.value) return 'task'
-  return 'idle'
+  if (!act) return 'idle'
+  return act.kind === 'task' || act.status === 'running' ? 'task' : 'notice'
 })
-
-const showingPrice = computed(() => !primaryAct.value && !legacyNotice.value && !crawlRunning.value && !legacyTask.value)
-const visible = computed(() => !idleStatusDismissed.value && (mode.value !== 'idle' || priceStale.value || islandController.isExpanded.value))
+const showingPrice = computed(() => !primaryAct.value)
+const visible = computed(() =>
+  mode.value !== 'idle'
+  || islandController.isExpanded.value
+  || (priceStale.value && !idleStatusDismissed.value))
 const showCompactMain = computed(() => Boolean(primaryAct.value) || !islandController.isExpanded.value)
 const waiting = computed(() => islandController.waitingCount)
-const isDevExpanded = computed(() => expandedAct.value?.id.startsWith('dev:') ?? false)
-
-const taskPercent = computed<number | null>(() => {
-  const act = primaryAct.value
-  if (act) return act.progress ?? null
-  if (legacyNotice.value?.sticky) return null
-  if (legacyTask.value) return legacyTask.value.percent
-  if (!progTotal.value) return null
-  return Math.min(100, Math.round((progDone.value / progTotal.value) * 100))
-})
-
-const crawlOnlyTask = computed(() => {
-  const act = primaryAct.value
-  if (act) return act.source === 'crawler' && act.status === 'running' && !act.id.startsWith('dev:')
-  return !legacyNotice.value && !legacyTask.value && crawlRunning.value
-})
-const canRetry = computed(() => Boolean(primaryAct.value?.retry || legacyNotice.value?.retry))
-const busy = computed(() => {
-  const act = primaryAct.value
-  if (act) return act.status === 'running' && (act.progress !== undefined || act.kind === 'task')
-  return Boolean(legacyNotice.value?.sticky || crawlRunning.value || legacyTask.value)
-})
-const taskLines = computed(() => island.tasks.slice(1, 4))
-const taskGoto = computed(() => legacyTask.value?.to ?? '')
-
-const goto = computed(() => {
-  const act = primaryAct.value
-  if (act) return act.to || (act.status === 'failed' || act.tone === 'error' ? '/logs' : '')
-  const notice = legacyNotice.value
-  return notice ? notice.to || (notice.tone === 'error' ? '/logs' : '') : ''
-})
-const gotoLabel = computed(() => {
-  const act = primaryAct.value
-  if (act?.toLabel) return act.toLabel
-  const notice = legacyNotice.value
-  if (notice?.toLabel) return notice.toLabel
-  return goto.value === '/logs' ? t('island.viewLogs') : t('island.view')
-})
-
-const headText = computed(() => {
-  if (showingPrice.value) return priceLabel.value
-  if (primaryAct.value) return primaryAct.value.title
-  if (legacyNotice.value) return legacyNotice.value.text
-  if (legacyTask.value) return legacyTask.value.text
-  return t('island.task.running', { done: progDone.value, total: progTotal.value })
-})
+const headText = computed(() => primaryAct.value?.title ?? priceLabel.value)
 const headTextStyle = computed(() => showingPrice.value ? { color: priceColor.value } : {})
 const headTruncated = computed(() => headText.value.length > 32)
-const trailing = computed(() => '')
+const detailText = computed(() => primaryAct.value ? primaryAct.value.detail ?? '' : priceDetail.value)
 
-function iconFor(activity: Activity | null, price: boolean, tone?: string): string {
-  if (price) return 'refresh'
-  if (activity?.icon) return activity.icon
-  if (activity?.tone && TONE_ICON[activity.tone]) return TONE_ICON[activity.tone]
-  if (activity?.status === 'failed') return 'x-circle'
-  if (activity?.status === 'success') return 'check-circle'
-  if (tone && TONE_ICON[tone]) return TONE_ICON[tone]
-  return 'refresh'
-}
-
-const leadIcon = computed(() => iconFor(primaryAct.value, showingPrice.value, legacyNotice.value?.tone))
-const leadSpin = computed(() => {
-  if (showingPrice.value) return priceKind.value === 'running'
-  if (primaryAct.value) return primaryAct.value.status === 'running'
-  if (mode.value === 'task') return true
-  return Boolean(legacyNotice.value?.sticky)
-})
-const leadToneClass = computed(() => {
-  if (showingPrice.value) return ''
-  const act = primaryAct.value
-  if (act?.status === 'failed') return 'is-error'
-  if (act?.tone) return 'is-' + act.tone
-  if (act) return 'is-progress'
-  return legacyNotice.value ? 'is-' + legacyNotice.value.tone : 'is-progress'
-})
-const showBar = computed(() => {
-  if (primaryAct.value) {
-    return primaryAct.value.status === 'running' && (primaryAct.value.progress !== undefined || primaryAct.value.kind === 'task')
-  }
-  return busy.value
-})
-const detailText = computed(() => primaryAct.value?.detail ?? legacyNotice.value?.detail ?? (showingPrice.value ? priceDetail.value : ''))
-
+/** 紧凑胶囊与展开卡动作共用同一套派生 */
+const primaryView = computed(() => resolveActivityCardView(primaryAct.value))
 const expandedShowingPrice = computed(() => islandController.isIdleExpanded)
-const expandedShowsTasks = computed(() => !expandedAct.value && !legacyNotice.value && Boolean(legacyTask.value))
-const expandedTaskLines = computed(() => island.tasks.slice(1, 4))
-const expandedTaskGoto = computed(() => legacyTask.value?.to ?? '')
-const expandedText = computed(() => {
-  if (expandedAct.value) return expandedAct.value.title
-  if (legacyNotice.value) return legacyNotice.value.text
-  if (legacyTask.value) return legacyTask.value.text
-  return priceLabel.value
-})
-const expandedProgress = computed<number | null>(() => {
-  if (expandedAct.value) return expandedAct.value.progress ?? null
-  if (legacyNotice.value?.sticky) return null
-  if (legacyTask.value) return legacyTask.value.percent
-  if (crawlRunning.value && progTotal.value) return Math.min(100, Math.round((progDone.value / progTotal.value) * 100))
-  return null
-})
-const expandedIcon = computed(() => iconFor(expandedAct.value, expandedShowingPrice.value, legacyNotice.value?.tone))
-const expandedSpin = computed(() => {
-  if (expandedShowingPrice.value) return priceKind.value === 'running'
-  if (expandedAct.value) return expandedAct.value.status === 'running'
-  return Boolean(legacyNotice.value?.sticky || legacyTask.value || crawlRunning.value)
-})
-const expandedToneClass = computed(() => {
-  if (expandedShowingPrice.value) return ''
-  if (expandedAct.value?.status === 'failed') return 'is-error'
-  if (expandedAct.value?.tone) return 'is-' + expandedAct.value.tone
-  if (expandedAct.value) return 'is-progress'
-  return legacyNotice.value ? 'is-' + legacyNotice.value.tone : 'is-progress'
-})
-const expandedIsTask = computed(() => {
-  if (expandedAct.value) return expandedAct.value.status === 'running' && expandedAct.value.kind === 'task' && expandedAct.value.source === 'crawler' && !expandedAct.value.id.startsWith('dev:')
-  return !legacyNotice.value && crawlRunning.value
-})
-const expandedCanRetry = computed(() => Boolean(expandedAct.value?.retry || legacyNotice.value?.retry))
-/** 忽略只在展开卡控制区提供：运行中且自带取消的任务以取消为准，不重复给忽略 */
-const expandedDismissible = computed(() => {
-  const act = expandedAct.value
-  return Boolean(act) && !(act!.cancel && act!.status === 'running')
-})
-const expandedGoto = computed(() => {
-  if (expandedAct.value) return expandedAct.value.to || (expandedAct.value.status === 'failed' || expandedAct.value.tone === 'error' ? '/logs' : '')
-  if (legacyNotice.value) return legacyNotice.value.to || (legacyNotice.value.tone === 'error' ? '/logs' : '')
-  return ''
-})
-const expandedGotoLabel = computed(() => {
-  if (expandedAct.value?.toLabel) return expandedAct.value.toLabel
-  if (legacyNotice.value?.toLabel) return legacyNotice.value.toLabel
-  return expandedGoto.value === '/logs' ? t('island.viewLogs') : t('island.view')
-})
-const expandedDetail = computed(() => expandedAct.value?.detail ?? legacyNotice.value?.detail ?? (expandedShowingPrice.value ? priceDetail.value : ''))
-const expandedShowBar = computed(() => {
-  if (expandedAct.value) return expandedAct.value.status === 'running' && (expandedAct.value.progress !== undefined || expandedAct.value.kind === 'task')
-  return Boolean(legacyTask.value || crawlRunning.value)
-})
+const expandedView = computed(() => resolveActivityCardView(expandedAct.value, { showingPrice: expandedShowingPrice.value }))
+const expandedText = computed(() => expandedAct.value?.title ?? priceLabel.value)
+const expandedDetail = computed(() => expandedAct.value?.detail ?? (expandedShowingPrice.value ? priceDetail.value : ''))
+
 const expandedTrailing = computed(() => {
-  if (expandedProgress.value !== null) return String(expandedProgress.value) + '%'
+  if (expandedView.value.percent !== null) return String(expandedView.value.percent) + '%'
   return waiting.value ? t('island.more', { n: waiting.value }) : ''
 })
 const expandedHeadStyle = computed(() => {
@@ -207,7 +67,7 @@ const expandedStyle = computed(() => ({
 
 const idleWidth = computed(() => Math.min(240, Math.max(146, 82 + priceLabel.value.length * 13)))
 const noticeWidth = computed(() => {
-  const title = primaryAct.value?.title ?? legacyNotice.value?.text ?? ''
+  const title = primaryAct.value?.title ?? ''
   return Math.min(320, Math.max(160, 76 + title.length * 13))
 })
 const size = computed(() => {
@@ -225,10 +85,6 @@ const mainDataId = computed(() => primaryAct.value?.id ?? (showingPrice.value ? 
 let activeMotion: IslandLayoutMotion | null = null
 let applyingControllerMutation = false
 
-function syncExpandedBridge() {
-  island.expanded = islandController.isExpanded.value
-}
-
 async function transitionLayout(change: () => void) {
   activeMotion?.finish()
   activeMotion = null
@@ -240,7 +96,6 @@ async function transitionLayout(change: () => void) {
   } finally {
     applyingControllerMutation = false
   }
-  syncExpandedBridge()
   await nextTick()
   if (activeMotion !== motion) return
   await motion?.play()
@@ -270,13 +125,7 @@ async function collapseExpanded() {
 function dismiss() {
   const act = expandedAct.value ?? primaryAct.value
   if (act) {
-    if (act.id.startsWith('notice:')) dropNotice(Number(act.id.slice('notice:'.length)))
-    else if (act.id.startsWith('task:')) endTask(act.id.slice('task:'.length))
-    else activityManager.remove(act.id)
-    return
-  }
-  if (legacyNotice.value) {
-    dropNotice(legacyNotice.value.id)
+    activityManager.remove(act.id)
     return
   }
   if (showingPrice.value) {
@@ -287,72 +136,37 @@ function dismiss() {
 
 function retry() {
   const act = expandedAct.value ?? primaryAct.value
+  if (!act) return
   islandController.collapseExpanded()
-  syncExpandedBridge()
-  if (act) {
-    if (act.id.startsWith('dev:')) {
-      activityManager.update(act.id, { status: 'running', tone: 'info', progress: 0 })
-      return
-    }
-    const fn = act.retry ?? null
-    activityManager.remove(act.id)
-    fn?.()
+  if (act.id.startsWith('dev:')) {
+    activityManager.update(act.id, { status: 'running', tone: 'info', progress: 0 })
     return
   }
-  const fn = legacyNotice.value?.retry ?? null
-  if (legacyNotice.value) dropNotice(legacyNotice.value.id)
-  fn?.()
+  activityManager.retry(act.id)
 }
 
 function goDetail() {
   const act = expandedAct.value ?? primaryAct.value
   if (act?.onOpen) {
     islandController.collapseExpanded()
-    syncExpandedBridge()
     act.onOpen()
     return
   }
-  const target = expandedGoto.value || goto.value
+  const target = expandedView.value.target || primaryView.value.target
   if (!target) return
   const isDev = act?.id.startsWith('dev:') ?? false
   islandController.collapseExpanded()
-  syncExpandedBridge()
   if (isDev) return
   void router.push(target)
 }
 
-function goTask() {
-  const target = expandedTaskGoto.value
-  if (!target) return
-  islandController.collapseExpanded()
-  syncExpandedBridge()
-  if (isDevExpanded.value) return
-  void router.push(target)
-}
-
-async function cancelTask(act: Activity | null) {
-  const id = crawl.activeJobId
-  if (act?.id === islandController.expandedId) {
-    void transitionLayout(() => islandController.collapseExpanded())
-  }
-  if (act?.id.startsWith('dev:')) {
-    activityManager.fail(act.id, { detail: 'Cancelled in test' })
-    return
-  }
-  if (id === null) return
-  try {
-    await crawlApi.stop(id)
-  } catch {
-    /* 忽略取消请求失败 */
-  }
-}
-
-function openTask() {
-  const act = expandedAct.value ?? primaryAct.value
-  islandController.collapseExpanded()
-  syncExpandedBridge()
-  if (act?.id.startsWith('dev:')) return
-  void router.push(act?.to || '/crawl')
+function cancelTask(act: Activity | null) {
+  const cancel = resolveActivityCardView(act).cancel
+  if (!cancel) return
+  void transitionLayout(() => {
+    if (act?.id === islandController.expandedId) islandController.collapseExpanded()
+    cancel()
+  })
 }
 
 function openOverview() {
@@ -379,12 +193,24 @@ watch(islandController.layoutRequest, () => {
   }
   void transitionLayout(actions[action])
 })
-watch(islandController.isExpanded, (expanded) => {
-  island.expanded = expanded
-}, { immediate: true })
 watch(
-  () => [primaryAct.value?.id, legacyNotice.value?.id, legacyTask.value?.key, priceKind.value, priceLabel.value, priceStale.value],
+  () => [priceKind.value, priceLabel.value, priceStale.value],
   () => { idleStatusDismissed.value = false },
+)
+/* 价格空闲结论只在连续可见 30s 内占岛：到点自动收起，价格状态变化才重新出现 */
+watch(
+  () => showingPrice.value && priceStale.value
+    && !islandController.isExpanded.value && !islandController.isOverviewOpen.value,
+  (idleShowing) => {
+    if (priceHideTimer) {
+      clearTimeout(priceHideTimer)
+      priceHideTimer = null
+    }
+    if (idleShowing) {
+      priceHideTimer = setTimeout(() => { idleStatusDismissed.value = true }, PRICE_STATUS_TTL_MS)
+    }
+  },
+  { immediate: true },
 )
 watch(
   () => JSON.stringify(islandController.layout),
@@ -420,6 +246,11 @@ function onPanelAction(activity: Activity) {
 onMounted(() => document.addEventListener('mousedown', onDocDown))
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocDown)
+  if (priceHideTimer) {
+    clearTimeout(priceHideTimer)
+    priceHideTimer = null
+  }
+  islandController.setHovered(false)
   activeMotion?.finish()
   activeMotion = null
 })
@@ -434,6 +265,8 @@ onBeforeUnmount(() => {
       :class="{ 'has-secondary': islandController.hasSecondary }"
       :style="{ '--island-main-width': islandStyle.width }"
       @keydown.esc.stop="collapseExpanded"
+      @mouseenter="islandController.setHovered(true)"
+      @mouseleave="islandController.setHovered(false)"
     >
       <!-- 主岛容器 -->
       <div
@@ -449,8 +282,6 @@ onBeforeUnmount(() => {
         aria-live="polite"
         :aria-label="t('island.label')"
         :title="mode === 'idle' ? priceTip || undefined : undefined"
-        @mouseenter="setHovered(true)"
-        @mouseleave="setHovered(false)"
         @click="onIslandClick"
         @keydown.enter.self.prevent="onIslandKeydown"
         @keydown.space.self.prevent="onIslandKeydown"
@@ -459,33 +290,18 @@ onBeforeUnmount(() => {
           :activity="primaryAct"
           :mode="mode"
           :is-pinned="islandController.pinnedId === primaryAct?.id"
-          :lead-spin="leadSpin"
-          :lead-icon="leadIcon"
-          :lead-tone-class="leadToneClass"
+          :price-running="priceKind === 'running'"
           :showing-price="showingPrice"
           :can-dismiss-status="!islandController.isExpanded.value"
           :price-color="priceColor"
           :head-text="headText"
           :head-text-style="headTextStyle"
           :head-truncated="headTruncated"
-          :trailing="trailing"
-          :crawl-only-task="crawlOnlyTask"
-          :show-bar="showBar"
-          :task-percent="taskPercent"
-          :expanded-shows-tasks="expandedShowsTasks"
-          :task-lines="taskLines"
-          :task-goto="taskGoto"
           :detail-text="detailText"
-          :expanded-is-task="expandedIsTask"
-          :can-retry="canRetry"
-          :goto="goto"
-          :goto-label="gotoLabel"
           @cancel="cancelTask(primaryAct)"
           @retry="retry"
           @dismiss="dismiss"
           @go-detail="goDetail"
-          @go-task="goTask"
-          @open-task="openTask"
         />
       </div>
 
@@ -516,9 +332,7 @@ onBeforeUnmount(() => {
           :activity="expandedAct"
           mode="expanded"
           :is-pinned="islandController.pinnedId === expandedAct?.id"
-          :lead-spin="expandedSpin"
-          :lead-icon="expandedIcon"
-          :lead-tone-class="expandedToneClass"
+          :price-running="priceKind === 'running'"
           :showing-price="expandedShowingPrice"
           :can-dismiss-status="true"
           :price-color="priceColor"
@@ -526,24 +340,11 @@ onBeforeUnmount(() => {
           :head-text-style="expandedHeadStyle"
           :head-truncated="true"
           :trailing="expandedTrailing"
-          :crawl-only-task="expandedIsTask"
-          :show-bar="expandedShowBar"
-          :task-percent="expandedProgress"
-          :expanded-shows-tasks="expandedShowsTasks"
-          :task-lines="expandedTaskLines"
-          :task-goto="expandedTaskGoto"
           :detail-text="expandedDetail"
-          :expanded-is-task="expandedIsTask"
-          :can-retry="expandedCanRetry"
-          :goto="expandedGoto"
-          :goto-label="expandedGotoLabel"
-          :dismissible="expandedDismissible"
           @cancel="cancelTask(expandedAct)"
           @retry="retry"
           @dismiss="dismiss"
           @go-detail="goDetail"
-          @go-task="goTask"
-          @open-task="openTask"
           @collapse="collapseExpanded"
         />
       </div>
@@ -698,7 +499,7 @@ onBeforeUnmount(() => {
 .hl-island--expanded :deep(.hl-island__lead) {
   width: 26px;
   height: 26px;
-  border-radius: 8px;
+  border-radius: 9px;
   background: var(--island-btn);
 }
 
@@ -756,7 +557,8 @@ onBeforeUnmount(() => {
   display: -webkit-box;
   -webkit-box-orient: vertical;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   white-space: normal;
   overflow-wrap: anywhere;
   text-overflow: clip;
@@ -798,12 +600,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-:deep(.hl-island__spacer) {
-  flex: 1 1 auto;
+  gap: 12px;
 }
 
 :deep(.hl-island__detail) {
@@ -816,43 +613,6 @@ onBeforeUnmount(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
   animation: hlIslandDrop 320ms var(--ease-island) 40ms both;
-}
-
-:deep(.hl-island__tasks) {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 7px;
-}
-
-:deep(.hl-island__taskline) {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-  animation: hlIslandDrop 300ms var(--ease-island) both;
-}
-
-:deep(.hl-island__tasktext) {
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-:deep(.hl-island__taskpct) {
-  font-size: 11px;
-  font-weight: 500;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-muted);
-  flex: 0 0 auto;
 }
 
 :deep(.hl-island__bar) {
@@ -1015,23 +775,8 @@ onBeforeUnmount(() => {
 
   :deep(.hl-island__trail),
   :deep(.hl-island__detail),
-  :deep(.hl-island__taskline),
   :deep(.hl-island__actions > *) {
     animation: none;
   }
-}
-
-.hl-island--expanded :deep(.hl-island__lead) {
-  border-radius: 9px;
-}
-
-.hl-island--expanded :deep(.hl-island__text) {
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-.hl-island--expanded :deep(.hl-island__detail),
-.hl-island--expanded :deep(.hl-island__taskpct) {
-  color: var(--island-shell-muted);
 }
 </style>

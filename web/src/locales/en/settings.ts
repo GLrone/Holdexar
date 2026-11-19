@@ -293,23 +293,35 @@ const settings: Partial<Record<MessageKey, string>> = {
   'settings.mcp.helpNote':
     'Reachable on loopback only; a wrong token is rejected. Full configuration examples are in the internal integration manual. Off by default; turning it off disconnects clients immediately.',
 
-  /* ── LAN access card (use from phones / other computers via browser) ── */
+  /* ── LAN access card (toggle + access password + LAN host projection) ── */
   'settings.section.lan': 'LAN Access',
   'settings.lan.desc':
     'When off, only this computer can open the app (default). When on, devices on the same network can use it directly in a browser with "this computer\'s address + access password" — handy for checking on a phone.',
+  'settings.lan.enableLabel': 'Enable LAN access',
   'settings.lan.enabledLabel': 'Allow LAN access',
   'settings.lan.enabledHint': 'Takes effect immediately; LAN devices unlock on first visit with the access password.',
+  'settings.lan.envForced': 'The access password is provided by a launch parameter and cannot be changed here.',
   'settings.lan.forcedHint': 'Force-enabled by the launch environment (HOLDEXAR_ACCESS=lan); this switch is unavailable.',
   'settings.lan.statusOn': 'On (reachable from LAN)',
   'settings.lan.statusOff': 'Off (this computer only)',
   'settings.lan.onPost': 'LAN access enabled',
   'settings.lan.offPost': 'LAN access disabled — external devices can no longer connect',
-  'settings.lan.passwordPlaceholder': 'Set an access password',
+  'settings.lan.passwordState': 'Access password: {state}',
+  'settings.lan.stateUser': 'set',
+  'settings.lan.stateEnv': 'provided by launch parameter',
+  'settings.lan.stateNone': 'not set',
+  'settings.lan.forgotHint': 'Forgot it? Open the Holdexar desktop app and set a new password here — no old password needed',
+  'settings.lan.passwordPlaceholder': 'New access password (at least 8 characters)',
   'settings.lan.passwordPlaceholderSet': 'Access password is set; type to replace it',
-  'settings.lan.passwordHint':
-    'The password is written only when set and is never shown back here; empty submissions are ignored. LAN devices unlock on first visit with this password.',
+  'settings.lan.setPassword': 'Set password',
   'settings.lan.passwordSave': 'Save password',
-  'settings.lan.passwordSaved': 'Access password updated',
+  'settings.lan.passwordSaved': 'Access password updated; other devices must sign in again',
+  'settings.lan.clearPassword': 'Clear password',
+  'settings.lan.clearConfirm': 'LAN devices will no longer be able to unlock. Clear the access password?',
+  'settings.lan.passwordCleared': 'Access password cleared',
+  'settings.lan.saved': 'LAN access settings saved',
+  'settings.lan.noPasswordWarning': 'Enabled without an access password: LAN devices cannot unlock until you set one',
+  'settings.lan.passwordHint': 'At least 8 characters; after changing it, other unlocked devices must sign in again',
   'settings.lan.addressHint':
     'Open the following addresses from LAN devices (port = local service port; addresses come from this machine\'s network adapters, actual reachability prevails):',
 }

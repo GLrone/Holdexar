@@ -45,8 +45,6 @@ test('island motion source：槽位容器与任务标识分别连续迁移', () 
   assert.doesNotMatch(secondarySource, /\.hl-secondary-island:hover\s*\{[^}]*transform:\s*scale/s)
   assert.match(primarySource, /emit\(['"]collapse['"]\)/)
   assert.doesNotMatch(primarySource, /returnToPrevious/)
-  /* 忽略动作收口在展开卡控制区（✕），折叠动作行不再重复提供 */
-  assert.match(primarySource, /mode === 'expanded' && dismissible/)
 })
 
 test('island motion overlays：候补动画副本清理后不会留成重复槽位', () => {
@@ -95,14 +93,21 @@ test('island controls：活动提示不提供类别静音入口', () => {
   assert.doesNotMatch(activityManagerSource, /_mutedTones|muteTone|unmuteTone/)
 })
 
-test('idle island status：空闲价格状态可关闭并在新活动到达后恢复', () => {
+test('idle island status：空闲价格状态可关闭且关闭只作用于空闲价格卡', () => {
   assert.match(primarySource, /v-if="showingPrice && canDismissStatus"[\s\S]*?t\('island\.hideStatus'\)[\s\S]*?emit\('dismiss'\)/)
   assert.match(islandSource, /:can-dismiss-status="!islandController\.isExpanded\.value"/)
   assert.match(islandSource, /:can-dismiss-status="true"/)
   assert.match(islandSource, /const idleStatusDismissed = ref\(false\)/)
-  assert.match(islandSource, /!idleStatusDismissed\.value &&/)
-  assert.match(islandSource, /if \(showingPrice\.value\) \{[\s\S]*?idleStatusDismissed\.value = true/)
-  assert.match(islandSource, /watch\([\s\S]*?idleStatusDismissed\.value = false/)
+  /* 关闭态只隐藏空闲价格卡：消息与任务不因它整岛隐藏 */
+  assert.match(islandSource, /priceStale\.value && !idleStatusDismissed\.value/)
+  assert.doesNotMatch(islandSource, /!idleStatusDismissed\.value && \(/)
+  assert.match(islandSource, /PRICE_STATUS_TTL_MS/)
+  assert.match(islandSource, /if \(idleShowing\) \{[\s\S]*?idleStatusDismissed\.value = true/)
+  assert.match(islandSource, /watch\(\s*\(\) => \[priceKind\.value, priceLabel\.value, priceStale\.value\]/)
+  assert.match(islandSource, /watch\(\s*\(\) => \[priceKind\.value, priceLabel\.value, priceStale\.value\][\s\S]*?idleStatusDismissed\.value = false/)
+  /* 忽略动作收口在展开卡控制区（✕），折叠动作行不再重复提供 */
+  assert.match(primarySource, /mode === 'expanded' && view\.dismissible/)
+  assert.doesNotMatch(primarySource, /v-if="view\.dismissible" class="hl-island__btn"/)
 })
 
 test('single island expansion：紧凑岛体直接形变为卡片且不补空闲主岛', () => {

@@ -290,23 +290,35 @@ const settings = {
   'settings.mcp.helpNote':
     '仅本机回环可访问，令牌不符即拒绝；完整配置示例见仓库内部集成手册。默认关闭，关闭立即断开接入。',
 
-  /* ── 局域网访问卡片（手机/其他电脑经浏览器使用） ── */
+  /* ── 局域网访问卡片（开关 + 访问密码 + 本机地址，忘记密码在此重设） ── */
   'settings.section.lan': '局域网访问',
   'settings.lan.desc':
     '关闭时只有本机能打开应用（默认）；开启后同一局域网内的设备可用「本机地址 + 访问密码」在浏览器直接使用，适合手机随手查看。',
+  'settings.lan.enableLabel': '启用局域网访问',
   'settings.lan.enabledLabel': '允许局域网访问',
   'settings.lan.enabledHint': '开启立即生效；局域网设备首次访问时输入访问密码即可解锁。',
+  'settings.lan.envForced': '访问密码由启动参数提供，界面不可修改。',
   'settings.lan.forcedHint': '已由启动环境强制开启（HOLDEXAR_ACCESS=lan），此开关不可用。',
   'settings.lan.statusOn': '已开启（局域网可访问）',
   'settings.lan.statusOff': '已关闭（仅本机）',
   'settings.lan.onPost': '局域网访问已开启',
   'settings.lan.offPost': '局域网访问已关闭，外部设备将无法连接',
-  'settings.lan.passwordPlaceholder': '设置访问密码',
+  'settings.lan.passwordState': '访问密码：{state}',
+  'settings.lan.stateUser': '已设置',
+  'settings.lan.stateEnv': '由启动参数提供',
+  'settings.lan.stateNone': '未设置',
+  'settings.lan.forgotHint': '忘记密码时打开 Holdexar 应用程序，在此直接设置新密码，无需旧密码',
+  'settings.lan.passwordPlaceholder': '新访问密码（至少 8 位）',
   'settings.lan.passwordPlaceholderSet': '已设置访问密码，输入可更换',
-  'settings.lan.passwordHint':
-    '密码只在设置时写入，界面不显示已有密码；留空提交无效。局域网设备首次访问时输入该密码解锁。',
+  'settings.lan.setPassword': '设置新密码',
   'settings.lan.passwordSave': '保存密码',
-  'settings.lan.passwordSaved': '访问密码已更新',
+  'settings.lan.passwordSaved': '访问密码已更新，其他设备需重新输入',
+  'settings.lan.clearPassword': '清除密码',
+  'settings.lan.clearConfirm': '清除后局域网设备将无法解锁，确定清除访问密码？',
+  'settings.lan.passwordCleared': '访问密码已清除',
+  'settings.lan.saved': '局域网访问设置已保存',
+  'settings.lan.noPasswordWarning': '已开启但尚未设置访问密码：局域网设备将无法解锁，请先设置密码',
+  'settings.lan.passwordHint': '至少 8 位；修改后其他已解锁的设备需要重新输入',
   'settings.lan.addressHint':
     '局域网设备用下列地址打开（端口为本机服务端口；地址来自本机网卡，以实际连通为准）：',
 } as const

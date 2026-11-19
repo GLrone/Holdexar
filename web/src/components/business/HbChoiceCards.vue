@@ -17,7 +17,7 @@ import { metadataApi, type HbChoiceGame } from '@/api/client'
 import { formatCnyFen } from '@/api/regions'
 import { useI18n, type MessageKey } from '@/locales'
 import { useOwnershipStore, type OwnershipInfo, type OwnershipType } from '@/stores/ownership'
-import { HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
+import { HlAvatar, HlButton, HlEmpty, HlImg, HlSkeleton } from '@/components/ui'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -102,11 +102,6 @@ const STATUS_BADGE_KEYS: Record<OwnershipType, MessageKey> = {
   family: 'gameCard.status.family',
   wishlist: 'gameCard.status.wishlist',
 }
-const STATUS_TITLE_KEYS: Record<OwnershipType, MessageKey> = {
-  owned: 'gameCard.status.ownedTitle',
-  family: 'gameCard.status.familyTitle',
-  wishlist: 'gameCard.status.wishlistTitle',
-}
 
 function ownershipOf(g: HbChoiceGame): OwnershipInfo | null {
   return ownershipStore.map[g.appid] ?? null
@@ -120,10 +115,52 @@ function badgeText(o: OwnershipInfo): string {
   return t(STATUS_BADGE_KEYS[o.type])
 }
 
-/** 悬停提示：归属维度 + 账号名（仪表盘轻量形态，native title） */
-function badgeTip(o: OwnershipInfo): string {
-  const owners = o.owners.length > 0 ? o.owners.join('、') : t('gameCard.owner.unknown')
-  return `${t(STATUS_TITLE_KEYS[o.type])}：${owners}`
+/** 悬停提示：归属维度 + 账号名（沿用游戏商店归属弹窗视觉，Teleport 落 body） */
+const STATUS_META: Record<OwnershipType, { titleKey: MessageKey; color: string; border: string }> = {
+  owned: { titleKey: 'gameCard.status.ownedTitle', color: 'var(--success)', border: 'var(--success-a40)' },
+  family: { titleKey: 'gameCard.status.familyTitle', color: 'var(--purple)', border: 'var(--purple-a30)' },
+  wishlist: { titleKey: 'gameCard.status.wishlistTitle', color: 'var(--accent)', border: 'var(--accent-a40)' },
+}
+
+/** 归属弹窗状态（悬停归属徽章弹出，账号行 + 头像；离开 120ms 延迟收场） */
+const statusTip = ref<{
+  type: OwnershipType
+  owners: string[]
+  avatars: string[]
+  left: number
+  top: number
+} | null>(null)
+let statusTipTimer: number | null = null
+
+function statusTipEnter(e: MouseEvent, g: HbChoiceGame) {
+  const ownership = ownershipOf(g)
+  if (!ownership) return
+  if (statusTipTimer !== null) {
+    window.clearTimeout(statusTipTimer)
+    statusTipTimer = null
+  }
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  let left = rect.left
+  if (left + 160 > window.innerWidth) left = window.innerWidth - 170
+  const owners = ownership.owners
+  statusTip.value = {
+    type: ownership.type,
+    owners: owners.length > 0 ? owners : [t('gameCard.owner.unknown')],
+    avatars:
+      owners.length > 0
+        ? owners.map((_, i) => ownership.ownerAvatars?.[i] || '')
+        : [''],
+    left: Math.max(8, left),
+    top: rect.bottom + 6,
+  }
+}
+
+function statusTipLeave() {
+  if (statusTipTimer !== null) window.clearTimeout(statusTipTimer)
+  statusTipTimer = window.setTimeout(() => {
+    statusTip.value = null
+    statusTipTimer = null
+  }, 120)
 }
 
 const HOUR_MS = 3_600_000
@@ -190,7 +227,6 @@ onBeforeUnmount(() => {
         :key="g.appid || `p-${g.name}`"
         class="hb-card"
         :class="[ownershipOf(g)?.type, { 'hb-card--external': isPlatformGame(g) }]"
-        :title="g.name"
         @click="isPlatformGame(g) || router.push(`/game/${g.appid}`)"
       >
         <div class="hb-card__media">
@@ -198,13 +234,14 @@ onBeforeUnmount(() => {
           <span v-if="g.discount > 0" class="hb-card__off">-{{ g.discount }}%</span>
           <!-- 非 Steam 平台徽章：Battle.net/Epic/育碧…（后端下发原值，本地化渲染） -->
           <span v-if="g.platform" class="hb-card__platform">{{ platformLabel(g.platform) }}</span>
-          <!-- 归属徽章（已拥有/家庭共享/愿望单）：与游戏库 status-badge 同源，
-               悬停 native title 给归属账号 -->
+          <!-- 归属徽章（已拥有/家庭共享/愿望单）：沿用游戏商店归属弹窗
+               （Teleport 账号行 + 头像），不再走 native title 气泡 -->
           <span
             v-if="ownershipOf(g)"
             class="hb-card__status"
             :class="ownershipOf(g)!.type"
-            :title="badgeTip(ownershipOf(g)!)"
+            @mouseenter="statusTipEnter($event, g)"
+            @mouseleave="statusTipLeave()"
           >{{ badgeText(ownershipOf(g)!) }}</span>
         </div>
         <div class="hb-card__body">
@@ -226,6 +263,29 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <p v-if="refreshNote" class="hb-choice__note">{{ refreshNote }}</p>
+
+    <!-- 归属弹窗（沿用游戏商店 cf-status-tip 同款视觉与全局样式） -->
+    <Teleport to="body">
+      <div
+        v-if="statusTip"
+        class="cf-status-tip"
+        :style="{ left: statusTip.left + 'px', top: statusTip.top + 'px', borderColor: STATUS_META[statusTip.type].border }"
+      >
+        <div class="cf-status-tip__title" :style="{ color: STATUS_META[statusTip.type].color }">
+          {{ t(STATUS_META[statusTip.type].titleKey) }}
+        </div>
+        <div class="cf-status-tip__list">
+          <div
+            v-for="(name, i) in statusTip.owners"
+            :key="`${name}-${i}`"
+            class="cf-status-tip__row"
+          >
+            <HlAvatar :src="statusTip.avatars[i]" :name="name" size="sm" square />
+            <span class="cf-status-tip__name">{{ name }}</span>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -387,7 +447,8 @@ onBeforeUnmount(() => {
   letter-spacing: 0.04em;
 }
 
-/* 非 Steam 平台徽章（右上角；归属徽章存在时顺移避让）：中性底色 */
+/* 非 Steam 平台徽章（右上角；归属徽章存在时顺移避让）：实底深墨 + 白字，
+   封面上任何主题都保持可读 */
 .hb-card__platform {
   position: absolute;
   top: 8px;
@@ -395,8 +456,8 @@ onBeforeUnmount(() => {
   z-index: 1;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
-  background: var(--surface-inset);
-  color: var(--text-primary);
+  background: var(--ink-on-fill);
+  color: var(--text-on-fill);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;

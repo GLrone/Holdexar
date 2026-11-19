@@ -177,7 +177,7 @@ test('refreshOneAccount：ok 后弹「已触发同步」并调度延迟快照重
   const ast = ts.createSourceFile('s.ts', script, ts.ScriptTarget.Latest, true)
   const varJs = ast.statements
     .filter((s) => ts.isVariableStatement(s) &&
-      (s.getText(ast).includes('syncingSteamId') || s.getText(ast).includes('snapshotRefreshTimer')))
+      (s.getText(ast).includes('syncingSteamId') || s.getText(ast).includes('snapshotRefreshTimer') || s.getText(ast).includes('accountRefreshDisposed')))
     .map((s) => ts.transpileModule(s.getText(ast), { compilerOptions: { target: ts.ScriptTarget.Latest } }).outputText)
     .join('\n')
   const js =

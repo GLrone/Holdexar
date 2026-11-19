@@ -144,7 +144,7 @@ test('IslandPlayground 副岛直开后紧急状态仍能插队', () => {
   assert.equal(ctrl.primaryId, 'dev:task-normal')
   assert.equal(ctrl.secondaryId, 'dev:task-secondary')
 
-  ctrl.swap()
+  ctrl.openSecondary()
   assert.equal(ctrl.primaryId, 'dev:task-normal')
   assert.equal(ctrl.secondaryId, null)
   assert.equal(ctrl.expandedId, 'dev:task-secondary')

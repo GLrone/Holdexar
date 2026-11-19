@@ -205,9 +205,9 @@ export const useFamilyStore = defineStore('familyLib', () => {
     try {
       const r = await familyApi.sync()
       if (r.failed > 0) {
-        message.warning(t('family.sync.partial', { joined: r.joined, failed: r.failed }))
+        message.warning(t('family.sync.partial', { joined: r.joined, failed: r.failed }), { to: '/family' })
       } else if (r.joined > 0) {
-        message.success(t('family.sync.all', { n: r.joined }))
+        message.success(t('family.sync.all', { n: r.joined }), { to: '/family' })
       } else {
         message.info(t('family.sync.none'))
       }

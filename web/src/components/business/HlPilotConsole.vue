@@ -1021,8 +1021,16 @@ async function rateTurn(turn: Turn, feedback: 'accepted' | 'rejected') {
 }
 
 /** 答复头的复制钮：取当面那一轮的可见正文（只有数据卡、没有正文的轮不挂钮） */
-/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换、复制操作与代码块复制 */
+/** 会话记录点击委托：处理内嵌 SVG 图卡的预览/源码切换、复制操作、代码块复制与外链窗外打开 */
 function onTurnsClick(e: MouseEvent) {
+  // 正文内 http(s) 外链一律窗外打开，杜绝应用窗口内导航；#fragment 与相对链接维持默认
+  const anchor = (e.target as HTMLElement).closest<HTMLAnchorElement>('a[href]')
+  const href = anchor?.getAttribute('href') ?? ''
+  if (anchor && /^https?:\/\//i.test(href)) {
+    e.preventDefault()
+    window.open(href, '_blank', 'noopener noreferrer')
+    return
+  }
   const codeCopy = (e.target as HTMLElement).closest<HTMLElement>('.pilot-code-copy')
   if (codeCopy) {
     const text = codeCopy.closest<HTMLElement>('.pilot-code')?.querySelector('code')?.textContent ?? ''

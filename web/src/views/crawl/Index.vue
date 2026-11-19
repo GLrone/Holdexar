@@ -18,6 +18,7 @@ import { useI18n } from '@/locales'
 import { useLocaleFormat } from '@/locales/format'
 import { parseAppRefs, parseFavoritesRefs } from '@/lib/appidRefs'
 import { HlAvatar, HlButton, HlDialog, HlIcon, HlInput, HlSwitch, message } from '@/components/ui'
+import HlQueueFlow from '@/components/business/HlQueueFlow.vue'
 
 const { t } = useI18n()
 const fmt = useLocaleFormat()
@@ -666,6 +667,9 @@ onBeforeUnmount(() => {
         <div class="progress-box__meta">{{ progressMeta }}</div>
       </div>
     </div>
+
+    <!-- 队列组成（来源 → 流线 → 本轮任务队列，逐段开关） -->
+    <HlQueueFlow />
 
     <!-- 捆绑包导入 -->
     <div class="card section-card" data-section="crawl.section.bundleImport">

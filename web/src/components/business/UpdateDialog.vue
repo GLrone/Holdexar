@@ -469,7 +469,7 @@ function onClose(): void {
 .upd-overlay {
   position: fixed;
   inset: 0;
-  z-index: 10000;
+  z-index: 1500;
   display: flex;
   align-items: center;
   justify-content: center;

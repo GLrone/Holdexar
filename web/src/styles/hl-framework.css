@@ -1002,6 +1002,13 @@ html:not(.dark) .hl-table th { color: var(--text-secondary); }
   filter: blur(16px) saturate(1.2);
   transition: filter calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
 }
+/* teleport 到 body 的弹层（HlDialog/更新弹窗等）不在 .app-shell 内，上面的
+   选择器够不到；同一拍挂 body.hlx-curtained（App.vue 开关）让它们入同一模糊面，
+   关窗确认时原生弹窗之外不残留清晰浮层。 */
+body.hlx-curtained > :not(#app) {
+  filter: blur(16px) saturate(1.2);
+  transition: filter calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);
+}
 .hl-curtain-fade-enter-active,
 .hl-curtain-fade-leave-active {
   transition: opacity calc(var(--duration-2) * var(--motion-scale)) var(--ease-inout);

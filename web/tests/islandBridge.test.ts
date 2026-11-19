@@ -1,105 +1,119 @@
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { afterEach, beforeEach, test } from 'node:test'
 
 import { activityManager } from '../src/components/ui/activity/activityManager.ts'
-import {
-  beginTask,
-  dropNotice,
-  endTask,
-  island,
-  pushNotice,
-  updateNotice,
-  updateTask,
-} from '../src/components/ui/island.ts'
+import { islandController } from '../src/components/ui/activity/islandController.ts'
+import { beginTask, dropNotice, endTask, pushNotice, updateNotice, updateTask } from '../src/components/ui/island.ts'
 
-test('islandBridge：beginTask 与 updateTask/endTask 正确桥接至 ActivityManager', () => {
+beforeEach(() => {
   activityManager.clear()
-  island.tasks = []
-
-  beginTask('bills-sync', '账单同步中', { percent: 10, to: '/bills' })
-
-  // 既有 island.tasks 数组同步存有该项
-  assert.equal(island.tasks.length, 1)
-  assert.equal(island.tasks[0].key, 'bills-sync')
-  assert.equal(island.tasks[0].text, '账单同步中')
-
-  // ActivityManager 存在对应活动
-  const act = activityManager.get('task:bills-sync')
-  assert.ok(act)
-  assert.equal(act.title, '账单同步中')
-  assert.equal(act.progress, 10)
-  assert.equal(act.source, 'bills')
-
-  // updateTask 原位更新
-  updateTask('bills-sync', '已导入 50 行', 50)
-  assert.equal(island.tasks[0].text, '已导入 50 行')
-  assert.equal(island.tasks[0].percent, 50)
-  assert.equal(activityManager.get('task:bills-sync')?.title, '已导入 50 行')
-  assert.equal(activityManager.get('task:bills-sync')?.progress, 50)
-
-  // endTask 撤下
-  endTask('bills-sync')
-  assert.equal(island.tasks.length, 0)
-  assert.equal(activityManager.get('task:bills-sync'), undefined)
+  islandController.setHovered(false)
+  islandController.collapseExpanded()
+  islandController.setOverview(false)
 })
+afterEach(() => activityManager.clear())
 
-test('islandBridge：pushNotice 与 dropNotice/updateNotice 正确桥接至 ActivityManager', () => {
-  activityManager.clear()
-  island.notices = []
+const notice = { tone: 'info' as const, text: 'Notice', detail: '', sticky: false,
+  duration: 0, retry: null, to: '', toLabel: '' }
 
-  const id = pushNotice({
-    tone: 'success',
-    text: '设置已保存',
-    detail: '配置已生效',
-    sticky: false,
-    duration: 3000,
-    retry: null,
-    to: '',
-    toLabel: '',
-    iconImageUrl: 'https://example.test/game-cover.jpg',
+for (const [tone, interaction] of (['success', 'warning', 'info'] as const)
+  .flatMap(tone => (['hover', 'expanded'] as const).map(interaction => [tone, interaction] as const))) {
+  test(`notice lifetime: light ${tone} expires on schedule even under ${interaction}`, (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const id = pushNotice({ ...notice, tone, duration: 2400 })
+    t.mock.timers.tick(1000)
+    if (interaction === 'hover') islandController.setHovered(true)
+    else islandController.openMain()
+    t.mock.timers.tick(3000)
+    assert.equal(activityManager.get(`notice:${id}`), undefined)
+    islandController.setHovered(false)
+    islandController.collapseExpanded()
+    assert.equal(activityManager.count, 0)
+    assert.equal(islandController.primaryActivity, null)
+    assert.equal(islandController.expandedActivity, null)
   })
+}
 
-  assert.ok(id > 0)
-  assert.equal(island.notices.length, 1)
-  assert.equal(island.notices[0].text, '设置已保存')
+for (const interaction of ['hover', 'expanded'] as const) {
+  test(`notice lifetime: error survives ${interaction} and expires after release`, (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const id = pushNotice({ ...notice, tone: 'error', duration: 2400 })
+    t.mock.timers.tick(1000)
+    if (interaction === 'hover') islandController.setHovered(true)
+    else islandController.openMain()
+    t.mock.timers.tick(3000)
+    assert.ok(activityManager.get(`notice:${id}`))
+    islandController.setHovered(false)
+    islandController.collapseExpanded()
+    t.mock.timers.tick(2399)
+    assert.ok(activityManager.get(`notice:${id}`))
+    t.mock.timers.tick(1)
+    assert.equal(activityManager.count, 0)
+    assert.equal(islandController.primaryActivity, null)
+    assert.equal(islandController.expandedActivity, null)
+  })
+}
 
-  // ActivityManager 中存在映射项
-  const act = activityManager.get(`notice:${id}`)
-  assert.ok(act)
-  assert.equal(act.title, '设置已保存')
-  assert.equal(act.detail, '配置已生效')
-  assert.equal(act.tone, 'success')
-  assert.equal(act.iconImageUrl, 'https://example.test/game-cover.jpg')
-
-  // updateNotice 原位更新
-  updateNotice(id, '设置已同步至云端')
-  assert.equal(island.notices[0].text, '设置已同步至云端')
-  assert.equal(activityManager.get(`notice:${id}`)?.title, '设置已同步至云端')
-
-  // dropNotice
+test('notice adapter: any removal is final and updates cannot resurrect it', () => {
+  const id = pushNotice({ ...notice, text: 'Saved', iconImageUrl: 'https://example.test/cover.jpg' })
+  assert.equal(activityManager.get(`notice:${id}`)?.iconImageUrl, 'https://example.test/cover.jpg')
+  updateNotice(id, 'Updated')
+  assert.equal(islandController.primaryActivity?.title, 'Updated')
+  activityManager.remove(`notice:${id}`)
+  updateNotice(id, 'Late update')
   dropNotice(id)
-  assert.equal(island.notices.length, 0)
-  assert.equal(activityManager.get(`notice:${id}`), undefined)
+  assert.equal(activityManager.count, 0)
+  assert.equal(islandController.primaryActivity, null)
 })
 
-test('islandBridge：管理器侧移除后队列自愈，不留死记录占位', () => {
-  activityManager.clear()
-  island.notices = []
-  island.tasks = []
+test('notice adapter: replacement and capacity use the same activity records', () => {
+  beginTask('bills-sync', 'Syncing')
+  const ids = Array.from({ length: 6 }, () => pushNotice(notice))
+  assert.deepEqual(activityManager.activities.filter(a => a.source === 'notice').map(a => a.id),
+    ids.slice(-4).map(id => `notice:${id}`))
+  assert.ok(activityManager.get('task:bills-sync'))
+  const loading = pushNotice({ ...notice, sticky: true, tone: 'progress' })
+  pushNotice({ ...notice, text: 'Completed' })
+  assert.equal(activityManager.get(`notice:${loading}`), undefined)
+  assert.equal(activityManager.activities.filter(a => a.source === 'notice').length, 4)
+})
 
-  const a = pushNotice({ tone: 'success', text: '第一条', detail: '', sticky: false, duration: 0, retry: null, to: '', toLabel: '' })
-  pushNotice({ tone: 'success', text: '第二条', detail: '', sticky: false, duration: 0, retry: null, to: '', toLabel: '' })
-  beginTask('cdk-redeem', '激活中', { percent: 10, to: '/toolbox' })
+test('notice retry retires the old record before publishing a replacement', () => {
+  let calls = 0
+  const id = pushNotice({ ...notice, tone: 'error', retry: () => {
+    calls++
+    assert.equal(activityManager.count, 0)
+    pushNotice({ ...notice, text: 'Recovered' })
+  } })
+  islandController.openMain()
+  activityManager.retry(`notice:${id}`)
+  assert.equal(calls, 1)
+  assert.equal(activityManager.get(`notice:${id}`), undefined)
+  assert.equal(activityManager.count, 1)
+  assert.equal(islandController.primaryActivity?.title, 'Recovered')
+})
 
-  // 管理器侧时钟先删记录（到期定时/忽略等任何路径），队列必须同步逐出
-  activityManager.remove(`notice:${a}`)
-  assert.equal(island.notices.some((n) => n.id === a), false)
-  endTask('cdk-redeem')
-  assert.equal(island.tasks.some((t) => t.key === 'cdk-redeem'), false)
+test('task adapter: update, repeat registration and removal share one record', () => {
+  beginTask('bills-sync', 'Syncing', { percent: 10, to: '/bills' })
+  beginTask('bills-sync', 'Continued', { percent: 20, to: '/bills' })
+  assert.equal(activityManager.count, 1)
+  islandController.openMain()
+  updateTask('bills-sync', 'Halfway', 50)
+  assert.equal(islandController.expandedActivity?.title, 'Halfway')
+  assert.equal(islandController.expandedActivity?.progress, 50)
+  assert.equal(islandController.expandedActivity?.to, '/bills')
+  activityManager.remove('task:bills-sync')
+  updateTask('bills-sync', 'Late update', 80)
+  endTask('bills-sync')
+  assert.equal(activityManager.count, 0)
+  assert.equal(islandController.expandedActivity, null)
+})
 
-  // 队列里不存在任何失去管理器记录的死项（视图不再渲染占位僵尸）
-  assert.ok(island.notices.every((n) => activityManager.get(`notice:${n.id}`)))
-  assert.ok(island.tasks.every((t) => activityManager.get(`task:${t.key}`)))
-  island.notices = []
-  island.tasks = []
+test('island architecture: the view has no secondary store or source-specific cleanup', () => {
+  const source = readFileSync(new URL('../src/components/ui/HlIsland.vue', import.meta.url), 'utf8')
+  const adapter = readFileSync(new URL('../src/components/ui/island.ts', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /legacyNotice|legacyTask|dropNotice|endTask|armTimer|notice:|task:/)
+  assert.doesNotMatch(adapter, /reactive\(|setTimeout|clearTimeout|export const island\b/)
+  assert.match(source, /activityManager\.retry\(act\.id\)/)
 })
