@@ -33,6 +33,7 @@ from app.domains.games.models import (
     CatalogRemoval,
     GameCurrentPrice,
     GamePriceHistory,
+    HistoryBackfillState,
 )
 from app.domains.games.sorting import build_order_by
 from app.domains.games.pricing import (
@@ -1227,10 +1228,34 @@ async def _fill_cny_fen_by_history(rows) -> dict[int, int]:
 
 
 async def _history_backfill_brief(appid: int, region: str) -> dict:
-    """图表附带的最小回填同步状态（行为状态，来自社区历史源适配器）。"""
-    from app.crawler.community_history import backfill_brief
-
-    return await backfill_brief(appid, region)
+    """图表附带的最小回填同步状态（只读既有同步状态表，无外部采集器时默认 idle）。"""
+    region_upper = region.upper()
+    async with get_session_factory()() as session:
+        row = (
+            await session.execute(
+                select(HistoryBackfillState).where(
+                    HistoryBackfillState.appid == int(appid),
+                    HistoryBackfillState.region_code == region_upper,
+                )
+            )
+        ).scalar_one_or_none()
+    if row is None:
+        return {"state": "idle", "lastOkAt": None, "lastError": None}
+    if row.last_error_at is not None and (
+        row.last_ok_at is None or row.last_error_at > row.last_ok_at
+    ):
+        state = "error"
+    elif row.last_empty_at is not None and (
+        row.last_ok_at is None or row.last_empty_at > row.last_ok_at
+    ):
+        state = "empty"
+    else:
+        state = "ok"
+    return {
+        "state": state,
+        "lastOkAt": row.last_ok_at.isoformat() if row.last_ok_at else None,
+        "lastError": row.last_error,
+    }
 
 
 async def get_game_history(

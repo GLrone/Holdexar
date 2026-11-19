@@ -2,8 +2,8 @@
 
 归属三要素：购买商品（sub_id / version_suffix / is_gold / is_bundle，
 或显式 product_unknown=1）、地区（region_code）、来源（source）。
-「标准版」与「商品身份未知」的判定只在此定义——写入侧（db_writer /
-community_history）与全部读取侧（games/service 五处、crawl/events 证据
+「标准版」与「商品身份未知」的判定只在此定义——写入侧（db_writer 与
+社区历史写入通道）与全部读取侧（games/service 五处、crawl/events 证据
 查询）一律引用本模块，禁止再手抄谓词（历史上六处手抄多次漂移）。
 
 商品身份未知的行（社区历史源的 appid 级序列，上游不区分版本/金版/捆绑）
