@@ -56,7 +56,7 @@ def _product(title: str, delivery: list[str], cent_amount: float | None = 1999) 
 
 
 def _membership_html() -> str:
-    """合成 membership 页（2026-11 RSC 改版形态）：flight 流分段内嵌
+    """合成 membership 页（RSC 形态）：flight 流分段内嵌
     subscriptionProducts 清单与期号描述，清单劈两段验证跨段拼接，重复 key
     首见生效；含字符串内嵌花括号与中括号的条目（验证括号配平扫描抗性）。"""
     products = [

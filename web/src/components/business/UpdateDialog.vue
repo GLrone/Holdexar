@@ -469,7 +469,7 @@ function onClose(): void {
 .upd-overlay {
   position: fixed;
   inset: 0;
-  /* 浮层 z 阶梯（learnings/frontend.md）：全局模态取菜单幕布档 1500，必须低于
+  /* 浮层 z 阶梯：全局模态取菜单幕布档 1500，必须低于
      关窗幕布（2000），确保关窗确认时幕布仍盖在全局模态之上。 */
   z-index: 1500;
   display: flex;

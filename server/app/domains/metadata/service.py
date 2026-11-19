@@ -379,7 +379,7 @@ def _extract_json_array(payload: str, key: str) -> list | None:
 
 
 def _parse_choice_page(html_text: str) -> dict:
-    """membership 页（2026-11 Next.js RSC 改版）→ 结构化当月包。
+    """membership 页（Next.js RSC 形态）→ 结构化当月包。
 
     页面内容以 RSC flight 流内嵌（每段 self.__next_f.push 是一个 JS 字符串
     字面量，按 JSON 转义解码后拼接），清单取 subscriptionProducts 全量：

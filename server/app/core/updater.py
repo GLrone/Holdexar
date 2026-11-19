@@ -86,7 +86,7 @@ def _env_update_base() -> str:
     log_event(
         logger,
         "忽略非回环更新源覆盖，回退签名镜像链",
-        tag="安全",
+        tag="拒绝",
         detail={"来源": base},
         level=logging.WARNING,
     )

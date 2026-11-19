@@ -19,13 +19,13 @@ for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 
 
 def _holdexar_temp_base():
-    r"""专用临时基地：HOLDEXAR_TEMP_BASE 优先，缺省 E:\HoldexarData\tmp（专用盘），
-    不可用回落系统临时目录；只取绝对路径，非 Windows 机器不误建相对目录。"""
+    """专用临时基地：HOLDEXAR_TEMP_BASE 优先，缺省落仓内 .tmp-pytest 目录，
+    不可用回落系统临时目录；只取绝对路径，防止在非预期盘符建目录。"""
     env_base = os.environ.get("HOLDEXAR_TEMP_BASE")
     if env_base:
         candidates = [Path(env_base)]
     else:
-        default = Path("E:/HoldexarData/tmp")
+        default = Path(__file__).resolve().parents[2] / ".tmp-pytest"
         candidates = [default] if default.is_absolute() else []
     for candidate in candidates:
         try:
