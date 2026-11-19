@@ -346,9 +346,30 @@ func TestYAMLAnchorsMergesMultiDocAndScalars(t *testing.T) {
 		"a: 1\n---\nb: 2\n",
 		"a: &self\n  - *self\n",
 		"a: &self\n  <<: *self\n",
+		"a0: &a0 [\"x\", \"x\", \"x\", \"x\", \"x\", \"x\", \"x\", \"x\", \"x\", \"x\"]\n" +
+			"a1: &a1 [*a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0]\n" +
+			"a2: &a2 [*a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1]\n" +
+			"a3: &a3 [*a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2]\n" +
+			"a4: &a4 [*a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3]\n" +
+			"a5: &a5 [*a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4]\n",
+		"m0: &m0 {a0: 1, a1: 2, a2: 3, a3: 4, a4: 5, a5: 6, a6: 7, a7: 8, a8: 9, a9: 0}\n" +
+			"m1: &m1 {b0: *m0, b1: *m0, b2: *m0, b3: *m0, b4: *m0, b5: *m0, b6: *m0, b7: *m0, b8: *m0, b9: *m0}\n" +
+			"m2: &m2 {c0: *m1, c1: *m1, c2: *m1, c3: *m1, c4: *m1, c5: *m1, c6: *m1, c7: *m1, c8: *m1, c9: *m1}\n" +
+			"m3: &m3 {d0: *m2, d1: *m2, d2: *m2, d3: *m2, d4: *m2, d5: *m2, d6: *m2, d7: *m2, d8: *m2, d9: *m2}\n" +
+			"m4: &m4 {e0: *m3, e1: *m3, e2: *m3, e3: *m3, e4: *m3, e5: *m3, e6: *m3, e7: *m3, e8: *m3, e9: *m3}\n" +
+			"m5: {<<: *m4}\n",
+		strings.Repeat("a: {", 140) + "b: 1" + strings.Repeat("}", 140),
 	} {
 		if _, err := LoadYAML(bad); err == nil {
-			t.Fatalf("应拒绝非法或多文档输入：%q", bad)
+			t.Fatalf("应拒绝非法或多文档或锚点爆炸输入：%q", bad)
 		}
+	}
+
+	okDoc, err := LoadYAML("base: &base\n  type: ss\n  server: 1.2.3.4\nproxies:\n  - <<: *base\n    name: n1\n  - <<: *base\n    name: n2\n")
+	if err != nil {
+		t.Fatalf("正常重复引用不应被拦截：%v", err)
+	}
+	if proxies, ok := okDoc["proxies"].([]any); !ok || len(proxies) != 2 {
+		t.Fatalf("正常重复引用展开异常：%#v", okDoc)
 	}
 }

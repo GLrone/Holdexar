@@ -442,3 +442,23 @@ func TestDefaultClientFactoryBlocksDirectSSRFAndDNSFailure(t *testing.T) {
 		t.Fatal("expected checkRedirectTarget to fail closed on DNS lookup error")
 	}
 }
+
+func TestParseNodesRejectsYAMLAnchorBomb(t *testing.T) {
+	bomb := "proxies:\n" +
+		"  - &p0\n" +
+		"    name: n\n" +
+		"    type: ss\n" +
+		"    server: 1.2.3.4\n" +
+		"    port: 443\n" +
+		"    cipher: aes-256-gcm\n" +
+		"    password: pw\n" +
+		"a0: &a0 [*p0, *p0, *p0, *p0, *p0, *p0, *p0, *p0, *p0, *p0]\n" +
+		"a1: &a1 [*a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0, *a0]\n" +
+		"a2: &a2 [*a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1, *a1]\n" +
+		"a3: &a3 [*a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2, *a2]\n" +
+		"a4: &a4 [*a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3, *a3]\n" +
+		"a5: &a5 [*a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4, *a4]\n"
+	if _, err := ParseNodes([]byte(bomb), "clash"); err == nil {
+		t.Fatal("应拒绝 YAML 锚点指数爆炸订阅内容")
+	}
+}

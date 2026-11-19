@@ -98,25 +98,53 @@ func firstOf(groupIDs, nodeIDs []int) int {
 }
 
 func deepCopyMap(m map[string]any) map[string]any {
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		out[k] = deepCopyAny(v)
-	}
+	out, _ := copyYAMLMapWithLimit(m, 0, nil)
 	return out
 }
 
 func deepCopyAny(v any) any {
+	out, _ := copyYAMLValueWithLimit(v, 0, nil)
+	return out
+}
+
+func copyYAMLMapWithLimit(m map[string]any, depth int, budget *yamlWalkBudget) (map[string]any, error) {
+	if budget != nil {
+		if err := budget.enter(depth); err != nil {
+			return nil, err
+		}
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		copied, err := copyYAMLValueWithLimit(v, depth+1, budget)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = copied
+	}
+	return out, nil
+}
+
+func copyYAMLValueWithLimit(v any, depth int, budget *yamlWalkBudget) (any, error) {
+	if budget != nil {
+		if err := budget.enter(depth); err != nil {
+			return nil, err
+		}
+	}
 	switch val := v.(type) {
 	case map[string]any:
-		return deepCopyMap(val)
+		return copyYAMLMapWithLimit(val, depth, budget)
 	case []any:
 		out := make([]any, len(val))
 		for i, item := range val {
-			out[i] = deepCopyAny(item)
+			copied, err := copyYAMLValueWithLimit(item, depth+1, budget)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = copied
 		}
-		return out
+		return out, nil
 	default:
-		return val
+		return val, nil
 	}
 }
 

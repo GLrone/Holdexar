@@ -10,7 +10,39 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const quotedOrBlockStyle = yaml.DoubleQuotedStyle | yaml.SingleQuotedStyle | yaml.LiteralStyle | yaml.FoldedStyle
+const (
+	quotedOrBlockStyle     = yaml.DoubleQuotedStyle | yaml.SingleQuotedStyle | yaml.LiteralStyle | yaml.FoldedStyle
+	yamlMaxDepth           = 128
+	yamlMinExpansionBudget = 100_000
+)
+
+type yamlWalkBudget struct {
+	active   map[*yaml.Node]bool
+	steps    int
+	maxSteps int
+}
+
+func newYAMLWalkBudget(inputLen int) *yamlWalkBudget {
+	maxSteps := yamlMinExpansionBudget
+	if scaled := inputLen * 2; scaled > maxSteps {
+		maxSteps = scaled
+	}
+	return &yamlWalkBudget{
+		active:   map[*yaml.Node]bool{},
+		maxSteps: maxSteps,
+	}
+}
+
+func (b *yamlWalkBudget) enter(depth int) error {
+	if depth > yamlMaxDepth {
+		return fmt.Errorf("YAML 嵌套层级超过上限（%d）", yamlMaxDepth)
+	}
+	b.steps++
+	if b.steps > b.maxSteps {
+		return fmt.Errorf("YAML 展开节点数超过安全上限（%d）", b.maxSteps)
+	}
+	return nil
+}
 
 func LoadYAML(text string) (map[string]any, error) {
 	doc, err := loadYAMLDoc(text)
@@ -40,14 +72,17 @@ func loadYAMLDoc(text string) (any, error) {
 		}
 		return nil, err
 	}
-	return walkYAMLNode(&root, map[*yaml.Node]bool{})
+	return walkYAMLNode(&root, 0, newYAMLWalkBudget(len(text)))
 }
 
-func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
+func walkYAMLNode(n *yaml.Node, depth int, budget *yamlWalkBudget) (any, error) {
 	if n == nil {
 		return nil, nil
 	}
-	if active[n] {
+	if err := budget.enter(depth); err != nil {
+		return nil, err
+	}
+	if budget.active[n] {
 		return nil, fmt.Errorf("YAML 存在循环引用")
 	}
 	switch n.Kind {
@@ -55,29 +90,29 @@ func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
 		if len(n.Content) == 0 {
 			return nil, nil
 		}
-		active[n] = true
-		defer delete(active, n)
-		return walkYAMLNode(n.Content[0], active)
+		budget.active[n] = true
+		defer delete(budget.active, n)
+		return walkYAMLNode(n.Content[0], depth, budget)
 	case yaml.AliasNode:
 		if n.Alias == nil {
 			return nil, fmt.Errorf("YAML 别名未定义：%s", n.Value)
 		}
-		if active[n.Alias] {
+		if budget.active[n.Alias] {
 			return nil, fmt.Errorf("YAML 存在循环引用")
 		}
-		active[n] = true
-		defer delete(active, n)
-		v, err := walkYAMLNode(n.Alias, active)
+		budget.active[n] = true
+		defer delete(budget.active, n)
+		v, err := walkYAMLNode(n.Alias, depth+1, budget)
 		if err != nil {
 			return nil, err
 		}
-		return deepCopyAny(v), nil
+		return copyYAMLValueWithLimit(v, depth+1, budget)
 	case yaml.SequenceNode:
-		active[n] = true
-		defer delete(active, n)
+		budget.active[n] = true
+		defer delete(budget.active, n)
 		out := make([]any, len(n.Content))
 		for i, item := range n.Content {
-			v, err := walkYAMLNode(item, active)
+			v, err := walkYAMLNode(item, depth+1, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -85,8 +120,8 @@ func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
 		}
 		return out, nil
 	case yaml.MappingNode:
-		active[n] = true
-		defer delete(active, n)
+		budget.active[n] = true
+		defer delete(budget.active, n)
 		if len(n.Content)%2 != 0 {
 			return nil, fmt.Errorf("YAML 映射键值不配对")
 		}
@@ -95,7 +130,7 @@ func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
 		for i := 0; i < len(n.Content); i += 2 {
 			kNode, vNode := n.Content[i], n.Content[i+1]
 			if isMergeKeyNode(kNode) {
-				mv, err := walkYAMLNode(vNode, active)
+				mv, err := walkYAMLNode(vNode, depth+1, budget)
 				if err != nil {
 					return nil, err
 				}
@@ -115,11 +150,11 @@ func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
 				}
 				continue
 			}
-			keyStr, err := resolveMapKey(kNode, active)
+			keyStr, err := resolveMapKey(kNode, depth+1, budget)
 			if err != nil {
 				return nil, err
 			}
-			val, err := walkYAMLNode(vNode, active)
+			val, err := walkYAMLNode(vNode, depth+1, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -128,7 +163,11 @@ func walkYAMLNode(n *yaml.Node, active map[*yaml.Node]bool) (any, error) {
 		for _, m := range merged {
 			for mk, mv := range m {
 				if _, exists := out[mk]; !exists {
-					out[mk] = deepCopyAny(mv)
+					copied, err := copyYAMLValueWithLimit(mv, depth+1, budget)
+					if err != nil {
+						return nil, err
+					}
+					out[mk] = copied
 				}
 			}
 		}
@@ -176,16 +215,23 @@ func resolveScalarNode(n *yaml.Node) any {
 	return resolveScalarText(n.Value)
 }
 
-func resolveMapKey(n *yaml.Node, active map[*yaml.Node]bool) (string, error) {
+func resolveMapKey(n *yaml.Node, depth int, budget *yamlWalkBudget) (string, error) {
 	seen := map[*yaml.Node]bool{}
-	for n != nil && n.Kind == yaml.AliasNode {
+	for {
+		if err := budget.enter(depth); err != nil {
+			return "", err
+		}
+		if n == nil || n.Kind != yaml.AliasNode {
+			break
+		}
 		if n.Alias == nil {
 			return "", fmt.Errorf("YAML 别名未定义：%s", n.Value)
 		}
-		if active[n.Alias] || seen[n] {
+		if budget.active[n.Alias] || seen[n] {
 			return "", fmt.Errorf("YAML 存在循环引用")
 		}
 		seen[n] = true
+		depth++
 		n = n.Alias
 	}
 	if n == nil || n.Kind != yaml.ScalarNode {
