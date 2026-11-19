@@ -603,7 +603,7 @@ async def test_derive_region_multi_currency_disambiguates_by_name():
     assert await account_service._derive_region("INR", "印度") == "in"
 
 
-# ── 头像 URL 归一（2026-09 CDN 域名轮换治理）──────────────────
+# ── 头像 URL 归一（CDN 域名轮换）──────────────────
 
 
 @pytest.mark.parametrize(

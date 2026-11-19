@@ -185,7 +185,7 @@ def test_dev_pointer_blank_comment_or_relative_ignored(fake_env, monkeypatch):
     _unfreeze(monkeypatch)
     pointer = fake_env["app_dir"] / paths.DEV_POINTER
     dev_machine = fake_env["local"] / f"{paths.APP_SLUG}-dev"
-    for body in ("", "# 把开发态数据放到别处：E:\\HoldexarData\n", "relative/path\n"):
+    for body in ("", "# 把开发态数据放到别处：C:\\ExampleData\\Holdexar\n", "relative/path\n"):
         pointer.write_text(body, encoding="utf-8")
         assert paths.resolve_data_dir() == dev_machine
 

@@ -67,7 +67,7 @@ func kvBool(ctx context.Context, conn *sql.Conn, key string, def bool) (bool, er
 	return def, nil
 }
 
-// kernelPortConfig 迁移自 Python kernel_port_config：模式缺省按有无存档端口判定，
+// kernelPortConfig 解析内核端口配置：模式缺省按有无存档端口判定，
 // 非法模式/端口自愈（自愈写回由调用方的写事务承载时落库）。
 func (s *ManualHealth) kernelPortConfig(ctx context.Context) (string, *int) {
 	var mode *string

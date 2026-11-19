@@ -10,11 +10,27 @@ import (
 	"testing"
 )
 
-const refWorktreeRoot = `E:\Holdexar-go-migration`
+func clashcfgWorktreeRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Skip("未定位到仓库根目录，跳过跨语言对照")
+		}
+		dir = parent
+	}
+}
 
 func venvPython(t *testing.T) string {
 	t.Helper()
-	py := filepath.Join(refWorktreeRoot, "server", ".venv", "Scripts", "python.exe")
+	py := filepath.Join(clashcfgWorktreeRoot(t), "server", ".venv", "Scripts", "python.exe")
 	if _, err := os.Stat(py); err != nil {
 		t.Skip("worktree venv 不存在，跳过跨语言对照")
 	}
@@ -39,7 +55,7 @@ func runPythonRef(t *testing.T, refBody string, inputs any, outputs any) {
 	}
 	script := "import sys, json, os\n" +
 		"os.environ.setdefault('HOLDEXAR_DATA_DIR', r'" + filepath.Join(dir, "data-py") + "')\n" +
-		"sys.path.insert(0, r'" + filepath.Join(refWorktreeRoot, "server") + "')\n" +
+		"sys.path.insert(0, r'" + filepath.Join(clashcfgWorktreeRoot(t), "server") + "')\n" +
 		"payload = json.load(open(r'" + inPath + "', encoding='utf-8'))\n" +
 		refBody + "\n" +
 		"result = ref_entry(payload)\n" +

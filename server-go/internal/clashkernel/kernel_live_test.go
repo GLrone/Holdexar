@@ -13,11 +13,23 @@ import (
 	"holdexar/server-go/internal/clashcfg"
 )
 
-const worktreeRoot = `E:\Holdexar-go-migration`
-
 func liveKernelAsset(t *testing.T) string {
 	t.Helper()
-	exe := filepath.Join(worktreeRoot, "assets", "clash", "holdexar-mihomo.exe")
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Skip("未定位到仓库根目录，跳过真内核行为验收")
+		}
+		dir = parent
+	}
+	exe := filepath.Join(dir, "assets", "clash", "holdexar-mihomo.exe")
 	if _, err := os.Stat(exe); err != nil {
 		t.Skip("随包内核缺失，跳过真内核行为验收")
 	}

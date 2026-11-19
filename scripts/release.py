@@ -348,7 +348,7 @@ def check_stale_version_refs(version: str) -> None:
     README 的版本徽章这类引用不会让构建失败，但会让页面长期显示错版本。
     """
     stale: list[str] = []
-    for path in (ROOT / "README.md", ROOT / "docs" / "DEV_LOG.md"):
+    for path in (ROOT / "README.md",):
         if not path.is_file():
             continue
         found = set(re.findall(r"v?(\d+\.\d+\.\d+)", path.read_text(encoding="utf-8", errors="replace")))

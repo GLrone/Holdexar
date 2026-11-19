@@ -593,10 +593,10 @@ def test_same_exit_primary_prefers_lower_latency() -> None:
 
 def test_same_exit_primary_prefers_probed_over_cooling() -> None:
     """冷却行（沿用账本判定）排在本次检测之后：有本次检测存活行时不当代表。"""
-    rows = [_row("冷却行", alive=True, ms=50, cooling=True), _row("实测行", alive=True, ms=900)]
-    proxies_service._mark_same_exit(rows, {"冷却行": 0, "实测行": 1})
+    rows = [_row("冷却行", alive=True, ms=50, cooling=True), _row("测速行", alive=True, ms=900)]
+    proxies_service._mark_same_exit(rows, {"冷却行": 0, "测速行": 1})
     by_name = {r["name"]: r for r in rows}
-    assert by_name["实测行"]["duplicate"] is False
+    assert by_name["测速行"]["duplicate"] is False
     assert by_name["冷却行"]["duplicate"] is True
 
 

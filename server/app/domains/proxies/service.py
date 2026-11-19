@@ -468,7 +468,7 @@ async def resolve_proxy_url() -> str | None:
         return None
 
     if strategy == "proxy_first":
-        # 代理优先（2026-09 起默认）：Clash 内核在跑 → 内核端口（工作端口，
+        # 代理优先（默认策略）：Clash 内核在跑 → 内核端口（工作端口，
         # 网络页配置的那个）；代理池有启用节点 → 轮询；都没有 → 探用户自启
         # Verge 的兜底口（7897，与工作端口设置无关）；仍无 → 直连。
         status = clash_manager.runtime.status()

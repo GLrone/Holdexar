@@ -76,7 +76,7 @@ const island = {
   'island.playground.runVerify': '一键真实验收测试',
   'island.playground.verifying': '正在进行动态验收…',
   'island.playground.statusVerified': '已检验 (PASS)',
-  'island.playground.statusUnverified': '待检验 (未实测)',
+  'island.playground.statusUnverified': '待检验',
   'island.playground.presets': '预设场景快速注入',
   'island.playground.presetClear': '清空活动',
   'island.playground.presetSingle': '单活动 (价格抓取 45%)',

@@ -24,11 +24,9 @@ import (
 	"holdexar/server-go/internal/store"
 )
 
-const liveWorktreeRoot = `E:\Holdexar-go-migration`
-
 func liveKernelExe(t *testing.T) string {
 	t.Helper()
-	exe := filepath.Join(liveWorktreeRoot, "assets", "clash", "holdexar-mihomo.exe")
+	exe := filepath.Join(proxypoolWorktreeRoot(t), "assets", "clash", "holdexar-mihomo.exe")
 	if _, err := os.Stat(exe); err != nil {
 		t.Skip("随包内核缺失，跳过真内核三层体检验收")
 	}
@@ -383,7 +381,7 @@ func TestLiveHealthThreeLayers(t *testing.T) {
 	if l0Elapsed > 90*time.Second {
 		t.Fatalf("L0 24 节点（20 并发）累计耗时 %v，疑似饥饿", l0Elapsed)
 	}
-	t.Logf("实测耗时：L2 两波 %v，L0 全程 %v", bizElapsed, l0Elapsed)
+	t.Logf("总耗时：L2 两波 %v，L0 全程 %v", bizElapsed, l0Elapsed)
 
 	var ingest IngestionResult
 	alive := CheckRow{Name: names[0], Alive: true, ExitIP: "127.0.0.1", MS: 66, Probed: true}

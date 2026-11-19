@@ -545,6 +545,6 @@ func TestRegisterErrors(t *testing.T) {
 	s2.RunSim(t0.Add(time.Hour))
 	fires := log.of(EventFire, "late")
 	if len(fires) != 1 || !fires[0].At.Equal(t0.Add(30*time.Minute)) {
-		t.Fatalf("运行中注册应即时初锚，实测 %v", fires)
+		t.Fatalf("运行中注册应即时初锚，实际 %v", fires)
 	}
 }

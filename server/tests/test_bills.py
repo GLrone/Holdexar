@@ -133,7 +133,7 @@ def test_wallet_and_refund_classification():
     assert [g["acq"] for g in parsed["cdk_games"]] == ["cdk", "free"]
 
 
-# ── 2026-09 新 UI：礼物标记剥离 + 正则模糊分类 ────────────────
+# ── 礼物标记剥离 + 正则模糊分类 ────────────────
 
 
 @pytest.mark.parametrize(
@@ -390,7 +390,7 @@ def _load_fetch_sample(name: str) -> str:
 
 
 def test_steam_fetch_history_parser_real_html():
-    """后端爬虫的 history 行提取器对 2026-09 实网样本的口径验证。
+    """后端爬虫的 history 行提取器对样本 HTML 的口径验证。
 
     与 parseHistoryRows 同构：受赠人独立字段、item 不含礼物标记/退款尾缀、
     批量市场行带 type_count、余额/基准价列透传。
@@ -1464,7 +1464,7 @@ _PAGE = (
     ],
 )
 async def test_fetch_account_identity_avatar_domains(url, mime):
-    """新旧头像域名都要能抓到（2026-09 账号页迁移 fastly.steamstatic 后头像恒空的修复）。"""
+    """新旧头像域名（akamaized 与 fastly.steamstatic）都要能抓到。"""
     from app.domains.bills.steam_fetch import _fetch_account_identity
 
     client = _FakeClient(_PAGE.format(url=url))

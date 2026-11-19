@@ -55,12 +55,12 @@ func TestListImportsShape(t *testing.T) {
 	}
 }
 
-func g6Data(name string) string {
-	return filepath.Join("E:/Holdexar-g6/python-test-data", name)
-}
-
 func TestPyParityHash(t *testing.T) {
-	db, err := sql.Open("sqlite", g6Data("holdexar.db"))
+	base := strings.TrimSpace(os.Getenv("HOLDEXAR_PARITY_DB"))
+	if base == "" {
+		t.Skip("未设置对照库 HOLDEXAR_PARITY_DB，跳过")
+	}
+	db, err := sql.Open("sqlite", filepath.Join(base, "holdexar.db"))
 	if err != nil {
 		t.Skip("副本缺席: " + err.Error())
 	}
@@ -82,7 +82,7 @@ func TestPyParityHash(t *testing.T) {
 	sum := sha256.Sum256(b)
 	goHash := hex.EncodeToString(sum[:])
 
-	pyHashB, err := os.ReadFile(g6Data("py-bills-hash.txt"))
+	pyHashB, err := os.ReadFile(filepath.Join(base, "py-bills-hash.txt"))
 	if err != nil {
 		t.Skip("py 侧哈希未生成（harness 未跑）")
 	}

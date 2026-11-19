@@ -116,7 +116,7 @@ def test_redact_is_idempotent():
 @pytest.mark.parametrize(
     "line",
     [
-        "2026-09-12 00:01:43,217 [INFO] app.main: Holdexar 0.1.0 启动，data=C:\\Users\\k\\AppData\\Local\\holdexar-dev，port=28765",
+        "2026-09-12 00:01:43,217 [INFO] app.main: Holdexar 0.1.0 启动，data=C:\\Users\\demo\\AppData\\Local\\holdexar-dev，port=28765",
         "2026-09-12 00:01:42,655 [INFO] app.main: 历史表初始化完成：2373 行",
         "[链式] 跳过 repair：没有待补抓的欠账（missing）数据",
         "2026-09-12 00:01:43,194 [INFO] app.main: 愿望单初始化完成：2570 款",

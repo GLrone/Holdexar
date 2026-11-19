@@ -18,7 +18,7 @@
     python scripts/publish_release.py --dry-run     # 只打印将执行的命令
     python scripts/publish_release.py               # 正式发布
     python scripts/publish_release.py --prerelease  # 预发布标记留给真 RC（Beta 见下）
-    python scripts/publish_release.py --scoop-dir D:\\scoop-bucket   # 顺带更新 Scoop 清单
+    python scripts/publish_release.py --scoop-dir <scoop-bucket-dir>   # 顺带更新 Scoop 清单
 
 发 Beta 的推荐做法：标题写「Holdexar vX.Y.Z Beta」，**不加** --prerelease。
 预发布标记不能当 Latest（GitHub 限制），会让 releases/latest 指空，

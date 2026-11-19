@@ -22,7 +22,7 @@ const props = defineProps<{ career: CareerPayload }>()
 const { t } = useI18n()
 const { month: fmtMonth, yearMonth: fmtYearMonth } = useLocaleFormat()
 
-/* ── 日期工具（一律本地时区手撕，不走 Date 解析字符串——'2025-08' 会被当 UTC）── */
+/* ── 日期工具（一律本地时区手撕，不走 Date 解析字符串——'YYYY-MM' 会被当 UTC）── */
 function ymd(y: number, m: number, d: number): string {
   return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
 }
